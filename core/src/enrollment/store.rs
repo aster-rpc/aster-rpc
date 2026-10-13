@@ -169,6 +169,9 @@ struct State {
 /// restoring both stores is outside the local rollback guarantee.
 pub struct EnrollmentPolicyStore {
     path: PathBuf,
+    /// The path the consumer opened. A fleet store for another root lives
+    /// beside it (see [`Self::open`]), and the rotation journal beside that.
+    base: PathBuf,
     _lock: File,
     state: Mutex<State>,
     root: [u8; 32],
@@ -181,13 +184,44 @@ impl EnrollmentPolicyStore {
     /// Open the store for a fleet namespace: the namespace a consumer pins,
     /// which carries bindings, issuer statuses, credential revocations and
     /// denial mirrors as well as registrations.
+    ///
+    /// State is kept per root. The first root opened at `path` keeps its
+    /// state there; any other root's state lives beside it at
+    /// `<path>.root-<hex root>`. A node that rotated its root, at runtime or
+    /// by updating its profile, therefore reopens the same `path` with its
+    /// current root, and authority held for an earlier root is never read
+    /// for a later one.
     pub fn open(
         path: impl AsRef<Path>,
         root: [u8; 32],
         namespace: [u8; 32],
         audience: impl Into<String>,
     ) -> Result<Self, RecordError> {
-        Self::open_role(path, root, namespace, audience, StoreRole::Fleet)
+        let base = path.as_ref().to_path_buf();
+        let path = fleet_path(&base, &root)?;
+        let mut store = Self::open_role(path, root, namespace, audience, StoreRole::Fleet)?;
+        store.base = base;
+        Ok(store)
+    }
+
+    /// Open the fleet store for a root this node rotated to, beside the path
+    /// this store was opened at, with the same audience and leeway. Its state
+    /// starts empty the first time: nothing held for the previous root
+    /// carries over.
+    pub fn open_rotated(&self, root: [u8; 32], namespace: [u8; 32]) -> Result<Self, RecordError> {
+        if self.role != StoreRole::Fleet || root == self.root {
+            return Err(RecordError::InvalidConfiguration);
+        }
+        Self::open(&self.base, root, namespace, self.audience.clone())?
+            .with_activation_leeway(self.activation_leeway)
+    }
+
+    /// Where applied root rotations are journaled for this store's path, so a
+    /// restart cannot revert a rotation learned at runtime.
+    pub fn rotation_journal_path(&self) -> PathBuf {
+        let mut path = self.base.as_os_str().to_os_string();
+        path.push(".rotations");
+        PathBuf::from(path)
     }
 
     /// Open the store for a membership namespace bound to this fleet, beside
@@ -280,6 +314,7 @@ impl EnrollmentPolicyStore {
             return Err(RecordError::InvalidConfiguration);
         }
         let store = Self {
+            base: path.clone(),
             path,
             _lock: lock,
             state: Mutex::new(State {
@@ -1151,41 +1186,75 @@ impl EnrollmentPolicyStore {
         if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
             return Err(RecordError::TooManyRecords);
         }
-        let mut random = [0; 16];
-        getrandom::getrandom(&mut random).map_err(storage)?;
-        let tmp = self
-            .path
-            .with_extension(format!("pending-{}", hex::encode(random)));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
+        write_atomic(&self.path, &bytes)
+    }
+}
+/// Write `bytes` to a new owner-only file beside `path`, sync it, and rename
+/// it over `path`. Unix also syncs the containing directory.
+pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), RecordError> {
+    let mut random = [0; 16];
+    getrandom::getrandom(&mut random).map_err(storage)?;
+    let tmp = path.with_extension(format!("pending-{}", hex::encode(random)));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&tmp).map_err(storage)?;
+    let result = (|| {
+        file.write_all(bytes).map_err(storage)?;
+        file.sync_all().map_err(storage)?;
+        std::fs::rename(&tmp, path).map_err(storage)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            File::open(parent)
+                .and_then(|f| f.sync_all())
+                .map_err(storage)?;
         }
-        let mut file = options.open(&tmp).map_err(storage)?;
-        let result = (|| {
-            file.write_all(&bytes).map_err(storage)?;
-            file.sync_all().map_err(storage)?;
-            std::fs::rename(&tmp, &self.path).map_err(storage)?;
-            #[cfg(unix)]
-            {
-                let parent = self
-                    .path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(Path::new("."));
-                File::open(parent)
-                    .and_then(|f| f.sync_all())
-                    .map_err(storage)?;
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(tmp);
-        }
-        result
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
     }
+    result
+}
+/// The file holding a fleet store's state for `root`: `base` itself unless
+/// `base` already holds another root's state, else `<base>.root-<hex root>`.
+fn fleet_path(base: &Path, root: &[u8; 32]) -> Result<PathBuf, RecordError> {
+    #[derive(Deserialize)]
+    struct PersistedRoot {
+        root: [u8; 32],
+    }
+    let held = match File::open(base) {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            file.take(MAX_SNAPSHOT_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(storage)?;
+            if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+                return Err(RecordError::TooManyRecords);
+            }
+            Some(
+                serde_json::from_slice::<PersistedRoot>(&bytes)
+                    .map_err(storage)?
+                    .root,
+            )
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(storage(error)),
+    };
+    if held.is_none_or(|held| held == *root) {
+        return Ok(base.to_path_buf());
+    }
+    let mut path = base.as_os_str().to_os_string();
+    path.push(format!(".root-{}", hex::encode(root)));
+    Ok(PathBuf::from(path))
 }
 impl AdmissionGuard for EnrollmentPolicyStore {
     fn denial(&self, evidence: &VerifiedAdmissionEvidence, now: u64) -> Option<DenialReason> {

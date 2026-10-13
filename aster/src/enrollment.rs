@@ -37,6 +37,7 @@ pub use aster_transport_core::enrollment::{
     ReviewedObservation, MAX_OBSERVATION_LIFETIME, OBSERVATION_JWT_TYPE,
 };
 pub use aster_transport_core::enrollment::{DelegatedIssuer, IssuanceError, SubjectStanding};
+pub use aster_transport_core::enrollment::{RotationPin, MAX_FORWARDED_ROTATIONS};
 
 #[cfg(all(feature = "rpc", feature = "docs"))]
 pub mod issuer;
@@ -308,6 +309,35 @@ impl Enrollment {
         self.inner
             .track_connection(connection.enrollment_core())
             .await
+    }
+
+    /// Apply root rotation statements (for example one an operator received
+    /// out of band) that continue this node's pinned root. Requires
+    /// [`EnrollmentOptions::rotation`]. Peers also deliver them during the
+    /// enrollment handshake.
+    pub fn apply_root_rotations(&self, statements: &[String]) -> anyhow::Result<usize> {
+        self.inner.apply_root_rotations(statements)
+    }
+
+    /// Replace this node's credential, for example with one the new root
+    /// issued after a rotation, and present it again to every peer this node
+    /// has a session with. Returns the peers that could not be reached.
+    pub async fn replace_credential(
+        &self,
+        chain: String,
+    ) -> anyhow::Result<Vec<([u8; 32], String)>> {
+        self.inner.replace_credential(chain).await
+    }
+
+    /// The root this node trusts now, with its next-root commitment and
+    /// rotation count, when rotation is configured.
+    pub fn root_state(&self) -> Option<crate::delegation::RootState> {
+        self.inner.root_state()
+    }
+
+    /// The rotation statements this node has applied, oldest first.
+    pub fn root_rotations(&self) -> Vec<String> {
+        self.inner.root_rotations()
     }
 
     pub fn revocations(&self) -> tokio::sync::broadcast::Receiver<EnrollmentRevoked> {

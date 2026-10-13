@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, oneshot, Semaphore, SemaphorePermit};
 use tokio::task::AbortHandle;
 
+use super::rotation::{RotationJournal, RotationPin, MAX_FORWARDED_ROTATIONS};
 use super::{
     admit, local_clock_synchronization, AdmissionContext, AdmissionDecision,
     AdmissionEvidenceSource, AdmissionPolicy, ClockSynchronization, DenialReason, EnrollmentError,
@@ -26,14 +27,16 @@ use super::{
     RecordAvailability, RecordError, Registration, SourceAddressProvenance, SynchronizationSource,
     VerifiedAdmissionEvidence, MAX_CHAIN_BYTES,
 };
-use crate::delegation::ChainError;
+use crate::delegation::{
+    claimed_rotation_seq, verify_root_rotation, ChainError, RootState, MAX_ROTATION_BYTES,
+};
 use crate::{
     CoreAfterHandshakeDecision, CoreConnection, CoreDoc, CoreHookHandshakeInfo, CoreHookReceiver,
     CoreNode, CoreNodeAddr, CoreRecvStream, CoreSendStream, CoreWeakConnection,
 };
 
 pub const ENROLLMENT_ALPN: &[u8] = b"aster.enrollment/1";
-const MAX_ENVELOPE: usize = MAX_CHAIN_BYTES + 8192;
+const MAX_ENVELOPE: usize = MAX_CHAIN_BYTES + 8192 + MAX_FORWARDED_ROTATIONS * MAX_ROTATION_BYTES;
 const REJECT: u64 = 403;
 /// Close reason prefix carrying the observed offset (remote minus local
 /// seconds) back to a peer whose clock is outside the activation leeway.
@@ -75,6 +78,10 @@ pub struct EnrollmentOptions {
     /// Refuse to install while the kernel reports the local clock
     /// unsynchronized. When false the status is only reported in readiness.
     pub require_synchronized_clock: bool,
+    /// Accept root rotations: the commitment to the next root key the
+    /// consumer pins beside its root. `None` refuses every rotation
+    /// statement, and the root can then only change by reinstalling.
+    pub rotation: Option<RotationPin>,
 }
 
 impl Default for EnrollmentOptions {
@@ -96,6 +103,7 @@ impl Default for EnrollmentOptions {
             max_admitted_peers: 1024,
             session_idle_eviction: Duration::from_secs(300),
             require_synchronized_clock: false,
+            rotation: None,
         }
     }
 }
@@ -233,6 +241,10 @@ impl RevokedPeers {
 #[serde(deny_unknown_fields)]
 struct Hello {
     version: u8,
+    /// Root rotations this node applied, oldest first. Self-certifying, so a
+    /// peer applies any that continue its own pinned root.
+    #[serde(default)]
+    rotations: Vec<String>,
     /// Sender's Unix seconds, for clock-skew diagnosis.
     sent_at: u64,
 }
@@ -241,6 +253,8 @@ struct Hello {
 #[serde(deny_unknown_fields)]
 struct ReplicaProof {
     version: u8,
+    #[serde(default)]
+    rotations: Vec<String>,
     /// The responder's own delegation chain, in text form.
     chain: Option<String>,
     sent_at: u64,
@@ -317,7 +331,29 @@ struct HandshakeCounts {
     sources: BTreeMap<IpAddr, usize>,
 }
 
-#[derive(Default)]
+/// Everything bound to one root: the fleet store, the stores for the
+/// membership namespaces it binds, and the chain verifier anchored at it.
+struct Trust {
+    store: Arc<EnrollmentPolicyStore>,
+    stores: Arc<PolicyStores>,
+    verifier: Arc<JwtEnrollmentVerifier>,
+}
+
+impl Trust {
+    fn new(store: Arc<EnrollmentPolicyStore>, verifier: JwtEnrollmentVerifier) -> Self {
+        Self {
+            stores: Arc::new(PolicyStores::new(store.clone())),
+            store,
+            verifier: Arc::new(verifier),
+        }
+    }
+}
+
+struct RotationState {
+    root: RootState,
+    journal: RotationJournal,
+}
+
 struct OwnCredential {
     chain: Option<String>,
     evidence: Option<VerifiedAdmissionEvidence>,
@@ -356,10 +392,13 @@ fn decrement_count<K: Ord>(counts: &mut BTreeMap<K, usize>, key: &K) {
 pub struct EnrollmentService {
     this: Weak<Self>,
     node: CoreNode,
-    store: Arc<EnrollmentPolicyStore>,
-    /// The fleet store and one store per bound membership namespace.
-    stores: PolicyStores,
-    verifier: JwtEnrollmentVerifier,
+    /// The root this node trusts and the policy pinned to it. An accepted
+    /// root rotation replaces it as a whole.
+    trust: RwLock<Arc<Trust>>,
+    /// The pinned next-root commitment and the applied-rotation journal;
+    /// `None` when the consumer configured no rotation.
+    rotation: Mutex<Option<RotationState>>,
+    audience: String,
     /// This node's own credential, as presented in handshakes, and its
     /// verified evidence. Renewal replaces both together.
     own: RwLock<OwnCredential>,
@@ -449,25 +488,38 @@ impl EnrollmentService {
             );
             tracing::warn!("enrollment: local clock is not synchronized; admission may fail");
         }
+        let (store, verifier, rotation) = resume_rotation(store, verifier, options.rotation)?;
         let own = identity(&node.node_id())?;
-        let own_evidence = credential
-            .as_deref()
-            .map(|token| verifier.verify(token, &own, unix_now()))
-            .transpose()?;
+        // A credential anchored at a root this node has since rotated away
+        // from is not presented; the node is admitted by records instead.
+        let own_evidence = match credential.as_deref() {
+            Some(token) => match verifier.verify(token, &own, unix_now()) {
+                Ok(evidence) => Some(evidence),
+                Err(error) if rotation.as_ref().is_some_and(|r| r.root.seq > 0) => {
+                    tracing::warn!(?error, "enrollment: credential predates the current root");
+                    None
+                }
+                Err(error) => return Err(error.into()),
+            },
+            None => None,
+        };
+        let credential = credential.filter(|_| own_evidence.is_some());
         let hooks = node
             .take_hook_receiver()
             .ok_or_else(|| anyhow!("enrollment requires unused node hooks"))?;
         let service = Self::new(
             node,
-            store,
-            verifier,
-            credential,
+            Trust::new(store, verifier),
+            OwnCredential {
+                chain: credential,
+                evidence: own_evidence,
+            },
             policy,
             options,
-            own_evidence,
+            rotation,
         );
         // Bound stores keep their own durable denials across restart.
-        service.stores.sync_bindings()?;
+        service.trust().stores.sync_bindings()?;
         service.spawn_hook_loop(hooks);
         let weak = Arc::downgrade(&service);
         let interval = service.options.reconciliation_interval;
@@ -486,12 +538,11 @@ impl EnrollmentService {
 
     fn new(
         node: CoreNode,
-        store: Arc<EnrollmentPolicyStore>,
-        verifier: JwtEnrollmentVerifier,
-        credential: Option<String>,
+        trust: Trust,
+        own: OwnCredential,
         policy: Arc<dyn AdmissionPolicy>,
         options: EnrollmentOptions,
-        own_evidence: Option<VerifiedAdmissionEvidence>,
+        rotation: Option<RotationState>,
     ) -> Arc<Self> {
         // One reconciliation can revoke every admitted peer; size the channel
         // so that does not lag a promptly polling consumer.
@@ -499,16 +550,13 @@ impl EnrollmentService {
         Arc::new_cyclic(|this| Self {
             this: this.clone(),
             node,
-            stores: PolicyStores::new(store.clone()),
+            audience: trust.store.audience().to_owned(),
+            trust: RwLock::new(Arc::new(trust)),
+            rotation: Mutex::new(rotation),
             bound_documents: RwLock::new(BTreeMap::new()),
             offered_tickets: Mutex::new(BTreeMap::new()),
             observer: Mutex::new(Observer::default()),
-            store,
-            verifier,
-            own: RwLock::new(OwnCredential {
-                chain: credential,
-                evidence: own_evidence,
-            }),
+            own: RwLock::new(own),
             policy,
             inbound_permits: Semaphore::new(options.max_concurrent_handshakes),
             outbound_permits: Semaphore::new(options.max_concurrent_handshakes),
@@ -625,6 +673,7 @@ impl EnrollmentService {
     pub fn add_policy_document(&self, doc: CoreDoc) -> Result<NamespaceBindingV1> {
         let namespace = namespace(&doc.doc_id())?;
         let binding = self
+            .trust()
             .stores
             .sync_bindings()?
             .into_iter()
@@ -646,7 +695,8 @@ impl EnrollmentService {
             .bound_documents
             .read()
             .unwrap_or_else(|e| e.into_inner());
-        self.store
+        self.trust()
+            .store
             .bindings()
             .into_iter()
             .filter(|binding| binding.purpose == purpose)
@@ -665,7 +715,9 @@ impl EnrollmentService {
             .unwrap_or_else(|e| e.into_inner());
         documents
             .iter()
-            .filter_map(|(namespace, doc)| Some((self.stores.membership(namespace)?, doc.clone())))
+            .filter_map(|(namespace, doc)| {
+                Some((self.trust().stores.membership(namespace)?, doc.clone()))
+            })
             .collect()
     }
 
@@ -699,7 +751,7 @@ impl EnrollmentService {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&peer)
             .unwrap_or_default();
-        let bindings = self.stores.sync_bindings()?;
+        let bindings = self.trust().stores.sync_bindings()?;
         for ticket in offered {
             let mut decoded = DocTicket::decode_string(&ticket)?;
             ensure!(
@@ -724,7 +776,7 @@ impl EnrollmentService {
                 .join(decoded.encode_string())
                 .await?;
             let store = (binding.purpose == NamespacePurpose::Membership)
-                .then(|| self.stores.membership(&bound))
+                .then(|| self.trust().stores.membership(&bound))
                 .flatten();
             self.bound_documents
                 .write()
@@ -798,12 +850,16 @@ impl EnrollmentService {
     /// apply the same withdrawals enrollment does.
     pub fn delegate_revoked(&self, key: &[u8; 32]) -> bool {
         use crate::delegation::RevokedDelegates;
-        self.stores.is_revoked(key)
+        self.trust().stores.is_revoked(key)
     }
 
     /// The fleet audience this node's verifier and stores pin.
     pub fn audience(&self) -> &str {
-        self.store.audience()
+        &self.audience
+    }
+
+    fn trust(&self) -> Arc<Trust> {
+        self.trust.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     fn own_chain(&self) -> Option<String> {
@@ -835,14 +891,19 @@ impl EnrollmentService {
         subject: &[u8; 32],
         chain: &str,
     ) -> Result<VerifiedAdmissionEvidence, super::EnrollmentError> {
-        self.verifier
-            .verify_with(chain, subject, unix_now(), &self.stores)
+        self.trust()
+            .verifier
+            .verify_with(chain, subject, unix_now(), self.trust().stores.as_ref())
     }
 
     /// What the root's records, as this node last reconciled them across
     /// every bound namespace, say about `subject`.
     pub fn subject_standing(&self, subject: &[u8; 32]) -> SubjectStanding {
-        match self.stores.select_evidence(subject, None, unix_now()) {
+        match self
+            .trust()
+            .stores
+            .select_evidence(subject, None, unix_now())
+        {
             Ok(_) => SubjectStanding::Registered,
             Err(RecordError::Denied(reason)) if reason.is_definite() => {
                 SubjectStanding::Denied(reason)
@@ -885,6 +946,155 @@ impl EnrollmentService {
         Ok(unreached)
     }
 
+    /// The root this node currently trusts, with its next-root commitment
+    /// and rotation count. `None` when the consumer configured no rotation.
+    pub fn root_state(&self) -> Option<RootState> {
+        self.rotation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|rotation| rotation.root)
+    }
+
+    /// The rotation statements this node has applied, oldest first, as it
+    /// offers them to peers in the enrollment handshake.
+    pub fn root_rotations(&self) -> Vec<String> {
+        self.rotation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|rotation| rotation.journal.statements().to_vec())
+            .unwrap_or_default()
+    }
+
+    /// Statements a peer offered in a handshake. Each is self-certifying, so
+    /// the peer needs no trust; one that does not continue this node's root
+    /// is ignored.
+    fn offered_rotations(&self, statements: &[String]) {
+        if statements.is_empty() {
+            return;
+        }
+        if let Err(error) = self.apply_root_rotations(statements) {
+            tracing::debug!(%error, "enrollment: offered root rotation not applied");
+        }
+    }
+
+    /// Apply the statements that continue this node's pinned root, in
+    /// sequence order: each must be signed by the key the current
+    /// commitment names, name the current root as `prev`, and be exactly
+    /// the next sequence number. Each one is journaled durably before it
+    /// takes effect. Then the root's statement replaces the trusted root,
+    /// the policy stores re-target to its fleet namespace with no authority
+    /// carried over, and every session (all of them rest on the previous
+    /// root) is closed with [`DenialReason::RootRotated`]. Returns how many
+    /// were applied; statements already applied are skipped.
+    pub fn apply_root_rotations(&self, statements: &[String]) -> Result<usize> {
+        let mut ordered: Vec<(u64, &String)> = statements
+            .iter()
+            .take(MAX_FORWARDED_ROTATIONS)
+            .filter_map(|statement| Some((claimed_rotation_seq(statement)?, statement)))
+            .collect();
+        ordered.sort_by_key(|(seq, _)| *seq);
+        let mut applied = 0;
+        {
+            let mut rotation = self.rotation.lock().unwrap_or_else(|e| e.into_inner());
+            let rotation = rotation
+                .as_mut()
+                .ok_or_else(|| anyhow!("root rotation is not configured"))?;
+            for (seq, statement) in ordered {
+                if seq <= rotation.root.seq {
+                    continue;
+                }
+                let trust = self.trust();
+                let verified = verify_root_rotation(
+                    statement,
+                    &rotation.root,
+                    unix_now(),
+                    trust.verifier.activation_leeway(),
+                )
+                .map_err(|error| anyhow!("root rotation rejected: {error:?}"))?;
+                let store = Arc::new(
+                    trust
+                        .store
+                        .open_rotated(*verified.new_root(), verified.namespaces()[0])?,
+                );
+                let verifier = rotated_verifier(&trust.verifier, *verified.new_root())?;
+                rotation.journal.append(verified.statement())?;
+                rotation.root = verified.apply();
+                *self.trust.write().unwrap_or_else(|e| e.into_inner()) =
+                    Arc::new(Trust::new(store, verifier));
+                tracing::info!(
+                    root = %hex::encode(verified.new_root()),
+                    seq = verified.seq(),
+                    "enrollment: root rotated"
+                );
+                applied += 1;
+            }
+        }
+        if applied > 0 {
+            self.after_rotation();
+        }
+        Ok(applied)
+    }
+
+    /// Drop everything held under the previous root: its policy documents,
+    /// observer grant and freshness, this node's own credential if the new
+    /// root does not anchor it, and every session.
+    fn after_rotation(&self) {
+        if let Some(watch) = self
+            .policy_watch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            watch.abort();
+        }
+        *self.document.write().unwrap_or_else(|e| e.into_inner()) = None;
+        self.bound_documents
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.offered_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        *self.observer.lock().unwrap_or_else(|e| e.into_inner()) = Observer::default();
+        {
+            let mut context = self.context.write().unwrap_or_else(|e| e.into_inner());
+            context.policy_sync = None;
+            context.pending_policy_content = true;
+        }
+        let own = identity(&self.node.node_id()).ok();
+        let mut credential = self.own.write().unwrap_or_else(|e| e.into_inner());
+        let still_valid = credential
+            .chain
+            .as_deref()
+            .zip(own)
+            .is_some_and(|(chain, own)| {
+                self.trust()
+                    .verifier
+                    .verify(chain, &own, unix_now())
+                    .is_ok()
+            });
+        if !still_valid {
+            *credential = OwnCredential {
+                chain: None,
+                evidence: None,
+            };
+        }
+        drop(credential);
+        let sessions: Vec<([u8; 32], u64)> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(peer, session)| (*peer, session.generation))
+            .collect();
+        for (peer, generation) in sessions {
+            self.revoke_generation(&peer, generation, DenialReason::RootRotated);
+        }
+    }
+
     pub fn revocations(&self) -> broadcast::Receiver<EnrollmentRevoked> {
         self.revoked.subscribe()
     }
@@ -894,7 +1104,7 @@ impl EnrollmentService {
     /// current from then on.
     pub fn set_policy_document(&self, doc: CoreDoc) -> Result<()> {
         ensure!(
-            namespace(&doc.doc_id())? == *self.store.namespace(),
+            namespace(&doc.doc_id())? == *self.trust().store.namespace(),
             "wrong policy namespace"
         );
         *self.document.write().unwrap_or_else(|e| e.into_inner()) = Some(doc.clone());
@@ -936,13 +1146,13 @@ impl EnrollmentService {
         let Ok(peer) = identity(peer) else {
             return;
         };
-        if peer != *self.store.root() && !self.has_session(&peer) {
+        if peer != *self.trust().store.root() && !self.has_session(&peer) {
             return;
         }
-        let Ok(report) = self.store.refresh(doc).await else {
+        let Ok(report) = self.trust().store.refresh(doc).await else {
             return;
         };
-        let _ = self.stores.sync_bindings();
+        let _ = self.trust().stores.sync_bindings();
         let mut context = self.context.write().unwrap_or_else(|e| e.into_inner());
         context.pending_policy_content = report.has_uncertainty();
         if report.pending == 0 {
@@ -953,7 +1163,7 @@ impl EnrollmentService {
     fn synchronization(&self, peer: [u8; 32]) -> PolicySynchronization {
         PolicySynchronization {
             completed_at: unix_now(),
-            source: if peer == *self.store.root() {
+            source: if peer == *self.trust().store.root() {
                 SynchronizationSource::Root
             } else {
                 SynchronizationSource::Replica(peer)
@@ -1064,7 +1274,7 @@ impl EnrollmentService {
             .clone();
         let mut unresolved = None;
         if let Some(doc) = &doc {
-            unresolved = self.refresh_issue(self.store.refresh_node(doc, peer).await);
+            unresolved = self.refresh_issue(self.trust().store.refresh_node(doc, peer).await);
         }
         for (store, doc) in self.membership_documents() {
             let issue = self.refresh_issue(store.refresh_node(&doc, peer).await);
@@ -1072,7 +1282,7 @@ impl EnrollmentService {
         }
         // Independent root registration replaces presentation evidence. An
         // obsolete/expired chain must not block a newer valid registration.
-        if let Ok(registration) = self.stores.select_evidence(peer, None, unix_now()) {
+        if let Ok(registration) = self.trust().stores.select_evidence(peer, None, unix_now()) {
             if let Some(issue) = unresolved {
                 return Err(issue);
             }
@@ -1082,8 +1292,12 @@ impl EnrollmentService {
         // Gate G6 rejects a chain through a delegate the root has revoked.
         let chain = token
             .map(|token| {
-                self.verifier
-                    .verify_with(token, peer, unix_now(), &self.stores)
+                self.trust().verifier.verify_with(
+                    token,
+                    peer,
+                    unix_now(),
+                    self.trust().stores.as_ref(),
+                )
             })
             .transpose()
             .map_err(|error| match error {
@@ -1097,19 +1311,25 @@ impl EnrollmentService {
             })?;
         if let (Some(doc), Some(chain)) = (&doc, chain.as_ref()) {
             if let Some(id) = chain.credential_id() {
-                let issue = self.refresh_issue(self.store.refresh_credential(doc, id).await);
+                let issue =
+                    self.refresh_issue(self.trust().store.refresh_credential(doc, id).await);
                 unresolved = unresolved.or(issue);
             }
             // Read the root's current statement about every delegate on the
             // path, so a revocation this node has not reconciled yet applies.
             if let AdmissionEvidenceSource::PresentedChain { issuers, .. } = chain.source() {
-                for delegate in issuers.iter().filter(|key| *key != self.store.root()) {
-                    let issue = self.refresh_issue(self.store.refresh_issuer(doc, delegate).await);
+                for delegate in issuers
+                    .iter()
+                    .filter(|key| *key != self.trust().store.root())
+                {
+                    let issue =
+                        self.refresh_issue(self.trust().store.refresh_issuer(doc, delegate).await);
                     unresolved = unresolved.or(issue);
                 }
             }
         }
         let evidence = self
+            .trust()
             .stores
             .select_evidence(peer, chain.as_ref(), unix_now())
             .map_err(AdmissionError::from_record)?;
@@ -1163,7 +1383,16 @@ impl EnrollmentService {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         context.observed_source = observed_source;
-        match admit(evidence, &self.stores, &context, policy, timeout, unix_now).await {
+        match admit(
+            evidence,
+            self.trust().stores.as_ref(),
+            &context,
+            policy,
+            timeout,
+            unix_now,
+        )
+        .await
+        {
             AdmissionDecision::Allow => Ok(()),
             AdmissionDecision::Deny(reason) => Err(AdmissionError::from_reason(reason)),
         }
@@ -1261,6 +1490,7 @@ impl EnrollmentService {
     /// to that namespace's write capability.
     async fn refresh_observer(&self, fleet: &CoreDoc) {
         let binding = self
+            .trust()
             .store
             .bindings()
             .into_iter()
@@ -1287,7 +1517,8 @@ impl EnrollmentService {
             .doc
             .as_ref()
             .is_some_and(|(namespace, _)| *namespace == target);
-        let grant = super::open_observer_grant(fleet, self.store.root(), &secret, &target).await;
+        let grant =
+            super::open_observer_grant(fleet, self.trust().store.root(), &secret, &target).await;
         let doc = match grant {
             Ok(ObserverGrant::Active(_)) if held => return,
             Ok(ObserverGrant::Active(write)) => {
@@ -1328,7 +1559,8 @@ impl EnrollmentService {
     /// has published one, else its own chain's.
     fn own_scopes(&self) -> Option<std::collections::BTreeSet<String>> {
         let own = identity(&self.node.node_id()).ok()?;
-        self.stores
+        self.trust()
+            .stores
             .select_evidence(&own, self.own_evidence().as_ref(), unix_now())
             .ok()?
             .claims()
@@ -1437,7 +1669,7 @@ impl EnrollmentService {
         let offset_seconds = i64::try_from(sent_at)
             .unwrap_or(i64::MAX)
             .saturating_sub(i64::try_from(unix_now()).unwrap_or(i64::MAX));
-        if offset_seconds.unsigned_abs() > self.verifier.activation_leeway() {
+        if offset_seconds.unsigned_abs() > self.trust().verifier.activation_leeway() {
             tracing::warn!(offset_seconds, "enrollment: peer clock outside leeway");
             return Err(AdmissionError::ClockSkew { offset_seconds });
         }
@@ -1471,7 +1703,7 @@ impl EnrollmentService {
         {
             return AdmissionError::Denied(reason.clone());
         }
-        match self.stores.select_evidence(peer, None, unix_now()) {
+        match self.trust().stores.select_evidence(peer, None, unix_now()) {
             Err(RecordError::Denied(reason)) if reason.is_definite() => {
                 AdmissionError::Denied(reason)
             }
@@ -1526,6 +1758,7 @@ impl EnrollmentService {
             let _slot = self.inbound_slot(peer, source.map(|source| source.address))?;
             ensure!(hello.version == 1, "unsupported enrollment version");
             self.check_skew(hello.sent_at)?;
+            self.offered_rotations(&hello.rotations);
             // Joining credentials are withheld until the client has verified
             // this responder. The responder's own identity proof is explicitly
             // public to bounded unauthenticated probes; no policy ticket yet.
@@ -1533,6 +1766,7 @@ impl EnrollmentService {
                 &send,
                 &ReplicaProof {
                     version: 1,
+                    rotations: self.root_rotations(),
                     chain: self.own_chain(),
                     sent_at: unix_now(),
                 },
@@ -1626,6 +1860,7 @@ impl EnrollmentService {
                     &send,
                     &Hello {
                         version: 1,
+                        rotations: self.root_rotations(),
                         sent_at: unix_now(),
                     },
                 )
@@ -1636,6 +1871,7 @@ impl EnrollmentService {
                         .map_err(|_| anyhow!("replica identity proof timeout"))??;
                 ensure!(proof.version == 1, "unsupported enrollment version");
                 self.check_skew(proof.sent_at)?;
+                self.offered_rotations(&proof.rotations);
                 let peer = identity(&connection.remote_id())?;
                 let source = observed_source(&connection);
                 let evidence = self.evidence(&peer, proof.chain.as_deref(), source).await?;
@@ -1708,7 +1944,7 @@ impl EnrollmentService {
             "bootstrap requires read-only policy capability"
         );
         ensure!(
-            namespace(&decoded.capability.id().to_string())? == *self.store.namespace(),
+            namespace(&decoded.capability.id().to_string())? == *self.trust().store.namespace(),
             "wrong policy namespace"
         );
         decoded.nodes.retain(|node| node.id.as_bytes() == &peer);
@@ -1725,9 +1961,9 @@ impl EnrollmentService {
         self.set_policy_document(doc.clone())?;
         self.note_pending_policy_content();
         let result = tokio::time::timeout(timeout, async {
-            self.sync_document(&doc, peer, Some(self.store.as_ref()), true)
+            self.sync_document(&doc, peer, Some(self.trust().store.as_ref()), true)
                 .await?;
-            self.stores.sync_bindings()?;
+            self.trust().stores.sync_bindings()?;
             self.synchronize_bound(peer).await
         })
         .await;
@@ -1907,11 +2143,11 @@ impl EnrollmentService {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(doc) = doc {
-            let mut pending = match self.store.refresh(&doc).await {
+            let mut pending = match self.trust().store.refresh(&doc).await {
                 Ok(report) => report.has_uncertainty(),
                 Err(_) => true,
             };
-            pending |= self.stores.sync_bindings().is_err();
+            pending |= self.trust().stores.sync_bindings().is_err();
             for (store, doc) in self.membership_documents() {
                 pending |= store
                     .refresh(&doc)
@@ -1943,6 +2179,7 @@ impl EnrollmentService {
         let mut pending = VecDeque::new();
         for (peer, evidence, source, generation) in peers {
             match self
+                .trust()
                 .stores
                 .select_evidence(&peer, Some(&evidence), unix_now())
             {
@@ -1985,6 +2222,47 @@ impl EnrollmentService {
         }
         workers.await;
     }
+}
+
+/// Re-apply the rotations journaled beside `store` that continue the pinned
+/// root, so a rotation learned at runtime survives restart. Returns the store
+/// and verifier for the current root.
+fn resume_rotation(
+    store: Arc<EnrollmentPolicyStore>,
+    verifier: JwtEnrollmentVerifier,
+    pin: Option<RotationPin>,
+) -> Result<(
+    Arc<EnrollmentPolicyStore>,
+    JwtEnrollmentVerifier,
+    Option<RotationState>,
+)> {
+    let Some(pin) = pin else {
+        return Ok((store, verifier, None));
+    };
+    let journal = RotationJournal::load(store.rotation_journal_path())?;
+    let mut root = RootState {
+        root: *store.root(),
+        next_commitment: pin.next_commitment,
+        seq: pin.seq,
+    };
+    let applied = journal.replay(root, unix_now(), verifier.activation_leeway());
+    let Some(last) = applied.last() else {
+        return Ok((store, verifier, Some(RotationState { root, journal })));
+    };
+    root = last.apply();
+    let store = Arc::new(store.open_rotated(root.root, last.namespaces()[0])?);
+    let verifier = rotated_verifier(&verifier, root.root)?;
+    Ok((store, verifier, Some(RotationState { root, journal })))
+}
+
+fn rotated_verifier(
+    previous: &JwtEnrollmentVerifier,
+    root: [u8; 32],
+) -> Result<JwtEnrollmentVerifier> {
+    Ok(
+        JwtEnrollmentVerifier::new(root, previous.intended_audience())?
+            .with_activation_leeway(previous.activation_leeway())?,
+    )
 }
 
 fn identity(hex: &str) -> Result<[u8; 32]> {
@@ -2154,7 +2432,17 @@ mod tests {
             Arc::new(EnrollmentPolicyStore::open(&path, public(1), [42; 32], AUDIENCE).unwrap());
         let verifier = JwtEnrollmentVerifier::new(public(1), AUDIENCE).unwrap();
         (
-            EnrollmentService::new(node, store, verifier, None, policy, options, None),
+            EnrollmentService::new(
+                node,
+                Trust::new(store, verifier),
+                OwnCredential {
+                    chain: None,
+                    evidence: None,
+                },
+                policy,
+                options,
+                None,
+            ),
             path,
         )
     }
@@ -2232,9 +2520,14 @@ mod tests {
             policy.pause_next.store(false, Ordering::SeqCst);
             let service = EnrollmentService::new(
                 root,
-                store.clone(),
-                JwtEnrollmentVerifier::new(public(1), AUDIENCE).unwrap(),
-                None,
+                Trust::new(
+                    store.clone(),
+                    JwtEnrollmentVerifier::new(public(1), AUDIENCE).unwrap(),
+                ),
+                OwnCredential {
+                    chain: None,
+                    evidence: None,
+                },
                 policy,
                 EnrollmentOptions::default(),
                 None,
@@ -2269,6 +2562,7 @@ mod tests {
             store.refresh(&doc).await.unwrap();
             assert!(matches!(
                 service
+                    .trust()
                     .stores
                     .select_evidence(&public(3), None, unix_now())
                     .unwrap()
@@ -2534,6 +2828,7 @@ mod tests {
         let (send, recv) = connection.open_bi().await.unwrap();
         let hello = Hello {
             version: 1,
+            rotations: Vec::new(),
             sent_at: unix_now() + 30,
         };
         transmit(&send, &hello).await.unwrap();
@@ -2548,6 +2843,7 @@ mod tests {
         let (send, recv) = connection.open_bi().await.unwrap();
         let hello = Hello {
             version: 1,
+            rotations: Vec::new(),
             sent_at: unix_now() + 90,
         };
         transmit(&send, &hello).await.unwrap();
@@ -2571,6 +2867,7 @@ mod tests {
             &send,
             &Hello {
                 version: 1,
+                rotations: Vec::new(),
                 sent_at: unix_now(),
             },
         )
@@ -2616,6 +2913,7 @@ mod tests {
                         // The replica's own clock runs 90 s behind.
                         let proof = ReplicaProof {
                             version: 1,
+                            rotations: Vec::new(),
                             chain: None,
                             sent_at: hello.sent_at - 90,
                         };
@@ -2676,6 +2974,7 @@ mod tests {
             &send,
             &Hello {
                 version: 1,
+                rotations: Vec::new(),
                 sent_at: unix_now(),
             },
         )
@@ -2741,6 +3040,7 @@ mod tests {
             &send,
             &Hello {
                 version: 1,
+                rotations: Vec::new(),
                 sent_at: unix_now(),
             },
         )

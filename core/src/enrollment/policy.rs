@@ -299,6 +299,10 @@ pub enum DenialReason {
     /// authorizes the node.
     IssuerRevoked,
     InvalidValidity,
+    /// This node accepted a root rotation. Every session rested on evidence
+    /// anchored at the previous root, which no longer confers authority; the
+    /// peer re-enrolls under the new root.
+    RootRotated,
     /// The peer's clock, or its credential issuer's, differs from ours by more
     /// than the activation leeway. Not definite: fix the clock and retry.
     ClockSkew {
@@ -325,6 +329,7 @@ impl DenialReason {
                 | Self::CredentialRevoked
                 | Self::IssuerRevoked
                 | Self::InvalidValidity
+                | Self::RootRotated
                 | Self::PolicyDidNotMatch
                 | Self::Consumer(_)
         )

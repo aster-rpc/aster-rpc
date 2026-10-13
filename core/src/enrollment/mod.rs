@@ -59,6 +59,7 @@ pub use issuer::{DelegatedIssuer, IssuanceError};
 mod records;
 mod root_records;
 mod root_revisions;
+mod rotation;
 mod store;
 mod stores;
 
@@ -98,5 +99,6 @@ pub use root_records::{
     validate_root_record_json, RootAuthoredDocView, RootRecordError, RootRecordRead,
 };
 pub use root_revisions::{check_root_revision, should_record_rejection, RootRevisionError};
+pub use rotation::{RotationPin, MAX_FORWARDED_ROTATIONS};
 pub use store::{EnrollmentPolicyStore, PolicyRefreshIssue, PolicyRefreshReport, RecordError};
 pub use stores::PolicyStores;

@@ -11,7 +11,7 @@ use super::ChainError;
 
 pub const ROOT_ROTATION_JWT_TYPE: &str = "aster-root-rotation-v1+jwt";
 const COMMITMENT_CONTEXT: &[u8] = b"aster.root.next.v1\0";
-const MAX_ROTATION_BYTES: usize = 8 * 1024;
+pub const MAX_ROTATION_BYTES: usize = 8 * 1024;
 const MAX_ROTATION_NAMESPACES: usize = 16;
 
 /// `BLAKE3("aster.root.next.v1\0" || next_root_public_key)`.
@@ -128,6 +128,22 @@ pub fn issue_root_rotation(
     };
     let payload = serde_json::to_vec(&claims).map_err(|_| ChainError::Malformed)?;
     jws::sign(ROOT_ROTATION_JWT_TYPE, &payload, next_root_secret).map_err(|_| ChainError::Issuance)
+}
+
+/// The sequence number a statement claims, read without verifying it. Use
+/// only to order or skip statements; [`verify_root_rotation`] decides
+/// whether one is accepted.
+pub fn claimed_rotation_seq(statement: &str) -> Option<u64> {
+    if statement.len() > MAX_ROTATION_BYTES {
+        return None;
+    }
+    let compact = jws::decode(statement).ok()?;
+    if compact.typ != ROOT_ROTATION_JWT_TYPE {
+        return None;
+    }
+    serde_json::from_slice::<RotationClaims>(&compact.payload)
+        .ok()
+        .map(|claims| claims.seq)
 }
 
 /// Accept a rotation only if it is signed by the key matching the pinned
