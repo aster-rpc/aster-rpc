@@ -166,7 +166,7 @@ public final class AsterEnvelope {
                     ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
 
     private static IrohLibrary lib() {
-      // Every ABI 4.x library exports the AEv1 functions; the major is checked at load.
+      // Every ABI 4.x/5.x library exports the AEv1 functions; the major is checked at load.
       return IrohLibrary.getInstance();
     }
 

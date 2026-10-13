@@ -1,11 +1,10 @@
-"""Plan P7 golden vectors -- attestation, identity-derived HPKE keys, sealed
-grants and lease rules, all through the PyO3 wrappers of the ``aster`` crate:
+"""Plan P7 golden vectors -- identity-derived HPKE keys, sealed grants and
+lease rules, all through the PyO3 wrappers of the ``aster`` crate:
 
 - conformance/vectors/grants.json (R5): AAD, open / open_invalid, namespace
   grants, the role rule, the grant key and reconcile decisions;
-- core/tests/fixtures/fory_golden_1_3_0.txt: the byte-stable attestation chain
-  (deterministic Ed25519), HPKE envelope, namespace capabilities and grant
-  records Rust core pins.
+- core/tests/fixtures/fory_golden_1_3_0.txt: the byte-stable HPKE envelope,
+  namespace capabilities and grant records Rust core pins.
 
 Offline, no nodes.
 """
@@ -13,15 +12,12 @@ Offline, no nodes.
 from __future__ import annotations
 
 import dataclasses
-import datetime as dt
 import json
 from pathlib import Path
 
 import pytest
 
 from aster import (
-    AttestationChain,
-    AttestationError,
     Fence,
     FenceRejectedError,
     GrantContext,
@@ -35,9 +31,6 @@ from aster import (
     NodeId,
     SecretKey,
     TransitionOutcome,
-    VerifiedChain,
-    attest_root_node,
-    attestation_public_key,
     check_fence,
     check_grant_role,
     grant_aad,
@@ -57,7 +50,6 @@ from aster import (
     seal_grant,
     seal_grant_to_key,
     seal_namespace_grant,
-    verify_chain,
 )
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -284,65 +276,6 @@ def test_invalid_identity_keys_rejected():
 
 
 # -- Fory golden fixtures (core byte stability) -------------------------------
-
-ROOT_SEED = "01" * 32
-NODE_SEED = "02" * 32
-
-
-def test_attestation_chain_is_byte_identical_and_verifies_offline():
-    chain = attest_root_node(ROOT_SEED, NODE_SEED, epoch=7)
-    assert chain.data.hex() == GOLDEN["attestation.chain.root_node"]
-    assert bytes(chain) == chain.data
-    # Typed secrets mint the same bytes.
-    assert attest_root_node(SecretKey.from_hex(ROOT_SEED), bytes.fromhex(NODE_SEED), epoch=7) == chain
-
-    root = attestation_public_key(ROOT_SEED)
-    node = attestation_public_key(NODE_SEED)
-    assert root == SecretKey.from_hex(ROOT_SEED).node_id()
-    golden = AttestationChain.from_bytes(bytes.fromhex(GOLDEN["attestation.chain.root_node"]))
-    v = verify_chain(golden, [root], node)
-    assert isinstance(v, VerifiedChain)
-    assert v.node == node and v.anchor == root
-    assert v.depth == 1 and v.intermediates == ()
-    assert v.role_of(root) == "anchor"
-    assert v.role_of(node) == "node"
-    assert v.role_of(node.to_bytes()) == "node"
-    assert v.role_of(attestation_public_key("03" * 32)) is None
-    assert v.is_anchor(str(root)) and not v.is_intermediate(root)
-
-
-def test_chain_text_round_trip_and_failures_raise_attestation_error():
-    chain = attest_root_node(ROOT_SEED, NODE_SEED, epoch=7)
-    text = chain.to_text()
-    assert text.startswith("aster.attestation.chain.v1:")
-    assert AttestationChain.from_text(text) == chain
-    assert hash(AttestationChain.from_text(text)) == hash(chain)
-
-    root = attestation_public_key(ROOT_SEED)
-    node = attestation_public_key(NODE_SEED)
-    other = attestation_public_key("03" * 32)
-    with pytest.raises(AttestationError):
-        verify_chain(chain, [other], node)
-    with pytest.raises(AttestationError):
-        verify_chain(chain, [root], other)
-    tampered = bytearray(chain.data)
-    tampered[-1] ^= 1
-    with pytest.raises(AttestationError):
-        verify_chain(bytes(tampered), [root], node)
-    with pytest.raises(AttestationError):
-        AttestationChain.from_text("nope")
-    with pytest.raises(ValueError):
-        verify_chain(chain, [b"short"], node)
-
-
-def test_expired_chains_fail():
-    past = dt.datetime.fromtimestamp(1000, tz=dt.timezone.utc)
-    chain = attest_root_node(ROOT_SEED, NODE_SEED, not_after=past)
-    with pytest.raises(AttestationError):
-        verify_chain(chain, [attestation_public_key(ROOT_SEED)], attestation_public_key(NODE_SEED))
-    future = attest_root_node(ROOT_SEED, NODE_SEED, not_before=4_000_000_000)
-    with pytest.raises(AttestationError):
-        verify_chain(future, [attestation_public_key(ROOT_SEED)], attestation_public_key(NODE_SEED))
 
 
 def test_hpke_envelope_namespace_capabilities_and_grant_records():

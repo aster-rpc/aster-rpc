@@ -578,8 +578,8 @@ func Version() (major, minor, patch uint32) {
 }
 
 // ABIMinorRequired is the lowest ABI minor version (within ABIVersionMajor)
-// this binding runs against: 4.17 adds owned raw WebTransport sessions and media stream controls.
-const ABIMinorRequired = uint32(17)
+// this binding runs against: 5.0 is 4.17 without the removed attestation functions.
+const ABIMinorRequired = uint32(0)
 
 // CheckABI returns an error if the loaded native library's ABI major version
 // differs from the one this binding was compiled against, or its minor

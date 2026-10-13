@@ -4,7 +4,7 @@ package site.aster.id;
 public enum IdKind {
   /** A node / endpoint id: an Ed25519 public key (must be a valid curve point). */
   NODE_ID(0),
-  /** An Ed25519 public key, e.g. an attestation anchor (must be a valid curve point). */
+  /** An Ed25519 public key, e.g. a root or issuer key (must be a valid curve point). */
   PUBLIC_KEY(1),
   /** A node secret key (Ed25519 seed). Any 32 bytes. */
   SECRET_KEY(2),

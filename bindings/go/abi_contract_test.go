@@ -175,9 +175,9 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	if ASTER_EVENT_TOPOLOGY_SNAPSHOT != 120 {
 		t.Error("topology snapshot event drifted from header")
 	}
-	// ABI 4.1 .. 4.17 are all in the library.
-	if _, minor, _ := Version(); minor < 17 || ABIMinorRequired != 17 {
-		t.Errorf("library ABI minor %d, binding needs >= 17 (floor %d)", minor, ABIMinorRequired)
+	// ABI 5.0 removed only the attestation functions; everything else of 4.17 remains.
+	if _, minor, _ := Version(); minor < ABIMinorRequired || ABIMinorRequired != 0 {
+		t.Errorf("library ABI minor %d, binding needs >= 0 (floor %d)", minor, ABIMinorRequired)
 	}
 	if ASTER_STATUS_ALREADY_EXISTS != 17 || !errors.Is(wrapError(ASTER_STATUS_ALREADY_EXISTS), ErrAlreadyExists) ||
 		StatusName(17) != "ASTER_STATUS_ALREADY_EXISTS" {
@@ -194,8 +194,8 @@ func TestABI_VersionMatchesHeader(t *testing.T) {
 	if got := major<<16 | minor<<8 | patch; got != headerABIVersion {
 		t.Errorf("library ABI %#x != header ASTER_ABI_VERSION %#x", got, headerABIVersion)
 	}
-	if major != 4 || ABIVersionMajor != 4 {
-		t.Errorf("expected ABI major 4, lib=%d binding=%d", major, ABIVersionMajor)
+	if major != 5 || ABIVersionMajor != 5 {
+		t.Errorf("expected ABI major 5, lib=%d binding=%d", major, ABIVersionMajor)
 	}
 	if err := CheckABI(); err != nil {
 		t.Fatal(err)

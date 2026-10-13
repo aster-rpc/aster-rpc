@@ -9,7 +9,7 @@ namespace Aster;
 internal static unsafe partial class Native
 {
     /// <summary>Minimum ABI minor (of <see cref="AbiVersionMajor"/>) for everything this binding declares.</summary>
-    public const uint RequiredAbiMinor = 17; // 4.17: owned raw WebTransport and media controls.
+    public const uint RequiredAbiMinor = 0; // 5.0: 4.17 minus the removed attestation functions.
 
     // ─── 3.1: AEv1 envelope + zstd ──────────────────────────────────────────
 
@@ -154,7 +154,7 @@ internal static unsafe partial class Native
     [LibraryImport(NativeLib, EntryPoint = "aster_send_stream_priority")]
     public static partial int aster_send_stream_priority(ulong runtime, ulong stream, ulong user_data, out ulong out_operation);
 
-    // ─── 3.4: ids, HPKE, attestation, grants (pure, no runtime) ─────────────
+    // ─── 3.4: ids, HPKE, grants (pure, no runtime) ──────────────────────────
 
     [LibraryImport(NativeLib, EntryPoint = "aster_id_parse")]
     public static partial int aster_id_parse(uint kind, Bytes text, byte* @out);
@@ -183,19 +183,6 @@ internal static unsafe partial class Native
     public static partial int aster_hpke_seal(byte* recipient_public_key, Bytes aad, Bytes plaintext, Bytes* @out);
     [LibraryImport(NativeLib, EntryPoint = "aster_hpke_open")]
     public static partial int aster_hpke_open(byte* recipient_private_key, Bytes aad, Bytes envelope, Bytes* @out);
-
-    [LibraryImport(NativeLib, EntryPoint = "aster_attest_root_node")]
-    public static partial int aster_attest_root_node(byte* root_secret, byte* node_secret, AttestOptionsNative* options, Bytes* @out);
-    [LibraryImport(NativeLib, EntryPoint = "aster_attestation_chain_to_text")]
-    public static partial int aster_attestation_chain_to_text(Bytes chain, Bytes* @out);
-    [LibraryImport(NativeLib, EntryPoint = "aster_attestation_chain_from_text")]
-    public static partial int aster_attestation_chain_from_text(Bytes text, Bytes* @out);
-    [LibraryImport(NativeLib, EntryPoint = "aster_attestation_verify_chain")]
-    public static partial int aster_attestation_verify_chain(Bytes chain, byte* trusted_anchors, UIntPtr anchor_count, byte* expected_node, VerifiedChainNative* @out);
-    [LibraryImport(NativeLib, EntryPoint = "aster_verified_chain_release")]
-    public static partial int aster_verified_chain_release(VerifiedChainNative* chain);
-    [LibraryImport(NativeLib, EntryPoint = "aster_verified_chain_role_of")]
-    public static partial int aster_verified_chain_role_of(VerifiedChainNative* chain, byte* id, uint* out_role);
 
     [LibraryImport(NativeLib, EntryPoint = "aster_grant_context_aad")]
     public static partial int aster_grant_context_aad(GrantContextNative* context, Bytes* @out);

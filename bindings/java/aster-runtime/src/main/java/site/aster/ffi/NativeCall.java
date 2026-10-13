@@ -10,9 +10,9 @@ import java.nio.charset.StandardCharsets;
 import site.aster.exception.VerificationFailedException;
 
 /**
- * Marshalling helpers for the synchronous, pure C ABI functions (ABI 3.4: ids, HPKE, attestation,
- * sealed grants). Used by {@code site.aster.id}, {@code site.aster.crypto}, {@code
- * site.aster.attestation} and {@code site.aster.grants}; not meant for application code.
+ * Marshalling helpers for the synchronous, pure C ABI functions (ABI 3.4: ids, HPKE, sealed
+ * grants). Used by {@code site.aster.id}, {@code site.aster.crypto} and {@code site.aster.grants};
+ * not meant for application code.
  *
  * <p>Conventions (see {@code ffi/RENAME_MAP.md} §"New in 3.4"): raw keys are 32-byte buffers,
  * variable inputs are {@code aster_bytes_t} by value, variable outputs are library-owned {@code
@@ -37,7 +37,9 @@ public final class NativeCall {
               FunctionDescriptor.of(
                   ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_LONG));
 
-  /** Resolve a pure function (every ABI 4.x library exports them; the major is checked at load). */
+  /**
+   * Resolve a pure function (every ABI 4.x/5.x library exports them; the major is checked at load).
+   */
   public static MethodHandle handle(String name, FunctionDescriptor desc) {
     return IrohLibrary.getInstance().getHandle(name, desc);
   }

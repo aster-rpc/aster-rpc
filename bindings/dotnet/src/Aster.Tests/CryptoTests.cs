@@ -4,7 +4,7 @@ using Aster.Crypto;
 
 namespace Aster.Tests;
 
-/// <summary>ABI 3.4 pure functions: ids, HPKE, attestation.</summary>
+/// <summary>ABI 3.4 pure functions: ids and HPKE.</summary>
 public class CryptoTests
 {
     [Fact]
@@ -55,43 +55,5 @@ public class CryptoTests
         byte[] fromIdentity = Hpke.X25519PublicFromIdentity(Ids.PublicKey(secret));
         Assert.Equal(Hpke.PublicKeyFromPrivate(x25519Secret), fromIdentity);
         Assert.Equal(fromIdentity, Hpke.X25519PublicFromNodeId(Ids.NodeId(secret)));
-    }
-
-    [Fact]
-    public void Attestation_Create_Text_Verify()
-    {
-        byte[] root = Ids.GenerateSecretKey();
-        byte[] node = Ids.GenerateSecretKey();
-        byte[] chain = Attestation.AttestRootNode(root, node);
-        string text = Attestation.ToText(chain);
-        Assert.StartsWith("aster.attestation.chain.v1:", text);
-        Assert.Equal(chain, Attestation.FromText(text));
-
-        var verified = Attestation.VerifyChain(chain, [Ids.PublicKey(root)], Ids.PublicKey(node));
-        Assert.Equal(Ids.PublicKey(node), verified.Node);
-        Assert.Equal(Ids.PublicKey(root), verified.Anchor);
-        Assert.Empty(verified.Intermediates);
-        Assert.Equal(AttestationRole.Node, verified.RoleOf(Ids.PublicKey(node)));
-        Assert.Equal(AttestationRole.Anchor, verified.RoleOf(Ids.PublicKey(root)));
-        Assert.Equal(AttestationRole.None, verified.RoleOf(new byte[32]));
-
-        var other = Ids.PublicKey(Ids.GenerateSecretKey());
-        Assert.Equal(Status.VerificationFailed,
-            Assert.Throws<IrohException>(() => Attestation.VerifyChain(chain, [other], Ids.PublicKey(node))).Status);
-        Assert.Equal(Status.VerificationFailed,
-            Assert.Throws<IrohException>(() => Attestation.VerifyChain(chain, [Ids.PublicKey(root)], other)).Status);
-    }
-
-    [Fact]
-    public void Attestation_Options_Are_Applied()
-    {
-        byte[] root = Ids.GenerateSecretKey();
-        byte[] node = Ids.GenerateSecretKey();
-        long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-        byte[] expired = Attestation.AttestRootNode(root, node, new AttestOptions(1, now - 7200, now - 3600));
-        Assert.Equal(Status.VerificationFailed,
-            Assert.Throws<IrohException>(() => Attestation.VerifyChain(expired, [Ids.PublicKey(root)], Ids.PublicKey(node))).Status);
-        byte[] valid = Attestation.AttestRootNode(root, node, new AttestOptions(1, now - 60, now + 3600));
-        Assert.True(Attestation.VerifyChain(valid, [Ids.PublicKey(root)], Ids.PublicKey(node)).Depth >= 1);
     }
 }

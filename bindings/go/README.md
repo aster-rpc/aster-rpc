@@ -10,11 +10,11 @@ public installation source. See [publication setup](../../deploy/go-vanity/READM
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Preview status (ABI 4.17 minimum)
+## Preview status (ABI 5.0 minimum)
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
-TypeScript, Java and .NET. The binding requires native ABI 4.17 or newer within
-major version 4 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview release.
+TypeScript, Java and .NET. The binding requires native ABI 5.0 or newer within
+major version 5 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview release.
 
 - **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
   safe for concurrent use (a pool of Fory instances, no global lock). Payload types implement `aster.WireTyped`
@@ -65,7 +65,7 @@ major version 4 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview rel
   bridge, Prometheus renderer) lives in Rust; the binding starts it and wraps the
   rest. `InitObservability(ObservabilityConfig{...})` (before the first server;
   otherwise `StartServer` / `StartHealth` run the implicit environment-only
-  start) and `ShutdownObservability`. Floor: the binding requires ABI 4.17 or newer
+  start) and `ShutdownObservability`. Floor: the binding requires ABI 5.0 or newer
   (`ABIMinorRequired`, checked by `CheckABI` / `NewRuntime`).
   - *Logs:* Rust `tracing` events reach `log/slog`. One goroutine on a locked OS
     thread polls `aster_log_poll`; `SetLogger(*slog.Logger)` picks the
@@ -168,8 +168,7 @@ major version 4 (`ABIMinorRequired` in `runtime.go`). Aster 0.3 is a preview rel
   receives with `io.EOF`. The old document-only `JoinAndSubscribe` is deprecated.
 - **ABI 3.4 pure functions:** typed ids (`ParseID`, `FormatID`, `ValidateID`,
   `SecretKeyPublicKey`, `NamespaceSecretID`), HPKE (`HPKESeal` / `HPKEOpen`,
-  identity-derived X25519), attestation (`AttestRootNode`,
-  `VerifyAttestationChain`, text form), sealed grants (`GrantSeal` /
+  identity-derived X25519), sealed grants (`GrantSeal` /
   `GrantOpen`, namespace grants, `GrantRecord`, `ReconcileGrant`);
   `conformance/vectors/grants.json` passes.
 
@@ -424,7 +423,7 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `relay_stream.go` | ABI 4.3 `Connection.RelayStream` (full-duplex streaming relay, readiness-driven) |
 | `expose.go`, `expose_http.go` | ABI 4.2 expose registry, body table, relay / route requests, `net/http` handler adapter |
 | `dataplane.go` | ABI 3.3 blobs / tags / docs / paths / priority wrappers |
-| `pure.go`, `grants.go` | ABI 3.4 ids, HPKE, attestation, sealed grants |
+| `pure.go`, `grants.go` | ABI 3.4 ids, HPKE, sealed grants |
 | `types.go` | Event types and event kind constants (`//go:build !cgo`) |
 | `error.go` | Typed errors with `errors.Is`/`errors.As` support (`//go:build cgo`) |
 | `runtime.go` | `Runtime` type — poller goroutine, event dispatch, sync FFI helpers |

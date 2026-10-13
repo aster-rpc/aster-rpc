@@ -1,5 +1,5 @@
 //! Key-material arguments and Python value construction shared by the P7
-//! modules (attestation, HPKE identity keys, grants, leases, topology).
+//! modules (HPKE identity keys, grants, leases, topology).
 //!
 //! 32-byte inputs take the typed id class, raw `bytes`, or 64 hex
 //! characters. Value types are frozen dataclasses defined in the Python

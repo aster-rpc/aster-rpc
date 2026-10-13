@@ -1,25 +1,20 @@
 /**
- * Plan T7 golden vectors — attestation, identity-derived HPKE keys, sealed
- * grants and lease rules, all through the NAPI wrappers of the `aster` crate:
+ * Plan T7 golden vectors — identity-derived HPKE keys, sealed grants and
+ * lease rules, all through the NAPI wrappers of the `aster` crate:
  *
  * - conformance/vectors/grants.json (R5): AAD, open / open_invalid,
  *   namespace grants, the role rule, the grant key and reconcile decisions;
- * - core/tests/fixtures/fory_golden_1_3_0.txt: the byte-stable attestation
- *   chain (deterministic Ed25519), HPKE envelope, namespace capabilities and
- *   grant records Rust core pins.
+ * - core/tests/fixtures/fory_golden_1_3_0.txt: the byte-stable HPKE envelope,
+ *   namespace capabilities and grant records Rust core pins.
  */
 
 import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import {
-  AttestationChain,
-  AttestationError,
   GrantRecord,
   HpkeEnvelope,
   NamespaceCapability,
-  attestRootNode,
-  attestationPublicKey,
   checkFence,
   checkGrantRole,
   grantAad,
@@ -39,7 +34,6 @@ import {
   sealGrant,
   sealGrantToKey,
   sealNamespaceGrant,
-  verifyChain,
   SecretKey,
   type GrantContext,
 } from '@aster-rpc/aster';
@@ -218,47 +212,6 @@ describe('identity-derived HPKE keys', () => {
 });
 
 describe('Fory golden fixtures (core byte stability)', () => {
-  const rootSeed = '01'.repeat(32);
-  const nodeSeed = '02'.repeat(32);
-
-  it('attestation chain is byte-identical to Rust and verifies offline', () => {
-    const chain = attestRootNode(rootSeed, nodeSeed, { epoch: 7 });
-    expect(hex(chain.bytes)).toBe(golden['attestation.chain.root_node']);
-
-    const root = attestationPublicKey(rootSeed);
-    const node = attestationPublicKey(nodeSeed);
-    const v = verifyChain(AttestationChain.fromBytes(fromHex(golden['attestation.chain.root_node'])), [root], node);
-    expect(v.node).toBe(node);
-    expect(v.anchor).toBe(root);
-    expect(v.depth).toBe(1);
-    expect(v.intermediates).toEqual([]);
-    expect(v.roleOf(root)).toBe('anchor');
-    expect(v.roleOf(node)).toBe('node');
-    expect(v.roleOf(attestationPublicKey('03'.repeat(32)))).toBeUndefined();
-  });
-
-  it('chain text form round-trips; verification failures throw AttestationError', () => {
-    const chain = attestRootNode(rootSeed, nodeSeed, { epoch: 7 });
-    const text = chain.toText();
-    expect(text.startsWith('aster.attestation.chain.v1:')).toBe(true);
-    expect(AttestationChain.fromText(text).equals(chain)).toBe(true);
-
-    const root = attestationPublicKey(rootSeed);
-    const node = attestationPublicKey(nodeSeed);
-    const other = attestationPublicKey('03'.repeat(32));
-    expect(() => verifyChain(chain, [other], node)).toThrow(AttestationError);
-    expect(() => verifyChain(chain, [root], other)).toThrow(AttestationError);
-    const tampered = chain.bytes;
-    tampered[tampered.length - 1] ^= 1;
-    expect(() => verifyChain(tampered, [root], node)).toThrow(AttestationError);
-    expect(() => AttestationChain.fromText('nope')).toThrow(AttestationError);
-  });
-
-  it('expired chains fail', () => {
-    const chain = attestRootNode(rootSeed, nodeSeed, { notAfter: new Date(1000_000) });
-    expect(() => verifyChain(chain, [attestationPublicKey(rootSeed)], attestationPublicKey(nodeSeed))).toThrow(AttestationError);
-  });
-
   it('hpke envelope, namespace capabilities and grant records', () => {
     const env = HpkeEnvelope.decodeFory(fromHex(golden['hpke.envelope']));
     expect(hex(env.encappedKey)).toBe('33'.repeat(32));

@@ -10,7 +10,7 @@
 //! - gossip.rs: GossipClient, GossipTopicHandle wrappers
 //! - monitor.rs: Phase 1b monitoring utilities
 //! - admission.rs: Gate 0 (`GatePolicy`, `PeerAdmissionStore`, `Admission`)
-//! - attestation.rs, grants.rs, lease.rs, topology.rs: plan P7 (values are
+//! - grants.rs, lease.rs, topology.rs: plan P7 (values are
 //!   the frozen dataclasses of the matching `aster.*` Python modules)
 //! - coordination.rs: plan P9, the wrapped coordination client (+ the
 //!   placement manager with Python providers)
@@ -31,7 +31,6 @@
 use pyo3::prelude::*;
 
 mod admission;
-mod attestation;
 mod audit_outbox;
 mod blob_custody;
 mod blobs;
@@ -115,7 +114,6 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     ticket::register(py, m)?;
     crypto::register(py, m)?;
     wire::register(py, m)?;
-    attestation::register(py, m)?;
     audit_outbox::register(m)?;
     grants::register(py, m)?;
     lease::register(py, m)?;

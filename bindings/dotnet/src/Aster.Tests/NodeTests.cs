@@ -24,18 +24,16 @@ public class NodeTests
         Assert.Equal(104, sizeof(GrantContextNative));
         Assert.Equal(72, sizeof(GrantRecordNative));
         Assert.Equal(72, sizeof(GrantOutcomeNative));
-        Assert.Equal(96, sizeof(VerifiedChainNative));
-        Assert.Equal(32, sizeof(AttestOptionsNative));
         Assert.Equal(72, sizeof(PathInfoNative));
         Assert.Equal(32, sizeof(PathListNative));
     }
 
     [Fact]
-    public void Abi_Is_4_x()
+    public void Abi_Is_5_x()
     {
         var (major, minor, _) = Runtime.Version;
-        Assert.Equal(4, major);
-        Assert.True(minor >= (int)Native.RequiredAbiMinor, $"native library ABI 4.{minor} < 4.{Native.RequiredAbiMinor}");
+        Assert.Equal(5, major);
+        Assert.True(minor >= (int)Native.RequiredAbiMinor, $"native library ABI 5.{minor} < 5.{Native.RequiredAbiMinor}");
     }
 
     [Fact]

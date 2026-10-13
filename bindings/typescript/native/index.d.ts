@@ -1780,40 +1780,6 @@ export interface AsterTicketInfo {
 /** Encode an AsterTicket to `aster1<base58>` string. */
 export declare function asterTicketToString(info: AsterTicketInfo): string
 
-/** Decode `aster.attestation.chain.v1:<base64url>` text into chain bytes. */
-export declare function attestationChainFromText(text: string): Buffer
-
-/** Encode chain bytes as `aster.attestation.chain.v1:<base64url>` text. */
-export declare function attestationChainToText(chain: Uint8Array): string
-
-/**
- * The Ed25519 public key (64 hex) of a 32-byte secret — the identity an
- * attestation edge signs as.
- */
-export declare function attestationPublicKey(secret: string | Uint8Array): string
-
-/**
- * Verify `chain` offline against `trustedAnchors`, bound to `expectedNode`.
- * Throws describing the first failure.
- */
-export declare function attestationVerifyChain(chain: Uint8Array, trustedAnchors: Array<string | Uint8Array>, expectedNode: string | Uint8Array): VerifiedChain
-
-/** Policy options for a minted attestation edge (all default 0). */
-export interface AttestOptions {
-  /** Monotonic replay counter (caller-managed). */
-  epoch?: number
-  /** 0 = no lower bound; else unix seconds before which the chain is invalid. */
-  notBefore?: number
-  /** 0 = no expiry; else unix seconds after which the chain is invalid. */
-  notAfter?: number
-}
-
-/**
- * Mint a single-edge root↔node attestation chain (wire bytes). Both
- * secrets are 32-byte Ed25519 seeds (hex or bytes).
- */
-export declare function attestRootNode(rootSecret: string | Uint8Array, nodeSecret: string | Uint8Array, options?: AttestOptions | undefined | null): Buffer
-
 export declare function attrsetFree(handle: number): boolean
 
 /**
@@ -3687,21 +3653,6 @@ export interface UpcallTopologyView {
   /** Corroborated far pairs (hex ids). */
   farPairs: Array<[string, string]>
   separationCoverage: number
-}
-
-/**
- * A successfully verified chain. Ids are 64-hex Ed25519 public keys
- * (node-level identities, not docs authors).
- */
-export interface VerifiedChain {
-  /** The node the chain binds to (== the expected node). */
-  node: string
-  /** The trusted anchor the chain terminates at. */
-  anchor: string
-  /** Intermediates between node and anchor, node-ward first. */
-  intermediates: Array<string>
-  /** Number of edges. */
-  depth: number
 }
 
 export declare function verifyCertificateBinding(certificatePem: Buffer, expectedNodeId: string): void

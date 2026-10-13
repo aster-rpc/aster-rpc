@@ -156,7 +156,7 @@ public class ObservabilityTests : IAsyncLifetime
     {
         Assert.Equal(17, (int)Status.AlreadyExists);
         Assert.Equal("ASTER_STATUS_ALREADY_EXISTS", Marshal.PtrToStringUTF8(Native.aster_status_name(17)));
-        Assert.Equal(17u, Native.RequiredAbiMinor);
+        Assert.Equal(0u, Native.RequiredAbiMinor);
     }
 
     [Fact]

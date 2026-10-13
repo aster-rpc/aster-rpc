@@ -286,17 +286,7 @@ export { IrohTransport } from './transport/iroh.js';
 
 // Node + configuration (Rust `aster::Node` / `aster::AsterConfig`)
 export { Node, NodeId, type NodeAddr, type NodeStartOptions, type LeaseGrantorOptions } from './node.js';
-// Attestation, identity-derived HPKE keys, sealed grants, leases, topology (plan T7)
-export {
-  AttestationChain,
-  AttestationError,
-  VerifiedChain,
-  attestRootNode,
-  verifyChain,
-  attestationPublicKey,
-  type AttestOptions,
-  type AttestationRole,
-} from './attestation.js';
+// Identity-derived HPKE keys, sealed grants, leases, topology (plan T7)
 export {
   hpkeX25519SecretFromIdentity,
   hpkeX25519PublicFromIdentity,

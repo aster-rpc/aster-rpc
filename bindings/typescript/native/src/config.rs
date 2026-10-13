@@ -508,7 +508,7 @@ pub fn secret_key_load_or_generate(path: String) -> Result<String> {
 #[napi]
 pub fn secret_key_public(secret_key: String) -> Result<String> {
     let key = SecretKey::from_hex(&secret_key).map_err(aster_err)?;
-    Ok(aster::attestation::public_key(&key).to_hex())
+    Ok(key.public_key().to_hex())
 }
 
 // ── `.aster-identity` credential files (frozen auth, D3) ──────────────────

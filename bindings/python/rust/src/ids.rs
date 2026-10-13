@@ -129,14 +129,14 @@ impl SecretKey {
     /// The matching public key.
     fn public_key(&self) -> PublicKey {
         PublicKey {
-            inner: aster::attestation::public_key(&self.inner),
+            inner: self.inner.public_key(),
         }
     }
 
     /// The node id a node started with this key has.
     fn node_id(&self) -> NodeId {
         NodeId {
-            hex: aster::attestation::public_key(&self.inner).to_hex(),
+            hex: self.inner.public_key().to_hex(),
         }
     }
 
@@ -149,7 +149,7 @@ impl SecretKey {
 
     fn __hash__(&self) -> isize {
         // Hash the public half: equal keys hash equal, nothing secret leaks.
-        str_hash(&aster::attestation::public_key(&self.inner).to_hex())
+        str_hash(&self.inner.public_key().to_hex())
     }
 
     fn __repr__(&self) -> String {

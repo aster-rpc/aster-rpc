@@ -162,15 +162,7 @@ from .audit_outbox import (
     AuditDispositionReceipt, AuditQuarantineExport,
 )
 
-# -- Attestation, sealed grants, leases, topology (plan P7) --
-from .attestation import (
-    AttestationChain,
-    AttestationError,
-    VerifiedChain,
-    attest_root_node,
-    attestation_public_key,
-    verify_chain,
-)
+# -- Sealed grants, leases, topology (plan P7) --
 from .grants import (
     GRANT_AAD_DOMAIN,
     GRANT_RECORD_VERSION,
@@ -449,13 +441,7 @@ __all__ = [
     "hpke_x25519_secret_from_identity",
     "hpke_x25519_public_from_identity",
     "hpke_x25519_public_from_node_id",
-    # -- Attestation, sealed grants, leases, topology (plan P7) --
-    "AttestationChain",
-    "AttestationError",
-    "VerifiedChain",
-    "attest_root_node",
-    "attestation_public_key",
-    "verify_chain",
+    # -- Sealed grants, leases, topology (plan P7) --
     "GRANT_AAD_DOMAIN",
     "GRANT_RECORD_VERSION",
     "GrantContext",

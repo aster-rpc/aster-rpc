@@ -338,7 +338,7 @@ public class AbiContractTests
     public void Runtime_Version_Is_Consistent()
     {
         var (major, minor, patch) = Runtime.Version;
-        Assert.Equal(4, major); // ASTER_ABI_VERSION_MAJOR this binding targets
+        Assert.Equal(5, major); // ASTER_ABI_VERSION_MAJOR this binding targets
         Assert.True(major >= 0);
         Assert.True(minor >= 0);
         Assert.True(patch >= 0);

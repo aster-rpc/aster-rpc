@@ -11,7 +11,6 @@
 use napi_derive::napi;
 
 mod admission;
-mod attestation;
 mod audit_outbox;
 mod blob_custody;
 mod blobs;

@@ -304,31 +304,6 @@ func TestPure_IDsHPKEAttestation(t *testing.T) {
 		t.Fatal("identity X25519 derivations disagree")
 	}
 
-	root, _ := GenerateSecretKey()
-	rootPub, _ := SecretKeyPublicKey(root)
-	chain, err := AttestRootNode(root, sk, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	txt, err := AttestationChainToText(chain)
-	if err != nil || !strings.HasPrefix(txt, "aster.attestation.chain.v1:") {
-		t.Fatalf("text %q %v", txt, err)
-	}
-	if b, err := AttestationChainFromText(txt); err != nil || !bytes.Equal(b, chain) {
-		t.Fatalf("from text: %v", err)
-	}
-	v, err := VerifyAttestationChain(chain, []Key{rootPub}, pk)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if v.Node != pk || v.Anchor != rootPub || v.RoleOf(pk) != RoleNode || v.RoleOf(rootPub) != RoleAnchor || v.RoleOf(Key{}) != RoleNone {
-		t.Fatalf("verified %+v", v)
-	}
-	other, _ := GenerateSecretKey()
-	otherPub, _ := SecretKeyPublicKey(other)
-	if _, err := VerifyAttestationChain(chain, []Key{otherPub}, pk); !errors.Is(err, ErrVerificationFailed) {
-		t.Fatalf("untrusted anchor: %v", err)
-	}
 }
 
 func TestGrants_SealOpenRoundTrip(t *testing.T) {

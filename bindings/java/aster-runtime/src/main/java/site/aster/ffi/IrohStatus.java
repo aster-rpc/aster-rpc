@@ -17,8 +17,8 @@ public enum IrohStatus {
   /** {@code aster_runtime_new} was called with a different ABI major than the library. */
   ABI_MISMATCH(12),
   /**
-   * A well-formed input failed a security check: an envelope did not open, an attestation chain did
-   * not verify, or a grant role did not match its capability (ABI 3.4).
+   * A well-formed input failed a security check: an envelope did not open, or a grant role did not
+   * match its capability (ABI 3.4).
    */
   VERIFICATION_FAILED(13),
   /** Reserved for the auth design (ABI 4.3). */

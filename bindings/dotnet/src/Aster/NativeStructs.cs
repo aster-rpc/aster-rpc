@@ -135,30 +135,6 @@ internal struct GrantOutcomeNative
     public IntPtr storage;
 }
 
-/// <summary><c>aster_verified_chain_t</c> (96 bytes).</summary>
-[StructLayout(LayoutKind.Sequential)]
-internal unsafe struct VerifiedChainNative
-{
-    public uint struct_size;
-    public uint depth;
-    public fixed byte node[32];
-    public fixed byte anchor[32];
-    public IntPtr intermediates;
-    public UIntPtr intermediates_count;
-    public IntPtr storage;
-}
-
-/// <summary><c>aster_attest_options_t</c> (32 bytes).</summary>
-[StructLayout(LayoutKind.Sequential)]
-internal struct AttestOptionsNative
-{
-    public uint struct_size;
-    public uint reserved;
-    public long epoch;
-    public long not_before;
-    public long not_after;
-}
-
 /// <summary><c>aster_path_info_t</c> (72 bytes).</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal struct PathInfoNative

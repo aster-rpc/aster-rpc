@@ -6,22 +6,15 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.lang.foreign.MemoryLayout;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HexFormat;
-import java.util.List;
-import java.util.Optional;
 import org.junit.jupiter.api.Test;
-import site.aster.attestation.AttestOptions;
-import site.aster.attestation.Attestation;
-import site.aster.attestation.AttestationRole;
-import site.aster.attestation.VerifiedChain;
 import site.aster.exception.VerificationFailedException;
 import site.aster.id.IdKind;
 import site.aster.id.Ids;
 
-/** Ids, HPKE and attestation through the C ABI 3.4 pure functions. */
+/** Ids and HPKE through the C ABI 3.4 pure functions. */
 final class PureFunctionsTest {
 
   private static byte[] fill(int b) {
@@ -32,19 +25,6 @@ final class PureFunctionsTest {
 
   private static byte[] utf8(String s) {
     return s.getBytes(StandardCharsets.UTF_8);
-  }
-
-  @Test
-  void layoutsMatchHeader() {
-    assertEquals(32, Attestation.ATTEST_OPTIONS.byteSize());
-    assertEquals(96, Attestation.VERIFIED_CHAIN.byteSize());
-    assertEquals(
-        72,
-        Attestation.VERIFIED_CHAIN.byteOffset(
-            MemoryLayout.PathElement.groupElement("intermediates")));
-    assertEquals(
-        88,
-        Attestation.VERIFIED_CHAIN.byteOffset(MemoryLayout.PathElement.groupElement("storage")));
   }
 
   @Test
@@ -88,42 +68,5 @@ final class PureFunctionsTest {
     assertArrayEquals(xp, Hpke.x25519PublicFromNodeId(Ids.nodeId(idSecret)));
     assertThrows(IllegalArgumentException.class, () -> Hpke.x25519PublicFromNodeId("nothex"));
     assertThrows(IllegalArgumentException.class, () -> Hpke.x25519PublicFromIdentity(new byte[32]));
-  }
-
-  @Test
-  void attestationMintVerifyRoles() {
-    byte[] root = fill(1);
-    byte[] node = fill(2);
-    byte[] rootPk = Ids.publicKey(root);
-    byte[] nodePk = Ids.publicKey(node);
-    byte[] chain = Attestation.attestRootNode(root, node);
-    String text = Attestation.toText(chain);
-    assertTrue(text.startsWith("aster.attestation.chain.v1:"));
-    assertArrayEquals(chain, Attestation.fromText(text));
-    assertThrows(IllegalArgumentException.class, () -> Attestation.fromText("nope"));
-
-    VerifiedChain v = Attestation.verifyChain(chain, List.of(fill(5), rootPk), nodePk);
-    assertEquals(1, v.depth());
-    assertArrayEquals(nodePk, v.node());
-    assertArrayEquals(rootPk, v.anchor());
-    assertTrue(v.intermediates().isEmpty());
-    assertEquals(Optional.of(AttestationRole.NODE), v.roleOf(nodePk));
-    assertEquals(Optional.of(AttestationRole.ANCHOR), v.roleOf(rootPk));
-    assertEquals(Optional.empty(), v.roleOf(fill(5)));
-
-    assertThrows(
-        VerificationFailedException.class,
-        () -> Attestation.verifyChain(chain, List.of(nodePk), nodePk));
-    assertThrows(
-        VerificationFailedException.class,
-        () -> Attestation.verifyChain(chain, List.of(rootPk), rootPk));
-    assertThrows(
-        VerificationFailedException.class, () -> Attestation.verifyChain(chain, List.of(), nodePk));
-    byte[] expired = Attestation.attestRootNode(root, node, new AttestOptions(1, 0, 1));
-    VerificationFailedException e =
-        assertThrows(
-            VerificationFailedException.class,
-            () -> Attestation.verifyChain(expired, List.of(rootPk), nodePk));
-    assertTrue(e.getMessage().contains("expired"), e.getMessage());
   }
 }

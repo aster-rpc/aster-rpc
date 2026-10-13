@@ -4,13 +4,13 @@
 **Target:** .NET 9+
 **ABI contract:** Rust FFI via source-generated P/Invoke (`LibraryImport`)
 **Native library:** `libaster_transport_ffi.{dylib,so}` / `aster_transport_ffi.dll` from `target/release` (falls back to `target/debug`; override with `-p:NativeLibraryPath=...`)
-**C header:** `ffi/aster_ffi.h`, ABI 4.x (`aster_*` symbols; `aster_runtime_new(4, ...)`)
+**C header:** `ffi/aster_ffi.h`, ABI 5.x (`aster_*` symbols; `aster_runtime_new(5, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 4.17, 2026-10-11)
+## STATUS (ABI 5.0, 2026-10-13)
 
-- **ABI:** needs `libaster_transport_ffi` ABI 4.x (`Native.AbiVersionMajor` = 4,
-  `Native.RequiredAbiMinor` = 17 (owned raw WebTransport and media controls), with 4.12 for explicit public listeners and certificate helpers (4.11 added owned authenticated HTTPS/WebTransport listeners, 4.10 added independently owned Doc event receivers, 4.6 added observability and health, and 4.5 added cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
+- **ABI:** needs `libaster_transport_ffi` ABI 5.x (`Native.AbiVersionMajor` = 5,
+  `Native.RequiredAbiMinor` = 0; 5.0 removed the Fory attestation functions and is otherwise 4.17: owned raw WebTransport and media controls, with 4.12 for explicit public listeners and certificate helpers (4.11 added owned authenticated HTTPS/WebTransport listeners, 4.10 added independently owned Doc event receivers, 4.6 added observability and health, and 4.5 added cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.
@@ -63,7 +63,7 @@
   over `aster_reactor_*` and framed `aster_call_*` (both removed in ABI 4.0) is gone.
 - **Data plane (3.3):** blobs read-range / provider fetch with report / GC / status, tag prefix
   delete, docs open / import / authority / retire / durable set / entry status, connection
-  paths, stream priority. **Pure functions (3.4):** `Aster.Crypto.Ids`, `Hpke`, `Attestation`,
+  paths, stream priority. **Pure functions (3.4):** `Aster.Crypto.Ids`, `Hpke` (`Attestation` removed in ABI 5.0),
   `Grants` (checked against `conformance/vectors/grants.json`).
 - **Upcalls, leases, topology (ABI 4.1):** `Aster.Upcall.Upcalls` is one table per runtime
   (`aster_upcalls_*`). A **dedicated poll thread** drains `aster_upcall_poll` (100 ms native wait,

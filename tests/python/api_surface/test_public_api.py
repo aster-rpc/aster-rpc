@@ -113,9 +113,7 @@ _CLASS_NAMES = [
     "ConnectRequest",
     "NamespaceCapability",
     "HpkeEnvelope",
-    # Plan P7: attestation, sealed grants, leases, topology
-    "AttestationChain",
-    "VerifiedChain",
+    # Plan P7: sealed grants, leases, topology
     "GrantContext",
     "GrantOutcome",
     "GrantRecord",
@@ -188,9 +186,6 @@ def test_iroh_node_is_gone():
         "hpke_x25519_secret_from_identity",
         "hpke_x25519_public_from_identity",
         "hpke_x25519_public_from_node_id",
-        "attest_root_node",
-        "attestation_public_key",
-        "verify_chain",
         "check_grant_role",
         "grant_aad",
         "grant_key",
@@ -211,7 +206,6 @@ def test_trust_config_primitive_function_is_callable(name):
 
 
 def test_p7_errors_are_exceptions():
-    assert issubclass(ap.AttestationError, Exception)
     assert issubclass(ap.FenceRejectedError, Exception)
 
 

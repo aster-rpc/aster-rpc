@@ -1,5 +1,5 @@
-//! Key-material inputs shared by the T7 modules (attestation, HPKE identity
-//! keys, grants): 32-byte values given as 64 hex characters or raw bytes.
+//! Key-material inputs shared by the T7 modules (HPKE identity keys,
+//! grants): 32-byte values given as 64 hex characters or raw bytes.
 
 use napi::bindgen_prelude::*;
 
