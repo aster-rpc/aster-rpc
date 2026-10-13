@@ -709,3 +709,66 @@ async fn future_issued_credential_denial_is_not_dropped() {
     );
     node.close().await;
 }
+
+/// Consumer predicates over the evidence source. `RequireRegistration` is
+/// Portal's strict mode: a valid chain alone does not match. `IssuedBy`
+/// names a key on a chain's issuer path and never matches a registration.
+/// `MaxCredentialAge` bounds `now - issued_at` for either kind.
+#[tokio::test]
+async fn source_predicates_distinguish_registration_and_chain_evidence() {
+    let (node, doc) = setup().await;
+    let path = Temp::new();
+    let store = store(&path.0, &doc);
+    let chain = store.select_evidence(&peer(), Some(&token()), NOW).unwrap();
+    write(&doc, &registration(1, NodeRegistrationStatus::Active)).await;
+    store.refresh_node(&doc, &peer()).await.unwrap();
+    let record = store.select_evidence(&peer(), Some(&token()), NOW).unwrap();
+    assert!(matches!(
+        record.source(),
+        AdmissionEvidenceSource::RootAuthoredRecord { .. }
+    ));
+    let context = AdmissionContext::default();
+    let eval = |predicate: PolicyPredicate, evidence: &VerifiedAdmissionEvidence| {
+        PolicyExpressionV1::Predicate(predicate)
+            .evaluate(evidence, &context, NOW)
+            .unwrap()
+    };
+    assert_eq!(
+        eval(PolicyPredicate::RequireRegistration, &record),
+        MatchState::Match
+    );
+    assert_eq!(
+        eval(PolicyPredicate::RequireRegistration, &chain),
+        MatchState::NoMatch
+    );
+    assert_eq!(
+        eval(PolicyPredicate::IssuedBy(root()), &chain),
+        MatchState::Match
+    );
+    assert_eq!(
+        eval(PolicyPredicate::IssuedBy(peer()), &chain),
+        MatchState::NoMatch
+    );
+    assert_eq!(
+        eval(PolicyPredicate::IssuedBy(root()), &record),
+        MatchState::NoMatch
+    );
+    // Both were issued 60 s before NOW.
+    for evidence in [&chain, &record] {
+        assert_eq!(
+            eval(
+                PolicyPredicate::MaxCredentialAge(Duration::from_secs(60)),
+                evidence
+            ),
+            MatchState::Match
+        );
+        assert_eq!(
+            eval(
+                PolicyPredicate::MaxCredentialAge(Duration::from_secs(59)),
+                evidence
+            ),
+            MatchState::NoMatch
+        );
+    }
+    node.close().await;
+}

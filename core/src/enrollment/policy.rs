@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::jwt::Activation;
-use super::{TypedAttribute, VerifiedAdmissionEvidence};
+use super::{AdmissionEvidenceSource, TypedAttribute, VerifiedAdmissionEvidence};
 
 pub const MAX_POLICY_DEPTH: usize = 32;
 pub const MAX_POLICY_NODES: usize = 256;
@@ -135,6 +135,17 @@ pub enum PolicyPredicate {
         max_age: Duration,
         require_root: bool,
     },
+    /// Only a root-authored registration admits: a presented chain alone
+    /// does not match. Portal's strict `RootPolicyAdmission` is this
+    /// predicate.
+    RequireRegistration,
+    /// A presented chain whose issuer path includes this key (an issuer or
+    /// delegate that signed one of its links, or the root). Registration
+    /// evidence names no issuer path and does not match.
+    IssuedBy([u8; 32]),
+    /// The evidence was issued at most this long ago (`now - issued_at`;
+    /// evidence issued within the activation leeway ahead counts as new).
+    MaxCredentialAge(Duration),
 }
 
 /// A separate versioned enrollment tree; the existing flat RPC capability
@@ -259,6 +270,17 @@ impl PolicyPredicate {
                 .as_ref()
                 .map(|attrs| attrs.get(key) == Some(value)),
             Self::TolerateStalePolicy => Some(true),
+            Self::RequireRegistration => Some(matches!(
+                evidence.source(),
+                AdmissionEvidenceSource::RootAuthoredRecord { .. }
+            )),
+            Self::IssuedBy(key) => Some(matches!(
+                evidence.source(),
+                AdmissionEvidenceSource::PresentedChain { issuers, .. } if issuers.contains(key)
+            )),
+            Self::MaxCredentialAge(max_age) => {
+                Some(Duration::from_secs(now.saturating_sub(evidence.issued_at())) <= *max_age)
+            }
             Self::PolicySynchronizedWithin {
                 max_age,
                 require_root,
