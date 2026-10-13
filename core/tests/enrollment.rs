@@ -692,6 +692,9 @@ fn activation_leeway_tolerates_issuer_clock_ahead_but_never_extends_expiry() {
             "{field}"
         );
     }
+    // INV-E14: skew is "cannot evaluate now", never a definite denial, so
+    // it cannot revoke an existing session (only definite denials do).
+    assert!(!DenialReason::ClockSkew { offset_seconds: 90 }.is_definite());
     let mut c = claims();
     c["exp"] = json!(NOW);
     assert_eq!(
