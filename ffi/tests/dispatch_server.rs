@@ -1089,6 +1089,44 @@ fn all_four_patterns_through_the_c_abi() {
                 "NodeInfo is registered: {code} {msg}"
             );
         }
+        // ABI 5.1: the binding announces attributes (its contract registry)
+        // in the served identity.
+        let (name, value) = (b"aster.registry_namespace", b"ab".repeat(32));
+        assert_eq!(
+            aster_server_set_node_attribute(
+                s.srv.server,
+                name.as_ptr(),
+                name.len() as u32,
+                value.as_ptr(),
+                value.len() as u32
+            ),
+            OK
+        );
+        assert_eq!(
+            aster_server_set_node_attribute(
+                s.srv.server,
+                name.as_ptr(),
+                name.len() as u32,
+                ptr::null(),
+                0
+            ),
+            OK,
+            "an empty value removes it"
+        );
+        assert_eq!(
+            aster_server_set_node_attribute(s.srv.server, ptr::null(), 0, value.as_ptr(), 1),
+            INVALID
+        );
+        assert_eq!(
+            aster_server_set_node_attribute(
+                u64::MAX,
+                name.as_ptr(),
+                name.len() as u32,
+                ptr::null(),
+                0
+            ),
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
 
         s.binding.assert_table_drains();
         assert_eq!(

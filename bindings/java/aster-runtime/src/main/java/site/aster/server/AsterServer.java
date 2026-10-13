@@ -111,6 +111,9 @@ public final class AsterServer implements AutoCloseable {
 
   private final boolean ownsHealth;
 
+  /** The {@code aster.ops.NodeInfo} attribute announcing the contract registry namespace. */
+  public static final String REGISTRY_NAMESPACE_ATTRIBUTE = "aster.registry_namespace";
+
   /** 64-char hex doc-id of the registry doc created by the contract publisher; empty until then. */
   private volatile String registryNamespace = "";
 
@@ -181,6 +184,15 @@ public final class AsterServer implements AutoCloseable {
   void setPublicationResult(String namespace, Map<String, String> contractIds) {
     this.registryNamespace = namespace == null ? "" : namespace;
     this.publishedContractIds.putAll(contractIds);
+    if (!this.registryNamespace.isEmpty()) {
+      // Clients find the contract registry through aster.ops.NodeInfo (the
+      // retired consumer-admission response used to carry it).
+      try {
+        dispatch.setNodeAttribute(REGISTRY_NAMESPACE_ATTRIBUTE, this.registryNamespace);
+      } catch (RuntimeException e) {
+        System.err.println("AsterServer: could not announce the contract registry: " + e);
+      }
+    }
   }
 
   /** The node ID of this server (hex string). */

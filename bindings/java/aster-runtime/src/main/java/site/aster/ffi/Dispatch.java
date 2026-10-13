@@ -163,6 +163,8 @@ public final class Dispatch implements AutoCloseable {
       h("aster_server_restrict_peer_roles", FunctionDescriptor.of(I32, I64, PTR, I32, PTR, I32));
   private static final MethodHandle CLEAR_PEER_RESTRICTION =
       h("aster_server_clear_peer_restriction", FunctionDescriptor.of(I32, I64, PTR, I32));
+  private static final MethodHandle SET_NODE_ATTRIBUTE =
+      h("aster_server_set_node_attribute", FunctionDescriptor.of(I32, I64, PTR, I32, PTR, I32));
   private static final MethodHandle LIVE_CALLS =
       h("aster_server_live_calls", FunctionDescriptor.of(I64, I64));
   private static final MethodHandle CONTRACT_ID =
@@ -640,6 +642,24 @@ public final class Dispatch implements AutoCloseable {
       check(
           (int) CLEAR_PEER_RESTRICTION.invoke(handle, ps, p.length),
           "aster_server_clear_peer_restriction");
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * Set (or, with an empty value, remove) a text attribute of the served {@code aster.ops.NodeInfo}
+   * identity (ABI 5.1), e.g. {@code aster.registry_namespace}.
+   */
+  public void setNodeAttribute(String name, String value) {
+    byte[] n = name.getBytes(StandardCharsets.UTF_8);
+    byte[] v = value == null ? new byte[0] : value.getBytes(StandardCharsets.UTF_8);
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment ns = arena.allocateFrom(U8, n);
+      MemorySegment vs = v.length == 0 ? MemorySegment.NULL : arena.allocateFrom(U8, v);
+      check(
+          (int) SET_NODE_ATTRIBUTE.invoke(handle, ns, n.length, vs, v.length),
+          "aster_server_set_node_attribute");
     } catch (Throwable t) {
       throw rethrow(t);
     }

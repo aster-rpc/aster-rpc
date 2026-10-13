@@ -7052,6 +7052,20 @@ int32_t aster_server_clear_peer_restriction(aster_server_t server,
                                             uint32_t peer_len);
 
 /**
+ * ABI 5.1: set (or, with an empty `value`, remove) a text attribute of the
+ * server's `aster.ops.NodeInfo` identity, e.g. `aster.registry_namespace`
+ * once the binding has published its contracts (clients read it to find
+ * the contract registry, as the retired consumer-admission response
+ * carried it). `NOT_FOUND` for an unknown server; `UNSUPPORTED` when the
+ * server was built with `ASTER_SERVER_OPTION_BUILTIN_NODE_INFO` = 0.
+ */
+int32_t aster_server_set_node_attribute(aster_server_t server,
+                                        const uint8_t *name,
+                                        uint32_t name_len,
+                                        const uint8_t *value,
+                                        uint32_t value_len);
+
+/**
  * Drain up to `max` events into `out`. `timeout_ms` 0 = return at once;
  * otherwise wait up to that long for the first event. Returns the count
  * (0 on timeout, unknown server or bad arguments). Single consumer: call it

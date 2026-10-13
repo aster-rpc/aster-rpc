@@ -1403,6 +1403,9 @@ class AsterClient:
         self._ep: Any | None = None
         self._enrollment: Any | None = None
         self._services: list[ServiceSummary] = []
+        # Whether the server advertised its services (``aster.services``);
+        # summaries resolved later from the registry do not make it so.
+        self._advertised = False
         self._registry_namespace: str = ""
         self._rpc_conns: dict[str, Any] = {}
         # Serialises concurrent `_rpc_conn_for` lookups so bursts of
@@ -1539,6 +1542,7 @@ class AsterClient:
         attributes = info.get("attributes") or {}
         services: list[ServiceSummary] = []
         raw = attributes.get(_SERVICES_ATTRIBUTE)
+        self._advertised = bool(raw)
         if raw:
             try:
                 from .limits import MAX_ADVERTISED_SERVICES
@@ -1951,8 +1955,9 @@ class AsterClient:
     def _rpc_key_for(self, name: str, version: int, channel: str | None) -> str:
         """The RPC connection key for a typed client of ``(name, version)``.
         A server that advertises its services must list it; one that does not
-        (another binding, or a Rust ``AsterServer``) is called directly."""
-        if not self._services:
+        (another binding, or a Rust ``AsterServer``) is called directly, even
+        after some of its services were resolved from its registry."""
+        if not self._advertised:
             return self._server_key
         summary: ServiceSummary | None = None
         for s in self._services:

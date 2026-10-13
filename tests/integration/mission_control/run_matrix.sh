@@ -82,45 +82,39 @@ start_python_server() {
 
   rm -f "$pid_file" "$addr_file" "$log_file"
 
-  local env_prefix=""
-  if [[ "$mode" == "auth" ]]; then
-    # Enrollment from the environment (setup_auth.sh): auth.env plus the
-    # server's own key, credential and state.
-    rm -f "$WORK_DIR/server-enrollment.json"
-    env_prefix="$(sed 's/^/export /' "$WORK_DIR/auth.env" | tr '\n' ';') ASTER_SECRET_KEY_FILE=$WORK_DIR/server.key ASTER_ENROLLMENT_CREDENTIAL=$WORK_DIR/server.cred ASTER_ENROLLMENT_STATE_PATH=$WORK_DIR/server-enrollment.json"
-  fi
-
+  # The server runs in a subshell that execs Python directly: the auth
+  # variables stay out of this script's environment (a later dev-mode server
+  # must not inherit them), and the recorded pid is the server itself, so
+  # stop_server's kill reaches it (`uv run` does not forward SIGTERM).
+  local services=services
+  [[ "$mode" == "auth" ]] && services=services_auth
   cd "$REPO_ROOT"
-  if [[ "$mode" == "auth" ]]; then
-    eval "$env_prefix uv run python -c \"
-import asyncio, os
-from aster import AsterServer, AsterConfig
-from examples.python.mission_control.services_auth import MissionControl, AgentSession
-
-async def main():
-    config = AsterConfig.from_env()
-    srv = AsterServer(services=[MissionControl(), AgentSession()], config=config)
-    await srv.start()
-    print(srv.address, flush=True)
-    await srv.serve()
-
-asyncio.run(main())
-\" > '$addr_file' 2> '$log_file' &"
-  else
-    uv run python -c "
+  local python
+  python="$(uv run python -c 'import sys; print(sys.executable)')"
+  (
+    if [[ "$mode" == "auth" ]]; then
+      # Enrollment from the environment (setup_auth.sh): auth.env plus the
+      # server's own key, credential and state.
+      set -a; . "$WORK_DIR/auth.env"; set +a
+      export ASTER_SECRET_KEY_FILE="$WORK_DIR/server.key"
+      export ASTER_ENROLLMENT_CREDENTIAL="$WORK_DIR/server.cred"
+      export ASTER_ENROLLMENT_STATE_PATH="$WORK_DIR/server-enrollment.json"
+      rm -f "$ASTER_ENROLLMENT_STATE_PATH"
+    fi
+    exec "$python" -c "
 import asyncio
-from aster import AsterServer
-from examples.python.mission_control.services import MissionControl, AgentSession
+from aster import AsterServer, AsterConfig
+from examples.python.mission_control.$services import MissionControl, AgentSession
 
 async def main():
-    srv = AsterServer(services=[MissionControl(), AgentSession()])
+    srv = AsterServer(services=[MissionControl(), AgentSession()], config=AsterConfig.from_env())
     await srv.start()
     print(srv.address, flush=True)
     await srv.serve()
 
 asyncio.run(main())
-" > "$addr_file" 2> "$log_file" &
-  fi
+"
+  ) > "$addr_file" 2> "$log_file" &
 
   echo $! > "$pid_file"
 

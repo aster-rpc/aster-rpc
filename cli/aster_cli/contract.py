@@ -607,7 +607,6 @@ async def _fetch_manifests_from_node(ticket: str, rcan_path: str | None = None) 
     from aster.runtime import AsterClient, _coerce_node_addr
     from aster.config import AsterConfig
     from aster import docs_client, blobs_client
-    from aster.registry.keys import contract_key
     import asyncio
     import os as _os
 
@@ -650,13 +649,17 @@ async def _fetch_manifests_from_node(ticket: str, rcan_path: str | None = None) 
                 break
 
     manifests: dict[str, dict] = {}
-    for svc in client._services:
+    # Every contract the server published, read from its registry. Only a
+    # Python server advertises its services on NodeInfo (``aster.services``);
+    # the registry is what every binding's server announces.
+    try:
+        entries = await doc.query_key_prefix(b"contracts/")
+    except Exception as exc:  # noqa: BLE001
+        print(f"Warning: failed to list the contract registry: {exc}", file=sys.stderr)
+        entries = []
+    for entry in entries:
         try:
-            key = contract_key(svc.contract_id)
-            entries = await doc.query_key_exact(key)
-            if not entries:
-                continue
-            content = await doc.read_entry_content(entries[0].content_hash)
+            content = await doc.read_entry_content(entry.content_hash)
             artifact = _json.loads(content)
             ch = artifact.get("collection_hash", "")
             if not ch:
@@ -664,10 +667,12 @@ async def _fetch_manifests_from_node(ticket: str, rcan_path: str | None = None) 
             files = await bc.download_collection_hash(ch, peer_id)
             for name, data in files:
                 if name == "manifest.json":
-                    manifests[svc.name] = _json.loads(data)
+                    manifest = _json.loads(data)
+                    manifests[manifest.get("service") or artifact.get("service", "")] = manifest
                     break
-        except Exception as exc:
-            print(f"Warning: failed to fetch manifest for {svc.name}: {exc}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: failed to fetch a published contract: {exc}", file=sys.stderr)
+    manifests.pop("", None)
 
     return manifests
 

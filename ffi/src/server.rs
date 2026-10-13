@@ -354,6 +354,9 @@ pub(crate) struct ServerState {
     /// Dropped with the server: ends Enrollment's per-connection tasks, which
     /// would otherwise keep the node (and its runtime) alive.
     _enrollment_stop: Option<tokio::sync::watch::Sender<()>>,
+    /// The served `aster.ops.NodeInfo` identity (ABI 5.1,
+    /// `aster_server_set_node_attribute`); `None` with the baseline off.
+    node_identity: Option<aster::rpc::baseline::NodeIdentityHandle>,
 }
 
 #[derive(Default)]
@@ -738,10 +741,11 @@ pub unsafe extern "C" fn aster_server_start(
     if let Some(timeout) = spec.handler_timeout {
         server = server.handler_timeout(timeout);
     }
+    let mut node_identity = None;
     if spec.node_info {
-        server = server
-            .with_builtin_node_info(&node, Default::default(), None)
-            .0;
+        let (with_info, handle) = server.with_builtin_node_info(&node, Default::default(), None);
+        server = with_info;
+        node_identity = Some(handle);
     }
     if spec.topology {
         server = server.with_builtin_topology(&node, spec.topology_requires);
@@ -792,6 +796,7 @@ pub unsafe extern "C" fn aster_server_start(
         rt: rt.clone(),
         health: spec.health.clone(),
         _enrollment_stop: enrollment_stop,
+        node_identity,
     };
     let mut tracked = bridge
         .server_handles
@@ -1149,6 +1154,54 @@ pub unsafe extern "C" fn aster_server_clear_peer_restriction(
         Err(code) => return code,
     };
     state.attributes.clear_restriction(&peer);
+    status(aster_status_t::ASTER_STATUS_OK)
+}
+
+/// ABI 5.1: set (or, with an empty `value`, remove) a text attribute of the
+/// server's `aster.ops.NodeInfo` identity, e.g. `aster.registry_namespace`
+/// once the binding has published its contracts (clients read it to find
+/// the contract registry, as the retired consumer-admission response
+/// carried it). `NOT_FOUND` for an unknown server; `UNSUPPORTED` when the
+/// server was built with `ASTER_SERVER_OPTION_BUILTIN_NODE_INFO` = 0.
+#[no_mangle]
+pub unsafe extern "C" fn aster_server_set_node_attribute(
+    server: aster_server_t,
+    name: *const u8,
+    name_len: u32,
+    value: *const u8,
+    value_len: u32,
+) -> i32 {
+    let Some(state) = SERVERS.get(server) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    // SAFETY: caller-provided lengths.
+    let (name, value) = unsafe { (bytes_in(name, name_len), bytes_in(value, value_len)) };
+    let (Ok(name), Ok(value)) = (std::str::from_utf8(name), std::str::from_utf8(value)) else {
+        return fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "attribute name and value must be UTF-8",
+        );
+    };
+    if name.is_empty() {
+        return fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "empty attribute name",
+        );
+    }
+    let Some(identity) = &state.node_identity else {
+        return fail(
+            aster_status_t::ASTER_STATUS_UNSUPPORTED,
+            "the server does not serve aster.ops.NodeInfo",
+        );
+    };
+    identity.update(|identity| {
+        identity.attributes.retain(|attr| attr.name != name);
+        if !value.is_empty() {
+            identity
+                .attributes
+                .push(aster::rpc::baseline::Attr::new(name, value));
+        }
+    });
     status(aster_status_t::ASTER_STATUS_OK)
 }
 

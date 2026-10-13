@@ -29,6 +29,7 @@ follows the kind: `DENIED` is `PERMISSION_DENIED`, `NOT_ADMITTED` is
 | `aster_enrollment_check_peer(rt, e, peer, ud, *op)` | Re-evaluate a peer before a sensitive operation; `DENIED` revokes. |
 | `aster_enrollment_next_revocation(rt, e, ud, *op)` | The next revocation (buffered from install) or `{lagged}`. |
 | `aster_enrollment_issuer_info(rt, e, *out_json)`, `aster_enrollment_issue(rt, e, request_json, *out_json)` | The server's configured issuer; `NOT_FOUND` without one. A refusal returns `PERMISSION_DENIED` with `{code, message, retryable}`. |
+| `aster_server_set_node_attribute(server, name, name_len, value, value_len)` | Set (empty value: remove) a text attribute of the served `aster.ops.NodeInfo` identity; bindings announce `aster.registry_namespace` there after publishing contracts (the retired consumer-admission response used to carry it). `UNSUPPORTED` with the baseline off. |
 | `aster_enrollment_free(rt, e)` | Release early (pending revocation waits end `ALREADY_CLOSED`). |
 | `aster_server_add_lease_grantor(builder, serializer, requires_json, revoke_requires_json)` | Serve `aster.lease.Grantor` over a lease serializer handle (foreign or memory). Requirements are `CapabilityRequirement` JSON; empty `revoke_requires_json` = the `operator` role, `null` = none. |
 | `aster_lease_serializer_grantor_new(rt, node, connection, *out)` | A serializer backed by a remote grantor over an `aster/1` connection (`GrantorSerializer`); acquire with holder = the node's id. |
