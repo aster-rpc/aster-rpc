@@ -6,7 +6,7 @@ rust-version.workspace = true
 description = "Where Aster operator tools keep profile root private keys: the OS credential store, or an owner-only file."
 license = "MIT OR Apache-2.0"
 repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
-publish = ["aster"]
+publish = false
 
 # Dependency policy: docs/_internal/working_ideas/aster-cli-rust.md. keyring-
 # core with explicit native stores (not the keyring facade crate); no Secret

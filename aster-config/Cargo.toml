@@ -6,7 +6,7 @@ rust-version.workspace = true
 description = "The shared Aster operator configuration (`~/.aster/config.toml`): profiles and @aster service settings, for every Aster tool."
 license = "MIT OR Apache-2.0"
 repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
-publish = ["aster"]
+publish = false
 
 # Deliberately tiny: any Aster tool can depend on it without a CLI stack.
 [dependencies]

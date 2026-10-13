@@ -6,7 +6,7 @@ rust-version.workspace = true
 description = "Client for the @aster directory service: handles, service publication and access grants."
 license = "MIT OR Apache-2.0"
 repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
-publish = ["aster"]
+publish = false
 
 # Every dependency is already in the Aster facade's tree; versions follow the
 # facade's pins (Fory exactly, for the cross-language wire format).
