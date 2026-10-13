@@ -168,6 +168,18 @@ describe('aster-gen scanner', () => {
     expect(block).toMatch(/idempotent: true/);
   });
 
+  it('evaluates requires: a role, a constant, anyOf(...) and allOf(...)', () => {
+    const block = (name: string) => {
+      const at = generatedSource.indexOf(`name: "${name}"`);
+      return generatedSource.slice(at, at + 600);
+    };
+    expect(block('getStatus')).toMatch(/requires: undefined/);
+    expect(block('getStatusWithCtx')).toContain('requires: { kind: "role", roles: ["ops.status"] }');
+    expect(block('watchStatus')).toContain('requires: { kind: "any_of", roles: ["ops.logs","ops.admin"] }');
+    expect(block('ingestEvents')).toContain('requires: { kind: "all_of", roles: ["ops.status","ops.admin"] }');
+    expect(block('exchange')).toContain('requires: { kind: "role", roles: ["ops.admin"] }');
+  });
+
   it('emits pre-derived requestFields and responseFields for _buildManifest', () => {
     expect(generatedSource).toMatch(/requestFields: \[\{"name":"agentId"/);
     expect(generatedSource).toMatch(/responseFields: \[\{"name":"status"/);
@@ -370,6 +382,9 @@ describe('aster-gen + registerGenerated roundtrip', () => {
     expect(info.version).toBe(1);
     expect(info.methods.size).toBeGreaterThanOrEqual(3);
     expect(info.methods.get('getStatusWithCtx').acceptsCtx).toBe(true);
+    expect(info.methods.get('getStatusWithCtx').requires).toEqual({ kind: 'role', roles: ['ops.status'] });
+    expect(info.methods.get('watchStatus').requires).toEqual({ kind: 'any_of', roles: ['ops.logs', 'ops.admin'] });
+    expect(info.methods.get('getStatus').requires).toBeUndefined();
     expect(info.methods.get('getStatus').handler).toBeTypeOf('function');
 
     // Wire types: WIRE_TYPE_KEY stamped, shape registry populated.

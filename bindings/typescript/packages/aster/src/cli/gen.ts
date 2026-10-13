@@ -153,6 +153,97 @@ function readDecoratorOptions(
   return out;
 }
 
+/** The raw initializer of option `key` in a decorator's object literal. */
+function decoratorOptionExpr(decorator: ts.Decorator, key: string): ts.Expression | undefined {
+  if (!ts.isCallExpression(decorator.expression)) return undefined;
+  const arg = decorator.expression.arguments[0];
+  if (!arg || !ts.isObjectLiteralExpression(arg)) return undefined;
+  for (const prop of arg.properties) {
+    if (!ts.isPropertyAssignment(prop)) continue;
+    if (!ts.isIdentifier(prop.name) && !ts.isStringLiteral(prop.name)) continue;
+    if (prop.name.text === key) return prop.initializer;
+  }
+  return undefined;
+}
+
+/** A `requires=` value as the runtime's `CapabilityRequirement`. */
+interface ScannedRequirement {
+  kind: 'role' | 'any_of' | 'all_of';
+  roles: string[];
+}
+
+/**
+ * The string an expression always evaluates to: a literal, or anything the
+ * checker types as one string literal (a `const`, an `as const` object
+ * member such as `Role.STATUS`, a string enum member).
+ */
+function constantString(ctx: ScanContext, expr: ts.Expression): string | undefined {
+  if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) return expr.text;
+  if (ts.isParenthesizedExpression(expr) || ts.isAsExpression(expr)) {
+    return constantString(ctx, expr.expression);
+  }
+  const type = ctx.checker.getTypeAtLocation(expr);
+  if (type.isStringLiteral()) return type.value;
+  return undefined;
+}
+
+/**
+ * Evaluate `requires` statically, as the decorators do at runtime: a role
+ * (`'ops.status'`, `Role.STATUS`), `anyOf(...)` / `allOf(...)` of roles, or
+ * a `{ kind, roles }` literal. Anything else is an error: emitting
+ * `undefined` would describe a gated method as open.
+ */
+function scanRequires(ctx: ScanContext, decorator: ts.Decorator): ScannedRequirement | undefined {
+  const expr = decoratorOptionExpr(decorator, 'requires');
+  if (!expr || expr.kind === ts.SyntaxKind.UndefinedKeyword || expr.kind === ts.SyntaxKind.NullKeyword) {
+    return undefined;
+  }
+  if (ts.isIdentifier(expr) && expr.text === 'undefined') return undefined;
+  const fail = (): never => {
+    throw new ScanError(
+      'requires must be a role (a string or a constant such as Role.STATUS), ' +
+        'anyOf(...) / allOf(...) of roles, or { kind, roles } with constant roles',
+      locationOf(expr),
+    );
+  };
+  const roles = (args: readonly ts.Expression[]): string[] =>
+    args.map((a) => constantString(ctx, a) ?? fail());
+
+  const role = constantString(ctx, expr);
+  if (role !== undefined) return { kind: 'role', roles: [role] };
+
+  if (ts.isCallExpression(expr)) {
+    const callee = expr.expression;
+    const name = ts.isIdentifier(callee)
+      ? callee.text
+      : ts.isPropertyAccessExpression(callee) ? callee.name.text : undefined;
+    if (name === 'anyOf') return { kind: 'any_of', roles: roles(expr.arguments) };
+    if (name === 'allOf') return { kind: 'all_of', roles: roles(expr.arguments) };
+    return fail();
+  }
+
+  if (ts.isObjectLiteralExpression(expr)) {
+    let kind: string | undefined;
+    let list: string[] | undefined;
+    for (const prop of expr.properties) {
+      if (!ts.isPropertyAssignment(prop)) return fail();
+      const key = ts.isIdentifier(prop.name) || ts.isStringLiteral(prop.name) ? prop.name.text : undefined;
+      if (key === 'kind') kind = constantString(ctx, prop.initializer);
+      else if (key === 'roles' && ts.isArrayLiteralExpression(prop.initializer)) {
+        list = roles(prop.initializer.elements);
+      } else return fail();
+    }
+    if ((kind === 'role' || kind === 'any_of' || kind === 'all_of') && list) return { kind, roles: list };
+    return fail();
+  }
+  return fail();
+}
+
+function requiresLiteral(req: ScannedRequirement | undefined): string {
+  if (!req) return 'undefined';
+  return `{ kind: ${JSON.stringify(req.kind)}, roles: ${JSON.stringify(req.roles)} }`;
+}
+
 function literalValue(expr: ts.Expression): unknown {
   if (ts.isStringLiteral(expr) || ts.isNoSubstitutionTemplateLiteral(expr)) return expr.text;
   if (ts.isNumericLiteral(expr)) return Number(expr.text);
@@ -445,6 +536,7 @@ interface ScannedMethod {
   acceptsCtx: boolean;
   idempotent: boolean;
   timeout: number | undefined;
+  requires: ScannedRequirement | undefined;
 }
 
 interface ScannedService {
@@ -454,6 +546,7 @@ interface ScannedService {
   version: number;
   scoped: 'shared' | 'session';
   serializationModes: string[];
+  requires: ScannedRequirement | undefined;
   methods: ScannedMethod[];
   sourceFile: string;
   importName: string;
@@ -649,6 +742,7 @@ function scanService(
     const methodName = typeof methodOpts.name === 'string' ? methodOpts.name : member.name.text;
     const timeout = typeof methodOpts.timeout === 'number' ? methodOpts.timeout : undefined;
     const idempotent = methodOpts.idempotent === true;
+    const requires = scanRequires(ctx, methodDecorator);
 
     // First non-CallContext parameter is the request; second (if present
     // and typed as CallContext) sets acceptsCtx.
@@ -691,6 +785,7 @@ function scanService(
       acceptsCtx,
       idempotent,
       timeout,
+      requires,
     });
   }
 
@@ -701,6 +796,7 @@ function scanService(
     version,
     scoped,
     serializationModes,
+    requires: scanRequires(ctx, decorator),
     methods,
     sourceFile: classDecl.getSourceFile().fileName,
     importName: classDecl.name!.text,
@@ -1372,7 +1468,7 @@ function emitServices(
       idempotent: ${m.idempotent},
       timeout: ${m.timeout ?? 'undefined'},
       serialization: undefined,
-      requires: undefined,
+      requires: ${requiresLiteral(m.requires)},
       metadata: undefined,
       requestFields: ${JSON.stringify(reqFields)},
       responseFields: ${JSON.stringify(resFields)},
@@ -1387,7 +1483,7 @@ function emitServices(
     version: ${s.version},
     scoped: ${JSON.stringify(s.scoped)},
     serializationModes: ${JSON.stringify(s.serializationModes)},
-    requires: undefined,
+    requires: ${requiresLiteral(s.requires)},
     metadata: undefined,
     methods: [
 ${methodExprs}

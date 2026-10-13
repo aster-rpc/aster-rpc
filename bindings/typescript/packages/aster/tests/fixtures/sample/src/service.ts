@@ -1,5 +1,8 @@
-import { Service, Rpc, ServerStream, ClientStream, BidiStream, CallContext } from '@aster-rpc/aster';
+import { Service, Rpc, ServerStream, ClientStream, BidiStream, CallContext, anyOf, allOf } from '@aster-rpc/aster';
 import { StatusRequest, StatusResponse, WatchRequest, StatusEvent } from './types.js';
+
+/** Roles as an application declares them: `requires` names them by constant. */
+const Role = { STATUS: 'ops.status', LOGS: 'ops.logs', ADMIN: 'ops.admin' } as const;
 
 @Service({ name: 'MissionControl', version: 1 })
 export class MissionControlService {
@@ -11,25 +14,25 @@ export class MissionControlService {
     return res;
   }
 
-  @Rpc()
+  @Rpc({ requires: Role.STATUS })
   async getStatusWithCtx(req: StatusRequest, ctx: CallContext): Promise<StatusResponse> {
     void ctx;
     return new StatusResponse();
   }
 
-  @ServerStream()
+  @ServerStream({ requires: anyOf(Role.LOGS, 'ops.admin') })
   async *watchStatus(req: WatchRequest): AsyncGenerator<StatusEvent> {
     void req;
     yield new StatusEvent();
   }
 
-  @ClientStream()
+  @ClientStream({ requires: allOf(Role.STATUS, Role.ADMIN) })
   async ingestEvents(stream: AsyncIterable<StatusEvent>): Promise<StatusResponse> {
     for await (const _ of stream) void _;
     return new StatusResponse();
   }
 
-  @BidiStream()
+  @BidiStream({ requires: 'ops.admin' })
   async *exchange(stream: AsyncIterable<StatusRequest>): AsyncGenerator<StatusEvent> {
     for await (const _ of stream) void _;
     yield new StatusEvent();
