@@ -1208,6 +1208,7 @@ impl EnrollmentService {
         let result = tokio::time::timeout(timeout, async {
             use futures_lite::StreamExt;
             let mut synchronized = false;
+            let mut backoff = crate::CrossedSyncBackoff::default();
             loop {
                 match events.next().await {
                     Some(Ok(iroh_docs::engine::LiveEvent::SyncFinished(event)))
@@ -1221,7 +1222,7 @@ impl EnrollmentService {
                             // case the replica cannot reach us. The deadline
                             // still bounds it.
                             Err(error) if crate::crossed_sync_abort(error) => {
-                                tokio::time::sleep(crate::CROSSED_SYNC_RETRY).await;
+                                tokio::time::sleep(backoff.next()).await;
                                 doc.start_sync(vec![hex::encode(peer)]).await?;
                             }
                             Err(error) => bail!("policy sync failed: {error}"),
@@ -2096,6 +2097,9 @@ mod tests {
             ));
         }
         assert!(!crate::crossed_sync_abort("failed to sync: AlreadySyncing"));
+        let mut backoff = crate::CrossedSyncBackoff::default();
+        let waits: Vec<_> = (0..5).map(|_| backoff.next().as_millis()).collect();
+        assert_eq!(waits, [250, 500, 1000, 2000, 2000]);
     }
 
     #[tokio::test]

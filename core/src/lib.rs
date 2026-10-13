@@ -4425,14 +4425,36 @@ pub struct CoreDoc {
     pub store: BlobStore,
 }
 
-/// Wait before dialling a replica again after a crossed sync.
-pub(crate) const CROSSED_SYNC_RETRY: Duration = Duration::from_millis(100);
+/// Redials after a crossed sync back off from 250 ms, doubling to 2 s.
+#[derive(Debug)]
+pub(crate) struct CrossedSyncBackoff(Duration);
+
+impl Default for CrossedSyncBackoff {
+    fn default() -> Self {
+        Self(Duration::from_millis(250))
+    }
+}
+
+impl CrossedSyncBackoff {
+    pub(crate) fn next(&mut self) -> Duration {
+        let wait = self.0;
+        self.0 = (self.0 * 2).min(Duration::from_secs(2));
+        wait
+    }
+}
 
 /// Whether a failed `SyncFinished` only means both ends dialled at once.
-/// iroh-docs aborts the losing direction with `AlreadySyncing` and reports
-/// that abort before the other direction finishes, so callers waiting for a
-/// completed sync keep waiting (within their deadline) instead of failing.
-/// Every other failure, including other aborts, still fails.
+///
+/// iroh-docs settles a simultaneous dial by a tie-break
+/// (`engine/state.rs` `expected_sync_direction`): the losing connect is
+/// rejected with `RemoteAbort(AlreadySyncing)`, which since the 0.101.4 wedge
+/// fix is reported through `on_sync_finished` (`engine/live.rs`
+/// `on_sync_via_connect_finished`) as a failed `SyncFinished`, and the real
+/// exchange then completes in the other direction. So this means "wait for
+/// the other direction", not "failed". If the winner's connect never arrives
+/// (a stale address), redialling is safe: the abort reset our connect state,
+/// and if an accept already owns it the local connect is a no-op. Every other
+/// failure, including other aborts, still fails.
 pub(crate) fn crossed_sync_abort(error: &str) -> bool {
     use iroh_docs::net::{AbortReason, ConnectError};
     error == ConnectError::RemoteAbort(AbortReason::AlreadySyncing).to_string()
@@ -4730,6 +4752,7 @@ impl CoreDoc {
     /// Failed syncs and a closed event stream fail closed. This waits for metadata
     /// reconciliation; callers must still require complete content when reading.
     pub async fn sync_with_timeout(&self, peers: Vec<String>, budget: Duration) -> Result<()> {
+        let mut backoff = CrossedSyncBackoff::default();
         let mut pending = peers
             .into_iter()
             .map(|peer| peer.parse::<EndpointId>())
@@ -4752,7 +4775,7 @@ impl CoreDoc {
                             Err(error) if crossed_sync_abort(error) => {
                                 // The other direction normally completes on
                                 // its own; dial again in case it cannot.
-                                tokio::time::sleep(CROSSED_SYNC_RETRY).await;
+                                tokio::time::sleep(backoff.next()).await;
                                 self.start_sync(vec![event.peer.to_string()]).await?;
                             }
                             Err(error) => {
