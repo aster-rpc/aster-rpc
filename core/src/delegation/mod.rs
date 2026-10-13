@@ -30,6 +30,8 @@ pub use rotation::{
     issue_root_rotation, next_root_commitment, verify_root_rotation, RootRotation, RootState,
     RotationReason, ROOT_ROTATION_JWT_TYPE,
 };
+/// Untrusted decoding helpers for enrollment diagnostics and reporting.
+#[cfg(feature = "enrollment")]
 pub(crate) use verify::{claimed_start, leaf_jti};
 pub use verify::{verify_chain, LeafClaims, VerifiedChain};
 

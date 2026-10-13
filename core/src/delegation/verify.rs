@@ -131,6 +131,7 @@ pub fn verify_chain(
 /// The latest `iat`/`nbf` any link of `chain` claims, decoded without trust.
 /// Only for diagnosing a [`ChainError::NotYetValid`]: callers re-verify at
 /// that time before reporting clock skew rather than a definite failure.
+#[cfg(feature = "enrollment")]
 pub(crate) fn claimed_start(chain: &[u8]) -> Option<u64> {
     let texts = split(chain, MAX_LINKS).ok()?;
     texts
@@ -147,6 +148,7 @@ pub(crate) fn claimed_start(chain: &[u8]) -> Option<u64> {
 
 /// The leaf link's `jti`, decoded without trust. For reporting what an
 /// issuer just signed.
+#[cfg(feature = "enrollment")]
 pub(crate) fn leaf_jti(chain: &super::Chain) -> Option<String> {
     let leaf = chain.links().next()?;
     let compact = jws::decode(leaf).ok()?;
