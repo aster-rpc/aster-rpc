@@ -9,6 +9,13 @@
  *
  * Usage:
  *     bun run agent.ts <server-address>
+ *
+ * Against `server.ts --auth` (Chapter 5) the agent presents its enrollment
+ * credential; nothing in this file changes, only the configuration:
+ *
+ *     ASTER_SECRET_KEY_FILE=agent.key ASTER_ENROLLMENT_CREDENTIAL=agent.cred \
+ *     ASTER_ROOT_PUBKEY=... ASTER_ENROLLMENT_AUDIENCE=mission-control \
+ *     ASTER_ENROLLMENT_FLEET_NAMESPACE=... bun run agent.ts <server-address>
  */
 
 import { AsterClientWrapper } from '@aster-rpc/aster';

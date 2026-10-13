@@ -18,7 +18,7 @@
  */
 
 import { AsterClientWrapper, ForyCodec, IrohTransport, newXlangFory } from '@aster-rpc/aster';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 // ── Output helpers ──────────────────────────────────────────────────────────
@@ -239,30 +239,58 @@ async function testCh4Session(client: AsterClientWrapper): Promise<void> {
 
 // ── Chapter 5: Auth ──────────────────────────────────────────────────────────
 
+/**
+ * The enrollment configuration of a client named `name` in the keys dir
+ * written by setup_auth.sh: the shared `auth.env` (root, audience, fleet
+ * namespace) plus `<name>.key` and `<name>.cred`.
+ */
+function enrolledConfig(keysDir: string, name: string): Record<string, unknown> {
+  const env: Record<string, string> = {};
+  for (const line of readFileSync(join(keysDir, 'auth.env'), 'utf-8').split('\n')) {
+    const m = line.match(/^([A-Z_]+)=(.*)$/);
+    if (m) env[m[1]] = m[2];
+  }
+  return {
+    rootPubkey: env.ASTER_ROOT_PUBKEY,
+    secretKeyFile: join(keysDir, `${name}.key`),
+    enrollmentCredentialFile: join(keysDir, `${name}.cred`),
+    enrollment: {
+      audience: env.ASTER_ENROLLMENT_AUDIENCE,
+      fleetNamespace: env.ASTER_ENROLLMENT_FLEET_NAMESPACE,
+    },
+  };
+}
+
 async function testCh5NoCredential(address: string): Promise<void> {
+  // A node with no credential: Gate 0 on the enrolled server closes its
+  // connection ("enrollment required"), so nothing can be called.
+  const client = new AsterClientWrapper({ address });
   try {
-    const client = new AsterClientWrapper({ address });
     await client.connect();
-    await client.close();
-    fail('Ch5 no-cred denied', 'connection succeeded (should have been refused)');
+    const mc = await client.proxy('MissionControl');
+    await mc.submitLog({ timestamp: 0, level: 'info', message: 'no-cred', agent_id: 'x' });
+    fail('Ch5 no-cred denied', 'call succeeded (should have been refused)');
   } catch (e) {
-    if (isPermissionDenied(e) || String(e).toLowerCase().includes('denied')) {
-      ok('Ch5 no credential → denied');
+    const msg = String(e).toLowerCase();
+    if (isPermissionDenied(e) || msg.includes('denied') || msg.includes('enrollment required')
+      || msg.includes('closed')) {
+      ok('Ch5 no credential → refused');
     } else {
       fail('Ch5 no-cred denied', `unexpected error: ${e}`);
     }
+  } finally {
+    await client.close();
   }
 }
 
-async function testCh5EdgeCredential(address: string, edgeCred: string): Promise<void> {
+async function testCh5EdgeCredential(address: string, keysDir: string): Promise<void> {
   let client: AsterClientWrapper;
   try {
-    // The .cred file is a TOML .aster-identity containing both the node
-    // secret key and the consumer peer entry. Pass it as identity= and the
-    // client extracts the inline credential automatically.
+    // edge.key + edge.cred (ops.status, ops.ingest): the client enrolls with
+    // the server before its RPC connection opens.
     client = new AsterClientWrapper({
       address,
-      identity: edgeCred,
+      config: enrolledConfig(keysDir, 'edge'),
     });
     await client.connect();
   } catch (e) {
@@ -327,12 +355,12 @@ async function testCh5EdgeCredential(address: string, edgeCred: string): Promise
   await client.close();
 }
 
-async function testCh5OpsCredential(address: string, opsCred: string): Promise<void> {
+async function testCh5OpsCredential(address: string, keysDir: string): Promise<void> {
   let client: AsterClientWrapper;
   try {
     client = new AsterClientWrapper({
       address,
-      identity: opsCred,
+      config: enrolledConfig(keysDir, 'ops'),
     });
     await client.connect();
   } catch (e) {
@@ -461,20 +489,16 @@ async function runDevMode(address: string): Promise<void> {
 
 async function runAuthMode(address: string, keysDir: string): Promise<void> {
   section('Auth mode (Chapter 5)');
-  const edgeCred = join(keysDir, 'edge.cred');
-  const opsCred = join(keysDir, 'ops.cred');
-  if (!existsSync(edgeCred)) {
-    fail('Ch5 setup', `missing ${edgeCred} — run setup_auth.sh first`);
-    return;
-  }
-  if (!existsSync(opsCred)) {
-    fail('Ch5 setup', `missing ${opsCred} — run setup_auth.sh first`);
-    return;
+  for (const file of ['auth.env', 'edge.key', 'edge.cred', 'ops.key', 'ops.cred']) {
+    if (!existsSync(join(keysDir, file))) {
+      fail('Ch5 setup', `missing ${join(keysDir, file)} — run setup_auth.sh first`);
+      return;
+    }
   }
 
   await testCh5NoCredential(address);
-  await testCh5EdgeCredential(address, edgeCred);
-  await testCh5OpsCredential(address, opsCred);
+  await testCh5EdgeCredential(address, keysDir);
+  await testCh5OpsCredential(address, keysDir);
 }
 
 // ── Main ────────────────────────────────────────────────────────────────────

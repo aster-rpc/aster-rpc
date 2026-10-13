@@ -11,7 +11,8 @@
 #
 # Working directory: tests/integration/mission_control/.work/
 # - server.log, server.addr, server.pid for each running server
-# - root.key, root.pub, edge.cred, ops.cred for auth tests
+# - auth.env, {server,edge,ops}.{key,cred} for auth tests (setup_auth.sh,
+#   Enrollment via the Rust `aster` CLI)
 # - generated/ for gen-client output
 #
 # On full success the .work directory is deleted. On failure it's preserved
@@ -83,7 +84,10 @@ start_python_server() {
 
   local env_prefix=""
   if [[ "$mode" == "auth" ]]; then
-    env_prefix="ASTER_ROOT_PUBKEY_FILE=$WORK_DIR/root.pub ASTER_ALLOW_ALL_CONSUMERS=false"
+    # Enrollment from the environment (setup_auth.sh): auth.env plus the
+    # server's own key, credential and state.
+    rm -f "$WORK_DIR/server-enrollment.json"
+    env_prefix="$(sed 's/^/export /' "$WORK_DIR/auth.env" | tr '\n' ';') ASTER_SECRET_KEY_FILE=$WORK_DIR/server.key ASTER_ENROLLMENT_CREDENTIAL=$WORK_DIR/server.cred ASTER_ENROLLMENT_STATE_PATH=$WORK_DIR/server-enrollment.json"
   fi
 
   cd "$REPO_ROOT"
@@ -95,7 +99,6 @@ from examples.python.mission_control.services_auth import MissionControl, AgentS
 
 async def main():
     config = AsterConfig.from_env()
-    config.allow_all_consumers = False
     srv = AsterServer(services=[MissionControl(), AgentSession()], config=config)
     await srv.start()
     print(srv.address, flush=True)
@@ -159,8 +162,16 @@ start_ts_server() {
   fi
 
   if [[ "$mode" == "auth" ]]; then
-    ASTER_ROOT_PUBKEY_FILE="$WORK_DIR/root.pub" \
-      bun run "$SCRIPT_DIR/_ts_server_auth.ts" > "$addr_file" 2> "$log_file" &
+    # Enrollment from the environment: auth.env (root, audience, fleet
+    # namespace) plus the server's own key, credential and state.
+    (
+      set -a; . "$WORK_DIR/auth.env"; set +a
+      export ASTER_SECRET_KEY_FILE="$WORK_DIR/server.key"
+      export ASTER_ENROLLMENT_CREDENTIAL="$WORK_DIR/server.cred"
+      export ASTER_ENROLLMENT_STATE_PATH="$WORK_DIR/server-enrollment.json"
+      rm -f "$ASTER_ENROLLMENT_STATE_PATH"
+      exec bun run "$SCRIPT_DIR/_ts_server_auth.ts"
+    ) > "$addr_file" 2> "$log_file" &
   else
     bun run "$SCRIPT_DIR/_ts_server_dev.ts" > "$addr_file" 2> "$log_file" &
   fi
@@ -376,7 +387,7 @@ run_combo_with_server() {
 mkdir -p "$WORK_DIR"
 
 # Set up auth credentials once (used by all auth combos)
-if [[ ! -f "$WORK_DIR/root.key" ]] || [[ ! -f "$WORK_DIR/edge.cred" ]] || [[ ! -f "$WORK_DIR/ops.cred" ]]; then
+if [[ ! -f "$WORK_DIR/auth.env" ]] || [[ ! -f "$WORK_DIR/edge.cred" ]] || [[ ! -f "$WORK_DIR/ops.cred" ]]; then
   [[ $QUIET -eq 0 ]] && echo -e "${C_DIM}Setting up auth credentials...${C_RESET}"
   bash "$SCRIPT_DIR/setup_auth.sh" "$WORK_DIR" >/dev/null
 fi

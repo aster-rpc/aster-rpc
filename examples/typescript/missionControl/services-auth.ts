@@ -2,7 +2,11 @@
  * Mission Control services with role-based access control (Chapter 5).
  *
  * Same services as services.ts but with requires= on each method.
- * Used by: node server.ts --auth
+ * Used by: bun run server.ts --auth
+ *
+ * No code here reads a credential: the server's enrollment configuration
+ * admits only enrolled nodes and turns the `aster.role` claim of each
+ * node's credential into the roles these requirements are checked against.
  */
 
 import { execFile } from 'node:child_process';

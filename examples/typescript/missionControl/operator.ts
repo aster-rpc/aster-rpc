@@ -8,6 +8,12 @@
  * Usage:
  *     bun run operator.ts <server-address>
  *
+ * Against `server.ts --auth` (Chapter 5), configure the operator's own key
+ * and credential (roles `ops.status,ops.logs`) the same way as the agent:
+ * ASTER_SECRET_KEY_FILE=operator.key ASTER_ENROLLMENT_CREDENTIAL=operator.cred
+ * plus ASTER_ROOT_PUBKEY / ASTER_ENROLLMENT_AUDIENCE /
+ * ASTER_ENROLLMENT_FLEET_NAMESPACE.
+ *
  * Press Ctrl+C to stop tailing.
  */
 
