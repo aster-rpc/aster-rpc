@@ -5,6 +5,22 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Changed: the credential sets the maximum roles; runtime can only restrict
+
+For a peer with a live enrollment session, the roles Gate 3 checks are now the
+roles from its credential (`[enrollment.roles]`) intersected with an optional
+runtime restriction. New `AsterServer.restrictPeerRoles(peerId, roles)`
+narrows them from the peer's next call (calls in flight finish); an empty list
+leaves the peer no roles; a role the credential lacks is never granted.
+`AsterServer.clearPeerRestriction(peerId)` restores the credential roles. A
+restriction survives renewals of the same credential subject and ends with
+the peer's enrollment session (revocation, eviction, expiry);
+`restrictPeerRoles` throws an `IrohException` (`NOT_FOUND`) for a peer without
+a live session. `setPeerAttributes` with `aster.role` for an enrolled peer now
+throws (`INVALID_ARGUMENT`); other keys still apply (the credential's
+attributes win on a clash). Peers without an enrollment session are
+unchanged.
+
 ### Breaking change: legacy consumer admission removed, replaced by Enrollment
 
 The consumer admission handshake (the `aster.consumer_admission` ALPN, the
@@ -133,8 +149,8 @@ and `NativeLeaseSerializer.grantor(..)`.
 3. Put roles on methods with `@Requires` (Rust enforces them, Gate 3) instead
    of copying roles into attributes yourself; drop `CapabilityInterceptor`
    wiring and any `setPeerAttributes` calls that granted roles. The roles come
-   from each peer's credential. `setPeerAttributes` remains as an escape hatch
-   for roles decided at runtime (enrollment-derived roles win on a key clash).
+   from each peer's credential, and runtime code can only narrow them with
+   `restrictPeerRoles` (see "the credential sets the maximum roles" above).
 
 4. Revoke with `aster enroll revoke --subject <id> --fleet-only … --peer <server>`;
    the revoked peer's next call is refused and its connection closes. Observe

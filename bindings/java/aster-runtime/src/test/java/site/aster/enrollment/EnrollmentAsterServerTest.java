@@ -33,6 +33,7 @@ import site.aster.contract.CapabilityRequirement;
 import site.aster.docs.AuthorId;
 import site.aster.docs.Doc;
 import site.aster.docs.Docs;
+import site.aster.ffi.IrohException;
 import site.aster.interceptors.CallContext;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
@@ -298,6 +299,38 @@ final class EnrollmentAsterServerTest {
     assertNotEquals(AdmissionException.Kind.OTHER, admission.kind());
     // Unaffected peers keep working.
     assertEquals("ops.ingest", call(ingest, addr, "ping"));
+  }
+
+  /**
+   * The credential sets the maximum; runtime settings can only restrict. Restricting a credential's
+   * {@code ops.status,ops.logs} to {@code ops.status} refuses {@code logs} on the next call; {@code
+   * setPeerAttributes} cannot grant an enrolled peer a role; clearing restores the credential
+   * roles; a peer without a session cannot be restricted.
+   */
+  @Test
+  void runtimeRestrictionRefusesTheNextCall() throws Exception {
+    AsterServer server = startOps(AsterServer.builder().config(serverCfg().build()));
+    NodeAddr addr = server.node().nodeAddr();
+    AsterClient session = client(enrolled(5, credentialFor(5, "ops.status,ops.logs")).build());
+    assertEquals("ops.logs,ops.status", call(session, addr, "logs"));
+
+    server.restrictPeerRoles(pub(5), List.of("ops.status"));
+    assertEquals("ops.status", call(session, addr, "status"));
+    assertTrue(denied(callFailure(session, addr, "logs")), "restricted: logs refused");
+
+    IrohException grant =
+        assertThrows(
+            IrohException.class,
+            () -> server.setPeerAttributes(pub(5), Map.of("aster.role", "ops.admin")));
+    assertTrue(grant.getMessage().contains("INVALID_ARGUMENT"), grant.getMessage());
+    assertTrue(denied(callFailure(session, addr, "logs")), "a refused grant grants nothing");
+
+    server.clearPeerRestriction(pub(5));
+    assertEquals("ops.logs,ops.status", call(session, addr, "logs"));
+    IrohException none =
+        assertThrows(
+            IrohException.class, () -> server.restrictPeerRoles(pub(9), List.of("ops.status")));
+    assertTrue(none.getMessage().contains("NOT_FOUND"), none.getMessage());
   }
 
   /**

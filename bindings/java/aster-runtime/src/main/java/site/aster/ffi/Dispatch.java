@@ -159,6 +159,10 @@ public final class Dispatch implements AutoCloseable {
       h("aster_server_poll", FunctionDescriptor.of(I32, I64, I64, PTR, I32, I32));
   private static final MethodHandle SET_PEER_ATTRIBUTES =
       h("aster_server_set_peer_attributes", FunctionDescriptor.of(I32, I64, PTR, I32, PTR, I32));
+  private static final MethodHandle RESTRICT_PEER_ROLES =
+      h("aster_server_restrict_peer_roles", FunctionDescriptor.of(I32, I64, PTR, I32, PTR, I32));
+  private static final MethodHandle CLEAR_PEER_RESTRICTION =
+      h("aster_server_clear_peer_restriction", FunctionDescriptor.of(I32, I64, PTR, I32));
   private static final MethodHandle LIVE_CALLS =
       h("aster_server_live_calls", FunctionDescriptor.of(I64, I64));
   private static final MethodHandle CONTRACT_ID =
@@ -605,6 +609,37 @@ public final class Dispatch implements AutoCloseable {
       check(
           (int) SET_PEER_ATTRIBUTES.invoke(handle, ps, p.length, ks, kv.length),
           "aster_server_set_peer_attributes");
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * Narrow an enrolled {@code peer}'s roles to {@code roles} (comma-separated) intersected with its
+   * credential roles. {@code NOT_FOUND} without a live enrollment session.
+   */
+  public void restrictPeerRoles(String peer, String roles) {
+    byte[] p = peer.getBytes(StandardCharsets.UTF_8);
+    byte[] r = roles.getBytes(StandardCharsets.UTF_8);
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment ps = arena.allocateFrom(U8, p);
+      MemorySegment rs = r.length == 0 ? MemorySegment.NULL : arena.allocateFrom(U8, r);
+      check(
+          (int) RESTRICT_PEER_ROLES.invoke(handle, ps, p.length, rs, r.length),
+          "aster_server_restrict_peer_roles");
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /** Remove {@code peer}'s role restriction. */
+  public void clearPeerRestriction(String peer) {
+    byte[] p = peer.getBytes(StandardCharsets.UTF_8);
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment ps = arena.allocateFrom(U8, p);
+      check(
+          (int) CLEAR_PEER_RESTRICTION.invoke(handle, ps, p.length),
+          "aster_server_clear_peer_restriction");
     } catch (Throwable t) {
       throw rethrow(t);
     }

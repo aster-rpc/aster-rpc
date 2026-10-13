@@ -266,9 +266,14 @@ public final class AsterServer implements AutoCloseable {
   /**
    * Attach admission attributes (e.g. {@code aster.role}) to every subsequent call from {@code
    * peerId}: Rust's Gate 3 checks {@code @Requires} against them, and they are merged into {@link
-   * CallContext#attributes()}. Pass {@code null} or an empty map to clear. An escape hatch for
-   * roles decided at runtime: with enrollment configured, roles come from each peer's credential
-   * ({@code [enrollment.roles]}) and win on a key clash.
+   * CallContext#attributes()}. Pass {@code null} or an empty map to clear.
+   *
+   * <p>With enrollment configured, the credential sets the maximum and runtime settings can only
+   * restrict: a peer with a live enrollment session takes its roles from its credential ({@code
+   * [enrollment.roles]}), so {@code aster.role} here fails with an {@code INVALID_ARGUMENT} {@link
+   * site.aster.ffi.IrohException} (narrow it with {@link #restrictPeerRoles}); other keys apply,
+   * and the credential's attributes win on a clash. For a peer without a session (no enrollment, or
+   * a custom gate) these attributes, {@code aster.role} included, apply as given.
    */
   public void setPeerAttributes(String peerId, Map<String, String> attributes) {
     if (peerId == null) {
@@ -279,8 +284,27 @@ public final class AsterServer implements AutoCloseable {
       dispatch.setPeerAttributes(peerId, Map.of());
       return;
     }
-    peerAttributes.put(peerId, Map.copyOf(attributes));
     dispatch.setPeerAttributes(peerId, attributes);
+    peerAttributes.put(peerId, Map.copyOf(attributes));
+  }
+
+  /**
+   * Narrow an enrolled peer's roles to {@code roles} intersected with its credential roles, from
+   * its next call (calls in flight finish). The credential sets the maximum: a role it lacks is
+   * never granted, and an empty list refuses every role-gated call. Replaces an earlier
+   * restriction, survives renewals of the same credential subject, and ends with the peer's
+   * enrollment session (revocation, eviction, expiry).
+   *
+   * @throws site.aster.ffi.IrohException {@code NOT_FOUND} when {@code peerId} has no live
+   *     enrollment session
+   */
+  public void restrictPeerRoles(String peerId, java.util.Collection<String> roles) {
+    dispatch.restrictPeerRoles(peerId, String.join(",", roles));
+  }
+
+  /** Remove {@code peerId}'s role restriction; its credential roles apply from its next call. */
+  public void clearPeerRestriction(String peerId) {
+    dispatch.clearPeerRestriction(peerId);
   }
 
   /** Drop any admission attributes for {@code peerId}. */
@@ -587,6 +611,8 @@ public final class AsterServer implements AutoCloseable {
         (flags & Dispatch.FLAG_IROH_AUTHENTICATED) != 0 ? peerAttributes.get(call.peer()) : null;
     if (peerAttrs != null) {
       attributes.putAll(peerAttrs);
+      // Roles are Rust's to decide (an enrolled peer's come from its credential).
+      attributes.remove("aster.role");
     }
     if ((flags & Dispatch.FLAG_HAS_ATTRIBUTES) != 0) {
       attributes.putAll(dispatch.attributes(callId));
