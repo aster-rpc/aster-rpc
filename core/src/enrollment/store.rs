@@ -784,6 +784,11 @@ impl EnrollmentPolicyStore {
         if !record.mandatory.is_empty() {
             return Err(RecordError::UnsupportedMandatoryRestriction);
         }
+        if record.reason.as_ref().is_some_and(|reason| {
+            reason.len() > MAX_REGISTRATION_REASON_BYTES || reason.chars().any(char::is_control)
+        }) {
+            return Err(RecordError::InvalidRecord);
+        }
         VerifiedAdmissionEvidence::from_registration(
             RegistrationEvidenceData {
                 issuer: self.root,

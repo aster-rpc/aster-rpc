@@ -88,8 +88,9 @@ pub use records::{
     credential_status_key, issuer_status_key, namespace_binding_key, node_registration_key,
     observation_key, BindingStatus, CredentialStatusV1, IssuerStatus, IssuerStatusV1,
     NamespaceBindingV1, NamespacePurpose, NodeRegistrationStatus, NodeRegistrationV1,
-    RecordAvailability, MAX_POLICY_RECORDS, MAX_POLICY_RECORD_BYTES, OBSERVER_GRANT_APP,
-    OBSERVER_GRANT_PREFIX, OBSERVER_SCOPE, POLICY_RECORD_PREFIX, POLICY_RECORD_VERSION,
+    RecordAvailability, MAX_POLICY_RECORDS, MAX_POLICY_RECORD_BYTES, MAX_REGISTRATION_REASON_BYTES,
+    OBSERVER_GRANT_APP, OBSERVER_GRANT_PREFIX, OBSERVER_SCOPE, POLICY_RECORD_PREFIX,
+    POLICY_RECORD_VERSION,
 };
 pub use root_records::{
     validate_root_record_json, RootAuthoredDocView, RootRecordError, RootRecordRead,

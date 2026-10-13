@@ -170,6 +170,7 @@ async fn revoked_issuer_closes_chain_sessions_and_keeps_registered_nodes() {
                 claims: AdmissionClaims::default(),
                 mandatory: vec![],
                 reauthorizes_revision: None,
+                reason: None,
             })
             .unwrap(),
         )

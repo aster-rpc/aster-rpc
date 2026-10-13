@@ -44,6 +44,7 @@ fn registration(revision: u64, status: NodeRegistrationStatus) -> NodeRegistrati
         },
         mandatory: vec![],
         reauthorizes_revision: None,
+        reason: None,
     }
 }
 async fn write(doc: &CoreDoc, record: &NodeRegistrationV1) {
@@ -197,6 +198,37 @@ async fn exact_root_ignores_spoofed_writer_and_pending_never_manufactures_eviden
         e.source(),
         AdmissionEvidenceSource::RootAuthoredRecord { revision: 1, .. }
     ));
+    node.close().await;
+}
+
+/// A revocation may carry an operator note; it is bounded and confers
+/// nothing, so an oversized or control-character note makes the record
+/// unusable rather than silently accepted.
+#[tokio::test]
+async fn revocation_reason_is_bounded_and_informational() {
+    let (node, doc) = setup().await;
+    let path = Temp::new();
+    let store = store(&path.0, &doc);
+    let mut revoked = registration(1, NodeRegistrationStatus::Revoked);
+    revoked.reason = Some("key exposed in CI logs".into());
+    write(&doc, &revoked).await;
+    store.refresh_node(&doc, &peer()).await.unwrap();
+    assert_eq!(
+        store.select_evidence(&peer(), None, NOW).unwrap_err(),
+        RecordError::Denied(DenialReason::NodeRevoked)
+    );
+    for reason in ["x".repeat(MAX_REGISTRATION_REASON_BYTES + 1), "a\nb".into()] {
+        let mut record = registration(2, NodeRegistrationStatus::Revoked);
+        record.reason = Some(reason);
+        write(&doc, &record).await;
+        assert!(store.refresh_node(&doc, &peer()).await.is_err());
+        // The unusable newer statement is a durable denial marker; the node
+        // stays denied.
+        assert_eq!(
+            store.select_evidence(&peer(), None, NOW).unwrap_err(),
+            RecordError::Denied(DenialReason::RegistrationRejected)
+        );
+    }
     node.close().await;
 }
 

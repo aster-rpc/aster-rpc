@@ -8,6 +8,7 @@
 mod observe;
 mod policy;
 mod publish;
+mod registration;
 
 use crate::files::read_bounded;
 use std::collections::{BTreeMap, BTreeSet};
@@ -50,6 +51,10 @@ pub enum EnrollCommand {
     Review(observe::ReviewArgs),
     /// Promote observed persistent nodes to root-authored registrations
     Promote(Box<observe::PromoteArgs>),
+    /// Revoke a node as the root, mirroring the denial into the fleet namespace
+    Revoke(Box<registration::RevokeArgs>),
+    /// Re-admit a revoked node as the root, naming the revoked revision
+    Reauthorize(Box<registration::ReauthorizeArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -202,6 +207,8 @@ pub async fn run(ctx: &Ctx, command: EnrollCommand) -> Result<()> {
         EnrollCommand::Issuer(args) => policy::issuer(ctx, args, now).await,
         EnrollCommand::Review(args) => observe::run_review(ctx, args).await,
         EnrollCommand::Promote(args) => observe::run_promote(ctx, *args).await,
+        EnrollCommand::Revoke(args) => registration::revoke(ctx, *args).await,
+        EnrollCommand::Reauthorize(args) => registration::reauthorize(ctx, *args).await,
     }
 }
 

@@ -175,6 +175,7 @@ fn registration(subject: u8, scopes: &[&str]) -> NodeRegistrationV1 {
         },
         mandatory: vec![],
         reauthorizes_revision: None,
+        reason: None,
     }
 }
 async fn review(root: &Root) -> ObservationReview {

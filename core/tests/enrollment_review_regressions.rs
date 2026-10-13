@@ -48,6 +48,7 @@ fn registration(
         claims: AdmissionClaims::default(),
         mandatory: vec![],
         reauthorizes_revision: None,
+        reason: None,
     }
 }
 async fn write(doc: &CoreDoc, record: &NodeRegistrationV1) {

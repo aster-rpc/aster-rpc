@@ -140,6 +140,7 @@ async fn check_before_reconciliation_moves_a_promoted_node_onto_its_record() {
             claims: AdmissionClaims::default(),
             mandatory: vec![],
             reauthorizes_revision: None,
+            reason: None,
         };
         fleet
             .set_bytes(

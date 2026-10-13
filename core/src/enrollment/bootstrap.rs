@@ -2133,6 +2133,7 @@ mod tests {
                 claims: AdmissionClaims::default(),
                 mandatory: vec![],
                 reauthorizes_revision: None,
+                reason: None,
             };
             doc.set_bytes_durable(
                 hex::encode(public(1)),

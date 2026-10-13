@@ -133,6 +133,7 @@ fn registration(revision: u64) -> NodeRegistrationV1 {
         claims: AdmissionClaims::default(),
         mandatory: vec![],
         reauthorizes_revision: None,
+        reason: None,
     }
 }
 

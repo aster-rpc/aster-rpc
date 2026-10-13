@@ -461,5 +461,6 @@ pub fn promotion_record(
         claims: claims.unwrap_or_else(|| reviewed.evidence.claims().clone()),
         mandatory: vec![],
         reauthorizes_revision: None,
+        reason: None,
     }
 }

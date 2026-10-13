@@ -47,7 +47,13 @@ pub struct NodeRegistrationV1 {
     /// A renewal issued before the prior expiry remains an ordinary update,
     /// even when an offline replica learns it after that expiry.
     pub reauthorizes_revision: Option<u64>,
+    /// Operator note, typically why a node was revoked. At most
+    /// [`MAX_REGISTRATION_REASON_BYTES`]; it confers and withholds nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
+
+pub const MAX_REGISTRATION_REASON_BYTES: usize = 256;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]

@@ -121,6 +121,7 @@ fn registration(
         claims: AdmissionClaims::default(),
         mandatory: vec![],
         reauthorizes_revision,
+        reason: None,
     }
 }
 async fn register(doc: &CoreDoc, record: &NodeRegistrationV1) {

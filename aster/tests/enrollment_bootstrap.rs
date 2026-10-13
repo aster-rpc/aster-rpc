@@ -99,6 +99,7 @@ fn registration(seed: u8, revision: u64, status: NodeRegistrationStatus) -> Node
         claims: AdmissionClaims::default(),
         mandatory: vec![],
         reauthorizes_revision: None,
+        reason: None,
     }
 }
 async fn write(root: &Node, doc: &Doc, record: &NodeRegistrationV1) {

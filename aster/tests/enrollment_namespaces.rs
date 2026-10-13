@@ -120,6 +120,7 @@ fn registration(seed: u8, revision: u64, status: NodeRegistrationStatus) -> Vec<
         },
         mandatory: vec![],
         reauthorizes_revision: None,
+        reason: None,
     })
     .unwrap()
 }
