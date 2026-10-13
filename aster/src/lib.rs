@@ -65,6 +65,8 @@ mod admission;
 pub mod binding_support;
 mod config;
 pub mod crypto;
+#[cfg(feature = "delegation")]
+pub mod delegation;
 #[cfg(feature = "enrollment")]
 pub mod enrollment;
 mod error;

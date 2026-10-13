@@ -9,7 +9,8 @@ repository = "https://forge.emrul.dev/Aster/aster-rpc-internal"
 publish = ["aster"]
 
 [features]
-enrollment = ["aster_transport_core/enrollment"]
+enrollment = ["delegation", "aster_transport_core/enrollment"]
+delegation = ["aster_transport_core/delegation"]
 default = ["blobs", "docs", "gossip", "attestation"]
 blobs = ["dep:iroh-blobs"]
 docs = ["blobs"]
