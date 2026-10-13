@@ -458,6 +458,54 @@ impl EnrollmentService {
         policy: Arc<dyn AdmissionPolicy>,
         options: EnrollmentOptions,
     ) -> Result<Arc<Self>> {
+        Self::install_inner(
+            node,
+            |node| node.take_hook_receiver(),
+            store,
+            verifier,
+            credential,
+            policy,
+            options,
+        )
+    }
+
+    /// [`Self::install`] for a host that already drains the node's hook
+    /// receiver and forwards both hook directions into `hooks` (the C ABI's
+    /// admission drainers). The node must still be started with fail-closed
+    /// hooks; the host must not answer forwarded invocations itself.
+    pub fn install_with_hooks(
+        node: CoreNode,
+        hooks: CoreHookReceiver,
+        store: Arc<EnrollmentPolicyStore>,
+        verifier: JwtEnrollmentVerifier,
+        credential: Option<String>,
+        policy: Arc<dyn AdmissionPolicy>,
+        options: EnrollmentOptions,
+    ) -> Result<Arc<Self>> {
+        ensure!(
+            node.has_hooks(),
+            "enrollment requires a node started with hooks"
+        );
+        Self::install_inner(
+            node,
+            move |_| Some(hooks),
+            store,
+            verifier,
+            credential,
+            policy,
+            options,
+        )
+    }
+
+    fn install_inner(
+        node: CoreNode,
+        take_hooks: impl FnOnce(&CoreNode) -> Option<CoreHookReceiver>,
+        store: Arc<EnrollmentPolicyStore>,
+        verifier: JwtEnrollmentVerifier,
+        credential: Option<String>,
+        policy: Arc<dyn AdmissionPolicy>,
+        options: EnrollmentOptions,
+    ) -> Result<Arc<Self>> {
         ensure!(
             options.max_concurrent_handshakes > 0
                 && options.max_concurrent_handshakes_per_peer > 0
@@ -517,9 +565,8 @@ impl EnrollmentService {
             None => None,
         };
         let credential = credential.filter(|_| own_evidence.is_some());
-        let hooks = node
-            .take_hook_receiver()
-            .ok_or_else(|| anyhow!("enrollment requires unused node hooks"))?;
+        let hooks =
+            take_hooks(&node).ok_or_else(|| anyhow!("enrollment requires unused node hooks"))?;
         let service = Self::new(
             node,
             Trust::new(store, verifier),
@@ -2028,6 +2075,14 @@ impl EnrollmentService {
                 Err(error)
             }
         }
+    }
+
+    /// The verified evidence `peer`'s current admission session rests on: the
+    /// claims a consumer maps to its own roles. `None` without a session.
+    /// This reads the session as last admitted or checked; call
+    /// [`Self::check_peer`] first to re-evaluate it against current policy.
+    pub fn peer_evidence(&self, peer: &[u8; 32]) -> Option<VerifiedAdmissionEvidence> {
+        self.session(peer).map(|session| session.evidence)
     }
 
     /// Evaluate a session's evidence at `source`. When a newer root record

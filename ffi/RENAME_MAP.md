@@ -1,4 +1,36 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x changelog (current: 5.0)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x changelog (current: 5.1)
+
+## New in 5.1 (Enrollment for enrolled nodes and delegated issuers; additive)
+
+Enrollment (`docs/_internal/working_ideas/aster-enrollment.md`) reaches the C
+ABI for the two roles a non-Rust process plays. Root operations (namespace
+create/bind, promote, revoke, reauthorize, trust rotate, delegate) stay in the
+Rust CLI and have no C functions. Configuration and results are UTF-8 JSON;
+synchronous outputs are owned spans freed with `aster_string_release`; async
+operations complete with the new `ASTER_EVENT_ENROLLMENT_RESULT` = 127 (JSON
+payload) or `ASTER_EVENT_ERROR`, whose `flags` carry an
+`aster_enrollment_error_t` (`NOT_ADMITTED` 1, `DENIED` 2, `CLOCK_SKEW` 3,
+`UNAVAILABLE` 4) for admission errors.
+
+| Function | Role |
+|---|---|
+| `aster_enrollment_install(rt, node, config_json, *out)` | Install Enrollment on a node started with `enable_hooks`, fail-closed hooks, `aster.enrollment/1` and no gate; the node's admission drainers forward to it from then on. Config: `root`, `audience`, `fleet_namespace`, `state_path`, optional `credential`, a declarative `policy` tree, optional `rotation`, `applied_rotations`, `require_synchronized_clock`, `activation_leeway_secs`, `limits`. |
+| `aster_enrollment_free` | Release the handle (pending revocation waits end `ALREADY_CLOSED`). |
+| `aster_enrollment_connect(rt, e, replicas_json, ud, *op)` | Reciprocal handshake with the first replica that completes; result `{readiness, policy_ticket}`. |
+| `aster_enrollment_synchronize(rt, e, peer, ticket, timeout_ms, ud, *op)` | Sync the fleet namespace (and offered bound namespaces) from an admitted peer. |
+| `aster_enrollment_check_peer(rt, e, peer, ud, *op)` | Re-evaluate a peer; `DENIED` revokes. |
+| `aster_enrollment_peer_claims(rt, e, peer, *out_json)` | The verified evidence a peer's session rests on (subject, root, issuer path, scopes, tags, attributes, validity, registration). |
+| `aster_enrollment_verify_credential(rt, e, subject, chain, *out_json)` | Offline verification of a credential chain under this node's trust. |
+| `aster_enrollment_status(rt, e, *out_json)` | Trusted root, fleet namespace, audience, own credential, rotation state. |
+| `aster_enrollment_replace_credential(rt, e, chain, ud, *op)` | Install a new credential and present it to every session peer. |
+| `aster_enrollment_next_revocation(rt, e, ud, *op)` | The next revocation (buffered from install) or `{lagged}`. |
+| `aster_enrollment_start_renewal(rt, e, config_json, *out)`, `_renewal_wait`, `_renewal_free` | Renew from the issuer until registered, refused or expired. |
+| `aster_enrollment_issuer_new(rt, e, delegation, lifetime_secs, *out)`, `_issuer_free`, `_issuer_info` | A delegated issuer on an enrolled node. |
+| `aster_enrollment_issue(rt, issuer, request_json, *out_json)` | Sign a credential for an orchestrator-authenticated subject; a refusal returns `PERMISSION_DENIED` with `{code, message, retryable}`. |
+| `aster_server_set_enrollment(rt, builder, e, issuer)` | Route `aster.enrollment/1` to Enrollment on a dispatch server and, with an issuer, serve `aster.enrollment.IssuerV1` renewals. |
+
+`aster_node_set_gate` returns `UNSUPPORTED` on a node with Enrollment
+installed. No struct layout changes. Go requires 5.1 (`ABIMinorRequired = 1`).
 
 ## 5.0 (removals)
 

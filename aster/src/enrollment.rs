@@ -217,6 +217,35 @@ impl Enrollment {
         })
     }
 
+    /// [`Self::install`] on a node whose hook receiver a language binding
+    /// already drains: the binding forwards both hook directions into
+    /// `hooks`. For `aster::binding_support` hosts only.
+    #[cfg(feature = "binding-support")]
+    #[doc(hidden)]
+    pub fn install_with_hooks(
+        node: &crate::Node,
+        hooks: aster_transport_core::CoreHookReceiver,
+        store: Arc<EnrollmentPolicyStore>,
+        verifier: JwtEnrollmentVerifier,
+        credential: Option<String>,
+        policy: Arc<dyn AdmissionPolicy>,
+        options: EnrollmentOptions,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: EnrollmentService::install_with_hooks(
+                node.enrollment_core(),
+                hooks,
+                store,
+                verifier,
+                credential,
+                policy,
+                options,
+            )?,
+            #[cfg(feature = "docs")]
+            node: node.clone(),
+        })
+    }
+
     pub async fn accept(
         &self,
         connection: &crate::Connection,
@@ -298,6 +327,35 @@ impl Enrollment {
     /// Recheck an admitted peer. Only [`AdmissionError::Denied`] revokes.
     pub async fn check_peer(&self, peer: &[u8; 32]) -> Result<EnrollmentReadiness, AdmissionError> {
         self.inner.check_peer(peer).await
+    }
+
+    /// The verified evidence (subject, issuer path, claims, validity) that
+    /// `peer`'s current admission session rests on, for mapping claims to
+    /// application roles. `None` without a session. It reflects the last
+    /// admission or check; call [`Self::check_peer`] first to re-evaluate.
+    pub fn peer_evidence(&self, peer: &[u8; 32]) -> Option<VerifiedAdmissionEvidence> {
+        self.inner.peer_evidence(peer)
+    }
+
+    /// This node's current credential chain and its verified evidence.
+    pub fn credential(&self) -> Option<(String, VerifiedAdmissionEvidence)> {
+        self.inner.credential()
+    }
+
+    /// The fleet audience this node's verifier and stores pin.
+    pub fn audience(&self) -> &str {
+        self.inner.audience()
+    }
+
+    /// Verify `chain` as a credential for `subject` the way admission would:
+    /// the trusted root and audience, signed validity, and the root's
+    /// delegate revocations. Root records are not consulted.
+    pub fn verify_credential(
+        &self,
+        subject: &[u8; 32],
+        chain: &str,
+    ) -> Result<VerifiedAdmissionEvidence, EnrollmentError> {
+        self.inner.verify_credential(subject, chain)
     }
 
     pub async fn check_connection(

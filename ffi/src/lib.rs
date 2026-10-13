@@ -31,6 +31,7 @@ pub mod coordination;
 pub mod coordination_codec;
 pub mod custody;
 pub mod data;
+pub mod enrollment;
 pub mod envelope;
 pub mod expose;
 pub mod grants;
@@ -169,8 +170,12 @@ pub mod upcall;
 //   `aster_verified_chain_t`). Delegation chains replace them and have no C
 //   ABI yet (`docs/_internal/ownership-attestations.md`). See
 //   `ffi/RENAME_MAP.md` "5.0".
+// - 5.1.0 (additive): Enrollment for enrolled nodes and delegated issuers
+//   (`aster_enrollment_*`, `aster_server_set_enrollment`,
+//   `ASTER_EVENT_ENROLLMENT_RESULT`). Root operations stay in the Rust CLI.
+//   See `ffi/RENAME_MAP.md` "5.1".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 5;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 0;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 1;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -429,6 +434,9 @@ pub enum aster_event_kind_t {
     ASTER_EVENT_RAW_WT_DATAGRAM = 124,
     ASTER_EVENT_RAW_WT_CLOSED = 125,
     ASTER_EVENT_RAW_WT_ACKED = 126,
+    /// ABI 5.1: an Enrollment operation's JSON result (payload); `handle` =
+    /// the enrollment or renewal it ran on.
+    ASTER_EVENT_ENROLLMENT_RESULT = 127,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and
@@ -820,6 +828,10 @@ pub(crate) struct BridgeRuntime {
     pub(crate) raw_wt_streams: HandleRegistry<raw_webtransport::StreamState>,
     pub(crate) blob_custody: HandleRegistry<custody::CustodyState>,
     pub(crate) topology_snapshots: HandleRegistry<aster::topology::TopologySnapshot>,
+    // ABI 5.1: installed Enrollments, delegated issuers and renewal tasks.
+    pub(crate) enrollments: HandleRegistry<enrollment::EnrollmentState>,
+    pub(crate) enrollment_issuers: HandleRegistry<enrollment::IssuerState>,
+    pub(crate) enrollment_renewals: HandleRegistry<enrollment::RenewalState>,
     pub(crate) topology_admitted:
         HandleRegistry<aster::binding_support::upcall::topology::ForeignAdmittedFn>,
     pub(crate) server_handles: Mutex<Vec<u64>>,
@@ -967,6 +979,9 @@ impl BridgeRuntime {
             raw_wt_streams: HandleRegistry::new(),
             blob_custody: HandleRegistry::new(),
             topology_snapshots: HandleRegistry::new(),
+            enrollments: HandleRegistry::new(),
+            enrollment_issuers: HandleRegistry::new(),
+            enrollment_renewals: HandleRegistry::new(),
             topology_admitted: HandleRegistry::new(),
             server_handles: Mutex::new(Vec::new()),
             upcall_handles: Mutex::new(Vec::new()),
@@ -1005,6 +1020,9 @@ impl BridgeRuntime {
         raw_webtransport::shutdown(self);
         self.topology_snapshots.clear();
         self.topology_admitted.clear();
+        self.enrollment_renewals.clear();
+        self.enrollment_issuers.clear();
+        self.enrollments.clear();
         custody::shutdown(self);
         self.hook_invocations.clear();
         self.operations.clear();

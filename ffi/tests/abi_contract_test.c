@@ -456,7 +456,10 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 0); /* 5.0: 4.17 without the attestation functions */
+    CHECK(ASTER_ABI_VERSION_MINOR == 1); /* 5.1: Enrollment (additive) */
+    CHECK(ASTER_EVENT_ENROLLMENT_RESULT == 127);
+    CHECK(ASTER_ENROLLMENT_ERROR_DENIED == 2 && ASTER_ENROLLMENT_ERROR_UNAVAILABLE == 4);
+    CHECK(aster_enrollment_free(0, 0) != ASTER_STATUS_OK);
     CHECK(aster_doc_event_receiver_free(0, 0) == ASTER_STATUS_NOT_FOUND);
     CHECK(sizeof(aster_audit_outbox_error_t) == 4);
     CHECK(sizeof(aster_audit_outbox_t) == 8);

@@ -24,8 +24,9 @@ aster-otel = { path = "../aster-otel", version = "=0.3.0", features = ["otlp", "
 # `expose` since ABI 4.2, `coordination-client` since ABI 4.4 (the binding
 # profile's "once the binding surfaces it"; the client only, never the voter),
 # and `otel` + `health` since ABI 4.6 (built-in metrics and spans, the ops
-# listener behind `aster_health_*`).
-aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "binding-support", "expose", "coordination-client", "otel", "health", "audit-outbox"] }
+# listener behind `aster_health_*`), and `enrollment` since ABI 5.1 (enrolled
+# nodes and delegated issuers; root operations stay in the Rust CLI).
+aster = { path = "../aster", version = "=0.3.0", features = ["rpc", "binding-support", "expose", "coordination-client", "otel", "health", "audit-outbox", "enrollment"] }
 async-trait = "0.1"
 iroh = { workspace = true }
 tokio = { workspace = true }

@@ -246,6 +246,8 @@ struct BuilderSpec {
     handler_timeout: Option<Option<Duration>>,
     max_foreign_inflight: usize,
     health: Option<HealthState>,
+    /// ABI 5.1: Enrollment (and an issuer) this server routes for.
+    enrollment: Option<crate::enrollment::ServerEnrollment>,
 }
 
 pub(crate) struct BuilderState {
@@ -347,6 +349,9 @@ pub(crate) struct ServerState {
     rt: tokio::runtime::Handle,
     /// An attached ops listener's state (`aster_server_attach_health`).
     health: Option<HealthState>,
+    /// Dropped with the server: ends Enrollment's per-connection tasks, which
+    /// would otherwise keep the node (and its runtime) alive.
+    _enrollment_stop: Option<tokio::sync::watch::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -474,6 +479,7 @@ pub unsafe extern "C" fn aster_server_builder_new(
             handler_timeout: None,
             max_foreign_inflight: aster::binding_support::dispatch::DEFAULT_MAX_FOREIGN_INFLIGHT,
             health: None,
+            enrollment: None,
         })),
     });
     // SAFETY: checked non-null above.
@@ -714,6 +720,12 @@ pub unsafe extern "C" fn aster_server_start(
     if spec.topology {
         server = server.with_builtin_topology(&node, spec.topology_requires);
     }
+    let mut enrollment_stop = None;
+    if let Some(enrollment) = spec.enrollment {
+        let (stop, stopped) = tokio::sync::watch::channel(());
+        server = enrollment.apply(server, stopped);
+        enrollment_stop = Some(stop);
+    }
     let services = spec.services.len() as u32;
     for svc in spec.services {
         server = match server.dynamic_service(svc) {
@@ -739,6 +751,7 @@ pub unsafe extern "C" fn aster_server_start(
         handle: Mutex::new(Some(handle)),
         rt: rt.clone(),
         health: spec.health.clone(),
+        _enrollment_stop: enrollment_stop,
     };
     let mut tracked = bridge
         .server_handles
@@ -788,6 +801,42 @@ pub extern "C" fn aster_server_attach_health(
         );
     };
     spec.health = Some(entry.state());
+    status(aster_status_t::ASTER_STATUS_OK)
+}
+
+/// Serve Enrollment on this server (ABI 5.1): inbound `aster.enrollment/1`
+/// connections go to `enrollment` (installed on the builder's node), and with
+/// `issuer` ≠ 0 the server also serves `aster.enrollment.IssuerV1` renewals
+/// (iroh-only, admitted callers). The node must list `aster.enrollment/1`
+/// among its ALPNs. A later call replaces the earlier one. `NOT_FOUND` for an
+/// unknown builder, enrollment or issuer; `ALREADY_CLOSED` for a builder
+/// already started.
+#[no_mangle]
+pub extern "C" fn aster_server_set_enrollment(
+    runtime: aster_runtime_t,
+    builder: aster_server_builder_t,
+    enrollment: crate::enrollment::aster_enrollment_t,
+    issuer: crate::enrollment::aster_enrollment_issuer_t,
+) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return status(s),
+    };
+    let Some(state) = BUILDERS.get(builder) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    let attached = match crate::enrollment::server_enrollment(&bridge, enrollment, issuer) {
+        Ok(attached) => attached,
+        Err(code) => return code,
+    };
+    let mut spec = state.spec.lock().unwrap();
+    let Some(spec) = spec.as_mut() else {
+        return fail(
+            aster_status_t::ASTER_STATUS_ALREADY_CLOSED,
+            "builder already started",
+        );
+    };
+    spec.enrollment = Some(attached);
     status(aster_status_t::ASTER_STATUS_OK)
 }
 

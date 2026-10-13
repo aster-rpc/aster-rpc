@@ -447,6 +447,86 @@ where
         Err(status) => return status as i32,
     };
     *out_operation = op_id;
+    run_op(bridge, op_id, cancelled, user_data, fut);
+    OK
+}
+
+/// Wakes an operation's future when the host cancels it or the runtime
+/// closes, so a long wait (a revocation, a renewal outcome) gives up without
+/// consuming what it waited for.
+pub(crate) struct CancelSignal {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+    closing: Arc<std::sync::atomic::AtomicBool>,
+    close_notify: Arc<tokio::sync::Notify>,
+}
+
+impl CancelSignal {
+    /// Resolves once the operation is cancelled or the runtime is closing.
+    pub(crate) async fn wait(&self) {
+        let cancelled = self.notify.notified();
+        let closed = self.close_notify.notified();
+        tokio::pin!(cancelled, closed);
+        // `notify_waiters` keeps no permit: register before testing the flags.
+        cancelled.as_mut().enable();
+        closed.as_mut().enable();
+        if self.cancelled.load(std::sync::atomic::Ordering::Acquire)
+            || self.closing.load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        tokio::select! {
+            _ = cancelled => {}
+            _ = closed => {}
+        }
+    }
+}
+
+/// [`spawn_op_coded`] whose future is built from the operation's
+/// [`CancelSignal`]. A future that returns after the signal fires completes
+/// nothing (the cancellation event was already queued).
+pub(crate) unsafe fn spawn_op_cancellable<M, F>(
+    bridge: &Arc<BridgeRuntime>,
+    user_data: u64,
+    out_operation: *mut aster_operation_t,
+    make: M,
+) -> i32
+where
+    M: FnOnce(CancelSignal) -> F,
+    F: Future<Output = Result<Done, OpError>> + Send + 'static,
+{
+    let (op_id, cancelled) = match bridge.new_operation(user_data) {
+        Ok(operation) => operation,
+        Err(status) => return status as i32,
+    };
+    // Shutdown can clear the registry right after admission.
+    let Some(notify) = bridge
+        .operations
+        .get(op_id)
+        .map(|operation| operation.cancel_notify.clone())
+    else {
+        return aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32;
+    };
+    let signal = CancelSignal {
+        cancelled: cancelled.clone(),
+        notify,
+        closing: bridge.closing.clone(),
+        close_notify: bridge.close_notify.clone(),
+    };
+    *out_operation = op_id;
+    run_op(bridge, op_id, cancelled, user_data, make(signal));
+    OK
+}
+
+fn run_op<F>(
+    bridge: &Arc<BridgeRuntime>,
+    op_id: u64,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    user_data: u64,
+    fut: F,
+) where
+    F: Future<Output = Result<Done, OpError>> + Send + 'static,
+{
     let b = bridge.clone();
     bridge.runtime.spawn(async move {
         if check_cancelled(&cancelled, &b, op_id, user_data) {
@@ -482,7 +562,6 @@ where
             Err(e) => b.emit_error_flagged(op_id, user_data, e.status, e.code, e.flags, &e.message),
         }
     });
-    OK
 }
 
 fn err(e: impl std::fmt::Display) -> String {
