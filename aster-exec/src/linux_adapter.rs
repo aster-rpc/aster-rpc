@@ -72,6 +72,10 @@ impl ExecRuntime for LinuxRuntime {
             },
             state: JobStateV1::Accepted,
             caller_id: caller,
+            principal_id: request
+                .on_behalf_of
+                .as_ref()
+                .map(|on_behalf| on_behalf.principal.clone()),
             resolved_target: request.target_id.clone(),
             execution_identity: authorized.account_alias,
             accepted_at_ms,

@@ -974,6 +974,7 @@ mod tests {
             },
             state: JobStateV1::Accepted,
             caller_id: "caller".into(),
+            principal_id: None,
             resolved_target: "target".into(),
             execution_identity: "runner".into(),
             accepted_at_ms: 1,
@@ -1034,6 +1035,7 @@ mod tests {
             stdin_bytes: None,
             execution_timeout_ms: None,
             output_limit_bytes: Some(4096),
+            on_behalf_of: None,
         };
         let spec = SupervisorSpecV1 {
             request,

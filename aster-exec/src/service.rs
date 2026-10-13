@@ -19,6 +19,9 @@ use crate::{
     unix_millis as now_ms,
 };
 use aster::audit_outbox::{AuditEvent, AuditOutbox};
+use aster::delegation::{
+    LeafClaims, LeafKind, NoRevocations, TrustContext, VerifiedChain, verify_chain,
+};
 use aster::enrollment::{AdmissionError, EnrollmentRevoked};
 use aster::rpc::{Call, RpcStatus, ServiceDispatch, StatusCode, async_trait};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,6 +47,8 @@ const LAUNCH_SETTLE: Duration = Duration::from_secs(120);
 const WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_WATCHES_PER_CALLER: usize = 4;
 const MAX_WATCHES: usize = 64;
+/// The action-chain operation that allows an on-behalf-of submission.
+pub const EXEC_SUBMIT_OPERATION: &str = "exec.submit";
 
 /// A caller's authority as of its latest refresh.
 #[derive(Clone, Debug)]
@@ -128,6 +133,55 @@ impl Drop for InflightAdmission {
     }
 }
 
+/// Whose grant an operation runs under. A caller acting for itself is its own
+/// principal; an on-behalf-of submission names another principal, whose grant
+/// applies while the caller (the actor) stays enrolled. Cached standings are
+/// keyed by [`Authority::key`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Authority {
+    actor: String,
+    principal: String,
+}
+
+impl Authority {
+    fn own(caller: &str) -> Self {
+        Self {
+            actor: caller.into(),
+            principal: caller.into(),
+        }
+    }
+
+    /// The authority a job's follow-up calls and revocation checks use.
+    fn of_job(job: &JobStatusV1) -> Self {
+        Self {
+            actor: job.caller_id.clone(),
+            principal: job
+                .principal_id
+                .clone()
+                .unwrap_or_else(|| job.caller_id.clone()),
+        }
+    }
+
+    /// The caller's hex identity alone, or `actor/principal`.
+    fn key(&self) -> String {
+        if self.actor == self.principal {
+            self.actor.clone()
+        } else {
+            format!("{}/{}", self.actor, self.principal)
+        }
+    }
+
+    fn parse(key: &str) -> Self {
+        match key.split_once('/') {
+            Some((actor, principal)) => Self {
+                actor: actor.into(),
+                principal: principal.into(),
+            },
+            None => Self::own(key),
+        }
+    }
+}
+
 struct WatchPermit {
     watchers: Arc<StdMutex<BTreeMap<String, usize>>>,
     caller: String,
@@ -185,6 +239,13 @@ pub trait GrantProvider: Send + Sync {
         target: [u8; 32],
         now_seconds: u64,
     ) -> Result<ExecGrantV1, ExecErrorV1>;
+
+    /// The audience every grant carries, when fixed. On-behalf-of chains are
+    /// then authenticated before any grant is read for the principal they
+    /// name; otherwise after, against the grant's audience.
+    fn audience(&self) -> Option<String> {
+        None
+    }
 }
 pub struct DocsGrantProvider {
     pub store: Arc<ExecGrantStore>,
@@ -213,6 +274,10 @@ impl GrantProvider for DocsGrantProvider {
         .map_err(|_| GrantError::PolicyUnavailable)
         .and_then(|result| result)
         .map_err(grant_error)
+    }
+
+    fn audience(&self) -> Option<String> {
+        Some(self.store.audience().to_owned())
     }
 }
 fn grant_error(failure: GrantError) -> ExecErrorV1 {
@@ -364,17 +429,27 @@ impl ExecService {
         }
     }
 
-    /// Read a caller's enrollment and grant. A definite denial from either
+    /// Read the actor's enrollment and the principal's grant (the same node
+    /// unless acting on another's behalf). A definite denial from either
     /// wins; otherwise any unevaluated part leaves the standing unknown.
-    async fn read_standing(&self, caller: [u8; 32], target: [u8; 32]) -> Standing {
-        let enrollment = self.enrollment.check(&caller).await;
+    async fn read_standing(
+        &self,
+        actor: [u8; 32],
+        principal: [u8; 32],
+        target: [u8; 32],
+    ) -> Standing {
+        let enrollment = self.enrollment.check(&actor).await;
         if let Err(AdmissionError::Denied(_)) = enrollment {
             return Standing::Denied(error(
                 ExecErrorCodeV1::PermissionDenied,
                 "enrollment admission revoked",
             ));
         }
-        let grant = match self.grants.current(caller, target, now_ms() / 1000).await {
+        let grant = match self
+            .grants
+            .current(principal, target, now_ms() / 1000)
+            .await
+        {
             Ok(grant) => grant,
             Err(failure) if failure.code == ExecErrorCodeV1::PermissionDenied => {
                 return Standing::Denied(failure);
@@ -400,11 +475,16 @@ impl ExecService {
             .map(|_| ())
     }
 
-    /// Refresh one caller outside the RPC hot path and record the result.
-    /// A refresh that started before a newer recorded one is discarded.
+    /// Refresh one authority key (see [`Authority::key`]) outside the RPC hot
+    /// path and record the result. A refresh that started before a newer
+    /// recorded one is discarded.
     async fn refresh_standing(&self, caller: &str) -> Standing {
         let started = Instant::now();
-        let Some(caller_bytes) = identity_bytes(caller) else {
+        let authority = Authority::parse(caller);
+        let (Some(actor_bytes), Some(principal_bytes)) = (
+            identity_bytes(&authority.actor),
+            identity_bytes(&authority.principal),
+        ) else {
             return Standing::Denied(error(
                 ExecErrorCodeV1::Unauthenticated,
                 "invalid node identity",
@@ -415,7 +495,7 @@ impl ExecService {
         };
         let standing = tokio::time::timeout(
             AUTHORITY_READ_TIMEOUT,
-            self.read_standing(caller_bytes, target_bytes),
+            self.read_standing(actor_bytes, principal_bytes, target_bytes),
         )
         .await
         .unwrap_or_else(|_| {
@@ -451,24 +531,35 @@ impl ExecService {
         standing
     }
 
-    /// Immediately deny a revoked caller. An older in-flight refresh cannot
-    /// replace this denial.
+    /// Immediately deny a revoked caller, including where it acts for another
+    /// principal. An older in-flight refresh cannot replace this denial.
     pub fn invalidate_peer(&self, caller: &str) {
         let mut snapshot = self.authority.write().unwrap_or_else(|e| e.into_inner());
-        snapshot.observed.remove(caller);
-        snapshot.reserve(caller);
+        let mut keys: Vec<String> = snapshot
+            .peers
+            .keys()
+            .filter(|key| Authority::parse(key).actor == caller)
+            .cloned()
+            .collect();
+        if !keys.iter().any(|key| key == caller) {
+            keys.push(caller.to_owned());
+        }
         let now = Instant::now();
-        snapshot.peers.insert(
-            caller.to_owned(),
-            PeerAuthority {
-                refreshed_at: now,
-                last_used: now,
-                standing: Standing::Denied(error(
-                    ExecErrorCodeV1::PermissionDenied,
-                    "enrollment admission revoked",
-                )),
-            },
-        );
+        for key in keys {
+            snapshot.observed.remove(&key);
+            snapshot.reserve(&key);
+            snapshot.peers.insert(
+                key,
+                PeerAuthority {
+                    refreshed_at: now,
+                    last_used: now,
+                    standing: Standing::Denied(error(
+                        ExecErrorCodeV1::PermissionDenied,
+                        "enrollment admission revoked",
+                    )),
+                },
+            );
+        }
     }
 
     /// Force every cached caller to be read again before its next call.
@@ -532,12 +623,19 @@ impl ExecService {
         standings
     }
 
+    /// Authorize a caller under its own grant.
     async fn authorize(
         &self,
         caller: &str,
         target: &str,
         op: ExecOperationV1,
     ) -> Result<ExecGrantV1, ExecErrorV1> {
+        self.authorize_as(&Authority::own(caller), target, op).await
+    }
+
+    /// Checks that need no policy read: the caller's identity, the target,
+    /// the owner's local ceiling and its denied callers.
+    fn precheck(&self, caller: &str, target: &str, op: ExecOperationV1) -> Result<(), ExecErrorV1> {
         if identity_bytes(caller).is_none() {
             return Err(error(
                 ExecErrorCodeV1::Unauthenticated,
@@ -554,6 +652,23 @@ impl ExecService {
                 "Exec operation denied",
             ));
         }
+        Ok(())
+    }
+
+    /// Authorize `op` under the principal's grant for the actor. Both must
+    /// pass the local ceiling; only the actor's enrollment is checked.
+    async fn authorize_as(
+        &self,
+        authority: &Authority,
+        target: &str,
+        op: ExecOperationV1,
+    ) -> Result<ExecGrantV1, ExecErrorV1> {
+        self.precheck(&authority.actor, target, op)?;
+        if authority.principal != authority.actor {
+            self.precheck(&authority.principal, target, op)?;
+        }
+        let key = authority.key();
+        let caller = key.as_str();
         if self.needs_cold_refresh(caller) {
             // Only first calls for the same peer share an authority read.
             // A slow peer cannot serialize cold admission for other peers.
@@ -598,7 +713,7 @@ impl ExecService {
             entry.last_used = Instant::now();
             entry.standing.call_result()?
         };
-        self.check_grant(&grant, caller, op)?;
+        self.check_grant(&grant, &authority.principal, op)?;
         Ok(grant)
     }
 
@@ -617,6 +732,7 @@ impl ExecService {
     }
 
     /// Time-dependent grant checks, applied on every use of a snapshot.
+    /// `caller` is the grant holder: the principal of the authority.
     fn check_grant(
         &self,
         grant: &ExecGrantV1,
@@ -658,26 +774,42 @@ impl ExecService {
         };
         match standing {
             Standing::Allowed(grant) | Standing::NotEnrolled(grant) => self
-                .check_grant(grant, owner, ExecOperationV1::Submit)
+                .check_grant(
+                    grant,
+                    &Authority::parse(owner).principal,
+                    ExecOperationV1::Submit,
+                )
                 .is_err(),
             Standing::Denied(_) => true,
             Standing::Unknown(_) => settled_at.elapsed() >= UNKNOWN_STANDING_GRACE,
         }
     }
+    /// A job's submitter may use it under the job's authority: its own grant,
+    /// or the principal's grant for an on-behalf-of job. The submitter's own
+    /// grant never authorizes another principal's job.
     async fn owned(
         &self,
         caller: &str,
         job: &JobRefV1,
         op: ExecOperationV1,
     ) -> Result<JobStatusV1, ExecErrorV1> {
-        self.authorize(caller, &job.target_id, op).await?;
-        let status = self.runtime.status(job).await?;
+        self.precheck(caller, &job.target_id, op)?;
+        let status = match self.runtime.status(job).await {
+            Ok(status) => status,
+            Err(failure) => {
+                // Only an authorized caller learns why the lookup failed.
+                self.authorize(caller, &job.target_id, op).await?;
+                return Err(failure);
+            }
+        };
         if status.caller_id != caller || status.job != *job {
             return Err(error(
                 ExecErrorCodeV1::PermissionDenied,
                 "job access denied",
             ));
         }
+        self.authorize_as(&Authority::of_job(&status), &job.target_id, op)
+            .await?;
         Ok(status)
     }
     async fn existing_submission(
@@ -757,10 +889,63 @@ impl ExecService {
         caller: &str,
         mut request: ExecRequestV1,
     ) -> Result<JobStatusV1, ExecErrorV1> {
+        request.validate()?;
+        let authority = match &request.on_behalf_of {
+            None => Authority::own(caller),
+            Some(on_behalf) if on_behalf.principal == caller => {
+                return Err(ExecErrorV1::invalid(
+                    "on_behalf_of names the caller; submit without it",
+                ));
+            }
+            Some(on_behalf) => Authority {
+                actor: caller.into(),
+                principal: on_behalf.principal.clone(),
+            },
+        };
+        // Bound to the request exactly as sent, before defaults are resolved.
+        let request_digest = request.on_behalf_digest()?;
+        // Authenticate the chain before reading the grant of the principal it
+        // names, so an actor cannot make this node read arbitrary grants.
+        let early = match (&request.on_behalf_of, self.grants.audience()) {
+            (Some(on_behalf), Some(audience)) => Some((
+                self.verify_on_behalf_chain(
+                    caller,
+                    &on_behalf.chain,
+                    &authority.principal,
+                    &audience,
+                )?,
+                audience,
+            )),
+            _ => None,
+        };
         let grant = self
-            .authorize(caller, &request.target_id, ExecOperationV1::Submit)
+            .authorize_as(&authority, &request.target_id, ExecOperationV1::Submit)
             .await?;
-        let authorized = self.ceiling.authorize_submit(caller, &grant, &request)?;
+        let authorized = self
+            .ceiling
+            .authorize_submit(&authority.principal, &grant, &request)?;
+        let delegation = match &request.on_behalf_of {
+            None => None,
+            Some(on_behalf) => {
+                let verified = match early {
+                    Some((verified, audience)) if audience == grant.audience => verified,
+                    Some(_) => {
+                        return Err(error(
+                            ExecErrorCodeV1::PermissionDenied,
+                            "on-behalf-of chain audience differs from the grant",
+                        ));
+                    }
+                    None => self.verify_on_behalf_chain(
+                        caller,
+                        &on_behalf.chain,
+                        &authority.principal,
+                        &grant.audience,
+                    )?,
+                };
+                self.check_action(&verified, &grant, &authorized, &request_digest)?;
+                Some(verified)
+            }
+        };
         request.cwd = authorized.canonical_cwd.to_string_lossy().into_owned();
         request.profile = Some(authorized.profile.clone());
         request.execution_timeout_ms = Some(authorized.timeout_ms);
@@ -789,18 +974,28 @@ impl ExecService {
                 .existing_submission(&key, reservation, &request, digest)
                 .await;
         }
+        let mut payload = serde_json::json!({
+            "caller": caller,
+            "target": request.target_id,
+            "request_id": request.request_id,
+            "job_id": job_id,
+            "request_digest": hex::encode(digest),
+            "grant_revision": grant.revision,
+            "profile": authorized.profile,
+        });
+        if let Some(chain) = &delegation {
+            payload["on_behalf_of"] = serde_json::json!({
+                "principal": authority.principal,
+                "actor": authority.actor,
+                "chain_digest": hex::encode(chain.digest()),
+                "chain_jtis": chain.jtis(),
+                "issuers": chain.issuers().iter().map(hex::encode).collect::<Vec<_>>(),
+            });
+        }
         let event = AuditEvent {
             timestamp_ms: now,
             kind: "exec.intent.v1".into(),
-            payload: serde_json::json!({
-                "caller": caller,
-                "target": request.target_id,
-                "request_id": request.request_id,
-                "job_id": job_id,
-                "request_digest": hex::encode(digest),
-                "grant_revision": grant.revision,
-                "profile": authorized.profile,
-            }),
+            payload,
         };
         if let Err(mut failure) = self.audit.admit(event).await {
             failure.request_id = Some(request.request_id.clone());
@@ -840,6 +1035,86 @@ impl ExecService {
             }
         }
     }
+    /// Verify an on-behalf-of action chain for the authenticated actor: it
+    /// must be anchored at exactly the named principal, for this audience.
+    fn verify_on_behalf_chain(
+        &self,
+        actor: &str,
+        chain: &str,
+        principal: &str,
+        audience: &str,
+    ) -> Result<VerifiedChain, ExecErrorV1> {
+        let denied = |message: &str| error(ExecErrorCodeV1::PermissionDenied, message);
+        let (Some(actor_key), Some(principal_key)) =
+            (identity_bytes(actor), identity_bytes(principal))
+        else {
+            return Err(denied("invalid on-behalf-of identity"));
+        };
+        let anchors = [principal_key];
+        let trust = TrustContext::new(&anchors, audience, now_ms() / 1000, &NoRevocations);
+        verify_chain(chain.as_bytes(), LeafKind::Action, &actor_key, &trust)
+            .map_err(|failure| denied(&format!("on-behalf-of chain rejected: {failure:?}")))
+    }
+
+    /// The verified leaf must allow `exec.submit`, and every resource
+    /// constraint must be one this target understands and satisfies. A leaf
+    /// `request` digest must match, and the grant can require one.
+    fn check_action(
+        &self,
+        verified: &VerifiedChain,
+        grant: &ExecGrantV1,
+        authorized: &AuthorizedSubmit,
+        request_digest: &[u8; 32],
+    ) -> Result<(), ExecErrorV1> {
+        let denied = |message: &str| error(ExecErrorCodeV1::PermissionDenied, message);
+        let LeafClaims::Action(action) = verified.leaf() else {
+            return Err(denied("on-behalf-of chain is not an action"));
+        };
+        if !action.operations.contains(EXEC_SUBMIT_OPERATION) {
+            return Err(denied("on-behalf-of chain does not allow exec.submit"));
+        }
+        for resource in &action.resources {
+            self.check_resource(resource, authorized)?;
+        }
+        let digest = hex::encode(request_digest);
+        match &action.request {
+            Some(bound) if *bound != digest => {
+                return Err(denied("on-behalf-of chain authorizes a different request"));
+            }
+            None if grant.require_request_digest => {
+                return Err(denied(
+                    "the principal's grant requires a chain bound to this request",
+                ));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// One `resources` constraint from an action leaf. Constraints this
+    /// target does not understand deny rather than being ignored.
+    fn check_resource(
+        &self,
+        resource: &str,
+        authorized: &AuthorizedSubmit,
+    ) -> Result<(), ExecErrorV1> {
+        let denied = |message: &str| error(ExecErrorCodeV1::PermissionDenied, message);
+        let satisfied = match resource.split_once('=') {
+            Some(("exec:target", target)) => target == self.ceiling.target_id,
+            Some(("exec:profile", profile)) => profile == authorized.profile,
+            Some(("exec:cwd_root", root)) => {
+                std::path::Path::new(root).is_absolute()
+                    && std::fs::canonicalize(root)
+                        .is_ok_and(|root| authorized.canonical_cwd.starts_with(root))
+            }
+            _ => return Err(denied("on-behalf-of chain has an unsupported resource")),
+        };
+        if !satisfied {
+            return Err(denied("request is outside the on-behalf-of resources"));
+        }
+        Ok(())
+    }
+
     /// Replays supervisor-owned terminal outcomes; acknowledgement follows
     /// durable outbox admission, so a crash causes a safe duplicate audit.
     pub async fn replay_outcomes(&self) -> Result<usize, ExecErrorV1> {
@@ -912,7 +1187,10 @@ impl ExecService {
             }
         }
         let live: Vec<&JobStatusV1> = jobs.iter().filter(|job| !job.state.is_terminal()).collect();
-        let owners: BTreeSet<String> = live.iter().map(|job| job.caller_id.clone()).collect();
+        let owners: BTreeSet<String> = live
+            .iter()
+            .map(|job| Authority::of_job(job).key())
+            .collect();
         self.owners_settled
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -920,10 +1198,11 @@ impl ExecService {
         let standings = self.refresh_many(owners.into_iter().collect()).await;
         let mut cancelled = 0;
         for job in live {
-            let Some(standing) = standings.get(&job.caller_id) else {
+            let owner = Authority::of_job(job).key();
+            let Some(standing) = standings.get(&owner) else {
                 continue;
             };
-            if !self.should_cancel(&job.caller_id, standing) {
+            if !self.should_cancel(&owner, standing) {
                 continue;
             }
             match self.cancel_for_revocation(job).await {
@@ -1040,6 +1319,7 @@ impl ExecService {
             kind: "exec.revocation.cancel.v1".into(),
             payload: serde_json::json!({
                 "caller": job.caller_id,
+                "principal": job.principal_id,
                 "job_id": job.job.job_id,
                 "target": job.job.target_id,
             }),
@@ -1131,8 +1411,12 @@ impl ExecService {
                     .owned(&caller, &request.job, ExecOperationV1::Watch)
                     .await?;
                 // Output authority is independently required for output bytes.
-                self.authorize(&caller, &request.job.target_id, ExecOperationV1::Output)
-                    .await?;
+                self.authorize_as(
+                    &Authority::of_job(&status),
+                    &request.job.target_id,
+                    ExecOperationV1::Output,
+                )
+                .await?;
                 let page = self
                     .runtime
                     .output(&OutputRequestV1 {
@@ -1252,7 +1536,8 @@ impl ExecService {
             }
             "cancel" => {
                 let req: CancelRequestV1 = decode(raw)?;
-                self.owned(caller, &req.job, ExecOperationV1::Cancel)
+                let job = self
+                    .owned(caller, &req.job, ExecOperationV1::Cancel)
                     .await?;
                 if req.grace_ms.is_some_and(|v| v > MAX_CANCEL_GRACE_MS) {
                     return Err(ExecErrorV1::invalid("invalid cancellation grace"));
@@ -1262,6 +1547,7 @@ impl ExecService {
                     kind: "exec.cancel.intent.v1".into(),
                     payload: serde_json::json!({
                         "caller": caller,
+                        "principal": job.principal_id,
                         "job_id": req.job.job_id,
                         "target": req.job.target_id,
                     }),
@@ -1536,6 +1822,7 @@ mod tests {
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
                 cancel_on_revocation: true,
                 reauthorizes_revision: None,
+                require_request_digest: false,
             })),
             Arc::new(AdmitAudit),
             Arc::new(NeverLaunch),
@@ -1666,6 +1953,7 @@ mod tests {
             },
             state: JobStateV1::Accepted,
             caller_id: "11".repeat(32),
+            principal_id: None,
             resolved_target: "22".repeat(32),
             execution_identity: "runner".into(),
             accepted_at_ms: 1,
@@ -1978,6 +2266,7 @@ mod tests {
                 max_output_bytes: DEFAULT_OUTPUT_BYTES,
                 cancel_on_revocation: true,
                 reauthorizes_revision: None,
+                require_request_digest: false,
             })),
             Arc::new(AdmitAudit),
             Arc::new(NeverLaunch),
@@ -2025,6 +2314,7 @@ mod tests {
             max_output_bytes: DEFAULT_OUTPUT_BYTES,
             cancel_on_revocation: true,
             reauthorizes_revision: None,
+            require_request_digest: false,
         };
         let ceiling = LocalCeilingV1 {
             version: 1,
@@ -2068,6 +2358,7 @@ mod tests {
             stdin_bytes: None,
             execution_timeout_ms: None,
             output_limit_bytes: None,
+            on_behalf_of: None,
         };
         service.enrollment = revoked();
         assert!(
@@ -2234,5 +2525,587 @@ mod tests {
             service.submit(&caller, changed).await.unwrap_err().code,
             ExecErrorCodeV1::RequestConflict
         );
+    }
+}
+
+/// On-behalf-of submissions (enrollment design §9, INV-E21 and INV-E22).
+#[cfg(test)]
+mod on_behalf_tests {
+    use super::*;
+    use crate::policy::GrantStatusV1;
+    use aster::delegation::{
+        ActionGrant, Audience, Chain, DelegationGrant, LinkKind, Validity, issue_action,
+        issue_delegation,
+    };
+    use aster::{PublicKey, SecretKey};
+
+    const AUDIENCE: &str = "fleet";
+
+    struct Admitted;
+    #[async_trait]
+    impl EnrollmentAdmission for Admitted {
+        async fn check(&self, _: &[u8; 32]) -> Result<(), AdmissionError> {
+            Ok(())
+        }
+    }
+
+    fn key(seed: u8) -> SecretKey {
+        SecretKey::from_bytes([seed; 32])
+    }
+    fn id(key: &SecretKey) -> String {
+        key.public_key().to_hex()
+    }
+    fn now() -> u64 {
+        now_ms() / 1000
+    }
+    fn validity() -> Validity {
+        Validity {
+            issued_at: now(),
+            not_before: None,
+            expires_at: now() + 3_600,
+        }
+    }
+
+    /// Grants by holder, all for one audience like the Docs store; a missing
+    /// holder is a definite denial. Records which holders were read.
+    #[derive(Default)]
+    struct GrantTable {
+        grants: StdMutex<BTreeMap<[u8; 32], ExecGrantV1>>,
+        reads: StdMutex<Vec<[u8; 32]>>,
+    }
+    #[async_trait]
+    impl GrantProvider for GrantTable {
+        async fn current(
+            &self,
+            caller: [u8; 32],
+            _: [u8; 32],
+            _: u64,
+        ) -> Result<ExecGrantV1, ExecErrorV1> {
+            self.reads.lock().unwrap().push(caller);
+            self.grants
+                .lock()
+                .unwrap()
+                .get(&caller)
+                .cloned()
+                .ok_or_else(|| error(ExecErrorCodeV1::PermissionDenied, "no grant"))
+        }
+        fn audience(&self) -> Option<String> {
+            Some(AUDIENCE.into())
+        }
+    }
+    impl GrantTable {
+        fn insert(&self, grant: ExecGrantV1) {
+            let holder = identity_bytes(&grant.caller).unwrap();
+            self.grants.lock().unwrap().insert(holder, grant);
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAudit(StdMutex<Vec<AuditEvent>>);
+    #[async_trait]
+    impl ExecAudit for RecordingAudit {
+        async fn admit(&self, event: AuditEvent) -> Result<(), ExecErrorV1> {
+            self.0.lock().unwrap().push(event);
+            Ok(())
+        }
+    }
+
+    /// Launches into memory, deriving the job's principal from the request
+    /// as the Linux adapter does.
+    #[derive(Default)]
+    struct MemoryRuntime {
+        jobs: StdMutex<BTreeMap<String, JobStatusV1>>,
+        cancelled: StdMutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl ExecRuntime for MemoryRuntime {
+        async fn capabilities(&self) -> Result<TargetCapabilitiesV1, ExecErrorV1> {
+            panic!("unexpected capabilities")
+        }
+        async fn launch(
+            &self,
+            request: ExecRequestV1,
+            authorized: AuthorizedSubmit,
+            job_id: String,
+            _: [u8; 32],
+            caller: String,
+            accepted_at_ms: u64,
+        ) -> Result<JobStatusV1, ExecErrorV1> {
+            let status = JobStatusV1 {
+                job: JobRefV1 {
+                    job_id: job_id.clone(),
+                    target_id: request.target_id.clone(),
+                },
+                state: JobStateV1::Running,
+                caller_id: caller,
+                principal_id: request
+                    .on_behalf_of
+                    .as_ref()
+                    .map(|on_behalf| on_behalf.principal.clone()),
+                resolved_target: request.target_id.clone(),
+                execution_identity: authorized.account_alias,
+                accepted_at_ms,
+                started_at_ms: Some(accepted_at_ms),
+                finished_at_ms: None,
+                exit_code: None,
+                signal: None,
+                reason_code: None,
+                output_cursor: 0,
+                guarantees: GuaranteesV1 {
+                    profile: authorized.profile,
+                    provider: "memory".into(),
+                    network: NetworkGuaranteeV1::Inherited,
+                    proxy_id: None,
+                    filesystem: FilesystemGuaranteeV1::Inherited,
+                    filesystem_policy_id: None,
+                    execution_identity: "runner".into(),
+                    resource_limits: ResourceLimitsV1 {
+                        cpu_millis_per_second: None,
+                        memory_bytes: None,
+                        processes: None,
+                        file_bytes: None,
+                    },
+                    descendant_scope: DescendantScopeV1::Cgroup,
+                    restart_survival: RestartSurvivalV1::ApiRestart,
+                },
+            };
+            self.jobs.lock().unwrap().insert(job_id, status.clone());
+            Ok(status)
+        }
+        async fn status(&self, job: &JobRefV1) -> Result<JobStatusV1, ExecErrorV1> {
+            self.jobs
+                .lock()
+                .unwrap()
+                .get(&job.job_id)
+                .cloned()
+                .ok_or_else(|| error(ExecErrorCodeV1::JobNotFound, "no such job"))
+        }
+        async fn output(&self, _: &OutputRequestV1) -> Result<OutputPageV1, ExecErrorV1> {
+            panic!("unexpected output")
+        }
+        async fn cancel(&self, request: &CancelRequestV1) -> Result<CancelReceiptV1, ExecErrorV1> {
+            self.cancelled
+                .lock()
+                .unwrap()
+                .push(request.job.job_id.clone());
+            if let Some(job) = self.jobs.lock().unwrap().get_mut(&request.job.job_id) {
+                job.state = JobStateV1::Cancelled;
+            }
+            Err(error(ExecErrorCodeV1::Internal, "receipt not modelled"))
+        }
+        async fn list_jobs(&self) -> Result<Vec<JobStatusV1>, ExecErrorV1> {
+            Ok(self.jobs.lock().unwrap().values().cloned().collect())
+        }
+        async fn pending_outcomes(&self) -> Result<Vec<(String, Vec<u8>)>, ExecErrorV1> {
+            Ok(vec![])
+        }
+        async fn ack_outcome(&self, _: &str) -> Result<(), ExecErrorV1> {
+            Ok(())
+        }
+    }
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        cwd: String,
+        target: String,
+        service: ExecService,
+        grants: Arc<GrantTable>,
+        audit: Arc<RecordingAudit>,
+        runtime: Arc<MemoryRuntime>,
+    }
+
+    fn grant(fixture_cwd: &str, holder: &str, target: &str) -> ExecGrantV1 {
+        ExecGrantV1 {
+            version: 1,
+            issuer: "33".repeat(32),
+            audience: AUDIENCE.into(),
+            caller: holder.into(),
+            target: target.into(),
+            revision: 1,
+            issued_at: 1,
+            not_before: None,
+            expires_at: None,
+            status: GrantStatusV1::Active,
+            account_alias: "builder".into(),
+            profiles: vec!["open".into(), "build".into()],
+            operations: vec![
+                ExecOperationV1::Submit,
+                ExecOperationV1::Status,
+                ExecOperationV1::Cancel,
+            ],
+            cwd_roots: vec![fixture_cwd.into()],
+            max_timeout_ms: DEFAULT_TIMEOUT_MS,
+            max_output_bytes: DEFAULT_OUTPUT_BYTES,
+            cancel_on_revocation: true,
+            reauthorizes_revision: None,
+            require_request_digest: false,
+        }
+    }
+
+    fn fixture() -> Fixture {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = std::fs::canonicalize(temp.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let target = id(&key(0x22));
+        let grants = Arc::new(GrantTable::default());
+        let audit = Arc::new(RecordingAudit::default());
+        let runtime = Arc::new(MemoryRuntime::default());
+        let service = ExecService::new(
+            LocalCeilingV1 {
+                version: 1,
+                target_id: target.clone(),
+                account_alias: "builder".into(),
+                default_profile: "open".into(),
+                enabled_profiles: ["open".into(), "build".into()].into(),
+                enabled_operations: [
+                    ExecOperationV1::Submit,
+                    ExecOperationV1::Status,
+                    ExecOperationV1::Cancel,
+                ]
+                .into(),
+                cwd_roots: vec![cwd.clone().into()],
+                max_timeout_ms: DEFAULT_TIMEOUT_MS,
+                max_output_bytes: DEFAULT_OUTPUT_BYTES,
+                denied_callers: Default::default(),
+            },
+            Arc::new(Admitted),
+            grants.clone(),
+            audit.clone(),
+            runtime.clone(),
+            RequestLedger::open(&temp.path().join("requests.redb")).unwrap(),
+        );
+        Fixture {
+            _temp: temp,
+            cwd,
+            target,
+            service,
+            grants,
+            audit,
+            runtime,
+        }
+    }
+
+    fn request(fixture: &Fixture) -> ExecRequestV1 {
+        ExecRequestV1 {
+            request_id: uuid::Uuid::new_v4().to_string(),
+            target_id: fixture.target.clone(),
+            profile: None,
+            cwd: fixture.cwd.clone(),
+            executable: "/bin/true".into(),
+            argv: vec![],
+            environment_overrides: Default::default(),
+            stdin_bytes: None,
+            execution_timeout_ms: None,
+            output_limit_bytes: None,
+            on_behalf_of: None,
+        }
+    }
+
+    /// Principal H delegates action issuance to orchestrator O.
+    fn principal_delegates(principal: &SecretKey, orchestrator: &SecretKey) -> Chain {
+        issue_delegation(
+            principal,
+            None,
+            &orchestrator.public_key(),
+            &Audience::One(AUDIENCE.into()),
+            &DelegationGrant {
+                may_issue: [LinkKind::Action].into(),
+                audiences: [AUDIENCE.to_string()].into(),
+                scopes: Default::default(),
+                tags: Default::default(),
+                attribute_keys: Default::default(),
+                max_child_lifetime: 3_600,
+                max_depth: 0,
+                subjects: None,
+                operations: ["exec.submit".to_string()].into(),
+                mandatory: Default::default(),
+                may_register: false,
+            },
+            validity(),
+        )
+        .unwrap()
+    }
+
+    /// O lets actor A submit for H within `resources`.
+    fn action(
+        orchestrator: &SecretKey,
+        parent: &Chain,
+        actor: &PublicKey,
+        resources: &[String],
+        request: Option<String>,
+    ) -> Chain {
+        issue_action(
+            orchestrator,
+            Some(parent),
+            actor,
+            &Audience::One(AUDIENCE.into()),
+            &ActionGrant {
+                operations: ["exec.submit".to_string()].into(),
+                resources: resources.iter().cloned().collect(),
+                request,
+                mandatory: Default::default(),
+            },
+            validity(),
+        )
+        .unwrap()
+    }
+
+    fn on_behalf(
+        mut request: ExecRequestV1,
+        principal: &SecretKey,
+        chain: &Chain,
+    ) -> ExecRequestV1 {
+        request.on_behalf_of = Some(OnBehalfOfV1 {
+            principal: id(principal),
+            chain: chain.to_text().into(),
+        });
+        request
+    }
+
+    fn denied(result: Result<JobStatusV1, ExecErrorV1>) -> ExecErrorV1 {
+        let failure = result.unwrap_err();
+        assert_eq!(
+            failure.code,
+            ExecErrorCodeV1::PermissionDenied,
+            "{failure:?}"
+        );
+        failure
+    }
+
+    /// INV-E21 and INV-E22: H → O (delegation) → A (action). A submits for
+    /// H; the job runs under H's grant and its audit names H, A, the chain
+    /// digest and every jti.
+    #[tokio::test]
+    async fn actor_submits_under_the_principals_grant_and_audit_names_both() {
+        let f = fixture();
+        let (h, o, a) = (key(1), key(2), key(3));
+        f.grants.insert(grant(&f.cwd, &id(&h), &f.target));
+        let chain = action(
+            &o,
+            &principal_delegates(&h, &o),
+            &a.public_key(),
+            &[
+                format!("exec:target={}", f.target),
+                "exec:profile=open".into(),
+                format!("exec:cwd_root={}", f.cwd),
+            ],
+            None,
+        );
+        let status = f
+            .service
+            .submit(&id(&a), on_behalf(request(&f), &h, &chain))
+            .await
+            .unwrap();
+        assert_eq!(status.caller_id, id(&a));
+        assert_eq!(status.principal_id.as_deref(), Some(id(&h).as_str()));
+
+        let intent = f.audit.0.lock().unwrap()[0].payload.clone();
+        assert_eq!(intent["caller"], id(&a));
+        let recorded = &intent["on_behalf_of"];
+        assert_eq!(recorded["principal"], id(&h));
+        assert_eq!(recorded["actor"], id(&a));
+        assert_eq!(recorded["chain_digest"], hex::encode(chain.digest()));
+        let jtis = recorded["chain_jtis"].as_array().unwrap();
+        assert_eq!(jtis.len(), 2);
+        assert!(
+            jtis.iter()
+                .all(|jti| jti.as_str().is_some_and(|v| !v.is_empty()))
+        );
+
+        // The actor follows its job under H's grant; it holds none itself.
+        let job = status.job.clone();
+        f.service
+            .owned(&id(&a), &job, ExecOperationV1::Status)
+            .await
+            .unwrap();
+        // H's revocation cancels the job: its authority is H's grant.
+        let mut revoked = grant(&f.cwd, &id(&h), &f.target);
+        revoked.status = GrantStatusV1::Revoked;
+        f.grants.insert(revoked);
+        f.service.invalidate_all();
+        let _ = f.service.reconcile_policy().await;
+        assert_eq!(*f.runtime.cancelled.lock().unwrap(), vec![job.job_id]);
+    }
+
+    /// INV-E21: without a chain the caller's own grant applies; with one, the
+    /// caller's own grant never substitutes for the principal's.
+    #[tokio::test]
+    async fn own_grant_applies_only_without_a_chain() {
+        let f = fixture();
+        let (h, o, a) = (key(1), key(2), key(3));
+        f.grants.insert(grant(&f.cwd, &id(&a), &f.target));
+        let status = f.service.submit(&id(&a), request(&f)).await.unwrap();
+        assert_eq!(status.principal_id, None);
+
+        // H holds no grant: A's own grant must not authorize the chain.
+        let chain = action(&o, &principal_delegates(&h, &o), &a.public_key(), &[], None);
+        denied(
+            f.service
+                .submit(&id(&a), on_behalf(request(&f), &h, &chain))
+                .await,
+        );
+        // Naming oneself as principal is refused rather than treated as own.
+        let mut own = request(&f);
+        own.on_behalf_of = Some(OnBehalfOfV1 {
+            principal: id(&a),
+            chain: chain.to_text().into(),
+        });
+        assert_eq!(
+            f.service.submit(&id(&a), own).await.unwrap_err().code,
+            ExecErrorCodeV1::InvalidArgument
+        );
+    }
+
+    /// INV-E21: resources narrow the principal's grant; a different target
+    /// or profile, an unknown resource, a missing `exec.submit`, a chain
+    /// rooted elsewhere or issued to another actor are all denied.
+    #[tokio::test]
+    async fn chains_outside_their_resources_or_anchor_are_denied() {
+        let f = fixture();
+        let (h, o, a, other) = (key(1), key(2), key(3), key(4));
+        f.grants.insert(grant(&f.cwd, &id(&h), &f.target));
+        let parent = principal_delegates(&h, &o);
+        for resources in [
+            vec![format!("exec:target={}", id(&key(0x23)))],
+            vec!["exec:profile=build".to_string()],
+            vec!["exec:cwd_root=/nonexistent-aster-root".to_string()],
+            vec!["exec:executable=/bin/true".to_string()],
+            vec!["unscoped".to_string()],
+        ] {
+            let chain = action(&o, &parent, &a.public_key(), &resources, None);
+            denied(
+                f.service
+                    .submit(&id(&a), on_behalf(request(&f), &h, &chain))
+                    .await,
+            );
+        }
+        // A grant for H, but the chain is rooted at another principal.
+        let elsewhere = action(
+            &o,
+            &principal_delegates(&other, &o),
+            &a.public_key(),
+            &[],
+            None,
+        );
+        let failure = denied(
+            f.service
+                .submit(&id(&a), on_behalf(request(&f), &h, &elsewhere))
+                .await,
+        );
+        assert!(
+            failure.safe_message.contains("UntrustedAnchor"),
+            "{failure:?}"
+        );
+        // Named principal holds no grant.
+        denied(
+            f.service
+                .submit(&id(&a), on_behalf(request(&f), &other, &elsewhere))
+                .await,
+        );
+        // Issued to a different actor than the one submitting.
+        let chain = action(&o, &parent, &other.public_key(), &[], None);
+        let failure = denied(
+            f.service
+                .submit(&id(&a), on_behalf(request(&f), &h, &chain))
+                .await,
+        );
+        assert!(failure.safe_message.contains("LeafMismatch"), "{failure:?}");
+        // A leaf without exec.submit.
+        let status_only = issue_action(
+            &o,
+            Some(&parent),
+            &a.public_key(),
+            &Audience::One(AUDIENCE.into()),
+            &ActionGrant {
+                operations: Default::default(),
+                resources: Default::default(),
+                request: None,
+                mandatory: Default::default(),
+            },
+            validity(),
+        )
+        .unwrap();
+        denied(
+            f.service
+                .submit(&id(&a), on_behalf(request(&f), &h, &status_only))
+                .await,
+        );
+        assert!(f.runtime.jobs.lock().unwrap().is_empty());
+    }
+
+    /// D5: a grant can require single-use chains bound to the request digest;
+    /// a bound digest must match whether or not the grant requires one.
+    #[tokio::test]
+    async fn request_digest_is_enforced_when_bound_or_required() {
+        let f = fixture();
+        let (h, o, a) = (key(1), key(2), key(3));
+        let mut required = grant(&f.cwd, &id(&h), &f.target);
+        required.require_request_digest = true;
+        f.grants.insert(required);
+        let parent = principal_delegates(&h, &o);
+
+        let unbound = action(&o, &parent, &a.public_key(), &[], None);
+        let failure = denied(
+            f.service
+                .submit(&id(&a), on_behalf(request(&f), &h, &unbound))
+                .await,
+        );
+        assert!(failure.safe_message.contains("requires"), "{failure:?}");
+
+        let submitted = request(&f);
+        let digest = hex::encode(submitted.on_behalf_digest().unwrap());
+        let other = hex::encode(request(&f).on_behalf_digest().unwrap());
+        let wrong = action(&o, &parent, &a.public_key(), &[], Some(other));
+        denied(
+            f.service
+                .submit(&id(&a), on_behalf(submitted.clone(), &h, &wrong))
+                .await,
+        );
+        let bound = action(&o, &parent, &a.public_key(), &[], Some(digest));
+        f.service
+            .submit(&id(&a), on_behalf(submitted, &h, &bound))
+            .await
+            .unwrap();
+    }
+
+    /// A chain that does not authenticate for the named principal is
+    /// rejected before Exec reads that principal's grant.
+    #[tokio::test]
+    async fn an_unauthenticated_chain_reads_no_principal_grant() {
+        let f = fixture();
+        let (h, o, a, other) = (key(1), key(2), key(3), key(4));
+        f.grants.insert(grant(&f.cwd, &id(&h), &f.target));
+        let foreign = action(
+            &o,
+            &principal_delegates(&other, &o),
+            &a.public_key(),
+            &[],
+            None,
+        );
+        for principal in [&h, &key(5)] {
+            denied(
+                f.service
+                    .submit(&id(&a), on_behalf(request(&f), principal, &foreign))
+                    .await,
+            );
+        }
+        let mut garbage = on_behalf(request(&f), &h, &foreign);
+        garbage.on_behalf_of.as_mut().unwrap().chain = "aster-chain-v1~not.a.jwt".into();
+        denied(f.service.submit(&id(&a), garbage).await);
+        assert!(f.grants.reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn authority_keys_round_trip() {
+        let own = Authority::own(&"11".repeat(32));
+        assert_eq!(own.key(), "11".repeat(32));
+        assert_eq!(Authority::parse(&own.key()), own);
+        let acting = Authority {
+            actor: "11".repeat(32),
+            principal: "22".repeat(32),
+        };
+        assert_eq!(Authority::parse(&acting.key()), acting);
     }
 }

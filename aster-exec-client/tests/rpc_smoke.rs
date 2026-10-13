@@ -95,6 +95,7 @@ impl ExecRuntime for Runtime {
             },
             state: JobStateV1::Succeeded,
             caller_id: caller,
+            principal_id: None,
             resolved_target: request.target_id,
             execution_identity: "builder".into(),
             accepted_at_ms,
@@ -185,6 +186,7 @@ async fn authenticated_rpc_retry_ownership_malformed_payload_and_grant_denial() 
             max_output_bytes: DEFAULT_OUTPUT_BYTES,
             cancel_on_revocation: true,
             reauthorizes_revision: None,
+            require_request_digest: false,
         };
         let ceiling = LocalCeilingV1 {
             version: 1,

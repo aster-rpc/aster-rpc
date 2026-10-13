@@ -347,6 +347,7 @@ mod linux {
             max_output_bytes: 65536,
             cancel_on_revocation: true,
             reauthorizes_revision: None,
+            require_request_digest: false,
         };
         let author = root_node.docs().default_author().await?;
         assert_eq!(

@@ -222,6 +222,7 @@ mod tests {
             },
             state: JobStateV1::Accepted,
             caller_id: "caller".into(),
+            principal_id: None,
             resolved_target: "target".into(),
             execution_identity: "runner".into(),
             accepted_at_ms: 1,

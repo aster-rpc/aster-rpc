@@ -152,6 +152,7 @@ mod tests {
             max_output_bytes: DEFAULT_OUTPUT_BYTES,
             cancel_on_revocation: true,
             reauthorizes_revision: None,
+            require_request_digest: false,
         };
         let ceiling = LocalCeilingV1 {
             version: 1,
@@ -176,6 +177,7 @@ mod tests {
             stdin_bytes: None,
             execution_timeout_ms: None,
             output_limit_bytes: None,
+            on_behalf_of: None,
         };
         assert!(ceiling.authorize_submit(&caller, &grant, &request).is_ok());
         request.cwd = other.to_string_lossy().into();

@@ -34,6 +34,11 @@ pub const MAX_REQUEST_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// Output paging charges each chunk this much beyond its bytes, so a page's
 /// encoded size stays within 4/3 of its byte budget however small its chunks.
 pub const OUTPUT_CHUNK_OVERHEAD_BYTES: usize = 96;
+/// Bound on an on-behalf-of chain's text; equals Aster's delegation
+/// `MAX_CHAIN_BYTES`, which verification enforces again.
+pub const MAX_ON_BEHALF_OF_CHAIN_BYTES: usize = 24 * 1024;
+/// Domain separator for [`ExecRequestV1::on_behalf_digest`].
+pub const REQUEST_DIGEST_DOMAIN: &[u8] = b"aster.exec.request.v1\0";
 
 /// Serde adapters that carry bytes as standard base64 strings rather than
 /// JSON number arrays, which cost up to four bytes per byte.
@@ -147,6 +152,24 @@ pub struct ExecRequestV1 {
     pub stdin_bytes: Option<Vec<u8>>,
     pub execution_timeout_ms: Option<u64>,
     pub output_limit_bytes: Option<u64>,
+    /// Submit for another principal under its Exec grant, narrowed by an
+    /// action chain the principal (or its delegate) issued to this caller.
+    /// Absent means the caller submits under its own grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_behalf_of: Option<OnBehalfOfV1>,
+}
+
+/// The principal whose grant applies and the action chain that lets the
+/// authenticated caller use it. `principal` only selects which grant to
+/// read; the chain must be anchored at that key or the request is denied.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct OnBehalfOfV1 {
+    /// Principal node identity: 64 lowercase hex characters.
+    pub principal: String,
+    /// Action chain text, `aster-chain-v1~<leaf>~...~<top>`: the leaf names
+    /// the caller and the top link is issued by `principal`.
+    pub chain: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -314,7 +337,12 @@ pub struct GuaranteesV1 {
 pub struct JobStatusV1 {
     pub job: JobRefV1,
     pub state: JobStateV1,
+    /// The authenticated submitter, who may observe and cancel the job.
     pub caller_id: String,
+    /// For an on-behalf-of submission, the principal whose grant the job runs
+    /// under. Its revocation cancels the job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal_id: Option<String>,
     pub resolved_target: String,
     pub execution_identity: String,
     pub accepted_at_ms: u64,
@@ -401,6 +429,17 @@ impl ExecRequestV1 {
         {
             return Err(ExecErrorV1::invalid("request exceeds v1 limits"));
         }
+        if let Some(on_behalf) = &self.on_behalf_of
+            && (on_behalf.principal.len() != 64
+                || !on_behalf
+                    .principal
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+                || on_behalf.chain.is_empty()
+                || on_behalf.chain.len() > MAX_ON_BEHALF_OF_CHAIN_BYTES)
+        {
+            return Err(ExecErrorV1::invalid("invalid on-behalf-of authority"));
+        }
         let env_bytes: usize = self
             .environment_overrides
             .iter()
@@ -414,7 +453,10 @@ impl ExecRequestV1 {
             + self.cwd.len()
             + env_bytes
             + argv_bytes
-            + self.stdin_bytes.as_ref().map_or(0, Vec::len);
+            + self.stdin_bytes.as_ref().map_or(0, Vec::len)
+            + self.on_behalf_of.as_ref().map_or(0, |on_behalf| {
+                on_behalf.principal.len() + on_behalf.chain.len()
+            });
         if env_bytes > MAX_ENV_BYTES
             || argv_bytes > MAX_ARGV_BYTES
             || request_bytes > MAX_REQUEST_BYTES
@@ -428,6 +470,35 @@ impl ExecRequestV1 {
             return Err(ExecErrorV1::invalid("invalid or oversized request fields"));
         }
         Ok(())
+    }
+
+    /// Submit for `principal` under the action chain it (or its delegate)
+    /// issued to the submitting node.
+    pub fn on_behalf(mut self, principal: impl Into<String>, chain: impl Into<String>) -> Self {
+        self.on_behalf_of = Some(OnBehalfOfV1 {
+            principal: principal.into(),
+            chain: chain.into(),
+        });
+        self
+    }
+
+    /// The digest an action link's `request` claim binds, so a principal can
+    /// authorize exactly one request: BLAKE3 over `"aster.exec.request.v1\0"`
+    /// followed by the compact `serde_json` encoding of the request exactly as
+    /// the client sends it, without `on_behalf_of`. That encoding has fields
+    /// in declaration order, `null` for absent options, sorted environment
+    /// keys and stdin as standard base64. The server computes it before
+    /// resolving defaults, so a client digests the same field values it
+    /// submits, including `request_id`.
+    pub fn on_behalf_digest(&self) -> Result<[u8; 32], ExecErrorV1> {
+        let mut unsigned = self.clone();
+        unsigned.on_behalf_of = None;
+        let bytes = serde_json::to_vec(&unsigned)
+            .map_err(|_| ExecErrorV1::invalid("invalid request encoding"))?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(REQUEST_DIGEST_DOMAIN);
+        hasher.update(&bytes);
+        Ok(*hasher.finalize().as_bytes())
     }
 
     pub fn canonical_digest(&self, resolved_profile: &str) -> Result<[u8; 32], ExecErrorV1> {
@@ -468,6 +539,10 @@ mod tests {
             stdin_bytes: Some(bytes.clone()),
             execution_timeout_ms: Some(MAX_TIMEOUT_MS),
             output_limit_bytes: Some(MAX_OUTPUT_BYTES),
+            on_behalf_of: Some(OnBehalfOfV1 {
+                principal: "11".repeat(32),
+                chain: "x".repeat(MAX_ON_BEHALF_OF_CHAIN_BYTES),
+            }),
         };
         request.validate().unwrap();
         let encoded = serde_json::to_vec(&request).unwrap();
@@ -552,11 +627,54 @@ mod tests {
             stdin_bytes: None,
             execution_timeout_ms: None,
             output_limit_bytes: None,
+            on_behalf_of: None,
         };
         let first = request.canonical_digest("open").unwrap();
         request.profile = Some("open".into());
         assert_eq!(first, request.canonical_digest("open").unwrap());
         request.argv.push("different".into());
         assert_ne!(first, request.canonical_digest("open").unwrap());
+    }
+
+    #[test]
+    fn on_behalf_digest_ignores_the_chain_and_binds_every_other_field() {
+        let mut request = ExecRequestV1 {
+            request_id: "6f1f1e1e-0000-4000-8000-000000000000".into(),
+            target_id: "22".repeat(32),
+            profile: None,
+            cwd: "/tmp".into(),
+            executable: "/bin/true".into(),
+            argv: vec![],
+            environment_overrides: Default::default(),
+            stdin_bytes: None,
+            execution_timeout_ms: None,
+            output_limit_bytes: None,
+            on_behalf_of: None,
+        };
+        let plain = request.on_behalf_digest().unwrap();
+        // The documented canonical form, written out independently.
+        let mut expected = blake3::Hasher::new();
+        expected.update(b"aster.exec.request.v1\0");
+        expected.update(
+            br#"{"request_id":"6f1f1e1e-0000-4000-8000-000000000000","target_id":"2222222222222222222222222222222222222222222222222222222222222222","profile":null,"cwd":"/tmp","executable":"/bin/true","argv":[],"environment_overrides":{},"stdin_bytes":null,"execution_timeout_ms":null,"output_limit_bytes":null}"#,
+        );
+        assert_eq!(plain, *expected.finalize().as_bytes());
+        request.on_behalf_of = Some(OnBehalfOfV1 {
+            principal: "11".repeat(32),
+            chain: "aster-chain-v1~x".into(),
+        });
+        assert_eq!(request.on_behalf_digest().unwrap(), plain);
+        request.validate().unwrap();
+        request.argv.push("changed".into());
+        assert_ne!(request.on_behalf_digest().unwrap(), plain);
+        for principal in ["11".repeat(31), "AB".repeat(32)] {
+            let mut invalid = request.clone();
+            invalid.on_behalf_of.as_mut().unwrap().principal = principal;
+            assert!(invalid.validate().is_err());
+        }
+        let mut oversized = request.clone();
+        oversized.on_behalf_of.as_mut().unwrap().chain =
+            "x".repeat(MAX_ON_BEHALF_OF_CHAIN_BYTES + 1);
+        assert!(oversized.validate().is_err());
     }
 }

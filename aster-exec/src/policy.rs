@@ -59,6 +59,10 @@ pub struct ExecGrantV1 {
     pub max_output_bytes: u64,
     pub cancel_on_revocation: bool,
     pub reauthorizes_revision: Option<u64>,
+    /// On-behalf-of submissions under this grant must carry an action chain
+    /// whose leaf binds the exact request digest (single-use authority).
+    #[serde(default)]
+    pub require_request_digest: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -149,6 +153,11 @@ pub struct ExecGrantStore {
 }
 
 impl ExecGrantStore {
+    /// The one audience every grant in this store carries.
+    pub fn audience(&self) -> &str {
+        &self.context.audience
+    }
+
     pub fn open(
         path: &Path,
         root: [u8; 32],
@@ -466,6 +475,7 @@ mod tests {
             max_output_bytes: 4096,
             cancel_on_revocation: true,
             reauthorizes_revision: None,
+            require_request_digest: false,
         }
     }
 
