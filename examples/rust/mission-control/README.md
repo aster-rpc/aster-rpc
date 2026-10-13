@@ -58,6 +58,100 @@ curl --insecure -X POST https://127.0.0.1:8443/aster/MissionControl/tailLogs \
 (bidi isn't projected over plain HTTP JSON). The dispatcher still runs Fory
 throughout; JSON is transcoded at the edge.
 
+## With auth (Chapter 5)
+
+`cargo run -p mission-control -- --auth` serves [`src/auth.rs`](src/auth.rs):
+the same service with `requires` on each method, using the roles in
+[`src/roles.rs`](src/roles.rs) (identical to Python's `roles.py`):
+
+| Method | Requires |
+|--------|----------|
+| `getStatus` | `ops.status` |
+| `submitLog` | any enrolled node |
+| `tailLogs` | `ops.logs` or `ops.admin` |
+| `ingestMetrics` | `ops.ingest` |
+| `runCommand` | `ops.admin` |
+
+Nothing in the code reads a credential. `AsterConfig::from_env()` switches
+enrollment on: the server admits only nodes holding a credential from your
+root, and each peer's `aster.role` claim becomes the role set `requires` is
+checked against. Auth mode serves Iroh only (an HTTP caller has no
+credential).
+
+**1. Produce the files with the CLI** (as the root operator):
+
+```bash
+aster key root generate
+ROOT=$(aster key root show --json | jq -r .root_pubkey)
+FLEET=$(aster enroll namespace create --out-secret fleet.secret --json | jq -r .namespace)
+SERVER=$(aster key node generate --out server.key --json | jq -r .node_id)
+AGENT=$(aster key node generate --out agent.key --json | jq -r .node_id)
+
+aster enroll node --subject $SERVER --audience mission-control --out server.cred
+echo '{"aster.role":{"type":"string","value":"ops.status,ops.ingest"}}' > agent-roles.json
+aster enroll node --subject $AGENT --audience mission-control \
+  --attributes agent-roles.json --out agent.cred
+```
+
+Add `--persistent` for long-lived nodes the root later promotes; see
+`aster enroll delegate` to run an online issuer instead of the root signing
+every credential.
+
+**2. Start the server** with those files:
+
+```bash
+export ASTER_ROOT_PUBKEY=$ROOT
+export ASTER_ENROLLMENT_AUDIENCE=mission-control
+export ASTER_ENROLLMENT_FLEET_NAMESPACE=$FLEET
+
+ASTER_SECRET_KEY_FILE=server.key \
+ASTER_ENROLLMENT_CREDENTIAL=server.cred \
+ASTER_ENROLLMENT_STATE_PATH=./mc-enrollment.json \
+cargo run -p mission-control -- --auth          # prints its aster1… address
+```
+
+or the same as an `aster.toml` (`AsterConfig::from_file`):
+
+```toml
+[trust]
+root_pubkey = "<ROOT>"
+enrollment_credential = "server.cred"
+
+[network]
+secret_key_file = "server.key"
+
+[enrollment]
+audience = "mission-control"
+fleet_namespace = "<FLEET>"
+state_path = "./mc-enrollment.json"
+```
+
+**3. Run the agent** with its own key and credential:
+
+```bash
+ASTER_SECRET_KEY_FILE=agent.key ASTER_ENROLLMENT_CREDENTIAL=agent.cred \
+cargo run -p mission-control --bin agent -- aster1…
+```
+
+`getStatus` and `ingestMetrics` succeed. A credential without those roles
+gets `PERMISSION_DENIED`, and a node with no credential cannot connect.
+
+**4. Revoke** the agent as the root. The server holds the fleet namespace, so
+the root's publication session delivers to it (the CLI profile needs its own
+enrolled publisher identity, `exec_credential_file`, and a route to the
+server):
+
+```bash
+aster enroll revoke --subject $AGENT --fleet-only --fleet-namespace $FLEET \
+  --fleet-secret-file fleet.secret --audience mission-control --peer $SERVER
+```
+
+The agent's next call is refused and its connection closes.
+
+`tests/auth.rs` runs this chapter as a test: a server configured from an
+`aster.toml`, and operator, agent, admin and role-less clients, each reaching
+exactly the methods its roles allow.
+
 ## Differences from the Python/TS example
 
 - Those split per-agent state into a **session-scoped** `AgentSession`
@@ -65,6 +159,7 @@ throughout; JSON is transcoded at the edge.
   `run_command` lives on the shared service here.
 - `run_command` echoes the command; it does **not** run a shell (the
   Python example does).
+- There are two binaries, the server and `agent`; no separate operator.
 
 Wire method names match the Python/TS peers (`getStatus`, `tailLogs`,
 `ingestMetrics`, `runCommand`) via `#[rpc(name = "...")]`, so the service

@@ -3669,6 +3669,7 @@ dependencies = [
  "salvo",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

@@ -20,8 +20,15 @@
 //! yet, so the bidi `run_command` lives on the shared service here.
 //! `run_command` echoes the command rather than executing a shell (the Python
 //! example runs arbitrary shell; we don't).
+//!
+//! The auth chapter lives in [`auth`] (the service with `requires`) and
+//! [`roles`]; `mission-control --auth` serves it, driven by `[enrollment]`
+//! configuration.
 
 use aster::rpc::{RequestStream, ResponseSink};
+
+pub mod auth;
+pub mod roles;
 use fory_derive::ForyStruct;
 use serde::{Deserialize, Serialize};
 
