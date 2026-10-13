@@ -30,6 +30,11 @@ pub use aster_transport_core::enrollment::{
     MAX_POLICY_NODES, MAX_POLICY_RECORDS, MAX_POLICY_RECORD_BYTES, OBSERVER_GRANT_APP,
     OBSERVER_GRANT_PREFIX, OBSERVER_SCOPE, POLICY_RECORD_PREFIX, POLICY_RECORD_VERSION,
 };
+pub use aster_transport_core::enrollment::{
+    issue_observation, promotion_record, verify_observation, ObservationError, ObservationKind,
+    ObservationRejection, ObservationReview, ObservationV1, ObserverGrant, PolicyStores,
+    ReviewedObservation, MAX_OBSERVATION_LIFETIME, OBSERVATION_JWT_TYPE,
+};
 
 use aster_transport_core::enrollment::{EnrollmentService, RootAuthoredDocView};
 
@@ -88,6 +93,68 @@ impl RootAuthoredReader {
     ) -> Result<RootRecordRead, RootRecordError> {
         self.0.read_exact(&doc.enrollment_core(), key).await
     }
+}
+
+/// Refresh a policy view from local documents: the fleet store from `fleet`,
+/// then the stores for every membership namespace it binds from the matching
+/// document in `membership` (others are ignored). For root-side tools such as
+/// review; an installed [`Enrollment`] refreshes itself.
+#[cfg(feature = "docs")]
+pub async fn refresh_policy(
+    stores: &PolicyStores,
+    fleet: &crate::docs::Doc,
+    membership: &[crate::docs::Doc],
+) -> anyhow::Result<()> {
+    stores.fleet().refresh(&fleet.enrollment_core()).await?;
+    stores.sync_bindings()?;
+    for doc in membership {
+        let core = doc.enrollment_core();
+        let namespace: [u8; 32] = *core.doc.id().as_bytes();
+        if let Some(store) = stores.membership(&namespace) {
+            store.refresh(&core).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Review the observations namespace as the root: see
+/// [`aster_transport_core::enrollment::review_observations`]. Observations
+/// confer no authority; only accepted ones are candidates for promotion.
+#[cfg(feature = "docs")]
+pub async fn review_observations(
+    observations: &crate::docs::Doc,
+    fleet: &crate::docs::Doc,
+    verifier: &JwtEnrollmentVerifier,
+    stores: &PolicyStores,
+    now: u64,
+) -> anyhow::Result<ObservationReview> {
+    aster_transport_core::enrollment::review_observations(
+        &observations.enrollment_core(),
+        &fleet.enrollment_core(),
+        verifier,
+        stores,
+        now,
+    )
+    .await
+}
+
+/// Open the root's sealed grant of the observations namespace's write
+/// capability to `observer`, from the fleet document. An issuer process uses
+/// this to start writing `issued` observations.
+#[cfg(feature = "docs")]
+pub async fn open_observer_grant(
+    fleet: &crate::docs::Doc,
+    root: &[u8; 32],
+    observer: &crate::SecretKey,
+    observations: &[u8; 32],
+) -> anyhow::Result<ObserverGrant> {
+    aster_transport_core::enrollment::open_observer_grant(
+        &fleet.enrollment_core(),
+        root,
+        &observer.to_bytes(),
+        observations,
+    )
+    .await
 }
 
 /// Cloneable facade over shared opt-in enrollment state.

@@ -483,6 +483,44 @@ fn explicit_key_requires_a_configured_profile_root() {
 }
 
 #[test]
+fn only_an_issuer_observes_and_only_persistent_credentials() {
+    let f = Fixture::new("observe");
+    f.pin_root(41);
+    let key = f.key(41);
+    let secret = f.0.join("observations.secret");
+    std::fs::write(&secret, hex::encode([5; 32])).unwrap();
+    let subject = hex::encode(JwtEnrollmentIssuer::from_seed(&[42; 32]).public_key());
+    let out = f.0.join("node.jwt");
+    let namespace = hex::encode([6; 32]);
+    let peer = hex::encode(JwtEnrollmentIssuer::from_seed(&[43; 32]).public_key());
+    // A root-issued persistent credential is never observed by an issuer.
+    let result = f.run(&[
+        "enroll",
+        "node",
+        "--subject",
+        &subject,
+        "--audience",
+        "fleet",
+        "--root-key",
+        key.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+        "--persistent",
+        "--observations-namespace",
+        &namespace,
+        "--observations-secret-file",
+        secret.to_str().unwrap(),
+        "--fleet-namespace",
+        &namespace,
+        "--peer",
+        &peer,
+    ]);
+    assert_eq!(result.status.code(), Some(2), "{result:?}");
+    assert!(String::from_utf8_lossy(&result.stderr).contains("only an issuer"));
+    assert!(!out.exists());
+}
+
+#[test]
 fn namespace_create_writes_an_owner_only_secret_once() {
     let f = Fixture::new("namespace");
     let secret = f.0.join("build.secret");

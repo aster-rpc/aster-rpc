@@ -47,6 +47,7 @@
 mod bootstrap;
 mod clock;
 mod jwt;
+mod observations;
 mod policy;
 
 pub use bootstrap::{
@@ -76,6 +77,12 @@ pub use policy::{
     SynchronizationSource, MAX_POLICY_DEPTH, MAX_POLICY_NODES,
 };
 
+pub use observations::{
+    issue_observation, open_observer_grant, promotion_record, review_observations,
+    verify_observation, ObservationError, ObservationKind, ObservationRejection, ObservationReview,
+    ObservationV1, ObserverGrant, ReviewedObservation, MAX_OBSERVATION_LIFETIME,
+    OBSERVATION_JWT_TYPE,
+};
 pub use policy::{AdmissionGuard, ObservedSourceAddress, SourceAddressProvenance, SourceCidr};
 pub use records::{
     credential_status_key, issuer_status_key, namespace_binding_key, node_registration_key,

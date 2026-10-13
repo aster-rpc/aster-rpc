@@ -5,6 +5,7 @@
 //! delegation chain. Every link expires, and lifetimes are sized to the
 //! profile's root cadence (enrollment design §4).
 
+mod observe;
 mod policy;
 mod publish;
 
@@ -45,6 +46,10 @@ pub enum EnrollCommand {
     Namespace(policy::NamespaceCommand),
     /// Revoke or reactivate an online issuer as the root
     Issuer(policy::IssuerArgs),
+    /// List the observations the root can promote, and those it ignores
+    Review(observe::ReviewArgs),
+    /// Promote observed persistent nodes to root-authored registrations
+    Promote(Box<observe::PromoteArgs>),
 }
 
 #[derive(Debug, Args)]
@@ -105,6 +110,8 @@ pub struct NodeArgs {
     /// JSON object of typed attributes, e.g. {"region":{"type":"string","value":"eu"}}
     #[arg(long, value_name = "FILE")]
     attributes: Option<PathBuf>,
+    #[command(flatten)]
+    observe: observe::IssuerObservationArgs,
 }
 
 #[derive(Debug, Args)]
@@ -157,6 +164,9 @@ struct IssuedReport {
     expires_at: u64,
     credential_file: PathBuf,
     registered: bool,
+    /// The `issued` observation key, when the issuer published one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation: Option<String>,
 }
 
 impl Report for IssuedReport {
@@ -186,10 +196,12 @@ impl Report for IssuedReport {
 pub async fn run(ctx: &Ctx, command: EnrollCommand) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     match command {
-        EnrollCommand::Node(args) => ctx.emit(&issue_node(ctx, args, now)?),
+        EnrollCommand::Node(args) => ctx.emit(&issue_node(ctx, args, now).await?),
         EnrollCommand::Delegate(args) => ctx.emit(&issue_delegate(ctx, args, now)?),
         EnrollCommand::Namespace(command) => policy::namespace(ctx, command).await,
         EnrollCommand::Issuer(args) => policy::issuer(ctx, args, now).await,
+        EnrollCommand::Review(args) => observe::run_review(ctx, args).await,
+        EnrollCommand::Promote(args) => observe::run_promote(ctx, *args).await,
     }
 }
 
@@ -320,7 +332,7 @@ fn expiry(args: &LifetimeArgs, now: u64, root_renewed: bool, trust: &ProfileTrus
     Ok(now + lifetime)
 }
 
-fn issue_node(ctx: &Ctx, args: NodeArgs, now: u64) -> Result<IssuedReport> {
+async fn issue_node(ctx: &Ctx, args: NodeArgs, now: u64) -> Result<IssuedReport> {
     let trust = profile_trust(ctx)?;
     let signer = signer(ctx, &trust, &args.signer)?;
     let subject = parse_key(&args.subject, "subject")?;
@@ -332,6 +344,13 @@ fn issue_node(ctx: &Ctx, args: NodeArgs, now: u64) -> Result<IssuedReport> {
     // Only a persistent, root-issued credential waits for the root to
     // promote it; an issuer renews its own leaves.
     let root_renewed = args.persistent && signer.parent.is_none();
+    if args.observe.observations_namespace.is_some()
+        && (!args.persistent || signer.parent.is_none())
+    {
+        return Err(Error::usage(
+            "only an issuer (--signer/--parent) publishes an observation, and only of a --persistent credential",
+        ));
+    }
     let expires_at = expiry(&args.lifetime, now, root_renewed, &trust)?;
     let attributes: BTreeMap<String, TypedAttribute> = match args.attributes {
         Some(path) => {
@@ -376,7 +395,18 @@ fn issue_node(ctx: &Ctx, args: NodeArgs, now: u64) -> Result<IssuedReport> {
         _ => vec![],
     };
     write_new(&args.out, issued.credential_id(), issued.chain())?;
+    let observation = observe::publish_issued(
+        ctx,
+        &args.observe,
+        &args.audience,
+        &signer.secret,
+        &subject,
+        issued.chain(),
+        now,
+    )
+    .await?;
     Ok(IssuedReport {
+        observation,
         kind: "enrollment",
         root: hex::encode(trust.root),
         subject: hex::encode(subject),
@@ -444,7 +474,12 @@ fn issue_delegate(ctx: &Ctx, args: DelegateArgs, now: u64) -> Result<IssuedRepor
         expires_at,
         credential_file: args.out,
         registered: false,
+        observation: None,
     })
+}
+
+pub(super) fn unix_now() -> Result<u64> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
 /// Publish only a complete file, atomically and without replacing an

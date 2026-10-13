@@ -22,8 +22,9 @@ use super::{
     admit, local_clock_synchronization, AdmissionContext, AdmissionDecision,
     AdmissionEvidenceSource, AdmissionPolicy, ClockSynchronization, DenialReason, EnrollmentError,
     EnrollmentPolicyStore, JwtEnrollmentVerifier, NamespaceBindingV1, NamespacePurpose,
-    ObservedSourceAddress, PolicyStores, PolicySynchronization, RecordAvailability, RecordError,
-    SourceAddressProvenance, SynchronizationSource, VerifiedAdmissionEvidence, MAX_CHAIN_BYTES,
+    ObservationKind, ObservedSourceAddress, ObserverGrant, PolicyStores, PolicySynchronization,
+    RecordAvailability, RecordError, Registration, SourceAddressProvenance, SynchronizationSource,
+    VerifiedAdmissionEvidence, MAX_CHAIN_BYTES,
 };
 use crate::delegation::ChainError;
 use crate::{
@@ -252,6 +253,18 @@ struct Welcome {
     bound_tickets: Vec<String>,
 }
 
+/// At most one `admitted` observation per subject per hour (enrollment B10).
+const OBSERVATION_INTERVAL_SECONDS: u64 = 3600;
+
+/// This node as an observer: the observations namespace it may write, once
+/// the root has bound one and sealed its write capability to this node.
+#[derive(Default)]
+struct Observer {
+    doc: Option<([u8; 32], CoreDoc)>,
+    /// Per subject: first observation and latest write, Unix seconds.
+    seen: BTreeMap<[u8; 32], (u64, u64)>,
+}
+
 /// Bound-namespace tickets kept from one replica between `connect` and
 /// `synchronize`; each is honoured only for a namespace the fleet binds.
 const MAX_OFFERED_TICKETS: usize = 32;
@@ -336,6 +349,9 @@ pub struct EnrollmentService {
     bound_documents: RwLock<BTreeMap<[u8; 32], CoreDoc>>,
     /// Bound-namespace read tickets each replica offered at `connect`.
     offered_tickets: Mutex<BTreeMap<[u8; 32], Vec<String>>>,
+    /// This node's own presented chain, verified at install.
+    own_evidence: Option<VerifiedAdmissionEvidence>,
+    observer: Mutex<Observer>,
     policy_watch: Mutex<Option<AbortHandle>>,
     context: RwLock<AdmissionContext>,
     sessions: Mutex<BTreeMap<[u8; 32], Session>>,
@@ -414,13 +430,23 @@ impl EnrollmentService {
             );
             tracing::warn!("enrollment: local clock is not synchronized; admission may fail");
         }
-        if let Some(token) = &credential {
-            verifier.verify(token, &identity(&node.node_id())?, unix_now())?;
-        }
+        let own = identity(&node.node_id())?;
+        let own_evidence = credential
+            .as_deref()
+            .map(|token| verifier.verify(token, &own, unix_now()))
+            .transpose()?;
         let hooks = node
             .take_hook_receiver()
             .ok_or_else(|| anyhow!("enrollment requires unused node hooks"))?;
-        let service = Self::new(node, store, verifier, credential, policy, options);
+        let service = Self::new(
+            node,
+            store,
+            verifier,
+            credential,
+            policy,
+            options,
+            own_evidence,
+        );
         // Bound stores keep their own durable denials across restart.
         service.stores.sync_bindings()?;
         service.spawn_hook_loop(hooks);
@@ -446,6 +472,7 @@ impl EnrollmentService {
         credential: Option<String>,
         policy: Arc<dyn AdmissionPolicy>,
         options: EnrollmentOptions,
+        own_evidence: Option<VerifiedAdmissionEvidence>,
     ) -> Arc<Self> {
         // One reconciliation can revoke every admitted peer; size the channel
         // so that does not lag a promptly polling consumer.
@@ -456,6 +483,8 @@ impl EnrollmentService {
             stores: PolicyStores::new(store.clone()),
             bound_documents: RwLock::new(BTreeMap::new()),
             offered_tickets: Mutex::new(BTreeMap::new()),
+            own_evidence,
+            observer: Mutex::new(Observer::default()),
             store,
             verifier,
             credential,
@@ -1031,7 +1060,157 @@ impl EnrollmentService {
         evidence: VerifiedAdmissionEvidence,
         observed_source: Option<ObservedSourceAddress>,
     ) -> Result<EnrollmentReadiness> {
-        self.replace_session(evidence, observed_source, None)
+        let readiness = self.replace_session(evidence.clone(), observed_source, None)?;
+        self.observe_admission(&evidence);
+        Ok(readiness)
+    }
+
+    /// As an observer, record a fresh admission on a persistent chain for the
+    /// root: on first admission, then at most hourly. Ephemeral credentials
+    /// and registrations are never observed. The write is best effort.
+    fn observe_admission(&self, evidence: &VerifiedAdmissionEvidence) {
+        let (Some(chain), Some(Registration::Persistent)) =
+            (evidence.presented_chain(), evidence.registration())
+        else {
+            return;
+        };
+        let Ok(own) = identity(&self.node.node_id()) else {
+            return;
+        };
+        let subject = *evidence.subject();
+        if subject == own {
+            return;
+        }
+        let now = unix_now();
+        let (doc, first_seen) = {
+            let mut observer = self.observer.lock().unwrap_or_else(|e| e.into_inner());
+            let Some((_, doc)) = observer.doc.clone() else {
+                return;
+            };
+            let first_seen = match observer.seen.get(&subject) {
+                Some((_, written)) if now < written + OBSERVATION_INTERVAL_SECONDS => return,
+                Some((first, _)) => *first,
+                None => now,
+            };
+            if !observer.seen.contains_key(&subject)
+                && observer.seen.len() >= self.options.max_admitted_peers
+            {
+                observer.seen.pop_first();
+            }
+            observer.seen.insert(subject, (first_seen, now));
+            (doc, first_seen)
+        };
+        let Ok(secret) = <[u8; 32]>::try_from(self.node.export_secret_key()) else {
+            return;
+        };
+        let Ok(token) = super::issue_observation(
+            &secret,
+            &subject,
+            chain,
+            ObservationKind::Admitted,
+            first_seen,
+            now,
+            now,
+        ) else {
+            return;
+        };
+        let docs = self.node.docs_client();
+        tokio::spawn(async move {
+            let written = async {
+                let author = docs.default_author().await?;
+                doc.set_bytes(
+                    author,
+                    super::observation_key(&own, &subject),
+                    token.into_bytes(),
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = written {
+                tracing::warn!(%error, "enrollment: observation write failed");
+            }
+        });
+    }
+
+    /// Become (or stop being) an observer. This node observes only while the
+    /// fleet binds an observations namespace, its own verified scopes include
+    /// one of the binding's `write_scopes`, and the root's sealed grant opens
+    /// to that namespace's write capability.
+    async fn refresh_observer(&self, fleet: &CoreDoc) {
+        let binding = self
+            .store
+            .bindings()
+            .into_iter()
+            .find(|binding| binding.purpose == NamespacePurpose::Observations);
+        let qualified = binding.as_ref().is_some_and(|binding| {
+            self.own_scopes()
+                .is_some_and(|scopes| !scopes.is_disjoint(&binding.write_scopes))
+        });
+        let target = binding
+            .as_ref()
+            .filter(|_| qualified)
+            .and_then(|binding| namespace(&binding.namespace).ok());
+        let Some(target) = target else {
+            self.observer.lock().unwrap_or_else(|e| e.into_inner()).doc = None;
+            return;
+        };
+        let Ok(secret) = <[u8; 32]>::try_from(self.node.export_secret_key()) else {
+            return;
+        };
+        let held = self
+            .observer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .doc
+            .as_ref()
+            .is_some_and(|(namespace, _)| *namespace == target);
+        let grant = super::open_observer_grant(fleet, self.store.root(), &secret, &target).await;
+        let doc = match grant {
+            Ok(ObserverGrant::Active(_)) if held => return,
+            Ok(ObserverGrant::Active(write)) => {
+                let opened = async {
+                    let doc = self
+                        .node
+                        .docs_client()
+                        .import_write_namespace(write.to_vec())
+                        .await?;
+                    ensure!(
+                        namespace(&doc.doc_id())? == target,
+                        "observer grant names another namespace"
+                    );
+                    // Serve the namespace so the root can sync observations.
+                    doc.start_sync(vec![]).await?;
+                    Ok::<_, anyhow::Error>(doc)
+                }
+                .await;
+                match opened {
+                    Ok(doc) => Some((target, doc)),
+                    Err(error) => {
+                        tracing::warn!(%error, "enrollment: observer grant unusable");
+                        None
+                    }
+                }
+            }
+            Ok(ObserverGrant::Absent) => return,
+            Ok(ObserverGrant::Revoked) => None,
+            Err(error) => {
+                tracing::warn!(%error, "enrollment: observer grant unusable");
+                None
+            }
+        };
+        self.observer.lock().unwrap_or_else(|e| e.into_inner()).doc = doc;
+    }
+
+    /// This node's current verified scopes: its registration's if the root
+    /// has published one, else its own chain's.
+    fn own_scopes(&self) -> Option<std::collections::BTreeSet<String>> {
+        let own = identity(&self.node.node_id()).ok()?;
+        self.stores
+            .select_evidence(&own, self.own_evidence.as_ref(), unix_now())
+            .ok()?
+            .claims()
+            .scopes
+            .clone()
     }
 
     /// Reconciliation may replace exactly the generation it evaluated, never
@@ -1584,6 +1763,7 @@ impl EnrollmentService {
                     .await
                     .map_or(true, |report| report.has_uncertainty());
             }
+            self.refresh_observer(&doc).await;
             self.context
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1819,7 +1999,7 @@ mod tests {
             Arc::new(EnrollmentPolicyStore::open(&path, public(1), [42; 32], AUDIENCE).unwrap());
         let verifier = JwtEnrollmentVerifier::new(public(1), AUDIENCE).unwrap();
         (
-            EnrollmentService::new(node, store, verifier, None, policy, options),
+            EnrollmentService::new(node, store, verifier, None, policy, options, None),
             path,
         )
     }

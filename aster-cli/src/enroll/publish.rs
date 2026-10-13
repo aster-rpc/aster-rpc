@@ -97,6 +97,25 @@ impl Session {
 
     /// Start the session as the selected profile's root.
     pub async fn start(ctx: &Ctx, fleet: &FleetArgs) -> Result<Self> {
+        Self::start_as(
+            ctx,
+            &fleet.fleet_namespace,
+            &fleet.audience,
+            &fleet.peer,
+            None,
+        )
+        .await
+    }
+
+    /// Start the session writing as `author` (an observer's key) instead of
+    /// the root; the root's private key is not needed.
+    pub async fn start_as(
+        ctx: &Ctx,
+        fleet_namespace: &str,
+        audience: &str,
+        peer: &[String],
+        author: Option<zeroize::Zeroizing<[u8; 32]>>,
+    ) -> Result<Self> {
         let cfg = aster_config::load(&ctx.home)?;
         let profile = cfg.selected_profile_name(ctx.profile.as_deref());
         aster_config::validate_profile_name(&profile)?;
@@ -108,21 +127,28 @@ impl Session {
             Error::new(ErrorKind::Denied, "selected profile has no root public key")
         })?;
         let root = hex32(root_hex, "profile root public key")?;
-        let secret = aster_keystore::KeyStore::open(&ctx.home)?
-            .get(&profile)?
-            .ok_or_else(|| {
-                Error::not_found(
-                    "selected profile has no root private key; import it with aster key root import",
-                )
-            })?;
-        if secret.public_key_hex() != *root_hex {
-            return Err(Error::new(
-                ErrorKind::Denied,
-                "root private key does not match the selected profile",
-            ));
-        }
-        let root_secret = zeroize::Zeroizing::new(*secret.as_bytes());
-        let fleet_namespace = hex32(&fleet.fleet_namespace, "fleet namespace")?;
+        let author_secret = match author {
+            Some(secret) => secret,
+            None => {
+                let secret = aster_keystore::KeyStore::open(&ctx.home)?
+                    .get(&profile)?
+                    .ok_or_else(|| {
+                        Error::not_found(
+                            "selected profile has no root private key; import it with aster key root import",
+                        )
+                    })?;
+                if secret.public_key_hex() != *root_hex {
+                    return Err(Error::new(
+                        ErrorKind::Denied,
+                        "root private key does not match the selected profile",
+                    ));
+                }
+                zeroize::Zeroizing::new(*secret.as_bytes())
+            }
+        };
+        let author_public =
+            aster::enrollment::JwtEnrollmentIssuer::from_seed(&author_secret).public_key();
+        let fleet_namespace = hex32(fleet_namespace, "fleet namespace")?;
         let owner = ctx.home.join("enroll-publisher").join(&profile);
         std::fs::create_dir_all(&owner)?;
         #[cfg(unix)]
@@ -183,9 +209,9 @@ impl Session {
                 owner.join("enrollment.json"),
                 root,
                 fleet_namespace,
-                &fleet.audience,
+                audience,
             )?),
-            JwtEnrollmentVerifier::new(root, &fleet.audience)?,
+            JwtEnrollmentVerifier::new(root, audience)?,
             Some(credential.trim().into()),
             Arc::new(PolicyExpressionV1::Predicate(
                 PolicyPredicate::TolerateStalePolicy,
@@ -193,7 +219,7 @@ impl Session {
             EnrollmentOptions::default(),
         )?;
         let mut peers = Vec::new();
-        for peer in fleet.peer.iter().collect::<std::collections::BTreeSet<_>>() {
+        for peer in peer.iter().collect::<std::collections::BTreeSet<_>>() {
             hex32(peer, "peer")?;
             tokio::time::timeout(
                 SYNC_BUDGET,
@@ -219,16 +245,16 @@ impl Session {
         node.docs()
             .native_docs()
             .api()
-            .author_import(aster::native::iroh_docs::Author::from_bytes(&root_secret))
+            .author_import(aster::native::iroh_docs::Author::from_bytes(&author_secret))
             .await?;
         Ok(Self {
-            author: aster::AuthorId::from_hex(root_hex.clone()),
+            author: aster::AuthorId::from_hex(hex::encode(author_public)),
             node,
             _enrollment: enrollment,
             _lock: lock,
             root,
             peers,
-            audience: fleet.audience.clone(),
+            audience: audience.to_owned(),
             fleet_namespace,
         })
     }
@@ -278,6 +304,22 @@ impl Session {
         doc.set_bytes_durable(&self.author, key.to_vec(), value)
             .await?;
         Ok(())
+    }
+
+    /// Leave read-only namespaces and shut down without delivering anything.
+    pub async fn close(self, docs: Vec<aster::Doc>) -> Result<()> {
+        for doc in docs {
+            doc.leave().await?;
+        }
+        self.node.shutdown().await;
+        Ok(())
+    }
+
+    /// Where this session keeps local state, such as the review store.
+    pub fn state_path(ctx: &Ctx, name: &str) -> Result<PathBuf> {
+        let cfg = aster_config::load(&ctx.home)?;
+        let profile = cfg.selected_profile_name(ctx.profile.as_deref());
+        Ok(ctx.home.join("enroll-publisher").join(profile).join(name))
     }
 
     /// Deliver every written namespace to every replica, keep serving
