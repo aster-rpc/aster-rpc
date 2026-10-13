@@ -203,6 +203,30 @@ export class AsterServer {
     return { ...(this._native?.peerAttributes(peer) ?? {}) };
   }
 
+  /**
+   * Narrow an enrolled peer's roles at runtime. The credential sets the
+   * maximum; runtime settings can only restrict. From the peer's next call
+   * (calls in flight finish) its effective roles are its credential roles
+   * intersected with `roles`: a role the credential lacks is never granted,
+   * and `[]` leaves it none. Replaces an earlier restriction, survives
+   * renewals of the same credential subject, and ends with the peer's
+   * enrollment session (revocation, eviction, expiry). Throws when `peer`
+   * (hex node id) has no live enrollment session.
+   */
+  restrictPeerRoles(peer: string, roles: readonly string[]): void {
+    if (!this._native) throw new Error('server is not serving');
+    this._native.restrictPeerRoles(peer, [...roles]);
+  }
+
+  /**
+   * Remove `peer`'s role restriction; its credential roles apply again from
+   * its next call. Returns whether one was set.
+   */
+  clearPeerRestriction(peer: string): boolean {
+    if (!this._native) throw new Error('server is not serving');
+    return this._native.clearPeerRestriction(peer);
+  }
+
   private get _native(): NativeDispatchServer | null {
     return this._rpcServer?.dispatchServer ?? null;
   }

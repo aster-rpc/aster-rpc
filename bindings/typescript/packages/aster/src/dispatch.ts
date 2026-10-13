@@ -225,7 +225,9 @@ export class RpcServer {
 
   /**
    * Attribute bridge (design §2.6): the attributes Gate 3 checks `requires`
-   * against for `peer`. `null` clears them.
+   * against for `peer`. `null` clears them. For a peer with a live
+   * enrollment session the credential sets the maximum roles: `aster.role`
+   * here throws (narrow it with `AsterServer.restrictPeerRoles`).
    */
   setPeerAttributes(peer: string, attributes: Record<string, string> | Map<string, string> | null): void {
     const attrs = attributes instanceof Map ? Object.fromEntries(attributes) : attributes;

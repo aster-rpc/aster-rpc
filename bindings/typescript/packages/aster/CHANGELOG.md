@@ -5,6 +5,21 @@ All notable changes to `@aster-rpc/aster` (and its native addon
 
 ## Unreleased
 
+### Changed: the credential sets the maximum roles; runtime can only restrict
+
+For a peer with a live enrollment session, the roles Gate 3 checks are now the
+roles from its credential (`[enrollment.roles]`) intersected with an optional
+runtime restriction. New `AsterServer.restrictPeerRoles(peer, roles)` narrows
+them from the peer's next call (calls in flight finish); `[]` leaves the peer
+no roles; a role the credential lacks is never granted.
+`AsterServer.clearPeerRestriction(peer)` restores the credential roles. A
+restriction survives renewals of the same credential subject and ends with
+the peer's enrollment session (revocation, eviction, expiry);
+`restrictPeerRoles` throws for a peer without a live session. The native
+`DispatchServer.setPeerAttributes` now throws when given `aster.role` for an
+enrolled peer (other keys still apply; the credential's attributes win on a
+clash). Peers without an enrollment session are unchanged.
+
 ### Breaking change: legacy consumer admission removed, replaced by Enrollment
 
 The consumer admission handshake (`aster.consumer_admission` ALPN, the

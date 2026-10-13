@@ -255,6 +255,33 @@ describe.skipIf(!available)('Enrollment on AsterServer / AsterClient from AsterC
     }
   }, 120_000);
 
+  it('a runtime restriction refuses the next call; the credential sets the maximum', async () => {
+    const server = await startServer(serverConfig());
+    try {
+      const session = await connect(server, clientConfig('ops.status,ops.logs'));
+      const peer = session.client.node!.id;
+      expect(await role(session.ops, 'logs')).toBe('ops.logs,ops.status');
+
+      server.restrictPeerRoles(peer, ['ops.status']);
+      expect(await role(session.ops, 'status')).toBe('ops.status');
+      expect(await denied(role(session.ops, 'logs'))).toBe(true);
+
+      // A restriction never grants a role the credential lacks.
+      server.restrictPeerRoles(peer, ['ops.admin']);
+      expect(await denied(role(session.ops, 'logs'))).toBe(true);
+      expect(server.peerAttributes(peer)['aster.role']).toBeUndefined();
+
+      expect(server.clearPeerRestriction(peer)).toBe(true);
+      expect(await role(session.ops, 'logs')).toBe('ops.logs,ops.status');
+      expect(() => server.restrictPeerRoles(SecretKey.nodeId(SecretKey.generate()), ['ops.status'])).toThrow();
+
+      await session.client.close();
+    } finally {
+      await server.close();
+    }
+  }, 120_000);
+
+
   it('a config-driven issuer renews the credentials it signed, across several lifetimes', async () => {
     const key = SecretKey.generate();
     const delegationFile = join(dir, 'issuer.chain');

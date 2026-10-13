@@ -455,10 +455,19 @@ export declare class DispatchServer {
   /**
    * Attribute bridge (design §2.6): set the attributes Gate 3 checks
    * `requires` against for `peer` (hex node id). `null` / empty clears
-   * the entry. Attributes derived from a peer's enrollment credential win
-   * on a key clash.
+   * the entry. For a peer with a live enrollment session the credential
+   * sets the maximum roles: `aster.role` here throws (use
+   * `restrictPeerRoles`), and the credential's attributes win on a clash.
    */
   setPeerAttributes(peer: string, attributes?: Record<string, string> | undefined | null): void
+  /**
+   * Narrow an enrolled `peer`'s roles to `roles` intersected with its
+   * credential roles, from its next call. Throws without a live
+   * enrollment session.
+   */
+  restrictPeerRoles(peer: string, roles: Array<string>): void
+  /** Remove `peer`'s role restriction; returns whether one was set. */
+  clearPeerRestriction(peer: string): boolean
   /** The attributes Gate 3 currently sees for `peer`. */
   peerAttributes(peer: string): Record<string, string>
   /**
