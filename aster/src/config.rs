@@ -10,6 +10,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod enrollment;
+pub use enrollment::{
+    EnrollmentConfig, EnrollmentLimits, RoleMappingConfig, DEFAULT_ROLE_ATTRIBUTE,
+};
+
 /// How the node uses relay servers.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum RelayMode {
@@ -74,23 +79,49 @@ pub struct LoadedIdentity {
 /// are persisted there and survive a restart.
 #[derive(Clone, Debug)]
 pub struct AsterConfig {
-    /// 32-byte Ed25519 root public key for the deployment mesh. Coordination
-    /// pins it; the Go binding's Enrollment install trusts it by default.
-    /// `aster::enrollment::Enrollment::install` takes its root explicitly.
+    /// 32-byte Ed25519 root public key for the deployment: the root
+    /// Enrollment trusts and coordination pins. Env `ASTER_ROOT_PUBKEY`;
+    /// TOML `[trust] root_pubkey`.
     pub root_pubkey: Option<PublicKey>,
     /// Path to a file containing the root public key as hex or JSON
-    /// `{ "public_key": "<hex>" }`.
+    /// `{ "public_key": "<hex>" }`. Env `ASTER_ROOT_PUBKEY_FILE`; TOML
+    /// `[trust] root_pubkey_file`.
     pub root_pubkey_file: Option<PathBuf>,
+    /// Pre-rotation commitment to the next root key (hex BLAKE3, as
+    /// `aster trust show` prints it). With it, Enrollment accepts a rotation
+    /// statement signed by that key; without it the root cannot rotate. Env
+    /// `ASTER_NEXT_ROOT_COMMITMENT`; TOML `[trust] next_root_commitment`.
+    pub next_root_commitment: Option<String>,
+    /// Rotations applied to reach [`root_pubkey`](Self::root_pubkey); 0 for
+    /// an original root. Env `ASTER_ROOT_SEQ`; TOML `[trust] root_seq`.
+    pub root_seq: u64,
+    /// The rotation statements applied to reach the root, oldest first, so
+    /// Enrollment relays them to peers on an older root. Env
+    /// `ASTER_ROOT_ROTATIONS` (comma-separated); TOML `[trust] root_rotations`.
+    pub root_rotations: Vec<String>,
     /// Path to this node's enrollment credential (a delegation chain,
-    /// `aster-chain-v1~…`). The Go binding's Enrollment install presents it
-    /// by default; `Enrollment::install` takes the credential explicitly.
+    /// `aster-chain-v1~…`, as `aster enroll node --out` writes it). Setting
+    /// it switches enrollment on (see [`EnrollmentConfig`]). Env
+    /// `ASTER_ENROLLMENT_CREDENTIAL`; TOML `[trust] enrollment_credential`
+    /// (the names every binding already reads).
     pub enrollment_credential_file: Option<PathBuf>,
-    /// Cloud Instance Identity Document token for the legacy Python consumer
-    /// admission. Enrollment does not use it.
+    /// This node's enrollment credential chain inline; wins over
+    /// [`enrollment_credential_file`](Self::enrollment_credential_file). Env
+    /// `ASTER_ENROLLMENT_CREDENTIAL_CHAIN`; TOML `[trust]
+    /// enrollment_credential_chain`.
+    pub enrollment_credential_chain: Option<String>,
+    /// Retired with the legacy consumer admission: read for the Python and
+    /// TypeScript loaders until phase 3 removes it, and ignored by Rust.
+    #[doc(hidden)]
     pub enrollment_credential_iid: Option<String>,
-    /// Skip the consumer admission gate.
+    /// Retired with the legacy consumer admission: read for the Python and
+    /// TypeScript loaders until phase 3 removes it, and ignored by Rust. A
+    /// node is open exactly when enrollment is not configured.
+    #[doc(hidden)]
     pub allow_all_consumers: bool,
-    /// Skip the producer admission gate.
+    /// Retired with the legacy producer admission: read for the Python and
+    /// TypeScript loaders until phase 3 removes it, and ignored by Rust.
+    #[doc(hidden)]
     pub allow_all_producers: bool,
 
     /// Producer endpoint address for consumer-side dialing.
@@ -210,6 +241,11 @@ pub struct AsterConfig {
     /// list passed to [`Node::start_with_alpns`](crate::Node::start_with_alpns).
     /// Not loaded from env/TOML.
     pub alpns: Vec<Vec<u8>>,
+
+    /// Enrollment for [`AsterServer`](crate::rpc::AsterServer) and
+    /// `AsterClient`: TOML `[enrollment]`, env `ASTER_ENROLLMENT_*`. Off
+    /// unless configured; see [`EnrollmentConfig`].
+    pub enrollment: EnrollmentConfig,
 }
 
 impl AsterConfig {
@@ -267,9 +303,23 @@ impl AsterConfig {
             if let Some(value) = toml_path(trust, "root_pubkey_file", label)? {
                 self.root_pubkey_file = Some(value);
             }
+            if let Some(value) = toml_string(trust, "next_root_commitment", label)? {
+                self.next_root_commitment = Some(value);
+            }
+            if let Some(value) = toml_u64(trust, "root_seq", label)? {
+                self.root_seq = value;
+            }
+            if let Some(value) = toml_string_list(trust, "root_rotations", label)? {
+                self.root_rotations = value.into_iter().filter(|v| !v.is_empty()).collect();
+            }
             if let Some(value) = toml_path(trust, "enrollment_credential", label)? {
                 self.enrollment_credential_file = Some(value);
             }
+            if let Some(value) = toml_string(trust, "enrollment_credential_chain", label)? {
+                self.enrollment_credential_chain = Some(value);
+            }
+            // Retired legacy consumer admission keys: still read for the
+            // Python/TypeScript loaders (phase 3 removes them); no effect here.
             if let Some(value) = toml_string(trust, "enrollment_credential_iid", label)? {
                 self.enrollment_credential_iid = Some(value);
             }
@@ -396,6 +446,8 @@ impl AsterConfig {
             }
         }
 
+        self.enrollment.apply_toml(raw, label)?;
+
         if let Some(health) = toml_section(raw, "health", label)? {
             if let Some(value) = toml_u16(health, "port", label)? {
                 self.health_port = value;
@@ -419,8 +471,33 @@ impl AsterConfig {
         if let Some(value) = env_path("ASTER_ENROLLMENT_CREDENTIAL") {
             self.enrollment_credential_file = Some(value);
         }
+        if let Some(value) = env_string("ASTER_ENROLLMENT_CREDENTIAL_CHAIN") {
+            self.enrollment_credential_chain = Some(value);
+        }
+        if let Some(value) = env_string("ASTER_NEXT_ROOT_COMMITMENT") {
+            self.next_root_commitment = Some(value);
+        }
+        if let Some(value) = env_u64("ASTER_ROOT_SEQ")? {
+            self.root_seq = value;
+        }
+        if let Some(value) = env_string("ASTER_ROOT_ROTATIONS") {
+            self.root_rotations = value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        // Retired legacy consumer admission settings: still read for the
+        // Python/TypeScript loaders (phase 3 removes them); no effect here.
         if let Some(value) = env_string("ASTER_ENROLLMENT_CREDENTIAL_IID") {
             self.enrollment_credential_iid = Some(value);
+        }
+        if let Some(value) = env_bool("ASTER_ALLOW_ALL_CONSUMERS")? {
+            self.allow_all_consumers = value;
+        }
+        if let Some(value) = env_bool("ASTER_ALLOW_ALL_PRODUCERS")? {
+            self.allow_all_producers = value;
         }
         if let Some(value) = env_string("ASTER_ENDPOINT_ADDR") {
             self.endpoint_addr = Some(value);
@@ -431,12 +508,6 @@ impl AsterConfig {
 
         if let Some(value) = env_string("ASTER_ROOT_PUBKEY") {
             self.root_pubkey = Some(parse_public_key("ASTER_ROOT_PUBKEY", &value)?);
-        }
-        if let Some(value) = env_bool("ASTER_ALLOW_ALL_CONSUMERS")? {
-            self.allow_all_consumers = value;
-        }
-        if let Some(value) = env_bool("ASTER_ALLOW_ALL_PRODUCERS")? {
-            self.allow_all_producers = value;
         }
 
         if let Some(value) = env_path("ASTER_STORAGE_PATH") {
@@ -590,6 +661,7 @@ impl AsterConfig {
         if let Some(value) = env_bool("ASTER_HEALTH_ENABLED")? {
             self.health_enabled = Some(value);
         }
+        self.enrollment.apply_env()?;
 
         Ok(())
     }
@@ -692,6 +764,18 @@ impl AsterConfig {
             Error::InvalidArgument(format!("{}: invalid TOML: {e}", path.to_string_lossy()))
         })?;
         parse_identity_value(path, &raw, peer_name, role)
+    }
+
+    /// Whether enrollment is on: [`EnrollmentConfig::enabled`] when set,
+    /// otherwise whether a credential, an audience, a fleet namespace or an
+    /// issuer delegation is configured. A half-configured enrollment is
+    /// therefore an error at start, never an open node.
+    pub fn is_enrollment_enabled(&self) -> bool {
+        self.enrollment.enabled.unwrap_or(
+            self.enrollment.defines_enrollment()
+                || self.enrollment_credential_chain.is_some()
+                || self.enrollment_credential_file.is_some(),
+        )
     }
 
     /// Whether this configuration selects a persistent node.
@@ -841,7 +925,11 @@ impl Default for AsterConfig {
         Self {
             root_pubkey: None,
             root_pubkey_file: None,
+            next_root_commitment: None,
+            root_seq: 0,
+            root_rotations: Vec::new(),
             enrollment_credential_file: None,
+            enrollment_credential_chain: None,
             enrollment_credential_iid: None,
             allow_all_consumers: false,
             allow_all_producers: true,
@@ -882,6 +970,7 @@ impl Default for AsterConfig {
             health_host: "127.0.0.1".into(),
             health_enabled: None,
             alpns: Vec::new(),
+            enrollment: EnrollmentConfig::default(),
         }
     }
 }
@@ -1163,6 +1252,42 @@ impl AsterConfigBuilder {
     /// Health listener bind host (default `127.0.0.1`).
     pub fn health_host(mut self, host: impl Into<String>) -> Self {
         self.config.health_host = host.into();
+        self
+    }
+
+    /// This node's enrollment credential chain, inline (see
+    /// [`AsterConfig::enrollment_credential_chain`]).
+    pub fn enrollment_credential_chain(mut self, chain: impl Into<String>) -> Self {
+        self.config.enrollment_credential_chain = Some(chain.into());
+        self
+    }
+
+    /// This node's enrollment credential file (see
+    /// [`AsterConfig::enrollment_credential_file`]).
+    pub fn enrollment_credential_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.enrollment_credential_file = Some(path.into());
+        self
+    }
+
+    /// Pin the next root (see [`AsterConfig::next_root_commitment`]), with the
+    /// rotations already applied to reach the current root and their
+    /// statements, as an `aster trust` profile records them.
+    pub fn root_rotation(
+        mut self,
+        next_root_commitment: impl Into<String>,
+        root_seq: u64,
+        root_rotations: Vec<String>,
+    ) -> Self {
+        self.config.next_root_commitment = Some(next_root_commitment.into());
+        self.config.root_seq = root_seq;
+        self.config.root_rotations = root_rotations;
+        self
+    }
+
+    /// Enrollment settings (see [`EnrollmentConfig`]); replaces any loaded
+    /// from TOML or the environment.
+    pub fn enrollment(mut self, enrollment: EnrollmentConfig) -> Self {
+        self.config.enrollment = enrollment;
         self
     }
 
@@ -1614,7 +1739,17 @@ mod tests {
         "ASTER_ROOT_PUBKEY",
         "ASTER_ROOT_PUBKEY_FILE",
         "ASTER_ENROLLMENT_CREDENTIAL",
+        "ASTER_ENROLLMENT_CREDENTIAL_CHAIN",
         "ASTER_ENROLLMENT_CREDENTIAL_IID",
+        "ASTER_NEXT_ROOT_COMMITMENT",
+        "ASTER_ROOT_SEQ",
+        "ASTER_ROOT_ROTATIONS",
+        "ASTER_ENROLLMENT_AUDIENCE",
+        "ASTER_ENROLLMENT_FLEET_NAMESPACE",
+        "ASTER_ENROLLMENT_REPLICAS",
+        "ASTER_ENROLLMENT_POLICY",
+        "ASTER_ENROLLMENT_ROLE_ATTRIBUTE",
+        "ASTER_ENROLLMENT_ISSUER_LIFETIME",
         "ASTER_ENDPOINT_ADDR",
         "ASTER_IDENTITY_FILE",
         "ASTER_ALLOW_ALL_CONSUMERS",
@@ -1699,11 +1834,18 @@ mod tests {
         env::set_var("ASTER_ROOT_PUBKEY", hex::encode(root));
         env::set_var("ASTER_ROOT_PUBKEY_FILE", "/tmp/root.pub");
         env::set_var("ASTER_ENROLLMENT_CREDENTIAL", "/tmp/node.cred");
-        env::set_var("ASTER_ENROLLMENT_CREDENTIAL_IID", "iid-token");
+        env::set_var("ASTER_ENROLLMENT_CREDENTIAL_CHAIN", "aster-chain-v1~inline");
+        env::set_var("ASTER_NEXT_ROOT_COMMITMENT", "ab".repeat(32));
+        env::set_var("ASTER_ROOT_SEQ", "2");
+        env::set_var("ASTER_ROOT_ROTATIONS", "s1, s2");
+        env::set_var("ASTER_ENROLLMENT_AUDIENCE", "mc");
+        env::set_var("ASTER_ENROLLMENT_FLEET_NAMESPACE", "cd".repeat(32));
+        env::set_var("ASTER_ENROLLMENT_REPLICAS", "aster1a, aster1b");
+        env::set_var("ASTER_ENROLLMENT_POLICY", r#"{"scope":"ops"}"#);
+        env::set_var("ASTER_ENROLLMENT_ROLE_ATTRIBUTE", "");
+        env::set_var("ASTER_ENROLLMENT_ISSUER_LIFETIME", "2h");
         env::set_var("ASTER_ENDPOINT_ADDR", "aster1ticket");
         env::set_var("ASTER_IDENTITY_FILE", "/tmp/.aster-identity");
-        env::set_var("ASTER_ALLOW_ALL_CONSUMERS", "yes");
-        env::set_var("ASTER_ALLOW_ALL_PRODUCERS", "0");
         env::set_var("ASTER_STORAGE_PATH", "/tmp/aster-data");
         env::set_var(
             "ASTER_SECRET_KEY",
@@ -1748,9 +1890,23 @@ mod tests {
             cfg.enrollment_credential_file.as_ref().unwrap(),
             &PathBuf::from("/tmp/node.cred")
         );
-        assert_eq!(cfg.enrollment_credential_iid.as_deref(), Some("iid-token"));
-        assert!(cfg.allow_all_consumers);
-        assert!(!cfg.allow_all_producers);
+        assert_eq!(
+            cfg.enrollment_credential_chain.as_deref(),
+            Some("aster-chain-v1~inline")
+        );
+        assert_eq!(cfg.next_root_commitment, Some("ab".repeat(32)));
+        assert_eq!(cfg.root_seq, 2);
+        assert_eq!(cfg.root_rotations, ["s1", "s2"]);
+        assert!(cfg.is_enrollment_enabled());
+        assert_eq!(cfg.enrollment.audience.as_deref(), Some("mc"));
+        assert_eq!(cfg.enrollment.fleet_namespace, Some("cd".repeat(32)));
+        assert_eq!(cfg.enrollment.replicas, ["aster1a", "aster1b"]);
+        assert_eq!(
+            cfg.enrollment.policy,
+            Some(serde_json::json!({"scope": "ops"}))
+        );
+        assert_eq!(cfg.enrollment.roles.attribute, "");
+        assert_eq!(cfg.enrollment.issuer_lifetime_secs, Some(7200));
         assert_eq!(cfg.endpoint_addr.as_deref(), Some("aster1ticket"));
         assert_eq!(
             cfg.identity_file.as_ref().unwrap(),
@@ -1806,9 +1962,15 @@ mod tests {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvGuard::new();
 
-        env::set_var("ASTER_ALLOW_ALL_CONSUMERS", "maybe");
+        env::set_var("ASTER_LOCAL_DISCOVERY", "maybe");
         let err = AsterConfig::from_env().unwrap_err();
-        assert!(err.to_string().contains("ASTER_ALLOW_ALL_CONSUMERS"));
+        assert!(err.to_string().contains("ASTER_LOCAL_DISCOVERY"));
+        env::remove_var("ASTER_LOCAL_DISCOVERY");
+
+        env::set_var("ASTER_ENROLLMENT_POLICY", "{not json");
+        let err = AsterConfig::from_env().unwrap_err();
+        assert!(err.to_string().contains("ASTER_ENROLLMENT_POLICY"));
+        env::remove_var("ASTER_ENROLLMENT_POLICY");
     }
 
     #[test]
@@ -1826,8 +1988,7 @@ mod tests {
                 r#"
 [trust]
 root_pubkey = "{}"
-allow_all_consumers = false
-allow_all_producers = false
+root_seq = 1
 
 [connect]
 endpoint_addr = "file-endpoint"
@@ -1863,12 +2024,11 @@ mask = false
 
         env::set_var("ASTER_BIND_ADDR", "127.0.0.1:2222");
         env::set_var("ASTER_RELAY_MODE", "staging");
-        env::set_var("ASTER_ALLOW_ALL_CONSUMERS", "true");
+        env::set_var("ASTER_ROOT_SEQ", "2");
 
         let cfg = AsterConfig::from_file(&config_path).unwrap();
         assert_eq!(cfg.root_pubkey.unwrap().to_bytes(), file_root);
-        assert!(cfg.allow_all_consumers); // env beats TOML
-        assert!(!cfg.allow_all_producers); // TOML beats default
+        assert_eq!(cfg.root_seq, 2); // env beats TOML
         assert_eq!(cfg.endpoint_addr.as_deref(), Some("file-endpoint"));
         assert_eq!(cfg.secret_key.as_ref().unwrap().to_bytes(), file_secret);
         assert_eq!(cfg.bind_addr.as_deref(), Some("127.0.0.1:2222"));

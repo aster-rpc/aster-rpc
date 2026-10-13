@@ -18,6 +18,12 @@
 //! [`Enrollment::accept`]. An online issuer runs `Issuer` (features `rpc`
 //! and `docs`), and nodes renew with `Enrollment::start_renewal`.
 //!
+//! Most applications never call any of this directly: `AsterServer` and
+//! `AsterClient` install Enrollment from the `[enrollment]` section of
+//! [`AsterConfig`](crate::AsterConfig), serve the handshake, map verified
+//! claims to the roles `requires` checks (`RoleMapping`), and renew
+//! credentials. The low-level API stays available as an escape hatch.
+//!
 //! Design and tested invariants: `docs/_internal/working_ideas/aster-enrollment.md`.
 
 pub use aster_transport_core::enrollment::{
@@ -56,6 +62,11 @@ pub use issuer::{
     RenewalHandle, RenewalOutcome, RenewedV1, DEFAULT_ISSUED_LIFETIME, ISSUER_SERVICE,
     ISSUER_SERVICE_VERSION,
 };
+
+#[cfg(all(feature = "rpc", feature = "docs"))]
+pub(crate) mod runtime;
+#[cfg(all(feature = "rpc", feature = "docs"))]
+pub use runtime::{PolicyConfig, RoleMapping};
 
 use aster_transport_core::enrollment::{EnrollmentService, RootAuthoredDocView};
 

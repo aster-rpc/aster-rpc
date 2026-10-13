@@ -30,7 +30,8 @@ pub mod alpns {
 
     /// Producer (mesh-join) admission.
     pub const PRODUCER_ADMISSION: &[u8] = trust::ALPN_PRODUCER_ADMISSION;
-    /// Consumer admission.
+    /// The retired legacy consumer admission; Enrollment replaces it. Kept
+    /// until the Python native module stops exporting it.
     pub const CONSUMER_ADMISSION: &[u8] = trust::ALPN_CONSUMER_ADMISSION;
     /// Delegated (@aster-issued token) admission.
     pub const DELEGATED_ADMISSION: &[u8] = trust::ALPN_DELEGATED_ADMISSION;

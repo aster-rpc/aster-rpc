@@ -1,0 +1,578 @@
+#![cfg(all(feature = "enrollment", feature = "docs", feature = "rpc"))]
+//! Enrollment through the high-level path only: `AsterServer` and
+//! `AsterClient` configured by `AsterConfig`'s `[enrollment]` section. The
+//! root is played with the low-level API (root operations belong to the CLI);
+//! everything the application writes is configuration and `requires`.
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use aster::delegation::{issue_delegation, Chain, DelegationGrant, LinkKind, Validity};
+use aster::enrollment::*;
+use aster::rpc::{
+    require_any_of, require_role, AsterClient, AsterServer, Call, CapabilityRequirement,
+    RpcConnection, RpcStatus, SerializationMode, ServiceDispatch, StatusCode, StreamHeader,
+};
+use aster::{
+    AsterConfig, Credential, Doc, EnrollmentConfig, EnrollmentLimits, Node, PublicKey, RelayMode,
+    SecretKey, Ticket,
+};
+
+const FLEET: &str = "mission-control";
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+fn key(seed: u8) -> SecretKey {
+    SecretKey::from_bytes([seed; 32])
+}
+fn public(seed: u8) -> [u8; 32] {
+    JwtEnrollmentIssuer::from_seed(&[seed; 32]).public_key()
+}
+fn role_claims(roles: Option<&str>) -> AdmissionClaims {
+    let mut attributes = std::collections::BTreeMap::new();
+    if let Some(roles) = roles {
+        attributes.insert("aster.role".into(), TypedAttribute::String(roles.into()));
+    }
+    AdmissionClaims {
+        scopes: Some(BTreeSet::new()),
+        tags: Some(BTreeSet::new()),
+        attributes: Some(attributes),
+    }
+}
+/// A root-issued credential for `seed`, carrying `roles` in `aster.role`.
+fn credential(seed: u8, roles: Option<&str>) -> String {
+    let mut request = EnrollmentIssueRequest::new(public(seed), FLEET, now() + 3600);
+    request.claims = role_claims(roles);
+    issue_credential(&key(1), &request, now())
+        .unwrap()
+        .into_chain()
+}
+
+/// `status` requires `ops.status`; `logs` requires `ops.logs` or
+/// `ops.admin`; `ping` is open. Each echoes the caller's `aster.role`.
+struct Ops;
+
+#[async_trait::async_trait]
+impl ServiceDispatch for Ops {
+    fn name(&self) -> &str {
+        "Ops"
+    }
+    fn version(&self) -> i32 {
+        1
+    }
+    fn methods(&self) -> &[&str] {
+        &["ping", "status", "logs"]
+    }
+    fn method_requires(&self, method: &str) -> Option<CapabilityRequirement> {
+        match method {
+            "status" => Some(require_role("ops.status")),
+            "logs" => Some(require_any_of(["ops.logs", "ops.admin"])),
+            _ => None,
+        }
+    }
+    async fn dispatch(&self, _method: &str, mut call: Call) {
+        let _ = call.recv_request().await;
+        let role = call
+            .attributes()
+            .get("aster.role")
+            .cloned()
+            .unwrap_or_default();
+        let _ = call.respond(role.into_bytes(), &RpcStatus::ok()).await;
+    }
+}
+
+fn header(method: &str) -> StreamHeader {
+    StreamHeader {
+        service: "Ops".into(),
+        method: method.into(),
+        version: 1,
+        serialization_mode: SerializationMode::Xlang.as_i8(),
+        ..Default::default()
+    }
+}
+
+async fn call(rpc: &RpcConnection, method: &str) -> aster::Result<String> {
+    let reply = tokio::time::timeout(Duration::from_secs(10), rpc.unary(&header(method), vec![1]))
+        .await
+        .map_err(|_| aster::Error::Connection("call timed out".into()))??;
+    Ok(String::from_utf8(reply).unwrap())
+}
+
+fn denied(result: &aster::Result<String>) -> bool {
+    matches!(result, Err(e) if e.rpc_code() == Some(StatusCode::PermissionDenied))
+}
+
+fn base(seed: u8) -> aster::AsterConfigBuilder {
+    AsterConfig::builder()
+        .relay(RelayMode::Disabled)
+        .bind_addr("127.0.0.1:0")
+        .secret_key(key(seed))
+        .root_pubkey(PublicKey::from_bytes(public(1)))
+}
+
+/// The server: seed 2, with a root-issued credential.
+fn server_base() -> aster::AsterConfigBuilder {
+    base(2).enrollment_credential_chain(credential(2, None))
+}
+
+fn namespace(doc: &Doc) -> [u8; 32] {
+    hex::decode(doc.id().unwrap().to_string())
+        .unwrap()
+        .try_into()
+        .unwrap()
+}
+
+async fn wait_for_addr(node: &Node) {
+    for _ in 0..100 {
+        if !node.addr().direct_addresses.is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The root: holds the writable fleet namespace and serves enrollment, as a
+/// CLI publication session or a long-running policy replica would.
+struct Root {
+    node: Node,
+    fleet: Doc,
+    enrollment: Enrollment,
+    _files: tempfile::TempDir,
+}
+
+impl Root {
+    async fn start() -> Self {
+        let files = tempfile::tempdir().unwrap();
+        let node = Node::start_with_alpns(
+            base(1)
+                .hooks(true)
+                .hook_failure_mode(aster::HookFailureMode::FailClosed)
+                .build(),
+            vec![ENROLLMENT_ALPN.to_vec()],
+        )
+        .await
+        .unwrap();
+        wait_for_addr(&node).await;
+        let fleet = node.docs().create().await.unwrap();
+        let enrollment = Enrollment::install(
+            &node,
+            Arc::new(
+                EnrollmentPolicyStore::open(
+                    files.path().join("root.json"),
+                    public(1),
+                    namespace(&fleet),
+                    FLEET,
+                )
+                .unwrap(),
+            ),
+            JwtEnrollmentVerifier::new(public(1), FLEET).unwrap(),
+            Some(credential(1, None)),
+            Arc::new(PolicyExpressionV1::Predicate(
+                PolicyPredicate::TolerateStalePolicy,
+            )),
+            EnrollmentOptions::default(),
+        )
+        .unwrap();
+        enrollment.set_policy_document(&fleet).unwrap();
+        let served = (node.clone(), enrollment.clone());
+        tokio::spawn(async move {
+            let (node, enrollment) = served;
+            while let Ok((alpn, connection)) = node.accept().await {
+                if alpn == ENROLLMENT_ALPN {
+                    let enrollment = enrollment.clone();
+                    tokio::spawn(async move {
+                        if enrollment.accept(&connection).await.is_ok() {
+                            connection.closed().await;
+                        }
+                    });
+                }
+            }
+        });
+        Self {
+            node,
+            fleet,
+            enrollment,
+            _files: files,
+        }
+    }
+
+    fn ticket(&self) -> String {
+        Ticket::from_node_addr(&self.node.addr(), Credential::Open)
+            .unwrap()
+            .to_base58()
+            .unwrap()
+    }
+
+    fn namespace(&self) -> String {
+        hex::encode(namespace(&self.fleet))
+    }
+
+    /// Publish a revoked registration for `subject` in the fleet namespace.
+    async fn revoke(&self, subject: [u8; 32]) {
+        let record = NodeRegistrationV1 {
+            version: 1,
+            issuer: hex::encode(public(1)),
+            subject: hex::encode(subject),
+            audience: Audience::One(FLEET.into()),
+            revision: 1,
+            issued_at: now() - 60,
+            not_before: None,
+            expires_at: None,
+            status: NodeRegistrationStatus::Revoked,
+            claims: role_claims(None),
+            mandatory: vec![],
+            reauthorizes_revision: None,
+            reason: Some("test".into()),
+        };
+        let author = self.node.docs().default_author().await.unwrap();
+        self.fleet
+            .set_bytes(
+                &author,
+                node_registration_key(&subject),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+}
+
+/// The server's `[enrollment]` section.
+fn server_enrollment(root: &Root, state: &std::path::Path) -> EnrollmentConfig {
+    EnrollmentConfig {
+        audience: Some(FLEET.into()),
+        fleet_namespace: Some(root.namespace()),
+        state_path: Some(state.join("server-enrollment.json")),
+        limits: EnrollmentLimits {
+            reconciliation_interval_ms: Some(200),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+async fn start_server(config: AsterConfig) -> aster::Result<AsterServer> {
+    let server = AsterServer::builder()
+        .service(Ops)
+        .config(config)
+        .start()
+        .await?;
+    wait_for_addr(server.node()).await;
+    Ok(server)
+}
+
+fn client_config(root: &Root, seed: u8, chain: String) -> AsterConfig {
+    base(seed)
+        .enrollment_credential_chain(chain)
+        .enrollment(EnrollmentConfig {
+            audience: Some(FLEET.into()),
+            fleet_namespace: Some(root.namespace()),
+            ..Default::default()
+        })
+        .build()
+}
+
+async fn connect(server: &AsterServer, config: AsterConfig) -> aster::Result<AsterClient> {
+    AsterClient::builder()
+        .config(config)
+        .address(server.address()?)
+        .connect()
+        .await
+}
+
+/// The roles in a client's credential are what `requires` checks, with no
+/// application code; a credential without the role is refused, and a node
+/// with no credential cannot even reach the RPC service. A revocation the
+/// root publishes refuses the next call and closes the connection.
+#[tokio::test]
+async fn credential_roles_gate_requires_and_root_revocation_closes_the_connection() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        // No replicas: the server holds the fleet namespace and the root
+        // publishes into it, as `aster enroll revoke --peer <server>` does.
+        let server = start_server(
+            server_base()
+                .enrollment(server_enrollment(&root, files.path()))
+                .build(),
+        )
+        .await
+        .unwrap();
+        assert!(server.enrollment().is_some());
+        assert!(server.take_admission().is_none(), "Enrollment owns Gate 0");
+
+        let operator = connect(
+            &server,
+            client_config(&root, 5, credential(5, Some("ops.status, ops.logs"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            call(&operator.rpc(), "ping").await.unwrap(),
+            "ops.logs,ops.status"
+        );
+        assert_eq!(
+            call(&operator.rpc(), "status").await.unwrap(),
+            "ops.logs,ops.status"
+        );
+        assert_eq!(
+            call(&operator.rpc(), "logs").await.unwrap(),
+            "ops.logs,ops.status"
+        );
+
+        let ingest = connect(
+            &server,
+            client_config(&root, 6, credential(6, Some("ops.ingest"))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(call(&ingest.rpc(), "ping").await.unwrap(), "ops.ingest");
+        assert!(denied(&call(&ingest.rpc(), "status").await));
+        assert!(denied(&call(&ingest.rpc(), "logs").await));
+
+        // No enrollment at all: Gate 0 refuses the connection itself.
+        let stranger = AsterClient::builder()
+            .config(base(8).build())
+            .address(server.address().unwrap())
+            .connect()
+            .await;
+        match stranger {
+            Err(_) => {}
+            Ok(stranger) => {
+                assert!(call(&stranger.rpc(), "ping").await.is_err());
+                stranger.close().await;
+            }
+        }
+
+        // The root enrolls with the server and delivers a revocation of the
+        // operator into the fleet namespace the server holds.
+        let mut revoked = server.enrollment().unwrap().revocations();
+        root.enrollment.connect(server.node().addr()).await.unwrap();
+        root.revoke(public(5)).await;
+        root.fleet
+            .sync_with_timeout(&[server.id()], Duration::from_secs(15))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if revoked.recv().await.unwrap().peer == public(5) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the server revokes the operator");
+        let rpc = operator.rpc();
+        assert!(call(&rpc, "status").await.is_err(), "revoked: refused");
+        assert!(call(&rpc, "ping").await.is_err(), "connection closed");
+        // Unaffected peers keep working.
+        assert_eq!(call(&ingest.rpc(), "ping").await.unwrap(), "ops.ingest");
+
+        for client in [operator, ingest] {
+            client.close().await;
+        }
+        server.shutdown().await;
+        root.node.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A server configured as a delegated issuer serves renewals; a client whose
+/// credential that server signed renews automatically and stays admitted, and
+/// its roles keep working, across several short lifetimes. The server syncs
+/// policy from a configured replica (the root).
+#[tokio::test]
+async fn config_driven_issuer_renews_client_credentials() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let delegation: Chain = issue_delegation(
+            &key(1),
+            None,
+            &key(2).public_key(),
+            &Audience::One(FLEET.into()),
+            &DelegationGrant {
+                may_issue: [LinkKind::Enrollment].into(),
+                audiences: [FLEET.to_string()].into(),
+                scopes: BTreeSet::new(),
+                tags: BTreeSet::new(),
+                attribute_keys: ["aster.role".to_string()].into(),
+                max_child_lifetime: 3600,
+                max_depth: 0,
+                subjects: None,
+                operations: BTreeSet::new(),
+                mandatory: BTreeSet::new(),
+                may_register: false,
+            },
+            Validity {
+                issued_at: now(),
+                not_before: None,
+                expires_at: now() + 3600,
+            },
+        )
+        .unwrap();
+        let delegation_file = files.path().join("issuer.chain");
+        std::fs::write(&delegation_file, format!("{}\n", delegation.to_text())).unwrap();
+        let server = start_server(
+            server_base()
+                .enrollment(EnrollmentConfig {
+                    replicas: vec![root.ticket()],
+                    issuer_delegation_file: Some(delegation_file),
+                    issuer_lifetime_secs: Some(6),
+                    ..server_enrollment(&root, files.path())
+                })
+                .build(),
+        )
+        .await
+        .unwrap();
+        let issuer = server.issuer().expect("configured issuer");
+        let issued = issuer
+            .issue_for(
+                &public(7),
+                role_claims(Some("ops.status")),
+                Registration::Ephemeral,
+            )
+            .unwrap()
+            .into_chain();
+
+        let client = connect(&server, client_config(&root, 7, issued.clone()))
+            .await
+            .unwrap();
+        assert!(client.is_renewing(), "the server signed it, so it renews");
+        let deadline = now() + 3 * 6 + 2;
+        while now() < deadline {
+            assert_eq!(call(&client.rpc(), "status").await.unwrap(), "ops.status");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let (current, _) = client.enrollment().unwrap().credential().unwrap();
+        assert_ne!(current, issued, "the credential was renewed");
+
+        client.close().await;
+        server.shutdown().await;
+        root.node.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// Misconfiguration stops the start with an error that names the problem;
+/// nothing runs open.
+#[tokio::test]
+async fn misconfiguration_fails_closed_with_a_clear_error() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let good = server_enrollment(&root, files.path());
+
+        async fn refused(config: AsterConfig, expect: &str) {
+            let error = match start_server(config).await {
+                Ok(_) => panic!("started despite: {expect}"),
+                Err(error) => error.to_string(),
+            };
+            assert!(error.contains(expect), "{expect:?} not in {error:?}");
+        }
+
+        refused(
+            server_base()
+                .enrollment(EnrollmentConfig {
+                    audience: None,
+                    ..good.clone()
+                })
+                .build(),
+            "audience is required",
+        )
+        .await;
+        refused(
+            AsterConfig::builder()
+                .relay(RelayMode::Disabled)
+                .secret_key(key(2))
+                .enrollment_credential_chain(credential(2, None))
+                .enrollment(good.clone())
+                .build(),
+            "no trusted root",
+        )
+        .await;
+        refused(
+            server_base()
+                .enrollment(EnrollmentConfig {
+                    state_path: None,
+                    ..good.clone()
+                })
+                .build(),
+            "keeps denials durably",
+        )
+        .await;
+        refused(base(2).enrollment(good.clone()).build(), "no credential").await;
+        // A file path where the inline chain belongs.
+        refused(
+            base(2)
+                .enrollment_credential_chain("/etc/aster/server.cred")
+                .enrollment(good.clone())
+                .build(),
+            "ASTER_ENROLLMENT_CREDENTIAL)",
+        )
+        .await;
+        // A credential issued for another key.
+        refused(
+            base(2)
+                .enrollment_credential_chain(credential(3, None))
+                .enrollment(good.clone())
+                .build(),
+            "enrollment:",
+        )
+        .await;
+        refused(
+            server_base()
+                .enrollment(EnrollmentConfig {
+                    policy: Some(serde_json::json!("allow_everyone")),
+                    ..good.clone()
+                })
+                .build(),
+            "policy",
+        )
+        .await;
+        refused(
+            server_base()
+                .enrollment(EnrollmentConfig {
+                    fleet_namespace: Some("not-hex".into()),
+                    ..good.clone()
+                })
+                .build(),
+            "fleet_namespace",
+        )
+        .await;
+        // Enabled with nothing else set: still refused, never open.
+        refused(
+            server_base()
+                .enrollment(EnrollmentConfig {
+                    enabled: Some(true),
+                    ..Default::default()
+                })
+                .build(),
+            "audience is required",
+        )
+        .await;
+
+        // A client: no credential, and server-only issuer settings.
+        let server = start_server(server_base().enrollment(good.clone()).build())
+            .await
+            .unwrap();
+        let mut no_credential = client_config(&root, 5, String::new());
+        no_credential.enrollment_credential_chain = None;
+        let error = connect(&server, no_credential).await.err().unwrap();
+        assert!(error.to_string().contains("no credential"), "{error}");
+        let mut issuer = client_config(&root, 5, credential(5, None));
+        issuer.enrollment.issuer_delegation_file = Some(files.path().join("x"));
+        let error = connect(&server, issuer).await.err().unwrap();
+        assert!(error.to_string().contains("server-only"), "{error}");
+        server.shutdown().await;
+        root.node.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

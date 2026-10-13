@@ -94,6 +94,9 @@ pub struct AsterServerBuilder {
     // Health listener override; `None` defers to the config's `[health]` keys.
     #[cfg(feature = "health")]
     health: Option<crate::ops::HealthConfig>,
+    // Code overrides of the `[enrollment]` policy and role mapping.
+    #[cfg(all(feature = "enrollment", feature = "docs"))]
+    enrollment_overrides: crate::enrollment::runtime::Overrides,
 }
 
 impl AsterServerBuilder {
@@ -106,6 +109,27 @@ impl AsterServerBuilder {
     #[cfg(feature = "health")]
     pub fn health(mut self, config: crate::ops::HealthConfig) -> Self {
         self.health = Some(config);
+        self
+    }
+
+    /// Admit enrolled peers with this policy instead of the configured
+    /// `[enrollment] policy` (for example a custom
+    /// [`AdmissionPolicy`](crate::enrollment::AdmissionPolicy)). Enrollment
+    /// itself is still switched on by the configuration.
+    #[cfg(all(feature = "enrollment", feature = "docs"))]
+    pub fn enrollment_policy(
+        mut self,
+        policy: impl crate::enrollment::AdmissionPolicy + 'static,
+    ) -> Self {
+        self.enrollment_overrides.policy = Some(Arc::new(policy));
+        self
+    }
+
+    /// Map verified claims to Gate-3 roles with `mapping` instead of the
+    /// configured `[enrollment.roles]`.
+    #[cfg(all(feature = "enrollment", feature = "docs"))]
+    pub fn enrollment_roles(mut self, mapping: crate::enrollment::RoleMapping) -> Self {
+        self.enrollment_overrides.roles = Some(mapping);
         self
     }
 
@@ -422,9 +446,15 @@ impl AsterServerBuilder {
             }
             builder = builder.secret_key_file(path.clone());
         }
-        // `mut` for `resolve_root_pubkey(&mut self)`, which only the
-        // coordination graph calls.
-        #[cfg_attr(not(feature = "coordination"), allow(unused_mut))]
+        // `mut` for `resolve_root_pubkey(&mut self)` (coordination) and for
+        // the hook settings Enrollment requires.
+        #[cfg_attr(
+            not(any(
+                feature = "coordination",
+                all(feature = "enrollment", feature = "docs")
+            )),
+            allow(unused_mut)
+        )]
         let mut config = builder.build();
 
         // The deployment ROOT public key, resolved once, here. Coordination
@@ -465,10 +495,31 @@ impl AsterServerBuilder {
             ));
         }
 
+        // Enrollment from `[enrollment]`: validated in full before the node
+        // starts, so a misconfiguration fails here with nothing to clean up.
+        #[cfg(all(feature = "enrollment", feature = "docs"))]
+        let enrollment_plan = crate::enrollment::runtime::plan(
+            &mut config,
+            crate::enrollment::runtime::Side::Server,
+            self.enrollment_overrides,
+        )?;
+        #[cfg(not(all(feature = "enrollment", feature = "docs")))]
+        if config.is_enrollment_enabled() {
+            return Err(Error::InvalidArgument(
+                "enrollment is configured ([enrollment] / ASTER_ENROLLMENT_*) but aster was \
+                 built without the `enrollment` and `docs` features"
+                    .into(),
+            ));
+        }
+
         // `aster/1` always; blobs/docs/gossip ALPNs are registered by core.
         // `route_alpn`/`with_expose` also push their ALPN into `extra_alpns`, so
         // dedup before registering (a user may also have called `.alpn(...)`).
         let mut alpns = vec![RPC_ALPN.to_vec()];
+        #[cfg(all(feature = "enrollment", feature = "docs"))]
+        if enrollment_plan.is_some() {
+            alpns.push(crate::enrollment::ENROLLMENT_ALPN.to_vec());
+        }
         for alpn in self.extra_alpns {
             if !alpns.contains(&alpn) {
                 alpns.push(alpn);
@@ -524,6 +575,39 @@ impl AsterServerBuilder {
         for svc in self.services {
             server = server.register_arc(svc);
         }
+        // Enrollment: installed before anything is served. It owns Gate 0
+        // (every non-enrollment ALPN), feeds Gate 3 the roles of each peer's
+        // live session, and, as a delegated issuer, serves renewals.
+        #[cfg(all(feature = "enrollment", feature = "docs"))]
+        let enrollment = match &enrollment_plan {
+            None => None,
+            Some(plan) => {
+                let installed = match plan.install(&node) {
+                    Ok(installed) => installed,
+                    Err(err) => {
+                        node.shutdown().await;
+                        return Err(err);
+                    }
+                };
+                attributes.set_source(Arc::new(crate::enrollment::runtime::EnrollmentAttributes {
+                    enrollment: installed.enrollment.clone(),
+                    mapping: plan.mapping.clone(),
+                }));
+                if let Some(issuer) = &installed.issuer {
+                    server = server.register(issuer.clone());
+                }
+                let routed = installed.enrollment.clone();
+                server = server.route_alpn(crate::enrollment::ENROLLMENT_ALPN, move |connection| {
+                    let enrollment = routed.clone();
+                    tokio::spawn(async move {
+                        if enrollment.accept(&connection).await.is_ok() {
+                            connection.closed().await;
+                        }
+                    });
+                });
+                Some(installed)
+            }
+        };
         // Baseline `aster.ops.NodeInfo` — registered unless disabled, with the
         // node_id stamped from the just-started node's key. The handle stays
         // on the AsterServer so the served identity can be updated live.
@@ -608,6 +692,29 @@ impl AsterServerBuilder {
         let handle = server.serve();
         let http = self.http.map(|t| t.serve(dispatcher.clone()));
 
+        // The acceptor is running: enroll with the policy replicas (or hold
+        // the fleet namespace for the root to publish into), then renew.
+        #[cfg(all(feature = "enrollment", feature = "docs"))]
+        let enrollment = match (enrollment_plan, enrollment) {
+            (Some(plan), Some(installed)) => {
+                if let Err(err) = plan.attach_policy(&node, &installed.enrollment).await {
+                    handle.abort();
+                    if let Some(http) = &http {
+                        http.abort();
+                    }
+                    node.shutdown().await;
+                    return Err(err);
+                }
+                let renewal = plan.start_renewal(&installed.enrollment, None);
+                Some(ServerEnrollment {
+                    enrollment: installed.enrollment,
+                    issuer: installed.issuer,
+                    _renewal: renewal,
+                })
+            }
+            _ => None,
+        };
+
         // The acceptor is running, so a peer can reach us. Only now open
         // storage, create the Raft, attach it, and run the start corridor.
         //
@@ -669,8 +776,19 @@ impl AsterServerBuilder {
             coordination,
             #[cfg(feature = "health")]
             health,
+            #[cfg(all(feature = "enrollment", feature = "docs"))]
+            enrollment,
         })
     }
+}
+
+/// The Enrollment an [`AsterServer`] installed from its configuration.
+#[cfg(all(feature = "enrollment", feature = "docs"))]
+struct ServerEnrollment {
+    enrollment: crate::enrollment::Enrollment,
+    issuer: Option<crate::enrollment::Issuer>,
+    /// Renewal of this server's own credential; dropping it stops renewal.
+    _renewal: Option<crate::enrollment::RenewalHandle>,
 }
 
 /// Binding support: the baseline services [`AsterServerBuilder`] registers,
@@ -772,6 +890,9 @@ pub struct AsterServer {
     /// The health/metrics HTTP listener, when enabled.
     #[cfg(feature = "health")]
     health: Option<crate::ops::HealthServer>,
+    /// Enrollment, when `[enrollment]` is configured.
+    #[cfg(all(feature = "enrollment", feature = "docs"))]
+    enrollment: Option<ServerEnrollment>,
 }
 
 impl AsterServer {
@@ -782,6 +903,23 @@ impl AsterServer {
     #[cfg(feature = "health")]
     pub fn health(&self) -> Option<&crate::ops::HealthServer> {
         self.health.as_ref()
+    }
+
+    /// The [`Enrollment`](crate::enrollment::Enrollment) this server
+    /// installed from `[enrollment]`, or `None` when enrollment is off. Use it
+    /// to check peers, follow revocations or apply root rotations.
+    #[cfg(all(feature = "enrollment", feature = "docs"))]
+    pub fn enrollment(&self) -> Option<&crate::enrollment::Enrollment> {
+        self.enrollment.as_ref().map(|e| &e.enrollment)
+    }
+
+    /// The delegated [`Issuer`](crate::enrollment::Issuer) this server runs
+    /// when `[enrollment.issuer] delegation_file` is set. It already serves
+    /// `aster.enrollment.IssuerV1` renewals; use
+    /// [`issue_for`](crate::enrollment::Issuer::issue_for) to enroll new nodes.
+    #[cfg(all(feature = "enrollment", feature = "docs"))]
+    pub fn issuer(&self) -> Option<&crate::enrollment::Issuer> {
+        self.enrollment.as_ref().and_then(|e| e.issuer.as_ref())
     }
 
     /// Start configuring a server.
@@ -834,7 +972,9 @@ impl AsterServer {
     }
 
     /// The Gate-3 [`AttributeStore`] this server checks. Populate it from your
-    /// admission logic to grant per-peer roles.
+    /// admission logic to grant per-peer roles. With enrollment configured,
+    /// each enrolled peer's roles come from its verified claims without any
+    /// entry here.
     pub fn attributes(&self) -> &AttributeStore {
         &self.attributes
     }
@@ -846,7 +986,8 @@ impl AsterServer {
     }
 
     /// Take the admission handle (one-shot) for Gate-0 connection gating.
-    /// Returns `None` unless built with [`hooks(true)`](AsterServerBuilder::hooks).
+    /// Returns `None` unless built with [`hooks(true)`](AsterServerBuilder::hooks),
+    /// and always `None` when enrollment is configured (Enrollment owns Gate 0).
     /// With the `otel` feature its accept/reject decisions are counted in
     /// `aster.admission.*` (and so on a health listener's `/metrics`).
     pub fn take_admission(&self) -> Option<crate::admission::Admission> {

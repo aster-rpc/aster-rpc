@@ -14,12 +14,26 @@ use std::sync::{Arc, RwLock};
 
 pub use aster_transport_core::contract::{CapabilityKind, CapabilityRequirement, ROLE_ATTRIBUTE};
 
+/// A source of per-peer attributes computed when a call arrives rather than
+/// stored, such as the claims of a peer's current enrollment session. It is
+/// consulted on every Gate-3 check, so a revoked or expired session stops
+/// contributing at once. It must be cheap and must not block.
+pub trait AttributeSource: Send + Sync + 'static {
+    /// `peer`'s attributes, or `None` when this source knows nothing of it.
+    fn attributes(&self, peer: &str) -> Option<HashMap<String, String>>;
+}
+
 /// A clone-shared map from peer id (hex `NodeId`) to that peer's attributes
 /// (e.g. `{"aster.role": "operator"}`). The application injects entries — the
 /// RPC server only reads them. Cheap to clone (`Arc` bump).
+///
+/// An optional [`AttributeSource`] (an `AsterServer` with enrollment installs
+/// one) is layered over the stored entries: its attributes win on a key
+/// collision, because they are verified by the root.
 #[derive(Clone, Default)]
 pub struct AttributeStore {
     inner: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
+    source: Arc<RwLock<Option<Arc<dyn AttributeSource>>>>,
 }
 
 impl AttributeStore {
@@ -40,19 +54,33 @@ impl AttributeStore {
         self.set(peer, attrs);
     }
 
-    /// Remove all attributes for `peer`.
+    /// Remove all stored attributes for `peer`. A source's attributes are
+    /// not affected.
     pub fn remove(&self, peer: &str) {
         self.inner.write().unwrap().remove(peer);
     }
 
-    /// The attributes recorded for `peer` (empty map if none).
+    /// Layer `source` over the stored entries for this store and every clone
+    /// of it, replacing any previous source.
+    pub fn set_source(&self, source: Arc<dyn AttributeSource>) {
+        *self.source.write().unwrap() = Some(source);
+    }
+
+    /// The attributes recorded for `peer` (empty map if none), with the
+    /// source's attributes layered over them.
     pub fn get(&self, peer: &str) -> HashMap<String, String> {
-        self.inner
+        let mut attributes = self
+            .inner
             .read()
             .unwrap()
             .get(peer)
             .cloned()
-            .unwrap_or_default()
+            .unwrap_or_default();
+        let source = self.source.read().unwrap().clone();
+        if let Some(derived) = source.and_then(|source| source.attributes(peer)) {
+            attributes.extend(derived);
+        }
+        attributes
     }
 }
 

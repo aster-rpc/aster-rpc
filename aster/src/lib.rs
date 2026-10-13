@@ -118,8 +118,8 @@ pub use aster_transport_core::trust::{
     TrustMode,
 };
 pub use config::{
-    AsterConfig, AsterConfigBuilder, AsterIdentityPeer, LoadedIdentity, PublishedServices,
-    RelayMode,
+    AsterConfig, AsterConfigBuilder, AsterIdentityPeer, EnrollmentConfig, EnrollmentLimits,
+    LoadedIdentity, PublishedServices, RelayMode, RoleMappingConfig, DEFAULT_ROLE_ATTRIBUTE,
 };
 
 /// The Aster RPC ALPN (`aster/1`). Also [`alpns::RPC`] and, with the `rpc`
@@ -155,4 +155,4 @@ pub use gossip::{Gossip, GossipEvent, GossipTopic};
 // Convenience: `#[aster::service]` and `#[derive(aster::AsterType)]` at the crate
 // root (both also available under `aster::rpc`).
 #[cfg(feature = "rpc")]
-pub use rpc::{service, AsterServer, AsterType};
+pub use rpc::{service, AsterClient, AsterServer, AsterType};

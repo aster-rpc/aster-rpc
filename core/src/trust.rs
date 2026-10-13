@@ -10,7 +10,10 @@ use std::time::{Duration, SystemTime};
 
 /// Producer mesh admission ALPN.
 pub const ALPN_PRODUCER_ADMISSION: &[u8] = b"aster.producer_admission";
-/// Consumer admission ALPN.
+/// The retired legacy consumer admission ALPN. Enrollment
+/// (`ENROLLMENT_ALPN`) replaces it; it stays in the default admission set only
+/// until the Python/TypeScript native modules and binding gates stop naming it
+/// (enrollment design, "Legacy consumer admission retired").
 pub const ALPN_CONSUMER_ADMISSION: &[u8] = b"aster.consumer_admission";
 /// Delegated admission ALPN.
 pub const ALPN_DELEGATED_ADMISSION: &[u8] = b"aster.admission";

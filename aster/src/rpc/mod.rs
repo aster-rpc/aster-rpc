@@ -21,6 +21,7 @@
 //! - [`Call`] is the per-call server context: pull requests, emit responses,
 //!   finish with an [`RpcStatus`].
 
+pub mod aster_client;
 pub mod auth;
 pub mod baseline;
 pub mod client;
@@ -45,9 +46,10 @@ pub mod streaming;
 #[cfg(all(feature = "docs", feature = "blobs"))]
 pub mod publish;
 
+pub use aster_client::{AsterClient, AsterClientBuilder};
 pub use auth::{
-    require_all_of, require_any_of, require_role, AttributeStore, AuthContext, AuthOutcome,
-    Authenticator, CapabilityKind, CapabilityRequirement, ROLE_ATTRIBUTE,
+    require_all_of, require_any_of, require_role, AttributeSource, AttributeStore, AuthContext,
+    AuthOutcome, Authenticator, CapabilityKind, CapabilityRequirement, ROLE_ATTRIBUTE,
 };
 pub use client::{
     BidiSink, CallOptions, RequestSink, ResponseFuture, ResponseStream, RpcConnection, RpcSession,
