@@ -21,9 +21,9 @@ use tokio::task::AbortHandle;
 use super::{
     admit, local_clock_synchronization, AdmissionContext, AdmissionDecision,
     AdmissionEvidenceSource, AdmissionPolicy, ClockSynchronization, DenialReason, EnrollmentError,
-    EnrollmentPolicyStore, JwtEnrollmentVerifier, ObservedSourceAddress, PolicySynchronization,
-    RecordAvailability, RecordError, SourceAddressProvenance, SynchronizationSource,
-    VerifiedAdmissionEvidence, MAX_CHAIN_BYTES,
+    EnrollmentPolicyStore, JwtEnrollmentVerifier, NamespaceBindingV1, NamespacePurpose,
+    ObservedSourceAddress, PolicyStores, PolicySynchronization, RecordAvailability, RecordError,
+    SourceAddressProvenance, SynchronizationSource, VerifiedAdmissionEvidence, MAX_CHAIN_BYTES,
 };
 use crate::delegation::ChainError;
 use crate::{
@@ -244,8 +244,17 @@ struct Presentation {
 #[serde(deny_unknown_fields)]
 struct Welcome {
     version: u8,
+    /// Read ticket for the fleet namespace.
     policy_ticket: Option<String>,
+    /// Read tickets for bound namespaces whose `read_scopes` intersect the
+    /// joining node's verified scopes and which this replica holds.
+    #[serde(default)]
+    bound_tickets: Vec<String>,
 }
+
+/// Bound-namespace tickets kept from one replica between `connect` and
+/// `synchronize`; each is honoured only for a namespace the fleet binds.
+const MAX_OFFERED_TICKETS: usize = 32;
 
 struct RateState {
     started: Instant,
@@ -316,11 +325,17 @@ pub struct EnrollmentService {
     this: Weak<Self>,
     node: CoreNode,
     store: Arc<EnrollmentPolicyStore>,
+    /// The fleet store and one store per bound membership namespace.
+    stores: PolicyStores,
     verifier: JwtEnrollmentVerifier,
     credential: Option<String>,
     policy: Arc<dyn AdmissionPolicy>,
     options: EnrollmentOptions,
     document: RwLock<Option<CoreDoc>>,
+    /// Documents for namespaces the fleet binds, by namespace id.
+    bound_documents: RwLock<BTreeMap<[u8; 32], CoreDoc>>,
+    /// Bound-namespace read tickets each replica offered at `connect`.
+    offered_tickets: Mutex<BTreeMap<[u8; 32], Vec<String>>>,
     policy_watch: Mutex<Option<AbortHandle>>,
     context: RwLock<AdmissionContext>,
     sessions: Mutex<BTreeMap<[u8; 32], Session>>,
@@ -406,6 +421,8 @@ impl EnrollmentService {
             .take_hook_receiver()
             .ok_or_else(|| anyhow!("enrollment requires unused node hooks"))?;
         let service = Self::new(node, store, verifier, credential, policy, options);
+        // Bound stores keep their own durable denials across restart.
+        service.stores.sync_bindings()?;
         service.spawn_hook_loop(hooks);
         let weak = Arc::downgrade(&service);
         let interval = service.options.reconciliation_interval;
@@ -436,6 +453,9 @@ impl EnrollmentService {
         Arc::new_cyclic(|this| Self {
             this: this.clone(),
             node,
+            stores: PolicyStores::new(store.clone()),
+            bound_documents: RwLock::new(BTreeMap::new()),
+            offered_tickets: Mutex::new(BTreeMap::new()),
             store,
             verifier,
             credential,
@@ -548,6 +568,180 @@ impl EnrollmentService {
         true
     }
 
+    /// Attach a document for a namespace the fleet binds, such as one this
+    /// node holds as a writer. Membership registrations in it take part in
+    /// admission, and joining nodes whose verified scopes intersect the
+    /// binding's `read_scopes` receive a read ticket for it.
+    pub fn add_policy_document(&self, doc: CoreDoc) -> Result<NamespaceBindingV1> {
+        let namespace = namespace(&doc.doc_id())?;
+        let binding = self
+            .stores
+            .sync_bindings()?
+            .into_iter()
+            .find(|binding| binding.namespace == hex::encode(namespace))
+            .ok_or_else(|| anyhow!("namespace is not bound by the fleet"))?;
+        self.bound_documents
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(namespace, doc);
+        Ok(binding)
+    }
+
+    /// Documents this node holds for currently bound namespaces of `purpose`.
+    pub fn policy_documents(
+        &self,
+        purpose: NamespacePurpose,
+    ) -> Vec<(NamespaceBindingV1, CoreDoc)> {
+        let documents = self
+            .bound_documents
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        self.store
+            .bindings()
+            .into_iter()
+            .filter(|binding| binding.purpose == purpose)
+            .filter_map(|binding| {
+                let namespace = namespace(&binding.namespace).ok()?;
+                let doc = documents.get(&namespace)?.clone();
+                Some((binding, doc))
+            })
+            .collect()
+    }
+
+    fn membership_documents(&self) -> Vec<(Arc<EnrollmentPolicyStore>, CoreDoc)> {
+        let documents = self
+            .bound_documents
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        documents
+            .iter()
+            .filter_map(|(namespace, doc)| Some((self.stores.membership(namespace)?, doc.clone())))
+            .collect()
+    }
+
+    /// Read tickets for bound namespaces this replica holds whose
+    /// `read_scopes` intersect the peer's verified scopes. The observations
+    /// namespace is never shared this way: observers get write access by a
+    /// sealed grant and only the root reads it.
+    async fn bound_tickets(&self, evidence: &VerifiedAdmissionEvidence) -> Result<Vec<String>> {
+        let scopes = evidence.claims().scopes.clone().unwrap_or_default();
+        let mut tickets = Vec::new();
+        for (binding, doc) in [NamespacePurpose::Membership, NamespacePurpose::ExecGrants]
+            .into_iter()
+            .flat_map(|purpose| self.policy_documents(purpose))
+        {
+            if !binding.read_scopes.is_disjoint(&scopes) {
+                tickets.push(doc.share_with_addr("read".into()).await?);
+            }
+        }
+        Ok(tickets)
+    }
+
+    /// Join and sync the bound namespaces `peer` offered at `connect`. Only a
+    /// read capability for a namespace the fleet binds, from that peer, is
+    /// accepted; the replica's offer carries no authority of its own.
+    async fn synchronize_bound(&self, peer: [u8; 32]) -> Result<()> {
+        use iroh_docs::{Capability, DocTicket};
+        use iroh_tickets::Ticket;
+        let offered = self
+            .offered_tickets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer)
+            .unwrap_or_default();
+        let bindings = self.stores.sync_bindings()?;
+        for ticket in offered {
+            let mut decoded = DocTicket::decode_string(&ticket)?;
+            ensure!(
+                matches!(decoded.capability, Capability::Read(_)),
+                "bound policy tickets must be read-only"
+            );
+            let bound = namespace(&decoded.capability.id().to_string())?;
+            let Some(binding) = bindings.iter().find(|binding| {
+                binding.namespace == hex::encode(bound)
+                    && binding.purpose != NamespacePurpose::Observations
+            }) else {
+                continue;
+            };
+            decoded.nodes.retain(|node| node.id.as_bytes() == &peer);
+            ensure!(
+                !decoded.nodes.is_empty(),
+                "bound policy ticket has no authenticated replica address"
+            );
+            let doc = self
+                .node
+                .docs_client()
+                .join(decoded.encode_string())
+                .await?;
+            let store = (binding.purpose == NamespacePurpose::Membership)
+                .then(|| self.stores.membership(&bound))
+                .flatten();
+            self.bound_documents
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(bound, doc.clone());
+            self.sync_document(&doc, peer, store.as_deref(), false)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// One sync round with `peer`, waiting until it completes and, when a
+    /// store is given, until that store has no pending content.
+    async fn sync_document(
+        &self,
+        doc: &CoreDoc,
+        peer: [u8; 32],
+        store: Option<&EnrollmentPolicyStore>,
+        fleet: bool,
+    ) -> Result<()> {
+        use futures_lite::StreamExt;
+        let events = doc.doc.subscribe().await?;
+        futures_lite::pin!(events);
+        doc.start_sync(vec![hex::encode(peer)]).await?;
+        let mut synchronized = false;
+        let mut backoff = crate::CrossedSyncBackoff::default();
+        loop {
+            match events.next().await {
+                Some(Ok(iroh_docs::engine::LiveEvent::SyncFinished(event)))
+                    if identity(&event.peer.to_string())? == peer =>
+                {
+                    match &event.result {
+                        Ok(_) => synchronized = true,
+                        // The replica's own sync on gossip neighbour-up
+                        // crossed our direct join. The other direction
+                        // normally completes on its own; dial again in
+                        // case the replica cannot reach us. The caller's
+                        // deadline still bounds it.
+                        Err(error) if crate::crossed_sync_abort(error) => {
+                            tokio::time::sleep(backoff.next()).await;
+                            doc.start_sync(vec![hex::encode(peer)]).await?;
+                        }
+                        Err(error) => bail!("policy sync failed: {error}"),
+                    }
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => return Err(error),
+                None => bail!("policy sync ended"),
+            }
+            if synchronized {
+                let Some(store) = store else {
+                    return Ok(());
+                };
+                let report = store.refresh(doc).await?;
+                if fleet {
+                    self.context
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .pending_policy_content = report.has_uncertainty();
+                }
+                if report.pending == 0 {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     pub fn revocations(&self) -> broadcast::Receiver<EnrollmentRevoked> {
         self.revoked.subscribe()
     }
@@ -605,6 +799,7 @@ impl EnrollmentService {
         let Ok(report) = self.store.refresh(doc).await else {
             return;
         };
+        let _ = self.stores.sync_bindings();
         let mut context = self.context.write().unwrap_or_else(|e| e.into_inner());
         context.pending_policy_content = report.has_uncertainty();
         if report.pending == 0 {
@@ -728,9 +923,13 @@ impl EnrollmentService {
         if let Some(doc) = &doc {
             unresolved = self.refresh_issue(self.store.refresh_node(doc, peer).await);
         }
+        for (store, doc) in self.membership_documents() {
+            let issue = self.refresh_issue(store.refresh_node(&doc, peer).await);
+            unresolved = unresolved.or(issue);
+        }
         // Independent root registration replaces presentation evidence. An
         // obsolete/expired chain must not block a newer valid registration.
-        if let Ok(registration) = self.store.select_evidence(peer, None, unix_now()) {
+        if let Ok(registration) = self.stores.select_evidence(peer, None, unix_now()) {
             if let Some(issue) = unresolved {
                 return Err(issue);
             }
@@ -741,7 +940,7 @@ impl EnrollmentService {
         let chain = token
             .map(|token| {
                 self.verifier
-                    .verify_with(token, peer, unix_now(), self.store.as_ref())
+                    .verify_with(token, peer, unix_now(), &self.stores)
             })
             .transpose()
             .map_err(|error| match error {
@@ -768,7 +967,7 @@ impl EnrollmentService {
             }
         }
         let evidence = self
-            .store
+            .stores
             .select_evidence(peer, chain.as_ref(), unix_now())
             .map_err(AdmissionError::from_record)?;
         if let Some(issue) = unresolved {
@@ -821,16 +1020,7 @@ impl EnrollmentService {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         context.observed_source = observed_source;
-        match admit(
-            evidence,
-            self.store.as_ref(),
-            &context,
-            policy,
-            timeout,
-            unix_now,
-        )
-        .await
-        {
+        match admit(evidence, &self.stores, &context, policy, timeout, unix_now).await {
             AdmissionDecision::Allow => Ok(()),
             AdmissionDecision::Deny(reason) => Err(AdmissionError::from_reason(reason)),
         }
@@ -979,7 +1169,7 @@ impl EnrollmentService {
         {
             return AdmissionError::Denied(reason.clone());
         }
-        match self.store.select_evidence(peer, None, unix_now()) {
+        match self.stores.select_evidence(peer, None, unix_now()) {
             Err(RecordError::Denied(reason)) if reason.is_definite() => {
                 AdmissionError::Denied(reason)
             }
@@ -1060,11 +1250,13 @@ impl EnrollmentService {
                 Some(doc) => Some(doc.share_with_addr("read".into()).await?),
                 None => None,
             };
+            let bound_tickets = self.bound_tickets(&evidence).await?;
             transmit(
                 &send,
                 &Welcome {
                     version: 1,
                     policy_ticket: ticket,
+                    bound_tickets,
                 },
             )
             .await?;
@@ -1168,6 +1360,18 @@ impl EnrollmentService {
                     "replica did not complete enrollment"
                 );
                 self.evaluate(&evidence, source).await?;
+                let mut offered = welcome.bound_tickets;
+                offered.truncate(MAX_OFFERED_TICKETS);
+                {
+                    let mut tickets = self
+                        .offered_tickets
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if tickets.len() >= MAX_OFFERED_TICKETS && !tickets.contains_key(&peer) {
+                        tickets.pop_first();
+                    }
+                    tickets.insert(peer, offered);
+                }
                 Ok((self.remember(evidence, source)?, welcome.policy_ticket))
             }
             .await;
@@ -1216,50 +1420,13 @@ impl EnrollmentService {
             .docs_client()
             .join(decoded.encode_string())
             .await?;
-        let events = doc.doc.subscribe().await?;
-        futures_lite::pin!(events);
         self.set_policy_document(doc.clone())?;
         self.note_pending_policy_content();
-        doc.start_sync(vec![hex::encode(peer)]).await?;
         let result = tokio::time::timeout(timeout, async {
-            use futures_lite::StreamExt;
-            let mut synchronized = false;
-            let mut backoff = crate::CrossedSyncBackoff::default();
-            loop {
-                match events.next().await {
-                    Some(Ok(iroh_docs::engine::LiveEvent::SyncFinished(event)))
-                        if identity(&event.peer.to_string())? == peer =>
-                    {
-                        match &event.result {
-                            Ok(_) => synchronized = true,
-                            // The replica's own sync on gossip neighbour-up
-                            // crossed our direct join. The other direction
-                            // normally completes on its own; dial again in
-                            // case the replica cannot reach us. The deadline
-                            // still bounds it.
-                            Err(error) if crate::crossed_sync_abort(error) => {
-                                tokio::time::sleep(backoff.next()).await;
-                                doc.start_sync(vec![hex::encode(peer)]).await?;
-                            }
-                            Err(error) => bail!("policy sync failed: {error}"),
-                        }
-                    }
-                    Some(Ok(_)) => {}
-                    Some(Err(error)) => return Err(error),
-                    None => bail!("policy sync ended"),
-                }
-                if synchronized {
-                    let report = self.store.refresh(&doc).await?;
-                    self.context
-                        .write()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .pending_policy_content = report.has_uncertainty();
-                    if report.pending == 0 {
-                        break;
-                    }
-                }
-            }
-            Ok::<(), anyhow::Error>(())
+            self.sync_document(&doc, peer, Some(self.store.as_ref()), true)
+                .await?;
+            self.stores.sync_bindings()?;
+            self.synchronize_bound(peer).await
         })
         .await;
         result.map_err(|_| anyhow!("policy synchronization timeout"))??;
@@ -1406,10 +1573,17 @@ impl EnrollmentService {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         if let Some(doc) = doc {
-            let pending = match self.store.refresh(&doc).await {
+            let mut pending = match self.store.refresh(&doc).await {
                 Ok(report) => report.has_uncertainty(),
                 Err(_) => true,
             };
+            pending |= self.stores.sync_bindings().is_err();
+            for (store, doc) in self.membership_documents() {
+                pending |= store
+                    .refresh(&doc)
+                    .await
+                    .map_or(true, |report| report.has_uncertainty());
+            }
             self.context
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
@@ -1434,7 +1608,7 @@ impl EnrollmentService {
         let mut pending = VecDeque::new();
         for (peer, evidence, source, generation) in peers {
             match self
-                .store
+                .stores
                 .select_evidence(&peer, Some(&evidence), unix_now())
             {
                 Err(RecordError::Denied(reason)) if reason.is_definite() => {

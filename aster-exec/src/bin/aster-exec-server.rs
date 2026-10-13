@@ -170,6 +170,20 @@ mod linux {
         if document.id()?.to_string() != config.policy_namespace {
             return Err("policy ticket namespace differs from pinned namespace".into());
         }
+        // Grants live in the Exec-grant namespace the fleet binds for this
+        // node's role, when there is one; otherwise in the fleet namespace.
+        let mut bound_grants = enrollment.policy_documents(NamespacePurpose::ExecGrants);
+        if bound_grants.len() > 1 {
+            return Err("more than one Exec-grant namespace is bound for this node".into());
+        }
+        let (grant_namespace, grant_document, grant_state) = match bound_grants.pop() {
+            Some((binding, bound)) => (
+                identity(&binding.namespace)?,
+                bound,
+                format!("grants-{}.redb", binding.namespace),
+            ),
+            None => (namespace, document, "grants.redb".to_string()),
+        };
         let audit = Arc::new(AuditOutbox::open(config.audit).await?);
         let guarantees = GuaranteesV1 {
             profile: "open".into(),
@@ -210,12 +224,12 @@ mod linux {
             Arc::new(enrollment.clone()),
             Arc::new(DocsGrantProvider {
                 store: Arc::new(ExecGrantStore::open(
-                    &config.state_directory.join("grants.redb"),
+                    &config.state_directory.join(grant_state),
                     root,
-                    namespace,
+                    grant_namespace,
                     config.audience,
                 )?),
-                document,
+                document: grant_document,
             }),
             audit.clone(),
             Arc::new(LinuxRuntime {

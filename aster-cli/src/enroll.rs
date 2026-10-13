@@ -5,6 +5,9 @@
 //! delegation chain. Every link expires, and lifetimes are sized to the
 //! profile's root cadence (enrollment design §4).
 
+mod policy;
+mod publish;
+
 use crate::files::read_bounded;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -37,6 +40,11 @@ pub enum EnrollCommand {
     Node(NodeArgs),
     /// Delegate bounded issuing authority to an online issuer, such as an orchestrator
     Delegate(DelegateArgs),
+    /// Create policy namespaces and bind them to the fleet as the root
+    #[command(subcommand)]
+    Namespace(policy::NamespaceCommand),
+    /// Revoke or reactivate an online issuer as the root
+    Issuer(policy::IssuerArgs),
 }
 
 #[derive(Debug, Args)]
@@ -177,11 +185,12 @@ impl Report for IssuedReport {
 
 pub async fn run(ctx: &Ctx, command: EnrollCommand) -> Result<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let report = match command {
-        EnrollCommand::Node(args) => issue_node(ctx, args, now)?,
-        EnrollCommand::Delegate(args) => issue_delegate(ctx, args, now)?,
-    };
-    ctx.emit(&report)
+    match command {
+        EnrollCommand::Node(args) => ctx.emit(&issue_node(ctx, args, now)?),
+        EnrollCommand::Delegate(args) => ctx.emit(&issue_delegate(ctx, args, now)?),
+        EnrollCommand::Namespace(command) => policy::namespace(ctx, command).await,
+        EnrollCommand::Issuer(args) => policy::issuer(ctx, args, now).await,
+    }
 }
 
 /// The profile's pinned root and declared cadence.

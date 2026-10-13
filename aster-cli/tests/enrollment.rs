@@ -481,3 +481,41 @@ fn explicit_key_requires_a_configured_profile_root() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("configured root public key"));
     assert!(!out.exists());
 }
+
+#[test]
+fn namespace_create_writes_an_owner_only_secret_once() {
+    let f = Fixture::new("namespace");
+    let secret = f.0.join("build.secret");
+    let created = f.run(&[
+        "enroll",
+        "namespace",
+        "create",
+        "--out-secret",
+        secret.to_str().unwrap(),
+    ]);
+    assert!(created.status.success(), "{created:?}");
+    let report: serde_json::Value = serde_json::from_slice(&created.stdout).unwrap();
+    let text = std::fs::read_to_string(&secret).unwrap();
+    let bytes: [u8; 32] = hex::decode(text.trim()).unwrap().try_into().unwrap();
+    assert_eq!(
+        report["namespace"],
+        hex::encode(aster::NamespaceSecret::from_bytes(bytes).id().to_bytes())
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&secret).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    let again = f.run(&[
+        "enroll",
+        "namespace",
+        "create",
+        "--out-secret",
+        secret.to_str().unwrap(),
+    ]);
+    assert!(!again.status.success());
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), text);
+}

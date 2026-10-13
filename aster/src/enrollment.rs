@@ -151,6 +151,43 @@ impl Enrollment {
         self.inner.set_policy_document(document.enrollment_core())
     }
 
+    /// Attach a document for a namespace the fleet binds (for example one the
+    /// root or a replica holds). Membership registrations in it take part in
+    /// admission, and joining nodes whose verified scopes intersect the
+    /// binding's `read_scopes` receive a read ticket for it.
+    #[cfg(feature = "docs")]
+    pub fn add_policy_document(
+        &self,
+        document: &crate::docs::Doc,
+    ) -> anyhow::Result<NamespaceBindingV1> {
+        self.inner.add_policy_document(document.enrollment_core())
+    }
+
+    /// Documents this node holds for currently bound namespaces of `purpose`,
+    /// such as the Exec-grant namespaces it received tickets for.
+    #[cfg(feature = "docs")]
+    pub fn policy_documents(
+        &self,
+        purpose: NamespacePurpose,
+    ) -> Vec<(NamespaceBindingV1, crate::docs::Doc)> {
+        self.inner
+            .policy_documents(purpose)
+            .into_iter()
+            .map(|(binding, doc)| {
+                (
+                    binding,
+                    crate::docs::Doc::from_enrollment_core(
+                        doc,
+                        self.node.enrollment_core().docs_client(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Sync the fleet namespace from `peer`, then every bound namespace it
+    /// offered a read ticket for at `connect`. Returns the fleet document;
+    /// bound ones are available from [`Self::policy_documents`].
     #[cfg(feature = "docs")]
     pub async fn synchronize(
         &self,

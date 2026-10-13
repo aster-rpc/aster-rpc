@@ -57,6 +57,7 @@ mod records;
 mod root_records;
 mod root_revisions;
 mod store;
+mod stores;
 
 pub(crate) use jwt::canonical_identity;
 
@@ -88,3 +89,4 @@ pub use root_records::{
 };
 pub use root_revisions::{check_root_revision, should_record_rejection, RootRevisionError};
 pub use store::{EnrollmentPolicyStore, PolicyRefreshIssue, PolicyRefreshReport, RecordError};
+pub use stores::PolicyStores;

@@ -103,6 +103,28 @@ enum StoreRole {
     Membership,
 }
 
+/// A store's view of one subject's registration, for resolution across
+/// namespaces (see `PolicyStores`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RegistrationView {
+    /// An accepted active record; activity and authentication are checked
+    /// when evidence is selected from it.
+    Active {
+        revision: u64,
+        reauthorizes_revision: Option<u64>,
+    },
+    /// A revoked or superseded record, or a rejected statement barrier.
+    Denied { revision: u64, reason: DenialReason },
+}
+
+impl RegistrationView {
+    pub(super) fn revision(&self) -> u64 {
+        match self {
+            Self::Active { revision, .. } | Self::Denied { revision, .. } => *revision,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PersistedPolicy {
@@ -409,6 +431,45 @@ impl EnrollmentPolicyStore {
             .filter(|binding| binding.status == BindingStatus::Active)
             .cloned()
             .collect()
+    }
+    pub(super) fn failed(&self) -> bool {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).failed
+    }
+    /// This namespace's statement about `peer`, before any choice between
+    /// namespaces. A rejected-statement barrier is a denial at its revision.
+    pub(super) fn registration_view(&self, peer: &[u8; 32]) -> Option<RegistrationView> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let subject = hex::encode(peer);
+        let record = state
+            .policy
+            .nodes
+            .get(&subject)
+            .map(|node| match node.status {
+                NodeRegistrationStatus::Active => RegistrationView::Active {
+                    revision: node.revision,
+                    reauthorizes_revision: node.reauthorizes_revision,
+                },
+                _ => RegistrationView::Denied {
+                    revision: node.revision,
+                    reason: DenialReason::NodeRevoked,
+                },
+            });
+        let rejected =
+            state
+                .policy
+                .rejected_nodes
+                .get(&subject)
+                .map(|revision| RegistrationView::Denied {
+                    revision: *revision,
+                    reason: DenialReason::RegistrationRejected,
+                });
+        match (record, rejected) {
+            (Some(record), Some(rejected)) if rejected.revision() >= record.revision() => {
+                Some(rejected)
+            }
+            (Some(record), _) => Some(record),
+            (None, rejected) => rejected,
+        }
     }
     fn check_doc(&self, doc: &CoreDoc) -> Result<(), RecordError> {
         if doc.doc.id().as_bytes() != &self.namespace {
