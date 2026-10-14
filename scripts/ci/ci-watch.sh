@@ -16,6 +16,7 @@ FORGE="${ASTER_FORGE_URL:-https://forge.emrul.dev}"
 REPO="${ASTER_FORGE_REPO:-Aster/aster-rpc-internal}"
 LOG_HOST="${ASTER_FORGE_LOG_HOST:-ubuntu@51.195.190.65}"
 LOG_ROOT="${ASTER_FORGE_LOG_ROOT:-/srv/portal/forgejo/forgejo-data/gitea/actions_log}"
+LOG_DB="${ASTER_FORGE_LOG_DB:-portal-forgejo-db}"
 POLL="${ASTER_CI_WATCH_POLL:-30}"
 APPEAR_TIMEOUT="${ASTER_CI_WATCH_APPEAR:-600}"
 
@@ -72,13 +73,20 @@ explain() {
   echo
   echo "=== $name (task $id) failed"
   path="$(ssh -o ConnectTimeout=15 "$LOG_HOST" "sudo find '$LOG_ROOT' -name '$id.log*' | head -1" 2>/dev/null || true)"
-  if [[ -z "$path" ]]; then
-    echo "(log not on disk yet; open $FORGE/$REPO/actions)"
-    return
-  fi
   local log
   log="$(mktemp)"
-  if [[ "$path" == *.zst ]]; then
+  if [[ -z "$path" ]]; then
+    # Forgejo keeps a log in its database filesystem (dbfs) until it moves it
+    # to storage, and for some long jobs it never does. The dbfs copy is plain
+    # text despite its .zst name; zstd -dcf passes it through either way.
+    local query="select string_agg(encode(d.blob_data,'hex'),'' order by d.blob_offset) from dbfs_data d join dbfs_meta m on m.id=d.meta_id where m.full_path like '%actions_log/$REPO/%/$id.log%'"
+    ssh "$LOG_HOST" "sudo docker exec $LOG_DB psql -U forgejo -d forgejo -At -c \"$query\" | xxd -r -p" \
+      | zstd -dcf >"$log" 2>/dev/null || true
+    if [[ ! -s "$log" ]]; then
+      echo "(log not in storage or dbfs yet; open $FORGE/$REPO/actions)"
+      return
+    fi
+  elif [[ "$path" == *.zst ]]; then
     ssh "$LOG_HOST" "sudo cat '$path'" | zstd -dc >"$log"
   else
     ssh "$LOG_HOST" "sudo cat '$path'" >"$log"
