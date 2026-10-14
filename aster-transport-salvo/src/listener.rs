@@ -115,10 +115,10 @@ pub(crate) struct QuicOwner {
 impl QuicOwner {
     pub(crate) fn bind(
         config: quinn::ServerConfig,
+        socket: std::net::UdpSocket,
         addr: SocketAddr,
     ) -> Result<(Self, salvo::conn::quinn::QuinnAcceptor), String> {
         use quinn::Runtime;
-        let socket = std::net::UdpSocket::bind(addr).map_err(|e| e.to_string())?;
         let runtime = Arc::new(quinn::TokioRuntime);
         let inner = runtime.wrap_udp_socket(socket).map_err(|e| e.to_string())?;
         let release = Arc::new(SocketRelease::default());

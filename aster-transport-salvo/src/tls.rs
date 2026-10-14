@@ -355,17 +355,37 @@ pub(crate) async fn start_pem_listener(
         );
     }
     let config = rustls_config(&tls)?;
-    let tcp = TcpListener::new(addr.to_owned())
-        .rustls(config.clone())
-        .try_bind()
-        .await
-        .map_err(|e| e.to_string())?;
-    let tcp_addr = tcp
-        .holdings()
-        .first()
-        .and_then(|h| h.local_addr.clone().into_std())
-        .ok_or("TCP listener did not report its bound address")?;
-    let (handle, server, quic) = if webtransport {
+    // WebTransport serves UDP on the TCP listener's port. With port 0 the
+    // kernel picks a free TCP port whose UDP twin may already be in use, so
+    // pick again rather than fail. An explicit port is never retried.
+    let ephemeral = addr
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| a.port() == 0);
+    let mut attempts = 0;
+    let (tcp, tcp_addr, udp) = loop {
+        let tcp = TcpListener::new(addr.to_owned())
+            .rustls(config.clone())
+            .try_bind()
+            .await
+            .map_err(|e| e.to_string())?;
+        let tcp_addr = tcp
+            .holdings()
+            .first()
+            .and_then(|h| h.local_addr.clone().into_std())
+            .ok_or("TCP listener did not report its bound address")?;
+        if !webtransport {
+            break (tcp, tcp_addr, None);
+        }
+        match std::net::UdpSocket::bind(tcp_addr) {
+            Ok(udp) => break (tcp, tcp_addr, Some(udp)),
+            Err(e) if ephemeral && e.kind() == std::io::ErrorKind::AddrInUse && attempts < 16 => {
+                attempts += 1;
+                drop(tcp);
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
+    let (handle, server, quic) = if let Some(udp) = udp {
         let mut quinn_config = config.build_quinn_config().map_err(|e| e.to_string())?;
         // Preserve the default transport settings used by QuinnListener.
         let mut transport = TransportConfig::default();
@@ -376,7 +396,7 @@ pub(crate) async fn start_pem_listener(
                 .map_err(|e| format!("invalid idle timeout: {e}"))?,
         ));
         quinn_config.transport_config(Arc::new(transport));
-        let (owner, quinn) = QuicOwner::bind(quinn_config, tcp_addr)?;
+        let (owner, quinn) = QuicOwner::bind(quinn_config, udp, tcp_addr)?;
         let acceptor = salvo::conn::JoinedAcceptor::new(quinn, tcp);
         let (handle, server) = serve_owned(acceptor, service);
         (handle, server, Some(owner))
