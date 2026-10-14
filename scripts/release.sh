@@ -20,11 +20,14 @@ WORKFLOW=linux.yml
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 allow_dirty=false
 push=true
+candidate_only=false
 for arg in "$@"; do
   case "$arg" in
     --allow-dirty) allow_dirty=true ;;
     --no-push) push=false ;;
-    *) echo "usage: scripts/release.sh [--allow-dirty] [--no-push]" >&2; exit 2 ;;
+    # Qualify HEAD (every producer, sealed candidate) without tagging it.
+    --candidate-only) candidate_only=true ;;
+    *) echo "usage: scripts/release.sh [--allow-dirty] [--no-push] [--candidate-only]" >&2; exit 2 ;;
   esac
 done
 
@@ -48,6 +51,7 @@ if git -C "$repo" rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
     exit 1
   }
   echo "$tag already tags HEAD"
+  if [[ "$candidate_only" == true ]]; then exit 0; fi
 else
   # The dispatch runs whatever origin/main points at; it must be this commit.
   git -C "$repo" fetch -q origin main
@@ -102,6 +106,10 @@ for r in json.load(sys.stdin).get("workflow_runs", []):
     exit 1
   }
   echo "release candidate run ${final% *} succeeded and sealed $head"
+  if [[ "$candidate_only" == true ]]; then
+    echo "not tagging (--candidate-only); rerun without it to release $tag"
+    exit 0
+  fi
 
   git -C "$repo" tag -a "$tag" -m "Aster $version"
   echo "created $tag at $(git -C "$repo" rev-parse --short HEAD)"
