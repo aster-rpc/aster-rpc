@@ -512,7 +512,12 @@ class CandidateTests(unittest.TestCase):
         # First-attempt rule binds the candidate dispatch, in every job.
         guard = 'if [[ "$FORGEJO_EVENT_NAME" == workflow_dispatch && "$FORGEJO_REF" == refs/heads/main ]]; then'
         self.assertEqual(workflow.count(guard), len(blocks))
-        self.assertNotIn('"$FORGEJO_EVENT_NAME" == push', workflow)
+        # The old push-based first-attempt guard is gone ...
+        self.assertNotIn('"$FORGEJO_EVENT_NAME" == push && "$FORGEJO_REF"', workflow)
+        # ... and a push builds unstamped only in the three gate jobs that build
+        # the tree; release-candidate.py refuses an unstamped build off a push.
+        unstamped = {job for job, block in blocks.items() if 'ASTER_UNSTAMPED_VERSION=' in block}
+        self.assertEqual(unstamped, {"rust-tests", "test", "typescript"})
         # The dispatch names its commit and lint refuses any other checkout.
         self.assertIn("  workflow_dispatch:\n    inputs:\n      sha:", workflow)
         self.assertIn('CANDIDATE_SHA: ${{ forgejo.event.inputs.sha }}', blocks["lint"])

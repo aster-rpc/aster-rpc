@@ -289,7 +289,13 @@ def verify_python_install(wheel: Path, interpreter: str) -> None:
     """Prove tests import the wheel's Python and native bytes, at this exact version."""
     code = "import aster,aster._aster,importlib.metadata,json; d=importlib.metadata.distribution('aster-rpc'); print(json.dumps({'package':aster.__file__,'distribution_package':str(d.locate_file('aster/__init__.py')),'native':aster._aster.__file__,'version':aster.VERSION,'native_version':aster._aster.VERSION,'distribution_version':d.version}))"
     installed = json.loads(subprocess.check_output([interpreter, "-c", code], text=True))
-    if any(installed[key] != identity()["version"] for key in ("version", "native_version", "distribution_version")):
+    # A push gate builds the committed, unstamped tree (linux.yml sets
+    # ASTER_UNSTAMPED_VERSION there and records nothing); candidates are stamped.
+    unstamped = os.environ.get("ASTER_UNSTAMPED_VERSION")
+    if unstamped and os.environ.get("FORGEJO_EVENT_NAME") != "push":
+        fail("an unstamped build is only allowed in a push gate")
+    expected = unstamped or identity()["version"]
+    if any(installed[key] != expected for key in ("version", "native_version", "distribution_version")):
         fail("installed Python/native version differs from exact candidate")
     package = Path(installed["package"]).parent
     if Path(installed["package"]) != Path(installed["distribution_package"]):
