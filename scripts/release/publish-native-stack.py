@@ -508,7 +508,7 @@ def download_bridge(package: Package, destination: Path) -> Path:
     return package_root / "Cargo.toml"
 
 
-def validate_package(package: Package, manifest_path: Path) -> None:
+def validate_package(package: Package, manifest_path: Path) -> list[str]:
     metadata_result = run(
         [
             "cargo",
@@ -571,21 +571,49 @@ def validate_package(package: Package, manifest_path: Path) -> None:
             f"{package.name} contains Cargo-reserved package files: "
             + ", ".join(reserved)
         )
+    return sorted(
+        {
+            dependency["name"]
+            for dependency in matches[0]["dependencies"]
+            if dependency["name"] in PACKAGE_NAMES and dependency.get("kind") != "dev"
+        }
+    )
 
 
 def publish_package(package: Package, manifest_path: Path) -> None:
-    common = [
-        "cargo",
-        "publish",
-        "--registry",
-        "aster",
-        "--allow-dirty",
-        "--manifest-path",
-        str(manifest_path),
-    ]
-    run(common + ["--dry-run"], cwd=manifest_path.parent)
-    run(common, cwd=manifest_path.parent)
+    verify_package(manifest_path)
+    run(
+        [
+            "cargo",
+            "publish",
+            "--registry",
+            "aster",
+            "--allow-dirty",
+            "--manifest-path",
+            str(manifest_path),
+        ],
+        cwd=manifest_path.parent,
+    )
     wait_until_published(package.name, package.version)
+
+
+def verify_package(manifest_path: Path) -> None:
+    # Builds the packaged crate on its own, outside any workspace that might
+    # enable features it uses but does not declare (iroh-blobs 0.103.6 needed
+    # tokio's rt-multi-thread and failed here only at release).
+    run(
+        [
+            "cargo",
+            "publish",
+            "--registry",
+            "aster",
+            "--allow-dirty",
+            "--dry-run",
+            "--manifest-path",
+            str(manifest_path),
+        ],
+        cwd=manifest_path.parent,
+    )
 
 
 def main() -> int:
@@ -640,7 +668,7 @@ def main() -> int:
                         vendor_manifests[package.name] = manifest_path
                 else:
                     manifest_path = source_manifest
-            validate_package(package, manifest_path)
+            wave_dependencies = validate_package(package, manifest_path)
             if already_published and package.kind != "bridge":
                 changed = published_source_drift(
                     package, manifest_path.parent, staging
@@ -664,8 +692,25 @@ def main() -> int:
                 continue
             if args.mode == "publish":
                 publish_package(package, manifest_path)
-            else:
+                continue
+            if already_published:
                 print(f"✓ {package.name} {package.version}")
+                continue
+            # A new version is verified now when everything it depends on is
+            # already in the registry; otherwise only publish can, in order.
+            pending = [
+                name
+                for name in wave_dependencies
+                if not is_published(name, PACKAGE_VERSIONS[name])
+            ]
+            if pending:
+                print(
+                    f"✓ {package.name} {package.version} (unpublished; verified at "
+                    f"publish, after {', '.join(pending)})"
+                )
+            else:
+                verify_package(manifest_path)
+                print(f"✓ {package.name} {package.version} (unpublished; package verified)")
         if drifted:
             raise RuntimeError(
                 "published source differs from the BOM revision for: "
