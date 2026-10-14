@@ -140,7 +140,8 @@ pub use ticket::{Credential, Ticket};
 
 #[cfg(feature = "blobs")]
 pub use blobs::{
-    BlobCustody, BlobFormat, BlobStatus, Blobs, FetchReport, FetchStrategy, ProviderOutcome,
+    BlobCustody, BlobFormat, BlobStatus, Blobs, FetchReport, FetchStrategy, FetchTracker,
+    ProviderOutcome,
 };
 #[cfg(feature = "docs")]
 pub use docs::{

@@ -4,7 +4,7 @@ use crate::error::{Error, Result};
 use crate::id::{Hash, NodeId};
 use aster_transport_core::{
     CoreBlobCustody, CoreBlobStatus, CoreBlobsClient, CoreFetchReport, CoreFetchStrategy,
-    CoreProviderOutcome,
+    CoreFetchTracker, CoreProviderOutcome,
 };
 
 /// The on-wire format of a blob.
@@ -83,6 +83,7 @@ pub struct ProviderOutcome {
     attempts: u32,
     failures: u32,
     completed_requests: u32,
+    in_flight: u32,
 }
 
 impl ProviderOutcome {
@@ -104,6 +105,13 @@ impl ProviderOutcome {
     pub fn completed_requests(&self) -> u32 {
         self.completed_requests
     }
+    /// How many requests were mid-attempt against this provider when the
+    /// report was taken. Always 0 in a finished fetch's report; in a
+    /// [`FetchTracker`] report taken after the fetch was cancelled, it names
+    /// the provider the fetch was waiting on.
+    pub fn in_flight(&self) -> u32 {
+        self.in_flight
+    }
 }
 
 impl From<CoreProviderOutcome> for ProviderOutcome {
@@ -113,6 +121,7 @@ impl From<CoreProviderOutcome> for ProviderOutcome {
             attempts: o.attempts,
             failures: o.failures,
             completed_requests: o.completed_requests,
+            in_flight: o.in_flight,
         }
     }
 }
@@ -148,6 +157,15 @@ impl FetchReport {
             .map(|p| &p.node_id)
     }
 
+    /// Providers that were mid-attempt when the report was taken: the ones a
+    /// cancelled fetch was waiting on. Empty for a finished fetch.
+    pub fn in_flight(&self) -> impl Iterator<Item = &NodeId> {
+        self.providers
+            .iter()
+            .filter(|p| p.in_flight > 0)
+            .map(|p| &p.node_id)
+    }
+
     /// Providers that carried at least one request to completion.
     pub fn served(&self) -> impl Iterator<Item = &NodeId> {
         self.providers
@@ -176,6 +194,37 @@ impl From<CoreFetchReport> for FetchReport {
             providers: r.providers.into_iter().map(Into::into).collect(),
             bytes_transferred: r.bytes_transferred,
         }
+    }
+}
+
+/// Records an ordered fetch as it runs, so its [`FetchReport`] can still be
+/// read when the fetch does not return one: the caller dropped it (its own
+/// timeout fired) or it failed.
+///
+/// Pass it to a `*_tracked` fetch ([`Blobs::download_hash_to_store_from_tracked`]
+/// and friends), then call [`Self::report`] whenever you like. Clones share
+/// state. Use one tracker per fetch: a fetch resets it when it starts.
+///
+/// ```ignore
+/// let tracker = FetchTracker::new();
+/// let fetch = blobs.download_hash_to_store_from_tracked(&hash, &from, format, strategy, &tracker);
+/// if tokio::time::timeout(limit, fetch).await.is_err() {
+///     let stalled: Vec<_> = tracker.report().in_flight().cloned().collect();
+/// }
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct FetchTracker {
+    inner: CoreFetchTracker,
+}
+
+impl FetchTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What the fetch has done so far.
+    pub fn report(&self) -> FetchReport {
+        self.inner.report().into()
     }
 }
 
@@ -456,6 +505,20 @@ impl Blobs {
         format: BlobFormat,
         strategy: FetchStrategy,
     ) -> Result<(Vec<u8>, FetchReport)> {
+        self.download_hash_from_tracked(hash, from, format, strategy, &FetchTracker::new())
+            .await
+    }
+
+    /// As [`Self::download_hash_from`], recording into `tracker` as it runs so
+    /// the report survives cancellation or failure. See [`FetchTracker`].
+    pub async fn download_hash_from_tracked(
+        &self,
+        hash: &Hash,
+        from: &[NodeId],
+        format: BlobFormat,
+        strategy: FetchStrategy,
+        tracker: &FetchTracker,
+    ) -> Result<(Vec<u8>, FetchReport)> {
         let providers = Self::providers(hash, from, format, strategy)?;
         let (bytes, report) = self
             .inner
@@ -464,6 +527,7 @@ impl Blobs {
                 providers,
                 format.as_core(),
                 strategy.as_core(),
+                Some(&tracker.inner),
             )
             .await?;
         Ok((bytes, report.into()))
@@ -479,6 +543,21 @@ impl Blobs {
         format: BlobFormat,
         strategy: FetchStrategy,
     ) -> Result<FetchReport> {
+        self.download_hash_to_store_from_tracked(hash, from, format, strategy, &FetchTracker::new())
+            .await
+    }
+
+    /// As [`Self::download_hash_to_store_from`], recording into `tracker` as it
+    /// runs so the report survives cancellation or failure. See
+    /// [`FetchTracker`].
+    pub async fn download_hash_to_store_from_tracked(
+        &self,
+        hash: &Hash,
+        from: &[NodeId],
+        format: BlobFormat,
+        strategy: FetchStrategy,
+        tracker: &FetchTracker,
+    ) -> Result<FetchReport> {
         let providers = Self::providers(hash, from, format, strategy)?;
         Ok(self
             .inner
@@ -487,6 +566,7 @@ impl Blobs {
                 providers,
                 format.as_core(),
                 strategy.as_core(),
+                Some(&tracker.inner),
             )
             .await?
             .into())
@@ -500,6 +580,20 @@ impl Blobs {
         from: &[NodeId],
         strategy: FetchStrategy,
     ) -> Result<(Vec<(String, Vec<u8>)>, FetchReport)> {
+        self.download_collection_from_tracked(hash, from, strategy, &FetchTracker::new())
+            .await
+    }
+
+    /// As [`Self::download_collection_from`], recording into `tracker` as it
+    /// runs so the report survives cancellation or failure. See
+    /// [`FetchTracker`].
+    pub async fn download_collection_from_tracked(
+        &self,
+        hash: &Hash,
+        from: &[NodeId],
+        strategy: FetchStrategy,
+        tracker: &FetchTracker,
+    ) -> Result<(Vec<(String, Vec<u8>)>, FetchReport)> {
         let providers = Self::providers(hash, from, BlobFormat::HashSeq, strategy)?;
         let (files, report) = self
             .inner
@@ -507,6 +601,7 @@ impl Blobs {
                 hash.as_str().to_string(),
                 providers,
                 strategy.as_core(),
+                Some(&tracker.inner),
             )
             .await?;
         Ok((files, report.into()))

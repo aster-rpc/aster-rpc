@@ -398,6 +398,7 @@ impl CoreBlobCustodyLease {
                 providers,
                 fmt.clone(),
                 strategy,
+                None,
             ));
             let result = tokio::select! {
                 result = &mut request => Some(result),

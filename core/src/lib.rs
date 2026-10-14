@@ -344,6 +344,44 @@ pub struct CoreProviderOutcome {
     pub failures: u32,
     /// How many requests this provider carried to completion.
     pub completed_requests: u32,
+    /// How many requests were mid-attempt against this provider when the
+    /// report was taken. Always 0 in the report a finished fetch returns;
+    /// non-zero in a [`CoreFetchTracker`] snapshot taken after the fetch was
+    /// cancelled, where it names the provider the fetch was waiting on.
+    pub in_flight: u32,
+}
+
+/// Records a multi-provider fetch as it runs, so its report can still be read
+/// if the caller drops the fetch (e.g. its own timeout fires) or it fails.
+///
+/// Clones share state. Use one tracker per fetch: a fetch resets it on start.
+#[derive(Clone, Default)]
+pub struct CoreFetchTracker(Arc<std::sync::Mutex<FetchAccumulator>>);
+
+impl CoreFetchTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// What the fetch has done so far, including which providers were
+    /// mid-attempt ([`CoreProviderOutcome::in_flight`]).
+    pub fn report(&self) -> CoreFetchReport {
+        self.lock().snapshot()
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, FetchAccumulator> {
+        // The accumulator holds plain counters, so a panic mid-update cannot
+        // leave it in a state worth refusing to read.
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl std::fmt::Debug for CoreFetchTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CoreFetchTracker")
+            .field(&self.report())
+            .finish()
+    }
 }
 
 /// The outcome of a multi-provider fetch, for callers that rank providers.
@@ -409,8 +447,8 @@ impl FetchAccumulator {
         }
     }
 
-    fn finish(self, hash: Hash) -> Result<CoreFetchReport> {
-        let providers: Vec<CoreProviderOutcome> = self
+    fn snapshot(&self) -> CoreFetchReport {
+        let providers = self
             .order
             .iter()
             .map(|id| {
@@ -420,9 +458,21 @@ impl FetchAccumulator {
                     attempts,
                     failures,
                     completed_requests,
+                    in_flight: self.active.values().filter(|a| *a == id).count() as u32,
                 }
             })
             .collect();
+        CoreFetchReport {
+            providers,
+            bytes_transferred: self.bytes,
+        }
+    }
+
+    fn finish(&self, hash: Hash) -> Result<CoreFetchReport> {
+        let CoreFetchReport {
+            providers,
+            bytes_transferred,
+        } = self.snapshot();
         if !self.errors.is_empty() || self.part_failed {
             let tried = providers
                 .iter()
@@ -446,7 +496,7 @@ impl FetchAccumulator {
         }
         Ok(CoreFetchReport {
             providers,
-            bytes_transferred: self.bytes,
+            bytes_transferred,
         })
     }
 }
@@ -3785,6 +3835,7 @@ impl CoreBlobsClient {
         haf: HashAndFormat,
         providers: Vec<EndpointId>,
         strategy: CoreFetchStrategy,
+        tracker: Option<&CoreFetchTracker>,
     ) -> Result<CoreFetchReport> {
         if providers.is_empty() {
             return Err(anyhow!(
@@ -3805,11 +3856,13 @@ impl CoreBlobsClient {
         let mut options = DownloadOptions::new(haf, providers, split);
         options.provider_idle_timeout = self.provider_idle_timeout;
         let mut stream = self.downloader.download_with_opts(options).stream().await?;
-        let mut acc = FetchAccumulator::default();
+        let tracker = tracker.cloned().unwrap_or_default();
+        *tracker.lock() = FetchAccumulator::default();
         while let Some(item) = futures_lite::StreamExt::next(&mut stream).await {
-            acc.observe(item);
+            tracker.lock().observe(item);
         }
-        acc.finish(haf.hash)
+        let result = tracker.lock().finish(haf.hash);
+        result
     }
 
     /// Download a blob by hash from an **ordered** list of providers, returning
@@ -3821,6 +3874,7 @@ impl CoreBlobsClient {
         node_ids_hex: Vec<String>,
         format: String,
         strategy: CoreFetchStrategy,
+        tracker: Option<&CoreFetchTracker>,
     ) -> Result<(Vec<u8>, CoreFetchReport)> {
         let hash: Hash = hash_hex.parse()?;
         let blob_format = Self::parse_blob_format(&format);
@@ -3833,6 +3887,7 @@ impl CoreBlobsClient {
                 },
                 providers,
                 strategy,
+                tracker,
             )
             .await?;
         Ok((self.read_resident(hash, blob_format).await?, report))
@@ -3847,6 +3902,7 @@ impl CoreBlobsClient {
         node_ids_hex: Vec<String>,
         format: String,
         strategy: CoreFetchStrategy,
+        tracker: Option<&CoreFetchTracker>,
     ) -> Result<CoreFetchReport> {
         let hash: Hash = hash_hex.parse()?;
         let providers = Self::parse_providers(&node_ids_hex)?;
@@ -3857,6 +3913,7 @@ impl CoreBlobsClient {
             },
             providers,
             strategy,
+            tracker,
         )
         .await
     }
@@ -3868,11 +3925,12 @@ impl CoreBlobsClient {
         hash_hex: String,
         node_ids_hex: Vec<String>,
         strategy: CoreFetchStrategy,
+        tracker: Option<&CoreFetchTracker>,
     ) -> Result<(Vec<(String, Vec<u8>)>, CoreFetchReport)> {
         let hash: Hash = hash_hex.parse()?;
         let providers = Self::parse_providers(&node_ids_hex)?;
         let report = self
-            .run_download(HashAndFormat::hash_seq(hash), providers, strategy)
+            .run_download(HashAndFormat::hash_seq(hash), providers, strategy, tracker)
             .await?;
         Ok((self.load_collection(hash).await?, report))
     }
@@ -3901,6 +3959,7 @@ impl CoreBlobsClient {
                 vec![node_id_hex],
                 format,
                 CoreFetchStrategy::Whole,
+                None,
             )
             .await?;
         Ok(bytes)
@@ -3926,6 +3985,7 @@ impl CoreBlobsClient {
             vec![node_id_hex],
             format,
             CoreFetchStrategy::Whole,
+            None,
         )
         .await?;
         Ok(())
@@ -3938,7 +3998,12 @@ impl CoreBlobsClient {
         node_id_hex: String,
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let (files, _report) = self
-            .download_collection_hash_multi(hash_hex, vec![node_id_hex], CoreFetchStrategy::Whole)
+            .download_collection_hash_multi(
+                hash_hex,
+                vec![node_id_hex],
+                CoreFetchStrategy::Whole,
+                None,
+            )
             .await?;
         Ok(files)
     }

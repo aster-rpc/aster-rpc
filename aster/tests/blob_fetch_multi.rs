@@ -625,64 +625,90 @@ async fn interrupted_download_resumes_verified_partial_content() -> anyhow::Resu
     Ok(())
 }
 
+/// A blobs provider that serves one chunk group of `payload` and then stops
+/// sending, with its connection still alive: it never answers a throttle
+/// request and keeps each one, so the transfer sits open.
+struct StallingProvider {
+    id: NodeId,
+    router: aster::native::iroh::protocol::Router,
+    gate: tokio::task::JoinHandle<()>,
+}
+
+impl StallingProvider {
+    async fn start(payload: &[u8], consumer: &Node) -> anyhow::Result<Self> {
+        use aster::native::{
+            iroh::{address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router},
+            iroh_blobs::{
+                provider::events::{EventMask, EventSender, ProviderMessage, ThrottleMode},
+                store::mem::MemStore,
+                BlobsProtocol,
+            },
+        };
+
+        let store = MemStore::new();
+        store.blobs().add_slice(payload).await?;
+        let endpoint = aster::native::iroh::Endpoint::builder(presets::N0)
+            .relay_mode(aster::native::iroh::RelayMode::Disabled)
+            .bind_addr("127.0.0.1:0")?
+            .bind()
+            .await?;
+        let (events, mut messages) = EventSender::channel(
+            8,
+            EventMask {
+                throttle: ThrottleMode::Intercept,
+                ..EventMask::DEFAULT
+            },
+        );
+        let router = Router::builder(endpoint.clone())
+            .accept(
+                aster::native::iroh_blobs::ALPN,
+                BlobsProtocol::new(&store, Some(events)),
+            )
+            .spawn();
+        let gate = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some(message) = messages.recv().await {
+                if let ProviderMessage::Throttle(message) = message {
+                    held.push(message);
+                }
+            }
+        });
+        let memory = MemoryLookup::new();
+        memory.add_endpoint_info(endpoint.addr());
+        consumer
+            .blobs()
+            .native_endpoint()
+            .address_lookup()?
+            .add(memory);
+        Ok(Self {
+            id: NodeId::from_hex(endpoint.id().to_string()),
+            router,
+            gate,
+        })
+    }
+
+    async fn shutdown(self) -> anyhow::Result<()> {
+        self.gate.abort();
+        self.router.shutdown().await?;
+        Ok(())
+    }
+}
+
+fn stall_payload() -> Vec<u8> {
+    (0..256 * 1024).map(|i| (i % 251) as u8).collect()
+}
+
 /// A provider that serves one chunk group and then stops sending, with its
 /// connection still alive, is abandoned after the idle timeout and reported
 /// as failed; the next candidate finishes the blob from where it stopped.
 #[tokio::test]
 async fn fails_over_from_a_provider_that_stalls_mid_transfer() -> anyhow::Result<()> {
-    use aster::native::{
-        iroh::{address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router},
-        iroh_blobs::{
-            provider::events::{EventMask, EventSender, ProviderMessage, ThrottleMode},
-            store::mem::MemStore,
-            BlobsProtocol,
-        },
-    };
-
-    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
-    let store = MemStore::new();
-    store.blobs().add_slice(&payload).await?;
-    let stalled = aster::native::iroh::Endpoint::builder(presets::N0)
-        .relay_mode(aster::native::iroh::RelayMode::Disabled)
-        .bind_addr("127.0.0.1:0")?
-        .bind()
-        .await?;
-    let stalled_id = NodeId::from_hex(stalled.id().to_string());
-    let (events, mut messages) = EventSender::channel(
-        8,
-        EventMask {
-            throttle: ThrottleMode::Intercept,
-            ..EventMask::DEFAULT
-        },
-    );
-    let router = Router::builder(stalled.clone())
-        .accept(
-            aster::native::iroh_blobs::ALPN,
-            BlobsProtocol::new(&store, Some(events)),
-        )
-        .spawn();
-    // Never answer a throttle request, and keep it alive: the provider sits
-    // after its first verified chunk group with the connection open.
-    let gate = tokio::spawn(async move {
-        let mut held = Vec::new();
-        while let Some(message) = messages.recv().await {
-            if let ProviderMessage::Throttle(message) = message {
-                held.push(message);
-            }
-        }
-    });
-
+    let payload = stall_payload();
     let holder = start_node().await;
     let hash = holder.blobs().add_bytes(payload.clone()).await?;
     let consumer = start_node().await;
     connect(&consumer, &holder);
-    let memory = MemoryLookup::new();
-    memory.add_endpoint_info(stalled.addr());
-    consumer
-        .blobs()
-        .native_endpoint()
-        .address_lookup()?
-        .add(memory);
+    let stalled = StallingProvider::start(&payload, &consumer).await?;
 
     let (got, report) = timeout(
         FETCH_TIMEOUT,
@@ -691,7 +717,7 @@ async fn fails_over_from_a_provider_that_stalls_mid_transfer() -> anyhow::Result
             .with_provider_idle_timeout(Some(Duration::from_millis(500)))
             .download_hash_from(
                 &hash,
-                &[stalled_id.clone(), holder.id()],
+                &[stalled.id.clone(), holder.id()],
                 BlobFormat::Raw,
                 FetchStrategy::Whole,
             ),
@@ -702,14 +728,52 @@ async fn fails_over_from_a_provider_that_stalls_mid_transfer() -> anyhow::Result
     assert_eq!(got, payload);
     assert_eq!(
         ids(report.attempted()),
-        vec![stalled_id.to_string(), holder.id().to_string()]
+        vec![stalled.id.to_string(), holder.id().to_string()]
     );
-    assert_eq!(ids(report.failed()), vec![stalled_id.to_string()]);
+    assert_eq!(ids(report.failed()), vec![stalled.id.to_string()]);
     assert_eq!(ids(report.served()), vec![holder.id().to_string()]);
+    assert!(report.in_flight().next().is_none());
     assert_eq!(report.bytes_transferred(), payload.len() as u64);
 
-    gate.abort();
-    router.shutdown().await?;
+    stalled.shutdown().await?;
+    holder.shutdown().await;
+    consumer.shutdown().await;
+    Ok(())
+}
+
+/// When the caller's own timeout cancels a fetch, the tracker still reports
+/// what happened, including the provider the fetch was waiting on.
+#[tokio::test]
+async fn tracker_reports_the_provider_a_cancelled_fetch_was_waiting_on() -> anyhow::Result<()> {
+    let payload = stall_payload();
+    let holder = start_node().await;
+    let hash = holder.blobs().add_bytes(payload.clone()).await?;
+    let consumer = start_node().await;
+    connect(&consumer, &holder);
+    let stalled = StallingProvider::start(&payload, &consumer).await?;
+
+    let tracker = aster::FetchTracker::new();
+    let blobs = consumer.blobs().with_provider_idle_timeout(None);
+    let from = [stalled.id.clone(), holder.id()];
+    let fetch = blobs.download_hash_to_store_from_tracked(
+        &hash,
+        &from,
+        BlobFormat::Raw,
+        FetchStrategy::Whole,
+        &tracker,
+    );
+    assert!(
+        timeout(Duration::from_secs(2), fetch).await.is_err(),
+        "the fetch should still be waiting on the stalled provider"
+    );
+
+    let report = tracker.report();
+    assert_eq!(ids(report.attempted()), vec![stalled.id.to_string()]);
+    assert_eq!(ids(report.in_flight()), vec![stalled.id.to_string()]);
+    assert!(report.failed().next().is_none());
+    assert!(report.served().next().is_none());
+
+    stalled.shutdown().await?;
     holder.shutdown().await;
     consumer.shutdown().await;
     Ok(())
