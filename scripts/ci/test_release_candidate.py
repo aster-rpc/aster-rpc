@@ -29,7 +29,7 @@ POLICY = {"assurance_profile": "standard", "optional_assurance_jobs": [], "full_
 
 def run_fixture(**updates):
     return {"id": 42, "index_in_repo": 27, "repository": {"full_name": C.REPOSITORY},
-            "commit_sha": SHA, "workflow_id": "linux.yml", "prettyref": "main", "event": "workflow_dispatch", "trigger_event": "workflow_dispatch",
+            "commit_sha": SHA, "workflow_id": "linux.yml", "prettyref": "main", "event": "", "trigger_event": "workflow_dispatch",  # live API shape: event is empty for dispatches
             "is_fork_pull_request": False, "need_approval": False, "is_ref_deleted": False,
             "status": "success", "stopped": datetime.now(timezone.utc).isoformat(), **updates}
 

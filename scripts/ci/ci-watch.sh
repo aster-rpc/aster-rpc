@@ -76,7 +76,8 @@ runs() {
 import json, sys
 sha, event = sys.argv[1], sys.argv[2]
 for r in json.load(sys.stdin).get("workflow_runs", []):
-    if r.get("commit_sha") == sha and (not event or r.get("event") == event):
+    # A run's "event" is empty for dispatches in the API; trigger_event is not.
+    if r.get("commit_sha") == sha and (not event or r.get("trigger_event") == event):
         print(r.get("workflow_id"), r.get("status"))
 ' "$sha" "$event"
 }

@@ -476,14 +476,18 @@ def check_api(api: Forgejo | None = None) -> None:
 def validate_run(run: dict, sha: str) -> None:
     repository = run.get("repository") or {}
     if (repository.get("full_name") != REPOSITORY or run.get("workflow_id") != WORKFLOW
-            or run.get("commit_sha") != sha or run.get("event") != CANDIDATE_EVENT
+            or run.get("commit_sha") != sha
+            # Forgejo's runs API leaves "event" empty for a dispatch and reports
+            # it in trigger_event (checked live, 2026-10-14).
+            or run.get("event") not in ("", CANDIDATE_EVENT)
             or run.get("trigger_event") != CANDIDATE_EVENT or run.get("prettyref") not in ("main", "refs/heads/main")
             or run.get("is_fork_pull_request") is not False or run.get("need_approval") is not False
             or run.get("is_ref_deleted") is not False):
         fail("run is not a trusted main candidate dispatch for this exact commit and workflow")
     if run.get("status") != "success":
         fail(f'candidate run is {run.get("status")}, not successful')
-    if not run.get("stopped") or run["stopped"].startswith("0001-"):
+    # Unfinished runs report a zero time: 1970-01-01 from the API, 0001- in Go.
+    if not run.get("stopped") or run["stopped"].startswith(("0001-", "1970-01-01")):
         fail("candidate run has not finished")
 
 
@@ -491,7 +495,7 @@ def select_run(runs: list[dict], sha: str) -> dict:
     # Do not hunt backwards for a green attempt after a failed/cancelled run.
     # A duplicate run for the same SHA is itself an error requiring review.
     candidates = [r for r in runs if r.get("workflow_id") == WORKFLOW
-                  and r.get("commit_sha") == sha and r.get("event") == CANDIDATE_EVENT
+                  and r.get("commit_sha") == sha and r.get("trigger_event") == CANDIDATE_EVENT
                   and r.get("prettyref") in ("main", "refs/heads/main")]
     if len(candidates) != 1:
         fail(f"expected exactly one main candidate run, found {len(candidates)}")
