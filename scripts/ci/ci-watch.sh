@@ -5,6 +5,9 @@
 #   scripts/ci/ci-watch.sh               HEAD
 #   scripts/ci/ci-watch.sh <sha>         that commit
 #   scripts/ci/ci-watch.sh <sha> --once  one status line, no waiting
+#   scripts/ci/ci-watch.sh <sha> --event workflow_dispatch
+#                                        only that event's runs (the release
+#                                        candidate; a push runs the gate)
 #
 # Exit 0 when every job that ran succeeded, 1 on the first failure, 2 when no
 # jobs appear for the commit within the wait. Reads the API with the git
@@ -21,9 +24,19 @@ POLL="${ASTER_CI_WATCH_POLL:-30}"
 APPEAR_TIMEOUT="${ASTER_CI_WATCH_APPEAR:-600}"
 
 cd "$(dirname "$0")/../.."
-sha="$(git rev-parse "${1:-HEAD}")"
+rev=HEAD
 once=false
-[[ "${2:-}" == "--once" ]] && once=true
+event=""
+while (( $# )); do
+  case "$1" in
+    --once) once=true ;;
+    --event) event="${2:?--event needs a value}"; shift ;;
+    -*) echo "usage: scripts/ci/ci-watch.sh [<sha>] [--once] [--event <name>]" >&2; exit 2 ;;
+    *) rev="$1" ;;
+  esac
+  shift
+done
+sha="$(git rev-parse "$rev")"
 
 token="$(printf 'protocol=https\nhost=%s\n\n' "${FORGE#https://}" | git credential fill 2>/dev/null | sed -n 's/^password=//p')"
 [[ -n "$token" ]] || { echo "ci-watch: no git credential for $FORGE" >&2; exit 2; }
@@ -37,21 +50,21 @@ jobs() {
     echo
   done | python3 -c '
 import json, sys
-sha = sys.argv[1]
+sha, event = sys.argv[1], sys.argv[2]
 seen = {}
 for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
     for t in json.loads(line).get("workflow_runs", []):
-        if t.get("head_sha") != sha:
+        if t.get("head_sha") != sha or (event and t.get("event") != event):
             continue
         key = (t.get("workflow_id"), t.get("name"))
         # Tasks are newest first: keep the latest attempt of each job.
         seen.setdefault(key, t)
 for (workflow, name), t in sorted(seen.items(), key=lambda kv: kv[1]["id"]):
     print(t["id"], t["status"], f"{workflow}:{name}")
-' "$sha"
+' "$sha" "$event"
 }
 
 # Status of each workflow run for this commit ("<workflow> <status>"). Tasks
@@ -61,11 +74,11 @@ runs() {
   curl -fsS -H "Authorization: token $token" \
     "$FORGE/api/v1/repos/$REPO/actions/runs?limit=50" | python3 -c '
 import json, sys
-sha = sys.argv[1]
+sha, event = sys.argv[1], sys.argv[2]
 for r in json.load(sys.stdin).get("workflow_runs", []):
-    if r.get("commit_sha") == sha:
+    if r.get("commit_sha") == sha and (not event or r.get("event") == event):
         print(r.get("workflow_id"), r.get("status"))
-' "$sha"
+' "$sha" "$event"
 }
 
 explain() {

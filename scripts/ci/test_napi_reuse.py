@@ -124,7 +124,7 @@ class NapiReuse(unittest.TestCase):
         workflow = (ROOT / ".forgejo/workflows/linux.yml").read_text()
         ts = workflow.split("\n  typescript:\n", 1)[1].split("\n  python-extended:", 1)[0]
         npm = workflow.split("\n  npm-native-linux-x64:\n", 1)[1].split("\n  npm-native-cross:", 1)[0]
-        self.assertIn("needs: test", ts)
+        self.assertIn("needs: [rust-tests, test]", ts)
         self.assertLess(ts.index("verify-input --artifact"), ts.index("cp napi-input/*"))
         self.assertLess(ts.index("cp napi-input/*"), ts.index("run: bun run build:test-hooks"))
         self.assertNotIn("run: bun run build\n", ts)

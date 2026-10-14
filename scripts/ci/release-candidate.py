@@ -29,6 +29,10 @@ from urllib.request import Request, urlopen
 ROOT = Path(__file__).resolve().parents[2]
 REPOSITORY = "Aster/aster-rpc-internal"
 WORKFLOW = "linux.yml"
+# A push to main runs only the gate jobs of linux.yml and never seals. The
+# release candidate is the workflow_dispatch run on main for the exact SHA
+# (scripts/release.sh). Gate push runs of the same SHA are never candidates.
+CANDIDATE_EVENT = "workflow_dispatch"
 PACKAGE = "aster-ci-candidate"
 RETENTION_DAYS = 30
 FFI_ARCHIVE_CONSUMER_TASKS = frozenset(
@@ -472,11 +476,11 @@ def check_api(api: Forgejo | None = None) -> None:
 def validate_run(run: dict, sha: str) -> None:
     repository = run.get("repository") or {}
     if (repository.get("full_name") != REPOSITORY or run.get("workflow_id") != WORKFLOW
-            or run.get("commit_sha") != sha or run.get("event") != "push"
-            or run.get("trigger_event") != "push" or run.get("prettyref") not in ("main", "refs/heads/main")
+            or run.get("commit_sha") != sha or run.get("event") != CANDIDATE_EVENT
+            or run.get("trigger_event") != CANDIDATE_EVENT or run.get("prettyref") not in ("main", "refs/heads/main")
             or run.get("is_fork_pull_request") is not False or run.get("need_approval") is not False
             or run.get("is_ref_deleted") is not False):
-        fail("run is not a trusted main push for this exact commit and workflow")
+        fail("run is not a trusted main candidate dispatch for this exact commit and workflow")
     if run.get("status") != "success":
         fail(f'candidate run is {run.get("status")}, not successful')
     if not run.get("stopped") or run["stopped"].startswith("0001-"):
@@ -487,7 +491,7 @@ def select_run(runs: list[dict], sha: str) -> dict:
     # Do not hunt backwards for a green attempt after a failed/cancelled run.
     # A duplicate run for the same SHA is itself an error requiring review.
     candidates = [r for r in runs if r.get("workflow_id") == WORKFLOW
-                  and r.get("commit_sha") == sha and r.get("event") == "push"
+                  and r.get("commit_sha") == sha and r.get("event") == CANDIDATE_EVENT
                   and r.get("prettyref") in ("main", "refs/heads/main")]
     if len(candidates) != 1:
         fail(f"expected exactly one main candidate run, found {len(candidates)}")
@@ -504,7 +508,7 @@ def validate_tasks(tasks: list[dict], run: dict) -> None:
     if not selected:
         fail("candidate has no task-attempt evidence")
     for task in selected:
-        if task.get("event") != "push" or task.get("head_branch") not in ("main", "refs/heads/main"):
+        if task.get("event") != CANDIDATE_EVENT or task.get("head_branch") not in ("main", "refs/heads/main"):
             fail("candidate task has untrusted event/ref evidence")
         if task.get("status") not in ("success", "skipped"):
             fail(f'candidate includes a {task.get("status")} task attempt; no retry-to-green promotion')
@@ -536,7 +540,7 @@ def fetch(output: Path, api: Forgejo | None = None) -> dict:
     runs = []
     page = 1
     while True:
-        query = urlencode({"head_sha": expected["sha"], "workflow_id": WORKFLOW, "event": "push", "ref": "refs/heads/main", "limit": 50, "page": page})
+        query = urlencode({"head_sha": expected["sha"], "workflow_id": WORKFLOW, "event": CANDIDATE_EVENT, "ref": "refs/heads/main", "limit": 50, "page": page})
         result = api.json(f"/api/v1/repos/{REPOSITORY}/actions/runs?{query}")
         batch = result["workflow_runs"]
         runs.extend(batch)

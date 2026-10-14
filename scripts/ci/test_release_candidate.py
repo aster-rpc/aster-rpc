@@ -29,14 +29,14 @@ POLICY = {"assurance_profile": "standard", "optional_assurance_jobs": [], "full_
 
 def run_fixture(**updates):
     return {"id": 42, "index_in_repo": 27, "repository": {"full_name": C.REPOSITORY},
-            "commit_sha": SHA, "workflow_id": "linux.yml", "prettyref": "main", "event": "push", "trigger_event": "push",
+            "commit_sha": SHA, "workflow_id": "linux.yml", "prettyref": "main", "event": "workflow_dispatch", "trigger_event": "workflow_dispatch",
             "is_fork_pull_request": False, "need_approval": False, "is_ref_deleted": False,
             "status": "success", "stopped": datetime.now(timezone.utc).isoformat(), **updates}
 
 
 def archive_consumer_tasks():
     return [{"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA,
-             "event": "push", "head_branch": "main", "status": "success", "name": name}
+             "event": "workflow_dispatch", "head_branch": "main", "status": "success", "name": name}
             for name in sorted(C.FFI_ARCHIVE_CONSUMER_TASKS)]
 
 
@@ -256,6 +256,22 @@ class CandidateTests(unittest.TestCase):
             with self.subTest(update=update), self.assertRaises(ValueError):
                 C.validate_run(run_fixture(**update), SHA)
 
+    def test_gate_push_run_is_never_a_candidate(self):
+        gate = run_fixture(id=41, index_in_repo=26, event="push", trigger_event="push")
+        with self.assertRaises(ValueError):
+            C.validate_run(gate, SHA)
+        with self.assertRaises(ValueError):
+            C.select_run([gate], SHA)
+        # The green gate run of the same SHA is neither selected nor counted
+        # as a duplicate of the dispatch candidate.
+        self.assertEqual(C.select_run([gate, run_fixture()], SHA)["id"], 42)
+        with self.assertRaises(ValueError):
+            C.select_run([gate, run_fixture(), run_fixture(id=43, index_in_repo=28)], SHA)
+        # Gate tasks of the same SHA never qualify a candidate run.
+        gate_tasks = [{**task, "event": "push"} for task in archive_consumer_tasks()]
+        with self.assertRaisesRegex(ValueError, "untrusted event"):
+            C.validate_tasks(gate_tasks, run_fixture())
+
     def test_no_fallback_to_older_green_or_duplicate_run(self):
         for runs in ([], [run_fixture(), run_fixture(id=43, status="failure")], [run_fixture(), run_fixture(id=43)]):
             with self.subTest(runs=runs), self.assertRaises(ValueError):
@@ -263,7 +279,7 @@ class CandidateTests(unittest.TestCase):
 
     def test_failed_task_attempt_cannot_be_replaced_by_green_retry(self):
         task = {"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA,
-                "event": "push", "head_branch": "main", "status": "success"}
+                "event": "workflow_dispatch", "head_branch": "main", "status": "success"}
         for status in ("failure", "cancelled", "running", "unknown"):
             with self.subTest(status=status), self.assertRaises(ValueError):
                 C.validate_tasks([task, {**task, "status": status}], run_fixture())
@@ -472,6 +488,46 @@ class CandidateTests(unittest.TestCase):
         self.assertNotIn("paths-ignore:", triggers)
         self.assertIn('cp "$CARGO_TARGET_DIR/$triple/release/libaster_transport_ffi.so"', workflow)
         self.assertIn('if ! python3 scripts/ci/release-candidate.py prune; then', workflow)
+
+    def test_push_runs_the_gate_and_only_a_main_dispatch_is_a_candidate(self):
+        workflow = (C.ROOT / ".forgejo/workflows/linux.yml").read_text()
+        policy = C.read_json(C.POLICY_PATH)
+        body = workflow[workflow.index("\njobs:"):]
+        matches = list(re.finditer(r"^  ([\w-]+):$", body, re.M))
+        blocks = {m[1]: body[m.end():matches[i + 1].start() if i + 1 < len(matches) else len(body)]
+                  for i, m in enumerate(matches)}
+        job_if = {job: (re.search(r"^    if: (.+)$", block, re.M) or [None, None])[1] for job, block in blocks.items()}
+        gate = {"lint", "rust-tests", "test", "typescript", "ffi-go"}
+        # Gate jobs run on every event, so a push to main qualifies correctness.
+        for job in gate:
+            self.assertIsNone(job_if[job], job)
+            self.assertIn(job, policy["required_jobs"])
+        # Every producer and assurance job is skipped on a push to main.
+        for job in set(blocks) - gate - {"candidate"}:
+            self.assertTrue("forgejo.event_name != 'push'" in job_if[job]
+                            or "forgejo.event_name == 'workflow_dispatch'" in job_if[job], job)
+        self.assertEqual(job_if["candidate"], "always() && forgejo.event_name == 'workflow_dispatch' && forgejo.ref == 'refs/heads/main'")
+        candidate_needs = set(re.findall(r"[\w-]+", re.search(r"^    needs: (.+)$", blocks["candidate"], re.M)[1]))
+        self.assertEqual(candidate_needs, set(policy["required_jobs"]) | set(policy["optional_assurance_jobs"]))
+        # First-attempt rule binds the candidate dispatch, in every job.
+        guard = 'if [[ "$FORGEJO_EVENT_NAME" == workflow_dispatch && "$FORGEJO_REF" == refs/heads/main ]]; then'
+        self.assertEqual(workflow.count(guard), len(blocks))
+        self.assertNotIn('"$FORGEJO_EVENT_NAME" == push', workflow)
+        # The dispatch names its commit and lint refuses any other checkout.
+        self.assertIn("  workflow_dispatch:\n    inputs:\n      sha:", workflow)
+        self.assertIn('CANDIDATE_SHA: ${{ forgejo.event.inputs.sha }}', blocks["lint"])
+        self.assertIn('"$CANDIDATE_SHA" == "$FORGEJO_SHA"', blocks["lint"])
+        self.assertIn("group: forgejo-aster-${{ forgejo.event_name }}-${{ forgejo.sha }}", workflow)
+        # Gate builds are debug and never recorded; recorded inputs are release.
+        test = blocks["test"]
+        self.assertIn("TESTED_PROFILE: ${{ forgejo.event_name == 'push' && 'debug' || 'release' }}", test)
+        for step in ("Record tested normal Linux NAPI inputs", "Record tested Linux wheel inputs"):
+            self.assertIn(f"- name: {step}\n        if: forgejo.event_name != 'push'\n", test)
+        self.assertEqual(test.count('[[ "$TESTED_PROFILE" == release ]] || {'), 2)
+        for name in ("tested-napi-linux-", "tested-python-linux-", "ci-evidence-test-"):
+            upload = test.index(f"name: {name}" + "${{ forgejo.run_number }}")
+            self.assertIn("if: forgejo.event_name != 'push'", test[test.rindex("- uses:", 0, upload):upload])
+        self.assertNotIn("--release --locked", test)
 
     def test_job_token_is_required_for_actions_and_not_sent_to_public_packages(self):
         with patch.dict(os.environ, {"ASTER_ACTIONS_TOKEN": "offline-job-token"}), patch.object(C, "urlopen", return_value=io.BytesIO(b"{}")) as http:
@@ -752,7 +808,7 @@ class FullPolicyHandoffTests(unittest.TestCase):
             self.assertEqual(manifest["artifacts"]["npm-linux-arm64-gnu-27"]["matrix"], policy["required_artifacts"]["npm-linux-arm64-gnu"]["matrix"])
             self.assertEqual(manifest["artifacts"]["npm-win32-x64-msvc-27"]["matrix"], policy["required_artifacts"]["npm-win32-x64-msvc"]["matrix"])
             downloaded = root / "downloaded"
-            tasks = [{"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA, "event": "push", "head_branch": "main",
+            tasks = [{"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA, "event": "workflow_dispatch", "head_branch": "main",
                       "status": result, "name": job} for job, result in C.expected_gates(policy).items()]
             tasks.extend(archive_consumer_tasks())
             tasks.append({**tasks[0], "status": "success", "name": "npm-native-cross (win32-x64-msvc)"})

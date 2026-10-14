@@ -126,9 +126,9 @@ class RuntimeGates(unittest.TestCase):
             return dependencies[job] | set().union(*(ancestors(parent, (*stack, job)) for parent in dependencies[job]))
         for job in dependencies:
             ancestors(job)
-        self.assertEqual(dependencies['typescript'], {'test'})
+        self.assertEqual(dependencies['typescript'], {'rust-tests', 'test'})
         for job in ('build-linux-arm64-wheel', 'build-windows-wheel', 'ffi-release-linux', 'ffi-natives-cross', 'npm-native-linux-x64', 'npm-native-cross', 'npm-native-darwin', 'mobile-ios', 'mobile-android', 'nightly-sanitize', 'nightly-miri'):
-            self.assertTrue({'test', 'typescript'} <= ancestors(job), job)
+            self.assertTrue({'rust-tests', 'test', 'typescript'} <= ancestors(job), job)
         ts = blocks['typescript']
         self.assertIn('--features coordination-fixture,test-hooks --bin aster-coordination-fixture', ts)
         self.assertLess(ts.index('Verify and reuse the tested normal NAPI addon'), ts.index('run: bun run build:test-hooks'))
