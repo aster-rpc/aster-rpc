@@ -73,7 +73,7 @@ import json, sys
 sha, workflow = sys.argv[1], sys.argv[2]
 for r in json.load(sys.stdin).get("workflow_runs", []):
     if (r.get("commit_sha") == sha and r.get("workflow_id") == workflow
-            and r.get("event") == "workflow_dispatch" and r.get("prettyref") in ("main", "refs/heads/main")):
+            and r.get("trigger_event") == "workflow_dispatch" and r.get("prettyref") in ("main", "refs/heads/main")):
         print(r["id"], r["status"])
 ' "$head" "$WORKFLOW"
   }
