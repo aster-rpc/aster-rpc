@@ -2,6 +2,7 @@
   "assurance_profile": "standard",
   "required_jobs": [
     "lint",
+    "rust-tests",
     "test",
     "typescript",
     "build-linux-wheel",

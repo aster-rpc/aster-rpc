@@ -375,7 +375,7 @@ class CandidateTests(unittest.TestCase):
             self.assertIn("needs.lint.outputs.assurance_profile == 'full'", block)
             self.assertIn("lint", re.search(r"needs: (.*)", block).group(1))
         self.assertIn("if: always() && forgejo.event_name", workflow[workflow.index("  candidate:"):])
-        self.assertEqual(len(policy["required_jobs"]), 19)
+        self.assertEqual(len(policy["required_jobs"]), 20)
         self.assertEqual(len(C.artifact_policy(policy)), 20)
         self.assertEqual(len(C.artifact_policy({**policy, "assurance_profile": "full"})), 22)
         promotion = (C.ROOT / ".forgejo/workflows/release.yml").read_text()
@@ -461,7 +461,7 @@ class CandidateTests(unittest.TestCase):
         policy = C.read_json(C.POLICY_PATH)
         jobs = set(re.findall(r"^  ([\w-]+):$", workflow[workflow.index("\njobs:"):], re.M))
         self.assertEqual(jobs, set(policy["required_jobs"]) | set(policy["optional_assurance_jobs"]) | {"python-windows", "candidate"})
-        for required in ("lint", "test", "coordination-fault-macos", "coordination-fault-windows", "nightly-sanitize", "nightly-miri", "ffi-go", "ffi-dotnet", "ffi-java", "ffi-macos", "typescript", "typescript-macos", "python-extended", "python-macos"):
+        for required in ("lint", "rust-tests", "test", "coordination-fault-macos", "coordination-fault-windows", "nightly-sanitize", "nightly-miri", "ffi-go", "ffi-dotnet", "ffi-java", "ffi-macos", "typescript", "typescript-macos", "python-extended", "python-macos"):
             self.assertIn(required, policy["required_jobs"] + policy["optional_assurance_jobs"])
         self.assertEqual(workflow.count("name: Refuse retry-to-green candidate builds"), len(jobs))
         self.assertNotIn('tags: ["v*"]', workflow)
