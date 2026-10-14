@@ -67,8 +67,14 @@ Use these rules when selecting peers:
   candidates* by path quality.
 - **Closeness is measured, not claimed.** A peer cannot talk its way into
   your cluster: cluster edges require *both* sides to have measured the
-  pair close, and LAN status requires a verified private-path dial. Claims
-  (subnets, ASNs) only generate candidates to check.
+  pair close, and LAN status requires a verified private-path dial with a
+  round trip under 500 µs. Claims (subnets, ASNs) only generate candidates
+  to check.
+- **A private address is not a LAN.** In a cloud VPC every peer, in every
+  availability zone, is reached on a private address. A private path whose
+  round trip is above the LAN ceiling (a cross-zone VPC peer, but also a
+  slow Wi-Fi LAN) gets its level from the RTT bands instead, usually
+  same-region. A private path with no RTT measured yet has no level.
 
 ## 3. Read the local peer view
 
@@ -92,7 +98,7 @@ for peer in topo.peers() {
 ```
 
 Each `PeerView` carries the ladder level *plus the signal that justified
-it* ("loopback path", "verified private path", …), smoothed RTT and
+it* ("loopback path", "private path, rtt under LAN ceiling", …), smoothed RTT and
 jitter, loss rate, a passive throughput estimate with a cwnd/RTT ceiling,
 direct-vs-relay, and a confidence score that grows with samples and
 decays with staleness. Levels are sticky: a change must hold for ~30

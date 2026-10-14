@@ -282,7 +282,7 @@ pub struct PeerView {
     /// Locality ladder level: 0 same-host, 1 same-lan, 2 same-site,
     /// 3 same-region, 4 far.
     pub level: i32,
-    /// The signal that justified the level (e.g. "verified private path").
+    /// The signal that justified the level (e.g. "private path, rtt under LAN ceiling").
     pub level_reason: String,
     /// Smoothed RTT, microseconds. 0 = not yet measured.
     pub rtt_us: i64,

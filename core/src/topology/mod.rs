@@ -29,6 +29,14 @@ const LEVEL_HOLD_SAMPLES: u32 = 30;
 /// only above 18 ms.
 const REGION_RTT_ENTER_US: f64 = 12_000.0;
 const REGION_RTT_EXIT_US: f64 = 18_000.0;
+/// Same-LAN RTT ceiling for a private path: enter below 500 µs, leave only
+/// above 1 ms. A private address alone does not mean a LAN: in a cloud VPC
+/// every peer, in every availability zone, is reached privately, and
+/// same-zone (~0.1–0.5 ms) and cross-zone (~0.5–2 ms) round trips overlap
+/// only at the edges. A slow private path (Wi-Fi, a routed VPC) falls to the
+/// RTT bands instead.
+const LAN_RTT_ENTER_US: f64 = 500.0;
+const LAN_RTT_EXIT_US: f64 = 1_000.0;
 /// EWMA weight for RTT / jitter / throughput smoothing.
 const EWMA_ALPHA: f64 = 0.3;
 /// Samples needed for confidence to saturate at its 0.99 cap.
@@ -44,8 +52,9 @@ const MIN_RATE_WINDOW: Duration = Duration::from_millis(100);
 pub enum CoreLadderLevel {
     /// L0 — loopback / same host.
     SameHost = 0,
-    /// L1 — verified private path (the live QUIC connection on a private
-    /// address *is* the verified private dial).
+    /// L1 — a verified private path (the live QUIC connection on a private
+    /// address *is* the verified private dial) whose RTT is under the LAN
+    /// ceiling. Reachability on a private address alone is not enough.
     SameLan = 1,
     /// L2 — same public egress IP, no private path.
     SameSite = 2,
@@ -325,9 +334,11 @@ fn unix_ms(t: SystemTime) -> u64 {
 }
 
 /// Pure ladder derivation: highest level the current signals justify.
-/// `prev` feeds the L3 enter/exit hysteresis band. Returns `None` when no
-/// signal exists yet (non-private path and no RTT measured) — Far is a
-/// conclusion drawn from a measured RTT, not from the absence of one.
+/// `prev` feeds the L1 and L3 enter/exit hysteresis bands. Returns `None`
+/// when no signal exists yet (no RTT measured on a non-loopback path): Far
+/// is a conclusion drawn from a measured RTT, not from the absence of one,
+/// and a private path is not a LAN until its RTT says so. Committing a level
+/// early would cost a full hold-down to correct.
 fn derive_level(
     remote: &TransportAddr,
     local_public_ips: &[IpAddr],
@@ -340,10 +351,20 @@ fn derive_level(
                 return Some((CoreLadderLevel::SameHost, "loopback path".to_string()));
             }
             AddrClass::Private => {
-                return Some((
-                    CoreLadderLevel::SameLan,
-                    "verified private path".to_string(),
-                ));
+                if rtt_us_smooth <= 0.0 {
+                    return None;
+                }
+                let ceiling = if prev == Some(CoreLadderLevel::SameLan) {
+                    LAN_RTT_EXIT_US
+                } else {
+                    LAN_RTT_ENTER_US
+                };
+                if rtt_us_smooth < ceiling {
+                    return Some((
+                        CoreLadderLevel::SameLan,
+                        "private path, rtt under LAN ceiling".to_string(),
+                    ));
+                }
             }
             AddrClass::Public => {
                 if local_public_ips.contains(&addr.ip()) {
@@ -379,7 +400,7 @@ fn derive_level(
 pub struct CorePeerView {
     pub node_id: String,
     pub level: CoreLadderLevel,
-    /// Signal that justified the level (e.g. "verified private path").
+    /// Signal that justified the level (e.g. "private path, rtt under LAN ceiling").
     pub level_reason: String,
     /// Smoothed RTT, microseconds. `None` until first measured.
     pub rtt_us: Option<u64>,
@@ -435,10 +456,14 @@ mod tests {
     }
 
     fn sample(remote: TransportAddr, rtt_ms: u64, conn_key: u64) -> PeerSample {
+        sample_us(remote, rtt_ms * 1_000, conn_key)
+    }
+
+    fn sample_us(remote: TransportAddr, rtt_us: u64, conn_key: u64) -> PeerSample {
         PeerSample {
             conn_key,
             remote,
-            rtt: Duration::from_millis(rtt_ms),
+            rtt: Duration::from_micros(rtt_us),
             lost_packets: 0,
             congestion_events: 0,
             cwnd: 64 * 1024,
@@ -466,7 +491,7 @@ mod tests {
     #[test]
     fn level_change_needs_hold_down() {
         let mut st = PeerTopoState::default();
-        st.apply_sample(sample(direct("192.168.1.9:4433"), 1, 1));
+        st.apply_sample(sample_us(direct("192.168.1.9:4433"), 200, 1));
         assert_eq!(
             st.to_view("p", true).unwrap().level,
             CoreLadderLevel::SameLan
@@ -590,5 +615,52 @@ mod tests {
             st.to_view("p", true).unwrap().level,
             CoreLadderLevel::SameRegion
         );
+    }
+
+    #[test]
+    fn private_path_without_rtt_gives_no_level() {
+        // A bare private path is not a LAN: committing SameLan here would
+        // take a full hold-down to correct once a cross-zone RTT arrives.
+        let mut st = PeerTopoState::default();
+        st.apply_sample(sample(direct("10.0.1.5:4433"), 0, 1));
+        assert!(st.to_view("p", true).is_none());
+    }
+
+    #[test]
+    fn private_path_under_lan_ceiling_is_same_lan() {
+        let mut st = PeerTopoState::default();
+        st.apply_sample(sample_us(direct("10.0.1.5:4433"), 150, 1));
+        let view = st.to_view("p", true).unwrap();
+        assert_eq!(view.level, CoreLadderLevel::SameLan);
+        assert_eq!(view.level_reason, "private path, rtt under LAN ceiling");
+    }
+
+    #[test]
+    fn cross_zone_private_path_is_not_same_lan() {
+        // A VPC peer in another availability zone: private address, 1.5 ms.
+        let mut st = PeerTopoState::default();
+        st.apply_sample(sample_us(direct("10.1.7.20:4433"), 1_500, 1));
+        let view = st.to_view("p", true).unwrap();
+        assert_eq!(view.level, CoreLadderLevel::SameRegion);
+        assert_eq!(view.level_reason, "rtt under region threshold");
+    }
+
+    #[test]
+    fn derive_level_private_path_table() {
+        let private = direct("10.0.1.5:4433");
+        let lan = |rtt_us: f64, prev| derive_level(&private, &[], rtt_us, prev).map(|(l, _)| l);
+        assert_eq!(lan(0.0, None), None);
+        assert_eq!(lan(499.0, None), Some(CoreLadderLevel::SameLan));
+        assert_eq!(lan(700.0, None), Some(CoreLadderLevel::SameRegion));
+        // Hysteresis: a committed LAN peer keeps L1 up to the exit ceiling.
+        assert_eq!(
+            lan(700.0, Some(CoreLadderLevel::SameLan)),
+            Some(CoreLadderLevel::SameLan)
+        );
+        assert_eq!(
+            lan(1_200.0, Some(CoreLadderLevel::SameLan)),
+            Some(CoreLadderLevel::SameRegion)
+        );
+        assert_eq!(lan(40_000.0, None), Some(CoreLadderLevel::Far));
     }
 }
