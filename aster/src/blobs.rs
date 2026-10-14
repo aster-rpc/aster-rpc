@@ -267,6 +267,20 @@ impl Blobs {
         Self { inner }
     }
 
+    /// This client with a different provider idle timeout for the ordered
+    /// fetches ([`Self::download_hash_from`] and friends): how long to wait on
+    /// a provider that has stopped delivering payload before moving to the
+    /// next one. `None` waits indefinitely. Defaults to 10 seconds.
+    ///
+    /// A provider that accepts a request and then stalls never fails on its
+    /// own, because its connection stays alive, so without this bound one stuck
+    /// provider would block every provider listed after it.
+    pub fn with_provider_idle_timeout(&self, idle: Option<std::time::Duration>) -> Self {
+        Self {
+            inner: self.inner.clone().with_provider_idle_timeout(idle),
+        }
+    }
+
     /// Clone the live Iroh Blobs store behind this facade.
     ///
     /// Raw store operations share data and GC state with Aster. Callers that
@@ -426,7 +440,9 @@ impl Blobs {
     /// returning the bytes and a report of what each provider did.
     ///
     /// Providers are tried strictly in the order given, moving to the next only
-    /// when one fails to connect or to transfer. Each attempt asks only for the
+    /// when one fails to connect or to transfer, or stalls: delivers no payload
+    /// for the provider idle timeout (see [`Self::with_provider_idle_timeout`]),
+    /// in which case it is reported as failed. Each attempt asks only for the
     /// ranges still missing, so a partial transfer from an earlier candidate is
     /// never re-fetched. Ranking the candidates is the caller's job.
     ///

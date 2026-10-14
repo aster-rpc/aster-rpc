@@ -311,6 +311,15 @@ pub struct CoreBlobLocalInfo {
     pub local_bytes: u64,
 }
 
+/// Default for [`CoreBlobsClient::with_provider_idle_timeout`]: how long an
+/// ordered fetch waits on a provider that has stopped delivering payload
+/// before moving to the next one.
+///
+/// A provider that accepts a request and then stalls never *fails* (QUIC
+/// keep-alive holds the connection open), so without a bound it would block
+/// every provider listed after it.
+pub const DEFAULT_PROVIDER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// How a multi-provider fetch should decompose a HashSeq.
 ///
 /// This is *not* about how many providers are used — ordered failover across
@@ -2001,6 +2010,7 @@ impl CoreNode {
             store: self.inner.store.clone(),
             endpoint: self.inner.endpoint.clone(),
             downloader: self.inner.downloader.clone(),
+            provider_idle_timeout: Some(DEFAULT_PROVIDER_IDLE_TIMEOUT),
             protect_cb: self.inner.protect_cb.clone(),
         }
     }
@@ -3360,6 +3370,9 @@ pub struct CoreBlobsClient {
     pub store: BlobStore,
     pub endpoint: Endpoint,
     downloader: Downloader,
+    /// Ordered fetches abandon a provider after this long without payload
+    /// progress; `None` waits indefinitely.
+    provider_idle_timeout: Option<std::time::Duration>,
     /// Docs GC protection callback (see [`CoreNodeInner::protect_cb`]). Replayed
     /// by [`Self::gc_run_once`] to seed the `live` set before a manual sweep, so
     /// a deterministic sweep protects docs content exactly as the periodic loop
@@ -3368,6 +3381,14 @@ pub struct CoreBlobsClient {
 }
 
 impl CoreBlobsClient {
+    /// Set how long an ordered fetch waits on a provider that has stopped
+    /// delivering payload before failing over to the next one (`None` waits
+    /// indefinitely). Defaults to [`DEFAULT_PROVIDER_IDLE_TIMEOUT`].
+    pub fn with_provider_idle_timeout(mut self, idle: Option<std::time::Duration>) -> Self {
+        self.provider_idle_timeout = idle;
+        self
+    }
+
     pub async fn add_bytes(&self, data: Vec<u8>) -> Result<String> {
         Ok(self.store.add_slice(&data).await?.hash.to_string())
     }
@@ -3781,11 +3802,9 @@ impl CoreBlobsClient {
             CoreFetchStrategy::Whole => SplitStrategy::None,
             CoreFetchStrategy::SplitChildren => SplitStrategy::Split,
         };
-        let mut stream = self
-            .downloader
-            .download_with_opts(DownloadOptions::new(haf, providers, split))
-            .stream()
-            .await?;
+        let mut options = DownloadOptions::new(haf, providers, split);
+        options.provider_idle_timeout = self.provider_idle_timeout;
+        let mut stream = self.downloader.download_with_opts(options).stream().await?;
         let mut acc = FetchAccumulator::default();
         while let Some(item) = futures_lite::StreamExt::next(&mut stream).await {
             acc.observe(item);

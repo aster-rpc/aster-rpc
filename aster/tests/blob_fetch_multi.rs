@@ -624,3 +624,93 @@ async fn interrupted_download_resumes_verified_partial_content() -> anyhow::Resu
     provider_closed.context("provider shutdown timed out")??;
     Ok(())
 }
+
+/// A provider that serves one chunk group and then stops sending, with its
+/// connection still alive, is abandoned after the idle timeout and reported
+/// as failed; the next candidate finishes the blob from where it stopped.
+#[tokio::test]
+async fn fails_over_from_a_provider_that_stalls_mid_transfer() -> anyhow::Result<()> {
+    use aster::native::{
+        iroh::{address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router},
+        iroh_blobs::{
+            provider::events::{EventMask, EventSender, ProviderMessage, ThrottleMode},
+            store::mem::MemStore,
+            BlobsProtocol,
+        },
+    };
+
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    let store = MemStore::new();
+    store.blobs().add_slice(&payload).await?;
+    let stalled = aster::native::iroh::Endpoint::builder(presets::N0)
+        .relay_mode(aster::native::iroh::RelayMode::Disabled)
+        .bind_addr("127.0.0.1:0")?
+        .bind()
+        .await?;
+    let stalled_id = NodeId::from_hex(stalled.id().to_string());
+    let (events, mut messages) = EventSender::channel(
+        8,
+        EventMask {
+            throttle: ThrottleMode::Intercept,
+            ..EventMask::DEFAULT
+        },
+    );
+    let router = Router::builder(stalled.clone())
+        .accept(
+            aster::native::iroh_blobs::ALPN,
+            BlobsProtocol::new(&store, Some(events)),
+        )
+        .spawn();
+    // Never answer a throttle request, and keep it alive: the provider sits
+    // after its first verified chunk group with the connection open.
+    let gate = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Some(message) = messages.recv().await {
+            if let ProviderMessage::Throttle(message) = message {
+                held.push(message);
+            }
+        }
+    });
+
+    let holder = start_node().await;
+    let hash = holder.blobs().add_bytes(payload.clone()).await?;
+    let consumer = start_node().await;
+    connect(&consumer, &holder);
+    let memory = MemoryLookup::new();
+    memory.add_endpoint_info(stalled.addr());
+    consumer
+        .blobs()
+        .native_endpoint()
+        .address_lookup()?
+        .add(memory);
+
+    let (got, report) = timeout(
+        FETCH_TIMEOUT,
+        consumer
+            .blobs()
+            .with_provider_idle_timeout(Some(Duration::from_millis(500)))
+            .download_hash_from(
+                &hash,
+                &[stalled_id.clone(), holder.id()],
+                BlobFormat::Raw,
+                FetchStrategy::Whole,
+            ),
+    )
+    .await
+    .expect("a stalled lead provider blocked the fetch")?;
+
+    assert_eq!(got, payload);
+    assert_eq!(
+        ids(report.attempted()),
+        vec![stalled_id.to_string(), holder.id().to_string()]
+    );
+    assert_eq!(ids(report.failed()), vec![stalled_id.to_string()]);
+    assert_eq!(ids(report.served()), vec![holder.id().to_string()]);
+    assert_eq!(report.bytes_transferred(), payload.len() as u64);
+
+    gate.abort();
+    router.shutdown().await?;
+    holder.shutdown().await;
+    consumer.shutdown().await;
+    Ok(())
+}
