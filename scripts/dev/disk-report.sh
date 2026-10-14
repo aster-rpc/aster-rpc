@@ -17,6 +17,11 @@ echo "== cargo/rustc processes (never clean a target while one is building it)"
 pgrep -fl 'cargo |rustc ' | grep -v pgrep | cut -c1-140 | sed 's/^/  /' || echo "  none"
 
 echo
+echo "== orphaned test processes (parent gone; safe to kill once confirmed)"
+ps -A -o pid=,ppid=,etime=,command= | awk '$2 == 1 && $4 ~ /\/target\/(debug|release)\// {print}' \
+  | cut -c1-140 | sed 's/^/  /' | grep . || echo "  none"
+
+echo
 echo "== target directories (logical size; APFS may count reflinked data twice)"
 find "$root" -maxdepth 5 -type d -name target -prune 2>/dev/null \
   | while read -r t; do

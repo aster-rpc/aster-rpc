@@ -47,19 +47,42 @@ async fn durable_write_child() {
     std::future::pending::<()>().await;
 }
 
+/// The writer child waits forever after its acknowledgement; kill and reap it
+/// however the round ends, so a failed `expect` cannot orphan it.
+struct KillOnDrop(std::process::Child);
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 #[test]
 fn public_durable_write_survives_an_immediate_hard_kill() {
     let exe = std::env::current_exe().expect("current test executable");
 
     for round in 0..5 {
         let dir = tempfile::tempdir().expect("temporary node directory");
-        let mut child = Command::new(&exe)
-            .args([CHILD_TEST, "--exact", "--ignored", "--nocapture"])
-            .env("ASTER_DURABLE_DIR", dir.path())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn writer child");
+        let mut child = KillOnDrop(
+            Command::new(&exe)
+                .args([CHILD_TEST, "--exact", "--ignored", "--nocapture"])
+                .env("ASTER_DURABLE_DIR", dir.path())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn writer child"),
+        );
 
         let stdout = child.stdout.take().expect("child stdout");
         let hash = BufReader::new(stdout)

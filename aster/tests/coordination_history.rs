@@ -642,6 +642,29 @@ async fn connect_clients(
 async fn committed_effects_survive_a_leader_kill_and_a_full_restart() {
     use std::process::{Child, Command};
 
+    /// The voter binary runs until killed, so a panic anywhere before the
+    /// explicit kills would orphan every voter: kill and reap on drop.
+    struct Voters(Vec<Option<Child>>);
+    impl std::ops::Deref for Voters {
+        type Target = Vec<Option<Child>>;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for Voters {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl Drop for Voters {
+        fn drop(&mut self) {
+            for child in self.0.iter_mut().flatten() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     const SIZE: usize = 3;
     const SEED: u8 = 0xF4;
     const DOMAIN: &str = "process-loss.test";
@@ -658,7 +681,7 @@ async fn committed_effects_survive_a_leader_kill_and_a_full_restart() {
             .spawn()
             .expect("the voter binary starts")
     };
-    let mut children: Vec<Option<Child>> = (0..SIZE).map(|i| Some(spawn(i))).collect();
+    let mut children = Voters((0..SIZE).map(|i| Some(spawn(i))).collect());
 
     // The same fixture derivation the binary uses.
     let fixture = aster::coordination::testing::GroupFixture::new(DOMAIN, SEED, SIZE);
@@ -811,7 +834,7 @@ async fn committed_effects_survive_a_leader_kill_and_a_full_restart() {
         let _ = std::fs::remove_file(control.join(format!("addr-{index}")));
         let _ = std::fs::remove_file(control.join(format!("status-{index}")));
     }
-    let mut children: Vec<Option<Child>> = (0..SIZE).map(|i| Some(spawn(i))).collect();
+    let mut children = Voters((0..SIZE).map(|i| Some(spawn(i))).collect());
     let deadline = std::time::Instant::now() + PATIENCE;
     loop {
         let ready = (0..SIZE).all(|i| {

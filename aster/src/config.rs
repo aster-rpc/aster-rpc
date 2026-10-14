@@ -1820,7 +1820,8 @@ mod tests {
 
     #[test]
     fn from_env_reads_trust_and_endpoint_config() {
-        let _lock = env_lock().lock().unwrap();
+        // One panicking env test must not poison the lock for all the others.
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::new();
 
         let root = [1u8; 32];
@@ -1953,7 +1954,8 @@ mod tests {
 
     #[test]
     fn from_env_rejects_invalid_values() {
-        let _lock = env_lock().lock().unwrap();
+        // One panicking env test must not poison the lock for all the others.
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::new();
 
         env::set_var("ASTER_LOCAL_DISCOVERY", "maybe");
@@ -1983,7 +1985,8 @@ mod tests {
 
     #[test]
     fn from_file_env_and_builder_follow_resolution_order() {
-        let _lock = env_lock().lock().unwrap();
+        // One panicking env test must not poison the lock for all the others.
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::new();
 
         let dir = tempfile::tempdir().unwrap();
@@ -2094,7 +2097,8 @@ mask = false
 
     #[test]
     fn load_identity_selects_peer_and_synthesizes_metadata() {
-        let _lock = env_lock().lock().unwrap();
+        // One panicking env test must not poison the lock for all the others.
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvGuard::new();
 
         let dir = tempfile::tempdir().unwrap();

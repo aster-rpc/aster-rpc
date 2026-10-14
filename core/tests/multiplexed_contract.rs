@@ -50,7 +50,9 @@ use aster_transport_core::reactor::{create_reactor, IncomingCall, OutgoingFrame,
 use aster_transport_core::{CoreConnection, CoreNetClient};
 
 const TEST_ALPN: &[u8] = b"aster-test/contract";
-const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds a hang, not a speed: under a loaded parallel run a 64 KiB call
+/// over iroh can take seconds.
+const STEP_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Start a reactor that feeds on connections accepted by the given
 /// server endpoint. Returns the reactor handle (for `next_event`) and
@@ -150,12 +152,14 @@ fn spawn_ack_binding(mut reactor: aster_transport_core::reactor::ReactorHandle) 
                     // trailer payload == clean OK (see
                     // bindings/python/aster/transport/iroh.py
                     // `check_trailer`).
+                    //
+                    // Record the call *before* acking it: the client returns
+                    // as soon as the trailer lands, and tests then count
+                    // the calls received.
                     let trailer = encode_frame(&[], FLAG_TRAILER).unwrap();
-                    let _ = call
-                        .response_sender
-                        .send(OutgoingFrame::Trailer(trailer))
-                        .await;
+                    let sender = call.response_sender.clone();
                     calls_c.lock().await.push(call);
+                    let _ = sender.send(OutgoingFrame::Trailer(trailer)).await;
                 }
                 ReactorEvent::ConnectionClosed { connection_id, .. } => {
                     closed_c.lock().await.push(connection_id);

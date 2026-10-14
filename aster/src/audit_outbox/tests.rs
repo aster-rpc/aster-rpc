@@ -11,7 +11,7 @@ pub(crate) fn quarantine_crash_point(stage: u8) {
         return;
     }
     let marker = std::env::var_os("ASTER_AUDIT_CHILD_MARKER").unwrap();
-    std::fs::write(marker, [stage]).unwrap();
+    write_marker(std::path::Path::new(&marker), &[stage]);
     loop {
         std::thread::sleep(Duration::from_secs(1));
     }
@@ -1014,7 +1014,7 @@ fn child_process_entry() {
         let error = store::Store::open(config).err().unwrap();
         assert_eq!(error.kind(), AuditErrorKind::Storage);
         assert!(error.message.contains("already owned"));
-        std::fs::write(marker, b"locked").unwrap();
+        write_marker(&marker, b"locked");
         return;
     }
     if mode.starts_with("quarantine_") {
@@ -1040,11 +1040,10 @@ fn child_process_entry() {
     runtime.block_on(async move {
         let outbox = AuditOutbox::open(config).await.unwrap();
         let id = outbox.submit(event(7)).await.unwrap();
-        std::fs::write(
-            marker,
-            serde_json::to_vec(&outbox.export(id.to_string()).await.unwrap()).unwrap(),
-        )
-        .unwrap();
+        write_marker(
+            &marker,
+            &serde_json::to_vec(&outbox.export(id.to_string()).await.unwrap()).unwrap(),
+        );
         loop {
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
@@ -1238,12 +1237,50 @@ async fn saturated_submission_queue_cannot_starve_ack_deletion_or_flush_controls
     assert_eq!(outbox.status().await.unwrap().pending_records, 0);
     outbox.close().await.unwrap();
 }
+/// Write a child's marker atomically, so the parent never reads a partial
+/// JSON export: `wait_file` sees the marker only once it is complete.
+fn write_marker(marker: &std::path::Path, contents: &[u8]) {
+    let staging = marker.with_extension("partial");
+    std::fs::write(&staging, contents).unwrap();
+    std::fs::rename(&staging, marker).unwrap();
+}
+
+/// Generous bound for cross-process steps: a loaded parallel run can delay
+/// a re-executed test binary's start, its worker and the receiver's durable
+/// commit by seconds. Waits poll a condition; this only bounds a hang.
+const CHILD_PATIENCE: Duration = Duration::from_secs(60);
+
+/// A child test process that is killed and reaped however the test ends.
+/// Several modes loop forever after writing their marker, so a panic between
+/// spawn and an explicit kill would otherwise orphan the child.
+struct ChildGuard(std::process::Child);
+
+impl std::ops::Deref for ChildGuard {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn child(
     path: &std::path::Path,
     marker: &std::path::Path,
     mode: &str,
     endpoint: Option<&str>,
-) -> std::process::Child {
+) -> ChildGuard {
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
         .args([
@@ -1259,14 +1296,14 @@ fn child(
     if let Some(endpoint) = endpoint {
         command.env("ASTER_AUDIT_CHILD_ENDPOINT", endpoint);
     }
-    command.spawn().unwrap()
+    ChildGuard(command.spawn().unwrap())
 }
 fn wait_file(path: &std::path::Path) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + CHILD_PATIENCE;
     while !path.exists() {
         assert!(
             std::time::Instant::now() < deadline,
-            "child marker timed out"
+            "child wrote no marker within {CHILD_PATIENCE:?}"
         );
         std::thread::sleep(Duration::from_millis(5));
     }
@@ -1330,9 +1367,12 @@ async fn process_kill_after_acceptance_and_after_receiver_commit_recovers_same_i
         let exported: QuarantineExport =
             serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
         if mode == 9 {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + CHILD_PATIENCE;
             while !receiver.contains(exported.event_id.as_str()) {
-                assert!(std::time::Instant::now() < deadline);
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "receiver did not commit the child's event within {CHILD_PATIENCE:?}"
+                );
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         }
