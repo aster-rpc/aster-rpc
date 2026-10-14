@@ -18,7 +18,7 @@
 //! encoding `value` with `StringEncoding::Pyfory` must reproduce them.
 //!
 //! Regenerate (only for an intended, recorded change):
-//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --features rpc --test dynamic_payload_vector`
+//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --features rpc --test it dynamic_payload_vector::`
 //! then re-run the pyfory script to refresh `pyfory_cases`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -36,8 +36,7 @@ use fory_core::Fory;
 use fory_derive::{ForyEnum, ForyStruct, ForyUnion};
 use serde_json::{json, Value};
 
-#[path = "../../tests/interop/rust/contract.rs"]
-mod interop;
+use crate::interop;
 use interop::{EchoReply, EchoRequest};
 
 // ── golden types ──────────────────────────────────────────────────────────────
@@ -555,7 +554,7 @@ fn dynamic_payload_vectors() {
             "description": "Dynamic Fory codec golden vectors (plan D5). Payloads are Fory 1.7.6 xlang with xlang=true, compatible=true, ref=false. `types` is the schema (contract TypeDefs, JSON). Each case: `hex` = the payload of `value` as the given `type`; `value` uses the Aster JSON encoding (int64/uint64 as decimal strings, binary as unpadded base64url, enums by name, unions as {\"_type\": <payload type>, ...}, maps with string keys as objects, other maps as [[key, value], ...]). A conforming dynamic codec must (1) decode `hex` to `value` and (2) encode `value` to exactly `hex` (cases: UTF-8 strings, as Fory Rust writes them; pyfory_cases: pyfory string encoding - LATIN1, else UTF-16 for BMP text, else UTF-8).",
             "fory_version": "1.7.6",
             "options": {"xlang": true, "compatible": true, "ref": false},
-            "rust_source": "aster/tests/dynamic_payload_vector.rs",
+            "rust_source": "aster/tests/it/dynamic_payload_vector.rs",
             "pyfory_source": "conformance/vectors/dynamic-payloads-pyfory.py",
             "types": types,
             "cases": got_cases,

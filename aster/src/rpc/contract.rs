@@ -7,7 +7,7 @@
 //! canonical encoder, independent of the Fory library version.
 //!
 //! Verified against the Python reference producer
-//! (`scripts/cross_lang_echo_contract_id.py`): see `aster/tests/rpc_contract.rs`.
+//! (`scripts/cross_lang_echo_contract_id.py`): see `aster/tests/it/rpc_contract.rs`.
 
 use aster_transport_core::canonical;
 use aster_transport_core::contract::{

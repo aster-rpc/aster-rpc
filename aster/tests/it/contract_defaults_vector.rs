@@ -5,7 +5,7 @@
 //! so the Python and TypeScript producers can be brought in line with it.
 //!
 //! Regenerate (only for an intended, recorded change):
-//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --features rpc --test contract_defaults_vector`
+//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --features rpc --test it contract_defaults_vector::`
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -111,7 +111,7 @@ fn contract_defaults_vector() {
                 "field_ids": "unaffected by defaults: 1-based position in NFC-name-sorted order",
                 "wire_payload": "defaults never change the Fory payload bytes; they only change type_hash / contract_id"
             },
-            "rust_source": "aster/tests/contract_defaults_vector.rs",
+            "rust_source": "aster/tests/it/contract_defaults_vector.rs",
             "vector": got,
         });
         std::fs::write(path(), serde_json::to_string_pretty(&doc).unwrap() + "\n").unwrap();

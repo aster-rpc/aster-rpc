@@ -1,7 +1,7 @@
 """Produce the ``pyfory_cases`` section of ``dynamic-payloads.json``.
 
 The dataclasses below mirror the Rust golden types in
-``aster/tests/dynamic_payload_vector.rs`` (same wire names, field names and
+``aster/tests/it/dynamic_payload_vector.rs`` (same wire names, field names and
 wire types), registered the way ``aster.codec.ForyCodec`` registers XLANG
 types (``xlang=True, compatible=True, ref=False, strict=True``, by
 ``package.Name``). Each case records pyfory's bytes and the value in the Aster

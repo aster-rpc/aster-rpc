@@ -904,7 +904,7 @@ async fn pooled_unary_stress() {
 ///
 /// ```text
 /// ASTER_STRESS_CALLS=5000000 cargo test --release -p aster --features rpc \
-///     --test rpc_client pooled_unary_stress_long -- --ignored --nocapture
+///     --test it rpc_client::pooled_unary_stress_long -- --ignored --nocapture
 /// ```
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "long-running stress test; run explicitly"]

@@ -156,7 +156,7 @@ _DEFAULTS = _load("contract-defaults.json")["vector"]
 @wire_type("defaults.v1/Settings")
 @dataclass
 class Settings:
-    """Python mirror of ``aster/tests/contract_defaults_vector.rs::Settings``."""
+    """Python mirror of ``aster/tests/it/contract_defaults_vector.rs::Settings``."""
 
     name: str = ""  # required: plain construction default only
     state: str = contract_default("idle")

@@ -6,7 +6,7 @@
 # 7.5). Every binding's server must produce these codes.
 #
 # Status: descriptive. No runner consumes conformance/scenarios/ yet. The Rust
-# server enforces this table in aster/tests/rpc_error_mapping.rs (one test per
+# server enforces this table in aster/tests/it/rpc_error_mapping.rs (one test per
 # row marked `rust_test`); the interop matrix (tests/interop/) is the intended
 # cross-binding runner.
 #

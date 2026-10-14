@@ -12,7 +12,7 @@
 //! records.
 //!
 //! Regenerate (only for an intended, recorded format change):
-//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --test grant_vectors`
+//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --test it grant_vectors::`
 
 use std::path::PathBuf;
 

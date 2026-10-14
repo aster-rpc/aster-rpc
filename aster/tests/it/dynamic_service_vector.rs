@@ -11,7 +11,7 @@
 //! mission-control services.
 //!
 //! Regenerate (only for an intended, recorded change):
-//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --features rpc --test dynamic_service_vector`
+//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --features rpc --test it dynamic_service_vector::`
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -25,8 +25,7 @@ use aster_transport_core::contract::{canonical_xlang_bytes_service_contract, com
 use fory_derive::ForyStruct;
 use serde_json::{json, Value};
 
-#[path = "../../tests/interop/rust/contract.rs"]
-mod interop;
+use crate::interop;
 
 /// The `InteropEcho` contract id the interop servers report
 /// (`interop_echo contract`; `tests/interop/run.py` fails the matrix when the
@@ -559,7 +558,7 @@ fn actual() -> Value {
         .collect();
     json!({
         "description": "DynamicService registration JSON (dynamic-dispatch-design.md §1.5) -> expected contract_id. contract_id = BLAKE3(canonical_xlang_bytes(ServiceContract)), with the contract derived from the service (§1.2). Every binding's decorator lowering must produce a service with the same contract_id; `invalid` services must be refused with the given error code (`schema` = does not parse).",
-        "rust_source": "aster/tests/dynamic_service_vector.rs",
+        "rust_source": "aster/tests/it/dynamic_service_vector.rs",
         "cases": cases,
         "invalid": invalid,
     })

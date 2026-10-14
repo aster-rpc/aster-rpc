@@ -7,7 +7,7 @@
 //!
 //! The placement cases need `coordination-client`; without it they are
 //! skipped (not removed). Regenerate (only for an intended, recorded change):
-//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --features binding-support,coordination-client --test upcall_vectors`
+//! `ASTER_VECTORS_WRITE=1 cargo test -p aster --features binding-support,coordination-client --test it upcall_vectors::`
 
 use std::path::PathBuf;
 use std::time::Duration;

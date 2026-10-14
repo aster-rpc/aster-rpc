@@ -5,7 +5,7 @@
 //! Run explicitly with:
 //!
 //! ```text
-//! cargo test -p aster --test relay_smoke -- --ignored --nocapture
+//! cargo test -p aster --test it relay_smoke:: -- --ignored --nocapture
 //! ```
 
 use std::time::Duration;

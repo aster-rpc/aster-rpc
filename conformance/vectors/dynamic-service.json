@@ -4268,5 +4268,5 @@
       }
     }
   ],
-  "rust_source": "aster/tests/dynamic_service_vector.rs"
+  "rust_source": "aster/tests/it/dynamic_service_vector.rs"
 }

@@ -1,7 +1,7 @@
 //! Dynamic Fory codec (`aster_transport_core::dynamic`): compatible-mode
 //! evolution, wire-driven decoding, JSON forms, contracts and error cases.
 //! Byte-identity against typed Rust and pyfory for every shape is pinned by
-//! `conformance/vectors/dynamic-payloads.json` (`aster/tests/dynamic_payload_vector.rs`).
+//! `conformance/vectors/dynamic-payloads.json` (`aster/tests/it/dynamic_payload_vector.rs`).
 
 use std::collections::BTreeMap;
 

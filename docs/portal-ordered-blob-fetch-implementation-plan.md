@@ -164,12 +164,12 @@ stays additive, and there is no consumer.
 - Fork: `cargo fmt --all --check`, `cargo clippy --all-features --tests -D warnings`,
   `cargo test --all-features` (125 passed, 2 ignored) before the pin moved.
 - Aster: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -D warnings`,
-  `cargo test -p aster --features rpc,expose --test blob_fetch_multi`
+  `cargo test -p aster --features rpc,expose --test it blob_fetch_multi::`
   (**10 tests**, non-zero count checked on the raw `running N tests` line),
   `cargo test -p aster_transport_core` (252), `cargo test -p aster --all-features`,
   and the three binding crates via `cargo check`.
 
-`aster/tests/blob_fetch_multi.rs` covers ordered preference, failover from an
+`aster/tests/it/blob_fetch_multi.rs` covers ordered preference, failover from an
 offline peer and from an unaddressable id, resumption without re-fetching
 resident content, split across two partial holders, resident children skipped in
 split mode, the all-candidates-fail error, and the degenerate cases. Byte

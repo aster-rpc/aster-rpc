@@ -13,7 +13,9 @@ use std::{
 
 use aster::{AsterConfig, Node, RelayMode};
 
-const CHILD_TEST: &str = "durable_write_child";
+// The full test name inside the shared `it` binary (tests/it/main.rs), which
+// `--exact` requires.
+const CHILD_TEST: &str = "durable_docs::durable_write_child";
 const READY_PREFIX: &str = "ASTER_DURABLE_READY ";
 const PAYLOAD_LEN: usize = 8 * 1024 * 1024;
 

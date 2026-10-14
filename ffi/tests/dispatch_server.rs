@@ -5,7 +5,7 @@
 //! call on its own handler thread, answering by `call_id` (what the Java
 //! binding does with virtual threads). Client: `aster_rpc_unary` /
 //! `aster_rpc_open` / `aster_call_*_payload` on an `aster_connect`ed
-//! connection of a second node. Mirrors `aster/tests/dynamic_dispatch.rs`
+//! connection of a second node. Mirrors `aster/tests/it/dynamic_dispatch.rs`
 //! (all four patterns, sessions, cancel, deadline, `QUEUE_FULL`/reserve,
 //! connection close, Gate 3, frame limits) and ends every test with an
 //! empty call table.
@@ -38,7 +38,7 @@ const CLOSED: i32 = aster_status_t::ASTER_STATUS_ALREADY_CLOSED as i32;
 const RPC_ALPN: &[u8] = b"aster/1";
 const ADMISSION_ALPN: &[u8] = b"example.custom/1";
 
-// ── the services (as in aster/tests/dynamic_dispatch.rs) ────────────────────
+// ── the services (as in aster/tests/it/dynamic_dispatch.rs) ────────────────────
 
 const ECHO: u32 = 0;
 const COUNTER: u32 = 1;

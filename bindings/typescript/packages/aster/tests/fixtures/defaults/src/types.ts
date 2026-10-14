@@ -2,7 +2,7 @@ import { WireType, ContractDefault, i32, i64 } from '@aster-rpc/aster';
 
 /**
  * TypeScript twin of the Rust `Settings` in
- * aster/tests/contract_defaults_vector.rs; must hash to
+ * aster/tests/it/contract_defaults_vector.rs; must hash to
  * conformance/vectors/contract-defaults.json.
  */
 @WireType('defaults.v1/Settings')
