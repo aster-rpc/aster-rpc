@@ -20,11 +20,10 @@ public sealed record DocEvent(DocEventKind Kind, DocEntry? Entry = null, string?
 
 public sealed partial class Doc
 {
-    /// <summary>Subscribes to future events. Dispose the receiver independently from this document. Requires ABI 4.10.</summary>
+    /// <summary>Subscribes to future events. Dispose the receiver independently from this document.</summary>
     public async Task<DocEventReceiver> SubscribeAsync(CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        DocEventReceiver.CheckAbi();
         _runtime.Retain();
         try
         {
@@ -41,11 +40,10 @@ public sealed partial class Doc
 
 public sealed partial class Docs
 {
-    /// <summary>Atomically joins and subscribes. The returned document and event receiver each require disposal. Requires ABI 4.10.</summary>
+    /// <summary>Atomically joins and subscribes. The returned document and event receiver each require disposal.</summary>
     public async Task<(Doc Doc, DocEventReceiver Events)> JoinAndSubscribeAsync(string ticket, CancellationToken ct = default)
     {
         ct.ThrowIfCancellationRequested();
-        DocEventReceiver.CheckAbi();
         _runtime.Retain();
         try
         {
@@ -74,13 +72,6 @@ public sealed class DocEventReceiver : IDisposable, IAsyncDisposable
     {
         _runtime = runtime.Retain();
         _handle = handle;
-    }
-
-    internal static void CheckAbi()
-    {
-        var (major, minor, _) = Runtime.Version;
-        if (major != 4 || minor < 10)
-            throw new NotSupportedException("Docs event receivers require Aster native ABI 4.10 or newer.");
     }
 
     // Do not cancel the managed completion task: cancellation can lose to a
