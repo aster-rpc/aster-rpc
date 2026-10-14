@@ -34,8 +34,11 @@ pub const VERSION: &str = env!("ASTER_BUILD_VERSION");
 pub use topology::cluster::{
     CoreClusterView, CoreSeparationVerdict, SharedView as CoreTopoSharedView, TopoConfig,
 };
+pub use topology::locality::{
+    CoreDeclaredLocality, CoreLevelSource, CoreLocalitySource, LocalityVerifyFn, OwnChainFn,
+};
 pub use topology::shared::{AdmittedFn, CoreTopoSwarm, CoreTopoSwarmConfig};
-pub use topology::{CoreLadderLevel, CorePeerView};
+pub use topology::{CoreLadderLevel, CoreLevelEstimate, CorePeerView};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -2092,19 +2095,76 @@ impl CoreNode {
     }
 
     /// Topology-v1 snapshot for one peer. `None` when monitoring is
-    /// disabled, the peer is unknown, or it has never been sampled.
+    /// disabled, the peer is unknown, or it has never been sampled. When a
+    /// topology swarm with declared locality is joined, both ends'
+    /// declarations bound the measured level.
     pub fn peer_view(&self, node_id: &str) -> Option<CorePeerView> {
-        self.inner.monitor.as_ref()?.peer_view(node_id)
+        let view = self.inner.monitor.as_ref()?.peer_view(node_id)?;
+        Some(self.with_declarations(view))
     }
 
     /// Topology-v1 snapshots for every known peer. Empty when monitoring
-    /// is disabled.
+    /// is disabled. Bounded by declarations as [`Self::peer_view`] is.
     pub fn peer_views(&self) -> Vec<CorePeerView> {
         self.inner
             .monitor
             .as_ref()
             .map(|m| m.peer_views())
             .unwrap_or_default()
+            .into_iter()
+            .map(|view| self.with_declarations(view))
+            .collect()
+    }
+
+    fn with_declarations(&self, view: CorePeerView) -> CorePeerView {
+        match self.topology_swarm() {
+            Some(swarm) => {
+                let theirs = swarm.declared_locality(&view.node_id);
+                view.with_declarations(swarm.own_locality().as_ref(), theirs.as_ref())
+            }
+            None => view,
+        }
+    }
+
+    /// A level for any node id, including one this node has never
+    /// contacted. Synchronous: it reads cached state only.
+    ///
+    /// Sources, combined rather than first-wins: this node's measurement,
+    /// bounded by both ends' verified declarations (or the declarations
+    /// alone when unmeasured); then, with neither, shared cluster membership
+    /// (same cluster ⇒ `SameRegion`). `None` when nothing is known.
+    pub fn topology_locate(&self, node_id: &str) -> Option<topology::CoreLevelEstimate> {
+        use topology::locality::{bound_level, CoreLevelSource};
+        let measured = self
+            .inner
+            .monitor
+            .as_ref()
+            .and_then(|m| m.peer_view(node_id))
+            .map(|v| (v.level, v.level_reason));
+        let swarm = self.topology_swarm();
+        let theirs = swarm.as_ref().and_then(|s| s.declared_locality(node_id));
+        let mine = swarm.as_ref().and_then(|s| s.own_locality());
+        let estimate = |level, level_reason, level_source| topology::CoreLevelEstimate {
+            level,
+            level_reason,
+            level_source,
+            declared_region: theirs.as_ref().map(|t| t.region.clone()),
+            declared_zone: theirs.as_ref().and_then(|t| t.zone.clone()),
+        };
+        if let Some((level, reason, source)) = bound_level(measured, mine.as_ref(), theirs.as_ref())
+        {
+            return Some(estimate(level, reason, source));
+        }
+        let view = swarm?.cached_view()?;
+        let mine = view.cluster_of(&self.node_id())?;
+        let theirs = view.cluster_of(node_id)?;
+        (mine.members == theirs.members).then(|| {
+            estimate(
+                topology::CoreLadderLevel::SameRegion,
+                "same shared cluster".to_string(),
+                CoreLevelSource::Shared,
+            )
+        })
     }
 
     /// Join a topology swarm (topology v2): import the shared namespace

@@ -67,6 +67,18 @@ pub struct LanEdge {
     pub verified_unix_ms: i64,
 }
 
+/// A node's declared-locality record (`topo/v1/<node>/locality`): its
+/// current enrollment chain, whose root-signed `aster.locality.*` attributes
+/// readers verify. `chain` is `""` for a node admitted by a root-authored
+/// registration record; readers then use the record they already hold.
+#[derive(ForyStruct, Clone, Debug, Default, PartialEq)]
+pub struct DeclaredLocality {
+    #[fory(id = 1)]
+    pub chain: String,
+    #[fory(id = 2)]
+    pub updated_unix_ms: i64,
+}
+
 static FORY: OnceLock<Fory> = OnceLock::new();
 
 fn fory() -> &'static Fory {
@@ -78,6 +90,8 @@ fn fory() -> &'static Fory {
             .expect("register RttEdge");
         f.register_by_name::<LanEdge>("aster.topo.LanEdge")
             .expect("register LanEdge");
+        f.register_by_name::<DeclaredLocality>("aster.topo.DeclaredLocality")
+            .expect("register DeclaredLocality");
         f
     })
 }
@@ -116,6 +130,18 @@ pub fn decode_lan_edge(bytes: &[u8]) -> Result<LanEdge> {
         .map_err(|e| anyhow!("LanEdge Fory decode failed: {e}"))
 }
 
+pub fn encode_locality(l: &DeclaredLocality) -> Vec<u8> {
+    fory()
+        .serialize(l)
+        .expect("DeclaredLocality Fory serialize")
+}
+
+pub fn decode_locality(bytes: &[u8]) -> Result<DeclaredLocality> {
+    fory()
+        .deserialize(bytes)
+        .map_err(|e| anyhow!("DeclaredLocality Fory decode failed: {e}"))
+}
+
 // ── Key layout ────────────────────────────────────────────────────────────────
 
 /// Parsed `topo/v1/…` key.
@@ -127,6 +153,8 @@ pub enum TopoKey {
     Rtt { node: String, peer: String },
     /// `topo/v1/<node>/lan/<peer>`
     Lan { node: String, peer: String },
+    /// `topo/v1/<node>/locality`
+    Locality { node: String },
 }
 
 impl TopoKey {
@@ -136,12 +164,17 @@ impl TopoKey {
             TopoKey::Position { node } => node,
             TopoKey::Rtt { node, .. } => node,
             TopoKey::Lan { node, .. } => node,
+            TopoKey::Locality { node } => node,
         }
     }
 }
 
 pub fn position_key(node_hex: &str) -> Vec<u8> {
     format!("{TOPO_KEY_PREFIX}{node_hex}/position").into_bytes()
+}
+
+pub fn locality_key(node_hex: &str) -> Vec<u8> {
+    format!("{TOPO_KEY_PREFIX}{node_hex}/locality").into_bytes()
 }
 
 pub fn rtt_key(node_hex: &str, peer_hex: &str) -> Vec<u8> {
@@ -172,6 +205,7 @@ pub fn parse_key(key: &[u8]) -> Option<TopoKey> {
     let kind = parts.next()?;
     let result = match kind {
         "position" => TopoKey::Position { node: node.into() },
+        "locality" => TopoKey::Locality { node: node.into() },
         "rtt" | "lan" => {
             let peer = parts.next()?;
             if !is_node_hex(peer) {
@@ -229,6 +263,12 @@ mod tests {
             verified_unix_ms: 1_700_000_000_000,
         };
         assert_eq!(decode_lan_edge(&encode_lan_edge(&l)).unwrap(), l);
+
+        let d = DeclaredLocality {
+            chain: "aster-chain-v1.abc".into(),
+            updated_unix_ms: 1_700_000_000_000,
+        };
+        assert_eq!(decode_locality(&encode_locality(&d)).unwrap(), d);
     }
 
     #[test]
@@ -262,6 +302,14 @@ mod tests {
                 node: a.clone(),
                 peer: b.clone()
             })
+        );
+        assert_eq!(
+            parse_key(&locality_key(&a)),
+            Some(TopoKey::Locality { node: a.clone() })
+        );
+        assert_eq!(
+            parse_key(format!("topo/v1/{a}/locality/x").as_bytes()),
+            None
         );
 
         // Rejects: future version, junk, bad hex, uppercase, truncation,

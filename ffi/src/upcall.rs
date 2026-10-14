@@ -1303,6 +1303,7 @@ pub unsafe extern "C" fn aster_topology_enable_shared(
         admitted: filter,
         position_refresh,
         topo: TopoConfig::default(),
+        ..CoreTopoSwarmConfig::default()
     };
     spawn_op(&bridge, user_data, out_operation, async move {
         core.topology_join_swarm(&secret, config)

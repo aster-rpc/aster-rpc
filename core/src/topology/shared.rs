@@ -15,18 +15,19 @@
 //!   reader rules ([`TopoRecords::insert_entry`]), and running the pure
 //!   derivation ([`cluster::derive`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{anyhow, Result};
 use iroh::Endpoint;
 
 use super::cluster::{self, SharedView, TopoConfig, TopoRecords};
-use super::records::{self, NetworkPosition, RttEdge, TOPO_KEY_PREFIX};
+use super::locality::{CoreDeclaredLocality, CoreLocalitySource};
+use super::records::{self, DeclaredLocality, NetworkPosition, RttEdge, TOPO_KEY_PREFIX};
 use super::{classify_ip, AddrClass};
-use crate::{CoreDoc, CoreMonitor};
+use crate::{CoreDoc, CoreDocEntry, CoreMonitor};
 
 /// How long a derived [`SharedView`] snapshot is served before recomputing.
 const VIEW_CACHE_TTL: Duration = Duration::from_secs(1);
@@ -35,6 +36,9 @@ const VIEW_CACHE_TTL: Duration = Duration::from_secs(1);
 /// future prefix hashes; edges are a handful of integers.
 const MAX_POSITION_LEN: u64 = 4096;
 const MAX_EDGE_LEN: u64 = 256;
+/// A locality record carries one enrollment chain (capped at 24 KiB by the
+/// chain verifier) plus framing.
+const MAX_LOCALITY_LEN: u64 = 32 * 1024;
 
 /// Pluggable admission check: is this author (hex node id) currently an
 /// admitted producer?
@@ -54,6 +58,13 @@ pub struct CoreTopoSwarmConfig {
     pub position_refresh: Duration,
     /// Reader timing/coverage rules (design-doc defaults).
     pub topo: TopoConfig,
+    /// Publish this node's declared locality and verify peers'. `None`
+    /// leaves declared locality off: nothing is published and peers'
+    /// records are not read.
+    pub locality: Option<CoreLocalitySource>,
+    /// How often the shared view (and with it the declared-locality cache
+    /// read by `CoreNode::topology_locate`) is refreshed in the background.
+    pub view_refresh: Duration,
 }
 
 impl Default for CoreTopoSwarmConfig {
@@ -63,6 +74,8 @@ impl Default for CoreTopoSwarmConfig {
             admitted: None,
             position_refresh: Duration::from_secs(60),
             topo: TopoConfig::default(),
+            locality: None,
+            view_refresh: Duration::from_secs(5),
         }
     }
 }
@@ -74,6 +87,8 @@ impl fmt::Debug for CoreTopoSwarmConfig {
             .field("admitted", &self.admitted.as_ref().map(|_| "<fn>"))
             .field("position_refresh", &self.position_refresh)
             .field("topo", &self.topo)
+            .field("locality", &self.locality)
+            .field("view_refresh", &self.view_refresh)
             .finish()
     }
 }
@@ -90,6 +105,20 @@ pub struct CoreTopoSwarm {
     view_cache: Mutex<Option<(Instant, Arc<SharedView>)>>,
     /// Peers we've already offered to the doc sync set.
     synced_peers: Mutex<HashSet<String>>,
+    /// Verified declarations: this node's, and every admitted peer's.
+    declared: RwLock<DeclaredState>,
+    /// The last value read for each record key. Doc sync delivers an entry
+    /// before its content, so a node's newest record can be briefly
+    /// unreadable; the reader then uses the previous value (which still
+    /// carries its own timestamps for the liveness and TTL rules) instead of
+    /// dropping the node from the view. Pruned to the keys still present.
+    last_read: Mutex<HashMap<Vec<u8>, Vec<u8>>>,
+}
+
+#[derive(Debug, Default)]
+struct DeclaredState {
+    mine: Option<CoreDeclaredLocality>,
+    peers: HashMap<String, CoreDeclaredLocality>,
 }
 
 impl fmt::Debug for CoreTopoSwarm {
@@ -128,22 +157,38 @@ impl CoreTopoSwarm {
             config,
             view_cache: Mutex::new(None),
             synced_peers: Mutex::new(HashSet::new()),
+            declared: RwLock::new(DeclaredState::default()),
+            last_read: Mutex::new(HashMap::new()),
         });
 
         // First publish + sync immediately so joiners appear without
-        // waiting a full refresh interval, then heartbeat.
+        // waiting a full refresh interval, then heartbeat. The view refresh
+        // keeps the cached clusters and declarations that synchronous
+        // lookups read current as the doc syncs.
         swarm.publish_once().await;
 
         let weak = Arc::downgrade(&swarm);
         let refresh = swarm.config.position_refresh;
+        let view_refresh = swarm.config.view_refresh;
         let task = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(refresh);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             ticker.tick().await; // immediate first tick already published
+            let mut view_ticker = tokio::time::interval(view_refresh);
+            view_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                ticker.tick().await;
-                let Some(swarm) = weak.upgrade() else { break };
-                swarm.publish_once().await;
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        let Some(swarm) = weak.upgrade() else { break };
+                        swarm.publish_once().await;
+                    }
+                    _ = view_ticker.tick() => {
+                        let Some(swarm) = weak.upgrade() else { break };
+                        if let Err(e) = swarm.view().await {
+                            tracing::debug!("topology: view refresh failed: {e}");
+                        }
+                    }
+                }
             }
         });
         let guard = crate::AbortOnDrop(task.abort_handle());
@@ -155,6 +200,36 @@ impl CoreTopoSwarm {
     /// scoring).
     pub fn namespace_id(&self) -> [u8; 32] {
         self.namespace_id
+    }
+
+    /// This node's verified declared locality, as of the last publisher
+    /// beat.
+    pub fn own_locality(&self) -> Option<CoreDeclaredLocality> {
+        self.declared
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .mine
+            .clone()
+    }
+
+    /// A peer's verified declared locality, as of the last view refresh.
+    pub fn declared_locality(&self, node_hex: &str) -> Option<CoreDeclaredLocality> {
+        self.declared
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .peers
+            .get(node_hex)
+            .cloned()
+    }
+
+    /// The most recently derived shared view, however old, without
+    /// recomputing it. `None` before the first derivation.
+    pub fn cached_view(&self) -> Option<Arc<SharedView>> {
+        self.view_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(_, view)| view.clone())
     }
 
     /// One publisher beat: position record, edge halves, sync offers.
@@ -229,6 +304,33 @@ impl CoreTopoSwarm {
             tracing::debug!("topology: position publish failed: {e}");
         }
 
+        // Declared locality: the current chain (renewals propagate within a
+        // beat), verified for ourselves too so both ends of a comparison go
+        // through the same rule.
+        if let Some(source) = &self.config.locality {
+            let chain = (source.own_chain)().unwrap_or_default();
+            let mine = (source.verify)(&self.self_hex, &chain);
+            self.declared
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .mine = mine;
+            let record = DeclaredLocality {
+                chain,
+                updated_unix_ms: now_ms as i64,
+            };
+            if let Err(e) = self
+                .doc
+                .set_bytes(
+                    self.self_hex.clone(),
+                    records::locality_key(&self.self_hex),
+                    records::encode_locality(&record),
+                )
+                .await
+            {
+                tracing::debug!("topology: locality publish failed: {e}");
+            }
+        }
+
         // One RttEdge half per measured peer — near or far.
         for view in self.monitor.peer_views() {
             let Some(rtt_us) = view.rtt_us else { continue };
@@ -250,6 +352,29 @@ impl CoreTopoSwarm {
                 tracing::debug!("topology: edge publish failed: {e}");
             }
         }
+    }
+
+    /// Read the values of `entries`, falling back per key to the last value
+    /// read when the newest content is not local yet (see `last_read`).
+    async fn read_values(&self, entries: &[&CoreDocEntry]) -> Result<Vec<Option<Vec<u8>>>> {
+        let contents = self
+            .doc
+            .read_entry_contents_if_complete(
+                entries.iter().map(|e| e.content_hash.clone()).collect(),
+            )
+            .await?;
+        let mut last = self.last_read.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(entries
+            .iter()
+            .zip(contents)
+            .map(|(entry, content)| match content {
+                Some(bytes) => {
+                    last.insert(entry.key.clone(), bytes.clone());
+                    Some(bytes)
+                }
+                None => last.get(&entry.key).cloned(),
+            })
+            .collect())
     }
 
     /// The derived shared view (cached ~1s). Same records + same rules on
@@ -278,9 +403,18 @@ impl CoreTopoSwarm {
             .query_key_prefix(TOPO_KEY_PREFIX.as_bytes().to_vec(), None)
             .await?;
 
+        {
+            let present: HashSet<&[u8]> = entries.iter().map(|e| e.key.as_slice()).collect();
+            self.last_read
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|key, _| present.contains(key.as_slice()));
+        }
+
         let mut dropped = 0u64;
         let mut pos_entries = Vec::new();
         let mut edge_entries = Vec::new();
+        let mut locality_entries = Vec::new();
         for entry in &entries {
             let Some(key) = records::parse_key(&entry.key) else {
                 continue; // unknown key shape/version — forward compat
@@ -307,6 +441,16 @@ impl CoreTopoSwarm {
                     }
                     edge_entries.push((entry, peer));
                 }
+                records::TopoKey::Locality { node } => {
+                    if self.config.locality.is_none() || node == self.self_hex {
+                        continue;
+                    }
+                    if entry.content_len > MAX_LOCALITY_LEN {
+                        dropped += 1;
+                        continue;
+                    }
+                    locality_entries.push((entry, node));
+                }
                 // LAN attestations don't participate in derivation yet —
                 // don't pay to fetch them.
                 records::TopoKey::Lan { .. } => {}
@@ -315,12 +459,7 @@ impl CoreTopoSwarm {
 
         // Pass 1: positions → the live-admitted vertex set.
         let mut recs = TopoRecords::default();
-        let contents = self
-            .doc
-            .read_entry_contents_if_complete(
-                pos_entries.iter().map(|e| e.content_hash.clone()).collect(),
-            )
-            .await?;
+        let contents = self.read_values(&pos_entries).await?;
         for (entry, content) in pos_entries.iter().zip(contents) {
             let Some(bytes) = content else { continue }; // value not local yet
             recs.insert_entry(
@@ -346,12 +485,7 @@ impl CoreTopoSwarm {
             .filter(|(entry, peer)| live.contains(&entry.author_id) && live.contains(peer))
             .map(|(entry, _)| entry)
             .collect();
-        let contents = self
-            .doc
-            .read_entry_contents_if_complete(
-                wanted.iter().map(|e| e.content_hash.clone()).collect(),
-            )
-            .await?;
+        let contents = self.read_values(&wanted).await?;
         for (entry, content) in wanted.iter().zip(contents) {
             let Some(bytes) = content else { continue };
             recs.insert_entry(
@@ -361,6 +495,38 @@ impl CoreTopoSwarm {
                 now_ms,
                 self.config.topo.max_skew,
             );
+        }
+        // Declared locality: only for live vertices, verified against the
+        // record's own node. Anything that does not verify is "no
+        // declaration", never an error.
+        if let Some(source) = &self.config.locality {
+            let wanted: Vec<_> = locality_entries
+                .into_iter()
+                .filter(|(_, node)| live.contains(node))
+                .collect();
+            let entries: Vec<_> = wanted.iter().map(|(e, _)| *e).collect();
+            let contents = self.read_values(&entries).await?;
+            let horizon =
+                (now_ms + self.config.topo.max_skew.as_millis() as u64).min(i64::MAX as u64) as i64;
+            let mut peers = HashMap::new();
+            for ((_, node), content) in wanted.iter().zip(contents) {
+                let Some(bytes) = content else { continue };
+                let Ok(record) = records::decode_locality(&bytes) else {
+                    dropped += 1;
+                    continue;
+                };
+                if record.updated_unix_ms > horizon {
+                    dropped += 1;
+                    continue;
+                }
+                if let Some(declared) = (source.verify)(node, &record.chain) {
+                    peers.insert(node.clone(), declared);
+                }
+            }
+            self.declared
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .peers = peers;
         }
         recs.dropped += dropped;
 

@@ -236,6 +236,57 @@ Two practical notes:
   namespace secret counts — which is already admission-gated by how you
   distributed the grants.
 
+### Declare zones and regions
+
+Zone and region are facts you already know, and measurement can only
+approximate them: in a cloud VPC every peer is private, and same-zone and
+cross-zone round trips overlap. Have the root (or a delegated issuer) sign
+them into each node's enrollment claims as two reserved string attributes:
+
+| Attribute | Example | Rule |
+|---|---|---|
+| `aster.locality.region` | `eu-west-1` | required for a declaration |
+| `aster.locality.zone` | `eu-west-1a` | optional; meaningful within its region |
+
+Values are 1–64 bytes of `[a-z0-9._-]`. Malformed values are refused at
+issuance. A delegated issuer can sign them only if its grant's
+`attribute_keys` lists both keys. Then pass the enrollment's locality source
+when joining the swarm:
+
+```rust
+let opts = TopologySwarmOptions {
+    locality: Some(enrollment.topology_locality()),
+    ..Default::default()
+};
+node.topology().enable_shared(&secret, opts).await?;
+```
+
+Each node publishes its current credential chain to the topology document
+(renewals included), and every reader verifies it as admission would before
+believing the zone. A node admitted by a registration record publishes no
+chain, and readers use the root's record instead. When both ends declare:
+
+| Declared relation | Level |
+|---|---|
+| different region | `Far`, however fast the path |
+| same region, different zone | exactly `SameRegion` |
+| same zone | at least `SameSite` |
+| same region, a zone missing | at least `SameRegion` |
+
+A measurement can still say a peer is closer than the bound (`SameLan`,
+`SameHost`), never further. `PeerView` reports `level_source`
+(`Measured` or `Declared`) and the peer's `declared_region` /
+`declared_zone`. Note that `SameSite` now also covers "same declared zone".
+
+For a peer you have never contacted, `topology.locate(&id)` answers
+synchronously from the cached declarations, then shared clusters:
+
+```rust
+if let Some(estimate) = node.topology().locate(&provider) {
+    rank_by(estimate.level, estimate.level_source);
+}
+```
+
 ## 5. What to rely on — and what not to
 
 **Rely on:**

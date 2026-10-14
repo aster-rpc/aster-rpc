@@ -43,7 +43,9 @@ pub fn issue_delegation(
     )
 }
 
-/// Enroll `subject` with the given claims.
+/// Enroll `subject` with the given claims. Malformed reserved locality
+/// attributes (`aster.locality.*`) are refused as [`ChainError::Malformed`]:
+/// readers would ignore them, so signing them would only hide the mistake.
 pub fn issue_enrollment(
     signer: &[u8; 32],
     parent: Option<&Chain>,
@@ -52,6 +54,9 @@ pub fn issue_enrollment(
     claims: &EnrollmentExtensionV1,
     validity: Validity,
 ) -> Result<Chain, ChainError> {
+    if claims.claims.declared_locality().is_err() {
+        return Err(ChainError::Malformed);
+    }
     issue(
         signer,
         parent,

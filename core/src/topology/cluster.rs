@@ -110,8 +110,9 @@ impl TopoRecords {
                 }
                 Err(_) => self.dropped += 1,
             },
-            // LAN attestations don't participate in cluster derivation yet.
-            TopoKey::Lan { .. } => {}
+            // LAN attestations don't participate in cluster derivation yet;
+            // declared locality is verified by the swarm engine, not here.
+            TopoKey::Lan { .. } | TopoKey::Locality { .. } => {}
         }
     }
 }

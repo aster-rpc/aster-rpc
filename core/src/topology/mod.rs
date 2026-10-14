@@ -12,6 +12,7 @@
 //! swarm engine).
 
 pub mod cluster;
+pub mod locality;
 pub mod records;
 pub mod shared;
 
@@ -322,6 +323,9 @@ impl PeerTopoState {
             last_measured_unix_ms: unix_ms(last_sample),
             cluster_held_since_unix_ms: self.cluster_held_since.map(unix_ms).unwrap_or(0),
             is_connected,
+            level_source: locality::CoreLevelSource::Measured,
+            declared_region: None,
+            declared_zone: None,
         })
     }
 }
@@ -429,6 +433,42 @@ pub struct CorePeerView {
     /// enter threshold (v2 publisher hysteresis); 0 = not currently held.
     pub cluster_held_since_unix_ms: u64,
     pub is_connected: bool,
+    /// Where `level` came from: this node's measurement, or both ends'
+    /// verified declarations bounding it (see [`locality::bound_level`]).
+    pub level_source: locality::CoreLevelSource,
+    /// The peer's verified declared region and zone, when it has them.
+    pub declared_region: Option<String>,
+    pub declared_zone: Option<String>,
+}
+
+impl CorePeerView {
+    /// Fold both ends' declarations into this view's measured level.
+    pub fn with_declarations(
+        mut self,
+        mine: Option<&locality::CoreDeclaredLocality>,
+        theirs: Option<&locality::CoreDeclaredLocality>,
+    ) -> Self {
+        if let Some((level, reason, source)) =
+            locality::bound_level(Some((self.level, self.level_reason.clone())), mine, theirs)
+        {
+            self.level = level;
+            self.level_reason = reason;
+            self.level_source = source;
+        }
+        self.declared_region = theirs.map(|t| t.region.clone());
+        self.declared_zone = theirs.and_then(|t| t.zone.clone());
+        self
+    }
+}
+
+/// A level for any node id, measured or not: see `CoreNode::topology_locate`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreLevelEstimate {
+    pub level: CoreLadderLevel,
+    pub level_reason: String,
+    pub level_source: locality::CoreLevelSource,
+    pub declared_region: Option<String>,
+    pub declared_zone: Option<String>,
 }
 
 #[cfg(test)]

@@ -462,6 +462,9 @@ mod tests {
             last_measured_unix_ms: 10,
             cluster_held_since_unix_ms: 11,
             is_connected: false,
+            level_source: aster::topology::LevelSource::Measured,
+            declared_region: None,
+            declared_zone: None,
         };
         let value = peer_json(peer);
         assert_eq!(value.as_object().unwrap().len(), 17);

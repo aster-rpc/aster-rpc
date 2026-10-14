@@ -18,9 +18,15 @@ use crate::id::{NamespaceSecret, NodeId};
 use aster_transport_core::{CoreNode, CoreTopoSwarm, CoreTopoSwarmConfig};
 
 pub use aster_transport_core::{
-    AdmittedFn, CoreClusterView as ClusterView, CoreLadderLevel as LadderLevel,
-    CorePeerView as PeerView, CoreSeparationVerdict as SeparationVerdict, TopoConfig,
+    AdmittedFn, CoreClusterView as ClusterView, CoreDeclaredLocality as DeclaredLocality,
+    CoreLadderLevel as LadderLevel, CoreLevelEstimate as LevelEstimate,
+    CoreLevelSource as LevelSource, CoreLocalitySource as LocalitySource, CorePeerView as PeerView,
+    CoreSeparationVerdict as SeparationVerdict, LocalityVerifyFn, OwnChainFn, TopoConfig,
 };
+
+/// Reserved enrollment attributes that declare a node's region and zone.
+/// See [`LocalitySource`] and `docs/aster-topology-getstarted.md`.
+pub use aster_transport_core::topology::locality::{REGION_ATTRIBUTE, ZONE_ATTRIBUTE};
 
 /// Clone-cheap handle to this node's local topology view. Obtain via
 /// [`Node::topology`](crate::Node::topology).
@@ -54,6 +60,17 @@ impl Topology {
         self.core.peer_view(id.as_str())
     }
 
+    /// A ladder level for any node, including one this node has never
+    /// contacted, and where it came from. Synchronous and cheap: it reads
+    /// cached state only, so it suits ranking on every fetch.
+    ///
+    /// Combines this node's measurement, both ends' verified declared
+    /// locality (with [`TopologySwarmOptions::locality`]), and, with neither,
+    /// shared cluster membership. `None` when nothing is known yet.
+    pub fn locate(&self, id: &NodeId) -> Option<LevelEstimate> {
+        self.core.topology_locate(id.as_str())
+    }
+
     // ── Topology v2: the shared swarm view ──────────────────────────────
 
     /// Join a topology swarm: import the shared namespace from its secret
@@ -71,11 +88,18 @@ impl Topology {
         } else {
             opts.position_refresh
         };
+        let view_refresh = if opts.view_refresh.is_zero() {
+            Duration::from_secs(5)
+        } else {
+            opts.view_refresh
+        };
         let config = CoreTopoSwarmConfig {
             bootstrap: opts.bootstrap.iter().map(|n| n.to_string()).collect(),
             admitted: opts.admitted,
             position_refresh,
             topo: opts.timing,
+            locality: opts.locality,
+            view_refresh,
         };
         self.core
             .topology_join_swarm(&secret.to_bytes(), config)
@@ -199,4 +223,12 @@ pub struct TopologySwarmOptions {
     /// Reader timing/coverage rules. `TopologySwarmOptions::default()`
     /// fills the design-doc defaults.
     pub timing: TopoConfig,
+    /// Publish this node's root-signed declared locality and verify peers'
+    /// (`None` = off). With enrollment, use
+    /// [`Enrollment::topology_locality`](crate::enrollment::Enrollment::topology_locality).
+    pub locality: Option<LocalitySource>,
+    /// How often the cached shared view and declarations behind
+    /// [`Topology::locate`] refresh. `Duration::ZERO` (the `Default`) means
+    /// 5s.
+    pub view_refresh: Duration,
 }

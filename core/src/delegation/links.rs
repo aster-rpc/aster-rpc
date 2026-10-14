@@ -8,6 +8,9 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 
 use super::{ChainError, MAX_LIST_ENTRIES, MAX_STRING_BYTES};
+use crate::topology::locality::{
+    CoreDeclaredLocality, MalformedLocality, REGION_ATTRIBUTE, ZONE_ATTRIBUTE,
+};
 
 pub const DELEGATION_JWT_TYPE: &str = "aster-delegation-v1+jwt";
 pub const ACTION_JWT_TYPE: &str = "aster-action-v1+jwt";
@@ -59,6 +62,29 @@ pub struct AdmissionClaims {
     pub scopes: Option<BTreeSet<String>>,
     pub tags: Option<BTreeSet<String>>,
     pub attributes: Option<BTreeMap<String, TypedAttribute>>,
+}
+
+impl AdmissionClaims {
+    /// The declared locality in the reserved `aster.locality.region` /
+    /// `aster.locality.zone` attributes. `Ok(None)` when neither is present;
+    /// [`MalformedLocality`] when either is present but malformed (not a
+    /// string, an invalid value, or a zone without a region).
+    pub fn declared_locality(&self) -> Result<Option<CoreDeclaredLocality>, MalformedLocality> {
+        let Some(attributes) = &self.attributes else {
+            return Ok(None);
+        };
+        let value = |key: &str| match attributes.get(key) {
+            None => Ok(None),
+            Some(TypedAttribute::String(value)) => Ok(Some(value.as_str())),
+            Some(_) => Err(MalformedLocality),
+        };
+        match (value(REGION_ATTRIBUTE)?, value(ZONE_ATTRIBUTE)?) {
+            (None, None) => Ok(None),
+            (region, zone) => CoreDeclaredLocality::from_values(region, zone)
+                .map(Some)
+                .ok_or(MalformedLocality),
+        }
+    }
 }
 
 /// What an enrolled node expects from its credential.

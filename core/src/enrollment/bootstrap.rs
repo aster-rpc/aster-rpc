@@ -985,6 +985,26 @@ impl EnrollmentService {
         }
     }
 
+    /// `subject`'s verified declared locality (`aster.locality.*` claims):
+    /// from `chain` when it is non-empty and verifies as admission would,
+    /// otherwise from the root's registration record for `subject`. `None`
+    /// when nothing verifies or no well-formed declaration is present.
+    pub fn declared_locality(
+        &self,
+        subject: &[u8; 32],
+        chain: &str,
+    ) -> Option<crate::topology::locality::CoreDeclaredLocality> {
+        let evidence = if chain.is_empty() {
+            self.trust()
+                .stores
+                .select_evidence(subject, None, unix_now())
+                .ok()?
+        } else {
+            self.verify_credential(subject, chain).ok()?
+        };
+        evidence.claims().declared_locality().ok().flatten()
+    }
+
     /// Replace this node's credential with a renewed chain, then present it
     /// again to every peer this node has a session with, so their sessions
     /// rest on it before the old chain expires. The chain must verify for

@@ -902,3 +902,102 @@ fn only_an_anchors_one_link_credential_may_name_its_own_issuer() {
     let text = chain(&[leaf, parent.links().next().unwrap().to_owned()]);
     assert_eq!(verify(&text, ISSUER).unwrap_err(), ChainError::Bridge);
 }
+
+// ── Declared locality (topology design §"Declared locality") ────────────────
+
+fn locality_claims(region: TypedAttribute, zone: Option<TypedAttribute>) -> EnrollmentExtensionV1 {
+    let mut attributes = std::collections::BTreeMap::new();
+    attributes.insert("aster.locality.region".to_string(), region);
+    if let Some(zone) = zone {
+        attributes.insert("aster.locality.zone".to_string(), zone);
+    }
+    EnrollmentExtensionV1 {
+        claims: AdmissionClaims {
+            scopes: Some(set(&["build"])),
+            tags: None,
+            attributes: Some(attributes),
+        },
+        mandatory: vec![],
+        registration: Registration::Ephemeral,
+    }
+}
+
+fn locality_grant() -> DelegationGrant {
+    DelegationGrant {
+        attribute_keys: set(&["role", "aster.locality.region", "aster.locality.zone"]),
+        ..grant()
+    }
+}
+
+fn s(value: &str) -> TypedAttribute {
+    TypedAttribute::String(value.into())
+}
+
+/// A delegated issuer granted the locality keys signs a zone that readers
+/// recover from the verified leaf.
+#[test]
+fn delegated_locality_survives_verification() {
+    let parent = delegation_to_issuer(&locality_grant());
+    let chain = issue_enrollment(
+        &seed(ISSUER),
+        Some(&parent),
+        &key(NODE),
+        &aud(),
+        &locality_claims(s("eu-west-1"), Some(s("eu-west-1a"))),
+        validity(NOW - 10, DAY),
+    )
+    .unwrap();
+    let verified = verify(chain.to_text(), NODE).unwrap();
+    let LeafClaims::Enrollment(leaf) = verified.leaf() else {
+        panic!("enrollment leaf expected");
+    };
+    let declared = leaf.claims.declared_locality().unwrap().unwrap();
+    assert_eq!(declared.region, "eu-west-1");
+    assert_eq!(declared.zone.as_deref(), Some("eu-west-1a"));
+}
+
+/// An issuer whose grant does not list the locality keys cannot sign them:
+/// zone is ordinary attenuated authority, not a free-for-all.
+#[test]
+fn locality_needs_the_keys_in_the_issuers_grant() {
+    let parent = delegation_to_issuer(&grant());
+    let refused = issue_enrollment(
+        &seed(ISSUER),
+        Some(&parent),
+        &key(NODE),
+        &aud(),
+        &locality_claims(s("eu-west-1"), None),
+        validity(NOW - 10, DAY),
+    );
+    assert_eq!(refused.unwrap_err(), ChainError::Attenuation);
+}
+
+/// Malformed locality is refused at issuance; readers would ignore it.
+#[test]
+fn malformed_locality_is_refused_at_issuance() {
+    let parent = delegation_to_issuer(&locality_grant());
+    for claims in [
+        locality_claims(s("EU West"), None),
+        locality_claims(TypedAttribute::Int(1), None),
+        locality_claims(s("eu-west-1"), Some(s("zone a"))),
+    ] {
+        let refused = issue_enrollment(
+            &seed(ISSUER),
+            Some(&parent),
+            &key(NODE),
+            &aud(),
+            &claims,
+            validity(NOW - 10, DAY),
+        );
+        assert_eq!(refused.unwrap_err(), ChainError::Malformed);
+    }
+    // A zone without a region is malformed too.
+    let mut zone_only = locality_claims(s("eu-west-1"), Some(s("eu-west-1a")));
+    zone_only
+        .claims
+        .attributes
+        .as_mut()
+        .unwrap()
+        .remove("aster.locality.region");
+    assert!(zone_only.claims.declared_locality().is_err());
+}

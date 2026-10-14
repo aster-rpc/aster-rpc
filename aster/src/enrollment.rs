@@ -365,6 +365,25 @@ impl Enrollment {
         self.inner.audience()
     }
 
+    /// The declared-locality source for
+    /// [`TopologySwarmOptions::locality`](crate::topology::TopologySwarmOptions::locality):
+    /// publishes this node's current credential chain (renewals included) and
+    /// verifies each peer's as admission would, falling back to the root's
+    /// registration record for a node that holds no chain. Region and zone
+    /// come from the reserved `aster.locality.region` / `aster.locality.zone`
+    /// attributes the root or a delegated issuer signed.
+    pub fn topology_locality(&self) -> crate::topology::LocalitySource {
+        let own = self.inner.clone();
+        let verify = self.inner.clone();
+        crate::topology::LocalitySource {
+            own_chain: Arc::new(move || own.credential().map(|(chain, _)| chain)),
+            verify: Arc::new(move |node_hex: &str, chain: &str| {
+                let subject: [u8; 32] = hex::decode(node_hex).ok()?.try_into().ok()?;
+                verify.declared_locality(&subject, chain)
+            }),
+        }
+    }
+
     /// Verify `chain` as a credential for `subject` the way admission would:
     /// the trusted root and audience, signed validity, and the root's
     /// delegate revocations. Root records are not consulted.
