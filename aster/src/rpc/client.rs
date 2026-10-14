@@ -849,6 +849,13 @@ impl CallCtl {
             r = timed => r,
             () = &mut cancelled => return Err(self.closed_error()),
         };
+        // Once the call is cancelled locally, every failure is that cancel. The
+        // server answers our reset by resetting too, so a pending read can fail
+        // with a transport error (UNAVAILABLE) at the same moment, and select!
+        // picks between ready branches at random.
+        if out.is_err() && self.state.load(Ordering::Acquire) == CANCELLED {
+            return Err(self.closed_error());
+        }
         if let Err(Error::Rpc { code, .. }) = &out {
             if *code == StatusCode::DeadlineExceeded.as_i32() {
                 self.observe(StatusCode::DeadlineExceeded);
@@ -1091,6 +1098,12 @@ impl ResponseStream {
             }
             let read = self.ctl.guarded(read_frame(&self.ctl.recv)).await;
             return match read {
+                // We cancelled the call ourselves (e.g. finishing an empty
+                // request stream), and the server answered by ending its side.
+                Ok(None) if self.ctl.state.load(Ordering::Acquire) == CANCELLED => {
+                    self.done = true;
+                    Some(Err(self.ctl.closed_error()))
+                }
                 Ok(None) => {
                     // Stream ended without a trailer — the handler panicked,
                     // dropped its `Call` without finishing, or the connection
