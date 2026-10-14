@@ -53,6 +53,20 @@ for (workflow, name), t in sorted(seen.items(), key=lambda kv: kv[1]["id"]):
 ' "$sha"
 }
 
+# Status of each workflow run for this commit ("<workflow> <status>"). Tasks
+# are created only as jobs are dispatched, so "nothing running" in the task
+# list is not "finished"; the run status is.
+runs() {
+  curl -fsS -H "Authorization: token $token" \
+    "$FORGE/api/v1/repos/$REPO/actions/runs?limit=50" | python3 -c '
+import json, sys
+sha = sys.argv[1]
+for r in json.load(sys.stdin).get("workflow_runs", []):
+    if r.get("commit_sha") == sha:
+        print(r.get("workflow_id"), r.get("status"))
+' "$sha"
+}
+
 explain() {
   local id="$1" name="$2" path
   echo
@@ -98,8 +112,14 @@ while true; do
     explain "$id" "$name"
     exit 1
   fi
-  if ! grep -qE ' (running|waiting|blocked|queued) ' <<<"$out"; then
-    echo "ci-watch: all jobs finished without failure"
+  run_states="$(runs)"
+  if [[ -n "$run_states" ]] && ! grep -qE ' (running|waiting|blocked|queued)$' <<<"$run_states"; then
+    if grep -qE ' (failure|cancelled)$' <<<"$run_states"; then
+      echo "ci-watch: run failed without a failed job in the task list:"
+      echo "$run_states"
+      exit 1
+    fi
+    echo "ci-watch: run finished: $(tr '\n' ' ' <<<"$run_states")"
     exit 0
   fi
   $once && exit 0
