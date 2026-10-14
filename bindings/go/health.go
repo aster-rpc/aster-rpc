@@ -71,7 +71,7 @@ func StartHealth(node *Node, cfg *HealthConfig) (*HealthServer, error) {
 	}
 	rt := C.uint64_t(node.runtime.handle)
 	var h C.aster_health_t
-	if err := statusError(C.aster_health_start(rt, C.uint64_t(node.handle), cc, &h)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_health_start(rt, C.uint64_t(node.handle), cc, &h) }); err != nil {
 		return nil, fmt.Errorf("aster_health_start: %w", err)
 	}
 	return &HealthServer{rt: rt, handle: uint64(h)}, nil
@@ -83,7 +83,7 @@ func (h *HealthServer) call(what string, fn func() C.int32_t) error {
 	if h.closed {
 		return fmt.Errorf("%s: %w", what, ErrAlreadyClosed)
 	}
-	if err := statusError(fn()); err != nil {
+	if err := ffiStatus(func() C.int32_t { return fn() }); err != nil {
 		return fmt.Errorf("%s: %w", what, err)
 	}
 	return nil
@@ -135,7 +135,7 @@ func (h *HealthServer) Stop() error {
 		return nil
 	}
 	h.closed = true
-	if err := statusError(C.aster_health_stop(h.rt, C.aster_health_t(h.handle))); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_health_stop(h.rt, C.aster_health_t(h.handle)) }); err != nil {
 		return fmt.Errorf("aster_health_stop: %w", err)
 	}
 	return nil

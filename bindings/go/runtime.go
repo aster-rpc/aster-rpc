@@ -612,6 +612,11 @@ func StatusName(code int32) string {
 
 // LastErrorMessage reads the most recent error message from the runtime.
 // Returns an empty string if there is no current error.
+//
+// The message is per OS thread, and a goroutine can move between threads
+// between two cgo calls, so this can miss the message of the call before it.
+// Prefer the error a failing call returns: it already carries the message,
+// read on the calling thread.
 func (r *Runtime) LastErrorMessage() string {
 	var buf [512]byte
 	n := C.aster_last_error_message((*C.uint8_t)(unsafe.Pointer(&buf[0])), 512)

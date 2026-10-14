@@ -313,7 +313,7 @@ func (rc *RpcConnection) conv() C.uint64_t { return C.uint64_t(rc.conn.handle) }
 // connection never collide). Pass it with WithSession.
 func (rc *RpcConnection) NewSessionID() (uint32, error) {
 	var id C.uint32_t
-	if err := statusError(C.aster_connection_next_session_id(rc.rt(), rc.conv(), &id)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_connection_next_session_id(rc.rt(), rc.conv(), &id) }); err != nil {
 		return 0, fmt.Errorf("aster_connection_next_session_id: %w", err)
 	}
 	return uint32(id), nil
@@ -420,29 +420,34 @@ func (rc *RpcConnection) unary(ctx context.Context, opts nativeOptions, req []by
 	var respBuf, statusBuf C.uint64_t
 	var code C.int32_t
 	var r C.int32_t
+	var rMsg string
 	if ctx.Done() == nil {
-		r = C.aster_rpc_unary(rc.rt(), rc.conv(), opts.ptr(), p, n,
-			&respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf)
+		r, rMsg = ffiCall(func() C.int32_t {
+			return C.aster_rpc_unary(rc.rt(), rc.conv(), opts.ptr(), p, n,
+				&respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf)
+		})
 	} else {
 		if ctx.Err() != nil {
 			return nil, ctxFailure(ctx)
 		}
 		rt := rc.rt()
 		var token C.aster_cancel_token_t
-		if err := statusError(C.aster_cancel_token_new(rt, &token)); err != nil {
+		if err := ffiStatus(func() C.int32_t { return C.aster_cancel_token_new(rt, &token) }); err != nil {
 			return nil, fmt.Errorf("aster_cancel_token_new: %w", err)
 		}
 		// Never blocks; a no-op (NOT_FOUND) once the call has returned.
 		stop := context.AfterFunc(ctx, func() { C.aster_cancel_token_cancel(rt, token) })
-		r = C.aster_rpc_unary_cancellable(rt, rc.conv(), opts.ptr(), token, p, n,
-			&respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf)
+		r, rMsg = ffiCall(func() C.int32_t {
+			return C.aster_rpc_unary_cancellable(rt, rc.conv(), opts.ptr(), token, p, n,
+				&respPtr, &respLen, &respBuf, &code, &statusPtr, &statusLen, &statusBuf)
+		})
 		stop()
 	}
 	if r != C.ASTER_STATUS_OK {
 		if r == C.ASTER_STATUS_NOT_FOUND {
 			return nil, &RpcError{Code: StatusUnavailable, Message: "connection closed"}
 		}
-		return nil, fmt.Errorf("aster_rpc_unary: %w", statusError(r))
+		return nil, fmt.Errorf("aster_rpc_unary: %w", statusErrorMsg(r, rMsg))
 	}
 	if code != 0 {
 		var st []byte
@@ -533,7 +538,7 @@ func openCall(ctx context.Context, rc *RpcConnection, pattern MethodPattern, ser
 	}
 	defer nopts.free()
 	var h C.aster_call_t
-	if err := statusError(C.aster_rpc_open(rc.rt(), rc.conv(), C.uint8_t(pattern), nopts.ptr(), &h)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_rpc_open(rc.rt(), rc.conv(), C.uint8_t(pattern), nopts.ptr(), &h) }); err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, &RpcError{Code: StatusUnavailable, Message: "connection closed"}
 		}
@@ -614,13 +619,13 @@ func (c *rpcCall) send(payload []byte, end bool) error {
 	if end {
 		e = 1
 	}
-	switch r := C.aster_call_send_payload(c.rc.rt(), c.h, p, n, e); r {
+	switch r, rMsg := ffiCall(func() C.int32_t { return C.aster_call_send_payload(c.rc.rt(), c.h, p, n, e) }); r {
 	case C.ASTER_STATUS_OK:
 		return nil
 	case C.ASTER_STATUS_ALREADY_CLOSED, C.ASTER_STATUS_NOT_FOUND:
 		return errCallClosed
 	default:
-		return fmt.Errorf("aster_call_send_payload: %w", statusError(r))
+		return fmt.Errorf("aster_call_send_payload: %w", statusErrorMsg(r, rMsg))
 	}
 }
 
@@ -638,7 +643,9 @@ func (c *rpcCall) recv() ([]byte, error) {
 	var buf C.uint64_t
 	var trailer C.uint8_t
 	for {
-		r := C.aster_call_recv_payload(c.rc.rt(), c.h, recvSliceMs, &ptr, &n, &buf, &trailer)
+		r, rMsg := ffiCall(func() C.int32_t {
+			return C.aster_call_recv_payload(c.rc.rt(), c.h, recvSliceMs, &ptr, &n, &buf, &trailer)
+		})
 		if r == C.ASTER_STATUS_TIMEOUT {
 			if c.ctx.Err() != nil {
 				c.cancel()
@@ -656,7 +663,7 @@ func (c *rpcCall) recv() ([]byte, error) {
 			}
 			return nil, &RpcError{Code: StatusCancelled, Message: "call cancelled"}
 		default:
-			return nil, fmt.Errorf("aster_call_recv_payload: %w", statusError(r))
+			return nil, fmt.Errorf("aster_call_recv_payload: %w", statusErrorMsg(r, rMsg))
 		}
 		break
 	}

@@ -109,14 +109,19 @@ func (s *AsterServer) startHTTP(ctx context.Context, up *Upcalls, cfg HTTPListen
 	var handle C.uint64_t
 	rt := s.node.runtime
 	var status C.int32_t
+	var statusMsg string
 	operation := "aster_server_http_start"
 	if public {
 		operation = "aster_server_http_start_public"
-		status = C.aster_server_http_start_public(C.uint64_t(rt.handle), s.ds.handle, &native, &handle)
+		status, statusMsg = ffiCall(func() C.int32_t {
+			return C.aster_server_http_start_public(C.uint64_t(rt.handle), s.ds.handle, &native, &handle)
+		})
 	} else {
-		status = C.aster_server_http_start(C.uint64_t(rt.handle), s.ds.handle, C.uint64_t(up.handle), &native, &handle)
+		status, statusMsg = ffiCall(func() C.int32_t {
+			return C.aster_server_http_start(C.uint64_t(rt.handle), s.ds.handle, C.uint64_t(up.handle), &native, &handle)
+		})
 	}
-	if err := wrapStatus(operation, status); err != nil {
+	if err := wrapStatusMsg(operation, status, statusMsg); err != nil {
 		return nil, err
 	}
 	listener := &HTTPListener{server: s, upcalls: up, runtime: rt.retain(), handle: uint64(handle)}
@@ -146,15 +151,20 @@ func (l *HTTPListener) address(quic bool) (string, error) {
 	var ptr *C.uint8_t
 	var length C.uint32_t
 	var status C.int32_t
+	var statusMsg string
 	if quic {
-		status = C.aster_http_listener_quic_addr(C.uint64_t(l.runtime.handle), C.uint64_t(l.handle), &buffer, &ptr, &length)
+		status, statusMsg = ffiCall(func() C.int32_t {
+			return C.aster_http_listener_quic_addr(C.uint64_t(l.runtime.handle), C.uint64_t(l.handle), &buffer, &ptr, &length)
+		})
 	} else {
-		status = C.aster_http_listener_tcp_addr(C.uint64_t(l.runtime.handle), C.uint64_t(l.handle), &buffer, &ptr, &length)
+		status, statusMsg = ffiCall(func() C.int32_t {
+			return C.aster_http_listener_tcp_addr(C.uint64_t(l.runtime.handle), C.uint64_t(l.handle), &buffer, &ptr, &length)
+		})
 	}
 	if buffer != 0 {
 		defer l.runtime.ReleaseBuffer(uint64(buffer))
 	}
-	if err := wrapStatus("HTTP listener address", status); err != nil {
+	if err := wrapStatusMsg("HTTP listener address", status, statusMsg); err != nil {
 		return "", err
 	}
 	return C.GoStringN((*C.char)(unsafe.Pointer(ptr)), C.int(length)), nil
@@ -185,9 +195,11 @@ func (l *HTTPListener) Stop(grace time.Duration) error {
 		ms++
 	}
 	ms = min(ms, uint64(1<<32-1))
-	status := C.aster_http_listener_stop(C.uint64_t(l.runtime.handle), C.uint64_t(l.handle), C.uint32_t(ms))
+	status, statusMsg := ffiCall(func() C.int32_t {
+		return C.aster_http_listener_stop(C.uint64_t(l.runtime.handle), C.uint64_t(l.handle), C.uint32_t(ms))
+	})
 	if status != C.ASTER_STATUS_NOT_FOUND && status != C.ASTER_STATUS_ALREADY_CLOSED {
-		if err := wrapStatus("aster_http_listener_stop", status); err != nil {
+		if err := wrapStatusMsg("aster_http_listener_stop", status, statusMsg); err != nil {
 			return err
 		}
 	}

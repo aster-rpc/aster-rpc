@@ -201,7 +201,7 @@ func OpenCoordinationClient(ctx context.Context, node *Node, opts CoordinationOp
 	var a cArena
 	defer a.free()
 	var o C.aster_coordination_client_options_t
-	if err := wrapStatus("aster_coordination_client_options_init", C.aster_coordination_client_options_init(&o)); err != nil {
+	if err := wrapCall("aster_coordination_client_options_init", func() C.int32_t { return C.aster_coordination_client_options_init(&o) }); err != nil {
 		return nil, err
 	}
 	gid := a.alloc(32)
@@ -230,8 +230,10 @@ func OpenCoordinationClient(ctx context.Context, node *Node, opts CoordinationOp
 	rt.releaseEventBuffer(ev)
 	c := &CoordinationClient{rt: rt, handle: ev.Handle, groupID: append([]byte(nil), opts.GroupID...), readOnly: opts.ReadOnly}
 	var group, local [32]C.uint8_t
-	if err := wrapStatus("aster_coordination_client_ids", C.aster_coordination_client_ids(C.uint64_t(rt.handle),
-		C.uint64_t(c.handle), &group[0], &local[0])); err != nil {
+	if err := wrapCall("aster_coordination_client_ids", func() C.int32_t {
+		return C.aster_coordination_client_ids(C.uint64_t(rt.handle),
+			C.uint64_t(c.handle), &group[0], &local[0])
+	}); err != nil {
 		_ = c.Close()
 		return nil, err
 	}
@@ -262,7 +264,7 @@ func (c *CoordinationClient) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
-	err := wrapStatus("aster_coordination_client_free", C.aster_coordination_client_free(c.rtH(), C.uint64_t(c.handle)))
+	err := wrapCall("aster_coordination_client_free", func() C.int32_t { return C.aster_coordination_client_free(c.rtH(), C.uint64_t(c.handle)) })
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -382,7 +384,7 @@ func (r *ResolvedMutation) Release() error {
 	if r.used.Swap(true) {
 		return nil
 	}
-	err := wrapStatus("aster_coordination_resolved_free", C.aster_coordination_resolved_free(r.c.rtH(), C.uint64_t(r.handle)))
+	err := wrapCall("aster_coordination_resolved_free", func() C.int32_t { return C.aster_coordination_resolved_free(r.c.rtH(), C.uint64_t(r.handle)) })
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -648,7 +650,7 @@ func (l *CoordinationLease) Status() (LeaseStatus, error) {
 		return LeaseStatusReleased, nil // released or freed: the handle is gone
 	}
 	var st C.uint32_t
-	if err := wrapStatus("aster_coordination_lease_status", C.aster_coordination_lease_status(l.rtH(), C.uint64_t(l.handle), &st)); err != nil {
+	if err := wrapCall("aster_coordination_lease_status", func() C.int32_t { return C.aster_coordination_lease_status(l.rtH(), C.uint64_t(l.handle), &st) }); err != nil {
 		return 0, err
 	}
 	return LeaseStatus(st), nil
@@ -705,7 +707,7 @@ func (l *CoordinationLease) Close() error {
 	if l.done.Swap(true) {
 		return nil
 	}
-	err := wrapStatus("aster_coordination_lease_free", C.aster_coordination_lease_free(l.rtH(), C.uint64_t(l.handle)))
+	err := wrapCall("aster_coordination_lease_free", func() C.int32_t { return C.aster_coordination_lease_free(l.rtH(), C.uint64_t(l.handle)) })
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}
@@ -814,8 +816,10 @@ func NewPlacementManager(c *CoordinationClient, up *Upcalls, topology *Node) (*P
 		tn = C.uint64_t(topology.handle)
 	}
 	var h C.aster_coordination_placement_manager_t
-	if err := wrapStatus("aster_coordination_placement_manager_new", C.aster_coordination_placement_manager_new(
-		c.rtH(), C.uint64_t(c.handle), C.uint64_t(up.handle), tn, &h)); err != nil {
+	if err := wrapCall("aster_coordination_placement_manager_new", func() C.int32_t {
+		return C.aster_coordination_placement_manager_new(
+			c.rtH(), C.uint64_t(c.handle), C.uint64_t(up.handle), tn, &h)
+	}); err != nil {
 		return nil, err
 	}
 	return &PlacementManager{c: c, handle: uint64(h)}, nil
@@ -839,7 +843,7 @@ func (m *PlacementManager) Close() error {
 	if m.closed.Swap(true) {
 		return nil
 	}
-	err := wrapStatus("aster_coordination_placement_manager_free", C.aster_coordination_placement_manager_free(m.c.rtH(), C.uint64_t(m.handle)))
+	err := wrapCall("aster_coordination_placement_manager_free", func() C.int32_t { return C.aster_coordination_placement_manager_free(m.c.rtH(), C.uint64_t(m.handle)) })
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}

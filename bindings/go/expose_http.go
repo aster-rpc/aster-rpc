@@ -85,7 +85,7 @@ func (e *Expose) ExposeHTTP(up *Upcalls, bodies *HTTPBodies, serviceID string, h
 		return fmt.Errorf("expose http: upcalls, bodies and registry must share a runtime: %w", ErrInvalidArgument)
 	}
 	var o C.aster_http_foreign_options_t
-	if err := wrapStatus("aster_http_foreign_options_init", C.aster_http_foreign_options_init(&o)); err != nil {
+	if err := wrapCall("aster_http_foreign_options_init", func() C.int32_t { return C.aster_http_foreign_options_init(&o) }); err != nil {
 		return err
 	}
 	svc := &httpService{bodies: bodies, handler: h, maxChunk: defaultChunk}
@@ -105,8 +105,10 @@ func (e *Expose) ExposeHTTP(up *Upcalls, bodies *HTTPBodies, serviceID string, h
 	}
 	var a cArena
 	defer a.free()
-	if err := wrapStatus("aster_expose_http_foreign", C.aster_expose_http_foreign(e.rtH(), C.uint64_t(e.handle),
-		C.uint64_t(up.handle), C.uint64_t(bodies.handle), a.str(serviceID), &o)); err != nil {
+	if err := wrapCall("aster_expose_http_foreign", func() C.int32_t {
+		return C.aster_expose_http_foreign(e.rtH(), C.uint64_t(e.handle),
+			C.uint64_t(up.handle), C.uint64_t(bodies.handle), a.str(serviceID), &o)
+	}); err != nil {
 		up.removeHTTPService(serviceID)
 		return err
 	}

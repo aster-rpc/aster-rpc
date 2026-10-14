@@ -101,8 +101,8 @@ type LeaseSerializerHandle struct {
 // A failed upcall is a backend error, never read as a denial.
 func NewForeignLeaseSerializer(up *Upcalls) (*LeaseSerializerHandle, error) {
 	var h C.aster_lease_serializer_t
-	if err := wrapStatus("aster_lease_serializer_foreign_new",
-		C.aster_lease_serializer_foreign_new(up.rtH(), C.uint64_t(up.handle), &h)); err != nil {
+	if err := wrapCall("aster_lease_serializer_foreign_new",
+		func() C.int32_t { return C.aster_lease_serializer_foreign_new(up.rtH(), C.uint64_t(up.handle), &h) }); err != nil {
 		return nil, err
 	}
 	return &LeaseSerializerHandle{rt: up.rt, handle: uint64(h)}, nil
@@ -119,8 +119,8 @@ func NewMemoryLeaseSerializer(rt *Runtime, authorizer *Upcalls) (*LeaseSerialize
 		auth = C.uint64_t(authorizer.handle)
 	}
 	var h C.aster_lease_serializer_t
-	if err := wrapStatus("aster_lease_serializer_memory_new",
-		C.aster_lease_serializer_memory_new(C.uint64_t(rt.handle), auth, &h)); err != nil {
+	if err := wrapCall("aster_lease_serializer_memory_new",
+		func() C.int32_t { return C.aster_lease_serializer_memory_new(C.uint64_t(rt.handle), auth, &h) }); err != nil {
 		return nil, err
 	}
 	return &LeaseSerializerHandle{rt: rt, handle: uint64(h)}, nil
@@ -211,7 +211,7 @@ func (s *LeaseSerializerHandle) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
-	return wrapStatus("aster_lease_serializer_free", C.aster_lease_serializer_free(s.rtH(), C.uint64_t(s.handle)))
+	return wrapCall("aster_lease_serializer_free", func() C.int32_t { return C.aster_lease_serializer_free(s.rtH(), C.uint64_t(s.handle)) })
 }
 
 // Lease is a held lease (aster_lease_t): it renews in the background, gates
@@ -250,7 +250,7 @@ func (l *Lease) Status() (LeaseStatus, error) {
 		return LeaseStatusReleased, nil
 	}
 	var st C.uint32_t
-	if err := wrapStatus("aster_lease_status", C.aster_lease_status(l.rtH(), C.uint64_t(l.handle), &st)); err != nil {
+	if err := wrapCall("aster_lease_status", func() C.int32_t { return C.aster_lease_status(l.rtH(), C.uint64_t(l.handle), &st) }); err != nil {
 		return 0, err
 	}
 	return LeaseStatus(st), nil
@@ -350,8 +350,8 @@ type FencedResourceHandle struct {
 // NewForeignFencedResource creates the handle over up.
 func NewForeignFencedResource(up *Upcalls) (*FencedResourceHandle, error) {
 	var h C.aster_fenced_resource_t
-	if err := wrapStatus("aster_fenced_resource_foreign_new",
-		C.aster_fenced_resource_foreign_new(up.rtH(), C.uint64_t(up.handle), &h)); err != nil {
+	if err := wrapCall("aster_fenced_resource_foreign_new",
+		func() C.int32_t { return C.aster_fenced_resource_foreign_new(up.rtH(), C.uint64_t(up.handle), &h) }); err != nil {
 		return nil, err
 	}
 	return &FencedResourceHandle{rt: up.rt, handle: uint64(h)}, nil
@@ -391,8 +391,8 @@ func (f *FencedResourceHandle) Close() error {
 	if f.closed.Swap(true) {
 		return nil
 	}
-	return wrapStatus("aster_fenced_resource_free",
-		C.aster_fenced_resource_free(C.uint64_t(f.rt.handle), C.uint64_t(f.handle)))
+	return wrapCall("aster_fenced_resource_free",
+		func() C.int32_t { return C.aster_fenced_resource_free(C.uint64_t(f.rt.handle), C.uint64_t(f.handle)) })
 }
 
 // ─── topology admitted filter ────────────────────────────────────────────
@@ -428,9 +428,11 @@ type AdmittedFilterHandle struct {
 // NewAdmittedFilter creates a filter whose questions are upcalls on up.
 func NewAdmittedFilter(up *Upcalls, opts AdmittedFilterOptions) (*AdmittedFilterHandle, error) {
 	var h C.aster_topology_admitted_t
-	if err := wrapStatus("aster_topology_admitted_new",
-		C.aster_topology_admitted_new(up.rtH(), C.uint64_t(up.handle), millis0(opts.TTL),
-			millis0(opts.FailureRetry), C.uint32_t(opts.MaxBatch), &h)); err != nil {
+	if err := wrapCall("aster_topology_admitted_new",
+		func() C.int32_t {
+			return C.aster_topology_admitted_new(up.rtH(), C.uint64_t(up.handle), millis0(opts.TTL),
+				millis0(opts.FailureRetry), C.uint32_t(opts.MaxBatch), &h)
+		}); err != nil {
 		return nil, err
 	}
 	return &AdmittedFilterHandle{rt: up.rt, handle: uint64(h)}, nil
@@ -455,8 +457,10 @@ func (f *AdmittedFilterHandle) IsAdmitted(nodeID string) (bool, error) {
 	var a cArena
 	defer a.free()
 	var out C.uint32_t
-	if err := wrapStatus("aster_topology_admitted_check",
-		C.aster_topology_admitted_check(f.rtH(), C.uint64_t(f.handle), a.str(nodeID), &out)); err != nil {
+	if err := wrapCall("aster_topology_admitted_check",
+		func() C.int32_t {
+			return C.aster_topology_admitted_check(f.rtH(), C.uint64_t(f.handle), a.str(nodeID), &out)
+		}); err != nil {
 		return false, err
 	}
 	return out != 0, nil
@@ -466,16 +470,20 @@ func (f *AdmittedFilterHandle) IsAdmitted(nodeID string) (bool, error) {
 func (f *AdmittedFilterHandle) Set(nodeID string, admitted bool) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("aster_topology_admitted_set",
-		C.aster_topology_admitted_set(f.rtH(), C.uint64_t(f.handle), a.str(nodeID), boolToUint32(admitted)))
+	return wrapCall("aster_topology_admitted_set",
+		func() C.int32_t {
+			return C.aster_topology_admitted_set(f.rtH(), C.uint64_t(f.handle), a.str(nodeID), boolToUint32(admitted))
+		})
 }
 
 // Invalidate forgets nodeID's answer (the next lookup re-resolves).
 func (f *AdmittedFilterHandle) Invalidate(nodeID string) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("aster_topology_admitted_invalidate",
-		C.aster_topology_admitted_invalidate(f.rtH(), C.uint64_t(f.handle), a.str(nodeID)))
+	return wrapCall("aster_topology_admitted_invalidate",
+		func() C.int32_t {
+			return C.aster_topology_admitted_invalidate(f.rtH(), C.uint64_t(f.handle), a.str(nodeID))
+		})
 }
 
 // Clear forgets every answer.
@@ -500,8 +508,8 @@ func (f *AdmittedFilterHandle) Prefetch(ctx context.Context, nodeIDs []string) e
 // Stats returns the filter's counters.
 func (f *AdmittedFilterHandle) Stats() (AdmittedFilterStats, error) {
 	var out C.aster_topology_admitted_stats_t
-	if err := wrapStatus("aster_topology_admitted_stats",
-		C.aster_topology_admitted_stats(f.rtH(), C.uint64_t(f.handle), &out)); err != nil {
+	if err := wrapCall("aster_topology_admitted_stats",
+		func() C.int32_t { return C.aster_topology_admitted_stats(f.rtH(), C.uint64_t(f.handle), &out) }); err != nil {
 		return AdmittedFilterStats{}, err
 	}
 	return AdmittedFilterStats{uint64(out.hits), uint64(out.stale), uint64(out.misses), uint64(out.upcalls)}, nil
@@ -513,7 +521,7 @@ func (f *AdmittedFilterHandle) Close() error {
 	if f.closed.Swap(true) {
 		return nil
 	}
-	return wrapStatus("aster_topology_admitted_free", C.aster_topology_admitted_free(f.rtH(), C.uint64_t(f.handle)))
+	return wrapCall("aster_topology_admitted_free", func() C.int32_t { return C.aster_topology_admitted_free(f.rtH(), C.uint64_t(f.handle)) })
 }
 
 // EnableShared joins a topology swarm (topology v2): import the shared

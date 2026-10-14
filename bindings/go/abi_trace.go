@@ -20,7 +20,7 @@ func cTraceparentFormat(sc SpanContext) (string, error) {
 	spanContextToC(sc, &c)
 	var buf [55]C.uint8_t
 	var n C.uint32_t
-	if err := statusError(C.aster_trace_context_format(&c, &buf[0], 55, &n)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_trace_context_format(&c, &buf[0], 55, &n) }); err != nil {
 		return "", err
 	}
 	return string(unsafe.Slice((*byte)(unsafe.Pointer(&buf[0])), int(n))), nil
@@ -30,7 +30,7 @@ func cTraceparentFormat(sc SpanContext) (string, error) {
 func cTraceparentParse(s string) (SpanContext, error) {
 	var c C.struct_aster_span_context_t
 	p, n := cBytesArg([]byte(s))
-	if err := statusError(C.aster_trace_context_parse(p, n, &c)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_trace_context_parse(p, n, &c) }); err != nil {
 		return SpanContext{}, err
 	}
 	return spanContextFromC(&c), nil

@@ -53,7 +53,7 @@ func NewGate(rt *Runtime) (*Gate, error) {
 		rt.retain()
 	}
 	var h C.aster_gate_t
-	if err := statusError(C.aster_gate_new(C.uint64_t(rt.handle), &h)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_gate_new(C.uint64_t(rt.handle), &h) }); err != nil {
 		_ = rt.release()
 		return nil, fmt.Errorf("aster_gate_new: %w", err)
 	}
@@ -67,8 +67,10 @@ func (g *Gate) rt() C.uint64_t { return C.uint64_t(g.runtime.handle) }
 
 // SetTrustMode sets the trust posture.
 func (g *Gate) SetTrustMode(mode TrustMode) error {
-	return wrapStatus("aster_gate_set_trust_mode",
-		C.aster_gate_set_trust_mode(g.rt(), C.aster_gate_t(g.handle), C.uint32_t(mode)))
+	return wrapCall("aster_gate_set_trust_mode",
+		func() C.int32_t {
+			return C.aster_gate_set_trust_mode(g.rt(), C.aster_gate_t(g.handle), C.uint32_t(mode))
+		})
 }
 
 // SetAdmissionALPNs replaces the ALPNs that stay open to peers that are not
@@ -76,30 +78,34 @@ func (g *Gate) SetTrustMode(mode TrustMode) error {
 func (g *Gate) SetAdmissionALPNs(alpns ...string) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("aster_gate_set_admission_alpns",
-		C.aster_gate_set_admission_alpns(g.rt(), C.aster_gate_t(g.handle), a.list(alpns)))
+	return wrapCall("aster_gate_set_admission_alpns",
+		func() C.int32_t {
+			return C.aster_gate_set_admission_alpns(g.rt(), C.aster_gate_t(g.handle), a.list(alpns))
+		})
 }
 
 // SetReject sets the QUIC close code and reason sent to rejected peers.
 func (g *Gate) SetReject(code uint32, reason string) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("aster_gate_set_reject",
-		C.aster_gate_set_reject(g.rt(), C.aster_gate_t(g.handle), C.uint32_t(code), a.str(reason)))
+	return wrapCall("aster_gate_set_reject",
+		func() C.int32_t {
+			return C.aster_gate_set_reject(g.rt(), C.aster_gate_t(g.handle), C.uint32_t(code), a.str(reason))
+		})
 }
 
 // Admit admits peer (64-hex node id, no expiry).
 func (g *Gate) Admit(peer string) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("aster_gate_admit", C.aster_gate_admit(g.rt(), C.aster_gate_t(g.handle), a.str(peer)))
+	return wrapCall("aster_gate_admit", func() C.int32_t { return C.aster_gate_admit(g.rt(), C.aster_gate_t(g.handle), a.str(peer)) })
 }
 
 // Revoke revokes peer's admission; new connections are gated again.
 func (g *Gate) Revoke(peer string) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("aster_gate_revoke", C.aster_gate_revoke(g.rt(), C.aster_gate_t(g.handle), a.str(peer)))
+	return wrapCall("aster_gate_revoke", func() C.int32_t { return C.aster_gate_revoke(g.rt(), C.aster_gate_t(g.handle), a.str(peer)) })
 }
 
 // IsAdmitted reports whether peer holds an unexpired admission.
@@ -107,8 +113,8 @@ func (g *Gate) IsAdmitted(peer string) (bool, error) {
 	var a cArena
 	defer a.free()
 	var out C.uint32_t
-	if err := wrapStatus("aster_gate_is_admitted",
-		C.aster_gate_is_admitted(g.rt(), C.aster_gate_t(g.handle), a.str(peer), &out)); err != nil {
+	if err := wrapCall("aster_gate_is_admitted",
+		func() C.int32_t { return C.aster_gate_is_admitted(g.rt(), C.aster_gate_t(g.handle), a.str(peer), &out) }); err != nil {
 		return false, err
 	}
 	return out != 0, nil
@@ -119,8 +125,10 @@ func (g *Gate) ShouldAllow(peer, alpn string) (bool, error) {
 	var a cArena
 	defer a.free()
 	var out C.uint32_t
-	if err := wrapStatus("aster_gate_should_allow",
-		C.aster_gate_should_allow(g.rt(), C.aster_gate_t(g.handle), a.str(peer), a.str(alpn), &out)); err != nil {
+	if err := wrapCall("aster_gate_should_allow",
+		func() C.int32_t {
+			return C.aster_gate_should_allow(g.rt(), C.aster_gate_t(g.handle), a.str(peer), a.str(alpn), &out)
+		}); err != nil {
 		return false, err
 	}
 	return HookDecision(out) == HookAllow, nil
@@ -130,7 +138,7 @@ func (g *Gate) ShouldAllow(peer, alpn string) (bool, error) {
 func (g *Gate) Close() error {
 	var err error
 	g.once.Do(func() {
-		err = wrapStatus("aster_gate_free", C.aster_gate_free(g.rt(), C.aster_gate_t(g.handle)))
+		err = wrapCall("aster_gate_free", func() C.int32_t { return C.aster_gate_free(g.rt(), C.aster_gate_t(g.handle)) })
 		if rerr := g.runtime.release(); err == nil {
 			err = rerr
 		}

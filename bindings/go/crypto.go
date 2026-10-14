@@ -197,7 +197,7 @@ func callWithBuffer(initial int, call func(buf *C.uint8_t, n *C.uintptr_t) C.int
 	for attempt := 0; attempt < 2; attempt++ {
 		buf := C.malloc(C.size_t(size))
 		n := C.uintptr_t(size)
-		r := call((*C.uint8_t)(buf), &n)
+		r, rMsg := ffiCall(func() C.int32_t { return call((*C.uint8_t)(buf), &n) })
 		if r == C.ASTER_STATUS_OK {
 			out := C.GoBytes(buf, C.int(n))
 			C.free(buf)
@@ -208,7 +208,7 @@ func callWithBuffer(initial int, call func(buf *C.uint8_t, n *C.uintptr_t) C.int
 			size = int(n)
 			continue
 		}
-		return nil, statusError(r)
+		return nil, statusErrorMsg(r, rMsg)
 	}
 	return nil, statusError(C.ASTER_STATUS_BUFFER_TOO_SMALL)
 }

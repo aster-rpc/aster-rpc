@@ -139,14 +139,16 @@ func (d *Docs) JoinAndSubscribe(ctx context.Context, ticket string) (*Doc, error
 
 // Close closes this document and frees its handle.
 func (d *Doc) Close() error {
-	return wrapStatus("aster_doc_free", C.aster_doc_free(C.uint64_t(d.runtime.handle), C.uint64_t(d.handle)))
+	return wrapCall("aster_doc_free", func() C.int32_t { return C.aster_doc_free(C.uint64_t(d.runtime.handle), C.uint64_t(d.handle)) })
 }
 
 // ID returns this document's namespace identifier.
 func (d *Doc) ID() (DocID, error) {
 	var buf [64]byte
 	n := C.uintptr_t(len(buf))
-	if err := wrapStatus("aster_doc_id", C.aster_doc_id(C.uint64_t(d.runtime.handle), C.uint64_t(d.handle), (*C.uint8_t)(unsafe.Pointer(&buf[0])), &n)); err != nil {
+	if err := wrapCall("aster_doc_id", func() C.int32_t {
+		return C.aster_doc_id(C.uint64_t(d.runtime.handle), C.uint64_t(d.handle), (*C.uint8_t)(unsafe.Pointer(&buf[0])), &n)
+	}); err != nil {
 		return "", err
 	}
 	if n != C.uintptr_t(len(buf)) {

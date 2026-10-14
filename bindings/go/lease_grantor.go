@@ -111,8 +111,10 @@ func (c *AsterClient) LeaseGrantor(ctx context.Context, addr *NodeAddr) (*LeaseS
 		return nil, err
 	}
 	var h C.aster_lease_serializer_t
-	if err := wrapStatus("aster_lease_serializer_grantor_new", C.aster_lease_serializer_grantor_new(
-		C.uint64_t(c.node.runtime.handle), C.uint64_t(c.node.handle), C.aster_connection_t(rc.conn.handle), &h)); err != nil {
+	if err := wrapCall("aster_lease_serializer_grantor_new", func() C.int32_t {
+		return C.aster_lease_serializer_grantor_new(
+			C.uint64_t(c.node.runtime.handle), C.uint64_t(c.node.handle), C.aster_connection_t(rc.conn.handle), &h)
+	}); err != nil {
 		return nil, err
 	}
 	return &LeaseSerializerHandle{rt: c.node.runtime, handle: uint64(h)}, nil

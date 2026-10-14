@@ -403,7 +403,9 @@ func (a *AuditOutbox) Clone() (*AuditOutbox, error) {
 		return nil, &AuditOutboxError{Kind: AuditClosed, Message: "handle is closed"}
 	}
 	var handle C.aster_audit_outbox_t
-	if err := wrapStatus("audit clone", C.aster_audit_outbox_clone(C.aster_runtime_t(a.rt.handle), C.aster_audit_outbox_t(a.handle), &handle)); err != nil {
+	if err := wrapCall("audit clone", func() C.int32_t {
+		return C.aster_audit_outbox_clone(C.aster_runtime_t(a.rt.handle), C.aster_audit_outbox_t(a.handle), &handle)
+	}); err != nil {
 		return nil, err
 	}
 	return &AuditOutbox{rt: a.rt, handle: uint64(handle), eventLimit: a.eventLimit}, nil

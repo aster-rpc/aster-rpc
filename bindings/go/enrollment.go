@@ -484,7 +484,9 @@ func (e *Enrollment) Close() error {
 	}
 	e.closed = true
 	e.mu.Unlock()
-	return statusError(C.aster_enrollment_free(C.uint64_t(e.rt.handle), C.aster_enrollment_t(e.handle)))
+	return ffiStatus(func() C.int32_t {
+		return C.aster_enrollment_free(C.uint64_t(e.rt.handle), C.aster_enrollment_t(e.handle))
+	})
 }
 
 // result runs an async Enrollment operation and decodes its JSON result.
@@ -495,7 +497,7 @@ func (e *Enrollment) result(ctx context.Context, what string, out any,
 		return err
 	}
 	var op C.aster_operation_t
-	if err := wrapStatus(what, call(C.aster_enrollment_t(h), &op)); err != nil {
+	if err := wrapCall(what, func() C.int32_t { return call(C.aster_enrollment_t(h), &op) }); err != nil {
 		return err
 	}
 	ev, err := e.rt.await(ctx, uint64(op))
@@ -590,8 +592,10 @@ func (e *Enrollment) PeerClaims(peer string) (*PeerEvidence, error) {
 	var a cArena
 	defer a.free()
 	var out C.aster_bytes_t
-	if err := wrapStatus("aster_enrollment_peer_claims", C.aster_enrollment_peer_claims(
-		C.uint64_t(e.rt.handle), C.aster_enrollment_t(h), a.str(peer), &out)); err != nil {
+	if err := wrapCall("aster_enrollment_peer_claims", func() C.int32_t {
+		return C.aster_enrollment_peer_claims(
+			C.uint64_t(e.rt.handle), C.aster_enrollment_t(h), a.str(peer), &out)
+	}); err != nil {
 		return nil, err
 	}
 	var ev PeerEvidence
@@ -606,8 +610,10 @@ func (e *Enrollment) Status() (EnrollmentStatus, error) {
 		return st, err
 	}
 	var out C.aster_bytes_t
-	if err := wrapStatus("aster_enrollment_status", C.aster_enrollment_status(
-		C.uint64_t(e.rt.handle), C.aster_enrollment_t(h), &out)); err != nil {
+	if err := wrapCall("aster_enrollment_status", func() C.int32_t {
+		return C.aster_enrollment_status(
+			C.uint64_t(e.rt.handle), C.aster_enrollment_t(h), &out)
+	}); err != nil {
 		return st, err
 	}
 	return st, takeJSON(out, &st)
@@ -681,8 +687,10 @@ func (i *EnrollmentIssuer) Info() (IssuerInfo, error) {
 		return info, err
 	}
 	var out C.aster_bytes_t
-	if err := wrapStatus("aster_enrollment_issuer_info", C.aster_enrollment_issuer_info(
-		C.uint64_t(i.e.rt.handle), C.aster_enrollment_t(h), &out)); err != nil {
+	if err := wrapCall("aster_enrollment_issuer_info", func() C.int32_t {
+		return C.aster_enrollment_issuer_info(
+			C.uint64_t(i.e.rt.handle), C.aster_enrollment_t(h), &out)
+	}); err != nil {
 		return info, err
 	}
 	return info, takeJSON(out, &info)
@@ -706,7 +714,9 @@ func (i *EnrollmentIssuer) Issue(subject string, claims EnrollmentClaims, regist
 	var a cArena
 	defer a.free()
 	var out C.aster_bytes_t
-	status := C.aster_enrollment_issue(C.uint64_t(i.e.rt.handle), C.aster_enrollment_t(h), a.bytes(body), &out)
+	status, statusMsg := ffiCall(func() C.int32_t {
+		return C.aster_enrollment_issue(C.uint64_t(i.e.rt.handle), C.aster_enrollment_t(h), a.bytes(body), &out)
+	})
 	if status == C.ASTER_STATUS_PERMISSION_DENIED && out.ptr != nil {
 		var refusal IssuerRefusal
 		if err := takeJSON(out, &refusal); err != nil {
@@ -714,7 +724,7 @@ func (i *EnrollmentIssuer) Issue(subject string, claims EnrollmentClaims, regist
 		}
 		return issued, &refusal
 	}
-	if err := wrapStatus("aster_enrollment_issue", status); err != nil {
+	if err := wrapStatusMsg("aster_enrollment_issue", status, statusMsg); err != nil {
 		return issued, err
 	}
 	return issued, takeJSON(out, &issued)

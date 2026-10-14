@@ -110,7 +110,7 @@ func (in *instrument) declare() error {
 		d.boundaries_len = C.uint32_t(n)
 	}
 	var h C.aster_instrument_t
-	if err := statusError(C.aster_instrument_new(d, &h)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_instrument_new(d, &h) }); err != nil {
 		return fmt.Errorf("aster_instrument_new(%q): %w", in.name, err)
 	}
 	in.handle.Store(uint64(h))
@@ -130,7 +130,7 @@ func (in *instrument) redeclare(stale uint64) {
 // Close releases the instrument's handle (optional: shutdown frees them all).
 func (in *instrument) Close() error {
 	if h := in.handle.Swap(0); h != 0 {
-		return statusError(C.aster_instrument_free(C.aster_instrument_t(h)))
+		return ffiStatus(func() C.int32_t { return C.aster_instrument_free(C.aster_instrument_t(h)) })
 	}
 	return nil
 }
@@ -155,7 +155,7 @@ func NewAttrSet(attrs ...Attr) (*AttrSet, error) {
 func (s *AttrSet) intern() error {
 	kv, n := cBytesArg(encodeAttrs(s.attrs))
 	var h C.aster_attrset_t
-	if err := statusError(C.aster_attrset_new(kv, n, &h)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_attrset_new(kv, n, &h) }); err != nil {
 		return fmt.Errorf("aster_attrset_new: %w", err)
 	}
 	s.handle.Store(uint64(h))
@@ -173,7 +173,7 @@ func (s *AttrSet) reintern(stale uint64) {
 // Close releases the set's handle.
 func (s *AttrSet) Close() error {
 	if h := s.handle.Swap(0); h != 0 {
-		return statusError(C.aster_attrset_free(C.aster_attrset_t(h)))
+		return ffiStatus(func() C.int32_t { return C.aster_attrset_free(C.aster_attrset_t(h)) })
 	}
 	return nil
 }

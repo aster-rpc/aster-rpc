@@ -53,14 +53,19 @@ func generateTLSCertificate(subject string, sans []string, nodeSecret []byte, we
 		}
 	}()
 	var status C.int32_t
+	var statusMsg string
 	operation := "aster_tls_generate_self_signed"
 	if webTransport {
 		operation = "aster_tls_generate_webtransport"
-		status = C.aster_tls_generate_webtransport(arena.str(subject), arena.list(sans), arena.bytes(nodeSecret), &native)
+		status, statusMsg = ffiCall(func() C.int32_t {
+			return C.aster_tls_generate_webtransport(arena.str(subject), arena.list(sans), arena.bytes(nodeSecret), &native)
+		})
 	} else {
-		status = C.aster_tls_generate_self_signed(arena.list(sans), arena.bytes(nodeSecret), &native)
+		status, statusMsg = ffiCall(func() C.int32_t {
+			return C.aster_tls_generate_self_signed(arena.list(sans), arena.bytes(nodeSecret), &native)
+		})
 	}
-	if err := wrapStatus(operation, status); err != nil {
+	if err := wrapStatusMsg(operation, status, statusMsg); err != nil {
 		return nil, err
 	}
 	result := &TLSCertificate{CertificatePEM: viewBytes(native.cert_pem), PrivateKeyPEM: viewBytes(native.key_pem)}
@@ -75,5 +80,7 @@ func generateTLSCertificate(subject string, sans []string, nodeSecret []byte, we
 func VerifyCertificateBinding(certificatePEM []byte, trustedExpectedNodeID string) error {
 	var arena cArena
 	defer arena.free()
-	return wrapStatus("aster_tls_verify_binding", C.aster_tls_verify_binding(arena.bytes(certificatePEM), arena.str(trustedExpectedNodeID)))
+	return wrapCall("aster_tls_verify_binding", func() C.int32_t {
+		return C.aster_tls_verify_binding(arena.bytes(certificatePEM), arena.str(trustedExpectedNodeID))
+	})
 }

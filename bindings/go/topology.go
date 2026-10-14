@@ -82,7 +82,7 @@ func topologyJSON(call func(*C.aster_bytes_t) C.int32_t, output any) error {
 			C.aster_string_release(data.ptr, data.len)
 		}
 	}()
-	if err := wrapStatus("topology", call(&data)); err != nil {
+	if err := wrapCall("topology", func() C.int32_t { return call(&data) }); err != nil {
 		return err
 	}
 	return json.Unmarshal(viewBytes(data), output)
@@ -91,7 +91,9 @@ func (t *TopologyView) HasMonitoring() (bool, error) {
 	rt := t.node.runtime.retain()
 	defer rt.release()
 	var enabled C.uint32_t
-	err := wrapStatus("aster_topology_has_monitoring", C.aster_topology_has_monitoring(C.uint64_t(rt.handle), C.uint64_t(t.node.handle), &enabled))
+	err := wrapCall("aster_topology_has_monitoring", func() C.int32_t {
+		return C.aster_topology_has_monitoring(C.uint64_t(rt.handle), C.uint64_t(t.node.handle), &enabled)
+	})
 	return enabled != 0, err
 }
 func (t *TopologyView) Peers() ([]TopologyPeerView, error) {
@@ -179,7 +181,9 @@ func (t *TopologyView) Snapshot(ctx context.Context) (*TopologyObservation, erro
 		}
 	}()
 	var op C.aster_operation_t
-	if err := wrapStatus("aster_topology_snapshot", C.aster_topology_snapshot(C.uint64_t(rt.handle), C.uint64_t(t.node.handle), 0, &op)); err != nil {
+	if err := wrapCall("aster_topology_snapshot", func() C.int32_t {
+		return C.aster_topology_snapshot(C.uint64_t(rt.handle), C.uint64_t(t.node.handle), 0, &op)
+	}); err != nil {
 		return nil, err
 	}
 	ch := make(chan *Event, 1)
@@ -212,9 +216,11 @@ func (s *TopologyObservation) Close() error {
 	if s.closed {
 		return nil
 	}
-	status := C.aster_topology_snapshot_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle))
+	status, statusMsg := ffiCall(func() C.int32_t {
+		return C.aster_topology_snapshot_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle))
+	})
 	if status != C.ASTER_STATUS_NOT_FOUND && status != C.ASTER_STATUS_ALREADY_CLOSED {
-		if err := wrapStatus("aster_topology_snapshot_free", status); err != nil {
+		if err := wrapStatusMsg("aster_topology_snapshot_free", status, statusMsg); err != nil {
 			return err
 		}
 	}
@@ -256,7 +262,9 @@ func (s *TopologyObservation) Separated(aID, bID string) (TopologySeparation, er
 	var a cArena
 	defer a.free()
 	var verdict C.uint32_t
-	err := wrapStatus("aster_topology_snapshot_separated", C.aster_topology_snapshot_separated(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), a.str(aID), a.str(bID), &verdict))
+	err := wrapCall("aster_topology_snapshot_separated", func() C.int32_t {
+		return C.aster_topology_snapshot_separated(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), a.str(aID), a.str(bID), &verdict)
+	})
 	if err == nil && verdict > 2 {
 		return TopologyUnknown, fmt.Errorf("invalid topology separation %d: %w", verdict, ErrInternal)
 	}

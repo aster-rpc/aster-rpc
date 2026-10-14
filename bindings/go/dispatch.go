@@ -99,7 +99,7 @@ type serverSettings struct {
 func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*dispatchServer, error) {
 	rt := C.uint64_t(node.runtime.handle)
 	var b C.aster_server_builder_t
-	if err := statusError(C.aster_server_builder_new(rt, C.uint64_t(node.handle), &b)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_server_builder_new(rt, C.uint64_t(node.handle), &b) }); err != nil {
 		return nil, fmt.Errorf("aster_server_builder_new: %w", err)
 	}
 	fail := func(what string, err error) (*dispatchServer, error) {
@@ -109,7 +109,7 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 	for i, js := range serviceJSON {
 		p, n := cBytesArg([]byte(js))
 		var idx C.uint32_t
-		if err := statusError(C.aster_server_add_service_json(b, p, n, &idx)); err != nil {
+		if err := ffiStatus(func() C.int32_t { return C.aster_server_add_service_json(b, p, n, &idx) }); err != nil {
 			return fail("aster_server_add_service_json", err)
 		}
 		if int(idx) != i {
@@ -117,7 +117,7 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 		}
 	}
 	opt := func(key C.uint32_t, v uint64) error {
-		return statusError(C.aster_server_set_option(b, key, C.uint64_t(v)))
+		return ffiStatus(func() C.int32_t { return C.aster_server_set_option(b, key, C.uint64_t(v)) })
 	}
 	nodeInfo := uint64(1)
 	if s.disableNodeInfo {
@@ -133,7 +133,7 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 	}
 	var arena cArena
 	defer arena.free()
-	errs := []error{opt(serverOptionBuiltinNodeInfo, nodeInfo), statusError(C.aster_server_set_topology(b, topology, arena.bytes(requirement)))}
+	errs := []error{opt(serverOptionBuiltinNodeInfo, nodeInfo), ffiStatus(func() C.int32_t { return C.aster_server_set_topology(b, topology, arena.bytes(requirement)) })}
 	if s.maxSessionsPerConnection > 0 {
 		errs = append(errs, opt(serverOptionMaxSessionsPerConnection, s.maxSessionsPerConnection))
 	}
@@ -144,7 +144,7 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 		return fail("aster_server_set_option", err)
 	}
 	if s.health != nil {
-		if err := statusError(C.aster_server_attach_health(b, C.uint64_t(s.health.handle))); err != nil {
+		if err := ffiStatus(func() C.int32_t { return C.aster_server_attach_health(b, C.uint64_t(s.health.handle)) }); err != nil {
 			return fail("aster_server_attach_health", err)
 		}
 	}
@@ -153,14 +153,16 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 		if err != nil {
 			return fail("lease grantor", err)
 		}
-		if err := statusError(C.aster_server_add_lease_grantor(b, C.aster_lease_serializer_t(s.grantor.serializer.handle),
-			arena.bytes(requires), arena.bytes(revoke))); err != nil {
+		if err := ffiStatus(func() C.int32_t {
+			return C.aster_server_add_lease_grantor(b, C.aster_lease_serializer_t(s.grantor.serializer.handle),
+				arena.bytes(requires), arena.bytes(revoke))
+		}); err != nil {
 			return fail("aster_server_add_lease_grantor", err)
 		}
 	}
 	var h C.aster_server_t
 	// aster_server_start consumes the builder whatever the outcome.
-	if err := statusError(C.aster_server_start(rt, b, C.uint32_t(s.ringCapacity), &h)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_server_start(rt, b, C.uint32_t(s.ringCapacity), &h) }); err != nil {
 		return nil, fmt.Errorf("aster_server_start: %w", err)
 	}
 	return &dispatchServer{rt: rt, handle: C.uint64_t(h), waiters: map[uint64]chan bool{}}, nil
@@ -176,7 +178,7 @@ func (d *dispatchServer) destroy() error {
 		delete(d.waiters, id)
 	}
 	d.mu.Unlock()
-	return statusError(C.aster_server_destroy(d.rt, d.handle))
+	return ffiStatus(func() C.int32_t { return C.aster_server_destroy(d.rt, d.handle) })
 }
 
 func (d *dispatchServer) releaseBuffer(id C.uint64_t) {
@@ -223,7 +225,9 @@ func (d *dispatchServer) awaitCapacity(ctx context.Context, callID uint64, requi
 	}
 	d.waiters[callID] = ch
 	d.mu.Unlock()
-	s := C.aster_dispatch_reserve(d.rt, d.handle, C.uint64_t(callID), C.uint64_t(required))
+	s, sMsg := ffiCall(func() C.int32_t {
+		return C.aster_dispatch_reserve(d.rt, d.handle, C.uint64_t(callID), C.uint64_t(required))
+	})
 	if s != C.ASTER_STATUS_OK {
 		d.mu.Lock()
 		delete(d.waiters, callID)
@@ -231,7 +235,7 @@ func (d *dispatchServer) awaitCapacity(ctx context.Context, callID uint64, requi
 		if s == C.ASTER_STATUS_NOT_FOUND || s == C.ASTER_STATUS_ALREADY_CLOSED {
 			return errCallGone
 		}
-		return fmt.Errorf("aster_dispatch_reserve: %w", statusError(s))
+		return fmt.Errorf("aster_dispatch_reserve: %w", statusErrorMsg(s, sMsg))
 	}
 	select {
 	case ok := <-ch:
@@ -254,7 +258,7 @@ func (d *dispatchServer) awaitCapacity(ctx context.Context, callID uint64, requi
 func (d *dispatchServer) submit(ctx context.Context, callID uint64, op string, attempt func(required *C.uint64_t) C.int32_t) error {
 	for {
 		var required C.uint64_t
-		s := attempt(&required)
+		s, sMsg := ffiCall(func() C.int32_t { return attempt(&required) })
 		switch s {
 		case C.ASTER_STATUS_OK:
 			return nil
@@ -266,7 +270,7 @@ func (d *dispatchServer) submit(ctx context.Context, callID uint64, op string, a
 				return err
 			}
 		default:
-			return fmt.Errorf("%s: %w", op, statusError(s))
+			return fmt.Errorf("%s: %w", op, statusErrorMsg(s, sMsg))
 		}
 	}
 }
@@ -318,7 +322,9 @@ func (d *dispatchServer) recv(callID uint64, timeoutMs uint32) (recvStatus, []by
 	var ptr *C.uint8_t
 	var n C.uint32_t
 	var buf C.uint64_t
-	s := C.aster_dispatch_recv(d.rt, d.handle, C.uint64_t(callID), C.uint32_t(timeoutMs), &ptr, &n, &buf)
+	s, sMsg := ffiCall(func() C.int32_t {
+		return C.aster_dispatch_recv(d.rt, d.handle, C.uint64_t(callID), C.uint32_t(timeoutMs), &ptr, &n, &buf)
+	})
 	switch s {
 	case C.ASTER_STATUS_OK:
 	case C.ASTER_STATUS_TIMEOUT:
@@ -326,7 +332,7 @@ func (d *dispatchServer) recv(callID uint64, timeoutMs uint32) (recvStatus, []by
 	case C.ASTER_STATUS_NOT_FOUND:
 		return recvGone, nil, nil
 	default:
-		return 0, nil, fmt.Errorf("aster_dispatch_recv: %w", statusError(s))
+		return 0, nil, fmt.Errorf("aster_dispatch_recv: %w", statusErrorMsg(s, sMsg))
 	}
 	if buf == 0 {
 		return recvEnd, nil, nil
@@ -376,20 +382,20 @@ func (d *dispatchServer) setPeerAttributes(peer string, kv []byte) error {
 	pp := []byte(peer)
 	p, pn := cBytesArg(pp)
 	k, kn := cBytesArg(kv)
-	return statusError(C.aster_server_set_peer_attributes(d.handle, p, pn, k, kn))
+	return ffiStatus(func() C.int32_t { return C.aster_server_set_peer_attributes(d.handle, p, pn, k, kn) })
 }
 
 func (d *dispatchServer) restrictPeerRoles(peer, roles string) error {
 	pp, rr := []byte(peer), []byte(roles)
 	p, pn := cBytesArg(pp)
 	r, rn := cBytesArg(rr)
-	return statusError(C.aster_server_restrict_peer_roles(d.handle, p, pn, r, rn))
+	return ffiStatus(func() C.int32_t { return C.aster_server_restrict_peer_roles(d.handle, p, pn, r, rn) })
 }
 
 func (d *dispatchServer) clearPeerRestriction(peer string) error {
 	pp := []byte(peer)
 	p, pn := cBytesArg(pp)
-	return statusError(C.aster_server_clear_peer_restriction(d.handle, p, pn))
+	return ffiStatus(func() C.int32_t { return C.aster_server_clear_peer_restriction(d.handle, p, pn) })
 }
 
 func (d *dispatchServer) liveCalls() uint64 {
@@ -457,7 +463,7 @@ func decodeKV(b []byte) ([]MetadataEntry, error) {
 func DynamicServiceContractID(serviceJSON string) (string, error) {
 	p, n := cBytesArg([]byte(serviceJSON))
 	var out C.struct_aster_bytes_t
-	if err := statusError(C.aster_dynamic_service_contract_id(p, n, &out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_dynamic_service_contract_id(p, n, &out) }); err != nil {
 		return "", fmt.Errorf("aster_dynamic_service_contract_id: %w", err)
 	}
 	return string(takeRustBytes(out)), nil

@@ -26,7 +26,7 @@ import (
 // startOp runs an async FFI call and waits for its completion event.
 func startOp(ctx context.Context, rt *Runtime, what string, call func(op *C.aster_operation_t) C.int32_t) (*Event, error) {
 	var op C.aster_operation_t
-	if err := wrapStatus(what, call(&op)); err != nil {
+	if err := wrapCall(what, func() C.int32_t { return call(&op) }); err != nil {
 		return nil, err
 	}
 	ev, err := rt.await(ctx, uint64(op))
@@ -228,8 +228,10 @@ func AuthorityFingerprint(namespaceID string, access LocalAccess) (Key, error) {
 	var a cArena
 	defer a.free()
 	out, get := cOutKey(&a)
-	if err := wrapStatus("aster_doc_authority_fingerprint",
-		C.aster_doc_authority_fingerprint(a.str(namespaceID), C.uint32_t(access), out)); err != nil {
+	if err := wrapCall("aster_doc_authority_fingerprint",
+		func() C.int32_t {
+			return C.aster_doc_authority_fingerprint(a.str(namespaceID), C.uint32_t(access), out)
+		}); err != nil {
 		return Key{}, err
 	}
 	return get(), nil
@@ -450,7 +452,9 @@ func readPaths(l *C.aster_path_list_t) []PathInfo {
 func (c *Connection) Paths() ([]PathInfo, error) {
 	var l C.aster_path_list_t
 	l.struct_size = C.uint32_t(unsafe.Sizeof(l))
-	if err := wrapStatus("aster_connection_paths", C.aster_connection_paths(C.uint64_t(c.runtime.handle), C.uint64_t(c.handle), &l)); err != nil {
+	if err := wrapCall("aster_connection_paths", func() C.int32_t {
+		return C.aster_connection_paths(C.uint64_t(c.runtime.handle), C.uint64_t(c.handle), &l)
+	}); err != nil {
 		return nil, err
 	}
 	return readPaths(&l), nil
@@ -460,7 +464,9 @@ func (c *Connection) Paths() ([]PathInfo, error) {
 func (c *Connection) SelectedPath() (PathInfo, bool, error) {
 	var l C.aster_path_list_t
 	l.struct_size = C.uint32_t(unsafe.Sizeof(l))
-	if err := wrapStatus("aster_connection_selected_path", C.aster_connection_selected_path(C.uint64_t(c.runtime.handle), C.uint64_t(c.handle), &l)); err != nil {
+	if err := wrapCall("aster_connection_selected_path", func() C.int32_t {
+		return C.aster_connection_selected_path(C.uint64_t(c.runtime.handle), C.uint64_t(c.handle), &l)
+	}); err != nil {
 		return PathInfo{}, false, err
 	}
 	paths := readPaths(&l)

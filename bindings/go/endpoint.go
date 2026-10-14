@@ -153,7 +153,9 @@ func (e *Endpoint) Connect(ctx context.Context, nodeIDHex, alpn string) (*Connec
 	}
 
 	var opID C.aster_operation_t
-	if err := wrapStatus("aster_connect", C.aster_connect(C.uint64_t(e.runtime.handle), C.uint64_t(e.handle), &config, 0, &opID)); err != nil {
+	if err := wrapCall("aster_connect", func() C.int32_t {
+		return C.aster_connect(C.uint64_t(e.runtime.handle), C.uint64_t(e.handle), &config, 0, &opID)
+	}); err != nil {
 		return nil, err
 	}
 	ev, err := e.runtime.await(ctx, uint64(opID))

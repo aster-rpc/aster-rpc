@@ -29,7 +29,9 @@ type BlobCustodyScope struct {
 func (b *Blobs) NewCustodyScope() (*BlobCustodyScope, error) {
 	rt := b.runtime.retain()
 	var handle C.uint64_t
-	if err := wrapStatus("aster_blobs_custody_new", C.aster_blobs_custody_new(C.uint64_t(rt.handle), C.uint64_t(b.node.handle), &handle)); err != nil {
+	if err := wrapCall("aster_blobs_custody_new", func() C.int32_t {
+		return C.aster_blobs_custody_new(C.uint64_t(rt.handle), C.uint64_t(b.node.handle), &handle)
+	}); err != nil {
 		_ = rt.release()
 		return nil, err
 	}
@@ -44,9 +46,9 @@ func (s *BlobCustodyScope) Close() error {
 	if s.closed {
 		return nil
 	}
-	status := C.aster_blob_custody_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle))
+	status, statusMsg := ffiCall(func() C.int32_t { return C.aster_blob_custody_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle)) })
 	if status != C.ASTER_STATUS_NOT_FOUND && status != C.ASTER_STATUS_ALREADY_CLOSED {
-		if err := wrapStatus("aster_blob_custody_free", status); err != nil {
+		if err := wrapStatusMsg("aster_blob_custody_free", status, statusMsg); err != nil {
 			return err
 		}
 	}
@@ -90,7 +92,7 @@ func (s *BlobCustodyScope) run(ctx context.Context, what string, expected EventK
 	}
 	rt := s.runtime.retain()
 	var op C.aster_operation_t
-	err := wrapStatus(what, submit(&op))
+	err := wrapCall(what, func() C.int32_t { return submit(&op) })
 	s.mu.Unlock()
 	defer rt.release()
 	if err != nil {
@@ -183,7 +185,7 @@ func (b *Blobs) verified(ctx context.Context, what string, submit func(*C.aster_
 	rt := b.runtime.retain()
 	defer rt.release()
 	var op C.aster_operation_t
-	if err := wrapStatus(what, submit(&op)); err != nil {
+	if err := wrapCall(what, func() C.int32_t { return submit(&op) }); err != nil {
 		return "", err
 	}
 	p, err := awaitCustodyOp(ctx, rt, uint64(op), ASTER_EVENT_BLOB_ADDED, what)

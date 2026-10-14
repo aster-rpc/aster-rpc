@@ -97,11 +97,13 @@ func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOpt
 		}
 		// Rust validates the whole enrollment plan here (fail closed) and,
 		// when the config does not enable enrollment, starts a plain node.
-		if err := wrapStatus("aster_node_start_enrolled", C.aster_node_start_enrolled(
-			C.uint64_t(rt.handle), &native, a.bytes(trust), C.uint32_t(side), 0, &op)); err != nil {
+		if err := wrapCall("aster_node_start_enrolled", func() C.int32_t {
+			return C.aster_node_start_enrolled(
+				C.uint64_t(rt.handle), &native, a.bytes(trust), C.uint32_t(side), 0, &op)
+		}); err != nil {
 			return nil, err
 		}
-	} else if err := wrapStatus("aster_node_start", C.aster_node_start(C.uint64_t(rt.handle), &native, gate, 0, &op)); err != nil {
+	} else if err := wrapCall("aster_node_start", func() C.int32_t { return C.aster_node_start(C.uint64_t(rt.handle), &native, gate, 0, &op) }); err != nil {
 		return nil, err
 	}
 	ev, err := rt.await(ctx, uint64(op))
@@ -157,7 +159,7 @@ func (n *Node) SetGate(g *Gate) error {
 		}
 		h = C.aster_gate_t(g.handle)
 	}
-	return wrapStatus("aster_node_set_gate", C.aster_node_set_gate(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), h))
+	return wrapCall("aster_node_set_gate", func() C.int32_t { return C.aster_node_set_gate(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), h) })
 }
 
 // Ticket returns an aster1 ticket for this node: its direct ip:port addresses
@@ -224,14 +226,16 @@ func (n *Node) AddNodeAddr(addr *NodeAddr) error {
 		relay_url:        a.str(addr.RelayURL),
 		direct_addresses: a.list(addr.DirectAddresses),
 	}
-	return wrapStatus("aster_add_node_addr", C.aster_add_node_addr(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), native))
+	return wrapCall("aster_add_node_addr", func() C.int32_t {
+		return C.aster_add_node_addr(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), native)
+	})
 }
 
 // Accept accepts the next inbound connection on one of the node's ALPNs
 // (aster_accept takes it from the node's ALPN accept queue).
 func (n *Node) Accept(ctx context.Context) (*Connection, error) {
 	var op C.aster_operation_t
-	if err := wrapStatus("aster_accept", C.aster_accept(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), 0, &op)); err != nil {
+	if err := wrapCall("aster_accept", func() C.int32_t { return C.aster_accept(C.uint64_t(n.runtime.handle), C.uint64_t(n.handle), 0, &op) }); err != nil {
 		return nil, err
 	}
 	ev, err := n.runtime.await(ctx, uint64(op))
@@ -261,7 +265,7 @@ func connectCore(ctx context.Context, rt *Runtime, handle uint64, addr *NodeAddr
 	cfg.alpn = a.str(alpn)
 	cfg.addr = nodeAddr
 	var op C.aster_operation_t
-	if err := wrapStatus("aster_connect", C.aster_connect(C.uint64_t(rt.handle), C.uint64_t(handle), cfg, 0, &op)); err != nil {
+	if err := wrapCall("aster_connect", func() C.int32_t { return C.aster_connect(C.uint64_t(rt.handle), C.uint64_t(handle), cfg, 0, &op) }); err != nil {
 		return nil, err
 	}
 	ev, err := rt.await(ctx, uint64(op))
@@ -309,12 +313,14 @@ func (r *AdmissionRequest) respond(decision HookDecision, code uint32, reason st
 	}
 	var a cArena
 	defer a.free()
-	s := C.aster_admission_respond(C.uint64_t(r.runtime.handle), C.uint64_t(r.invocation),
-		C.uint32_t(decision), C.uint32_t(code), a.str(reason))
+	s, sMsg := ffiCall(func() C.int32_t {
+		return C.aster_admission_respond(C.uint64_t(r.runtime.handle), C.uint64_t(r.invocation),
+			C.uint32_t(decision), C.uint32_t(code), a.str(reason))
+	})
 	if s == C.ASTER_STATUS_NOT_FOUND { // already timed out
 		return nil
 	}
-	return wrapStatus("aster_admission_respond", s)
+	return wrapStatusMsg("aster_admission_respond", s, sMsg)
 }
 
 // Admissions delivers admission requests for a node started with

@@ -91,8 +91,8 @@ func coordinationProvisioning(call func(*C.aster_provisioning_result_t) C.int32_
 			C.aster_string_release(out.error.ptr, out.error.len)
 		}
 	}()
-	status := call(&out)
-	if err := wrapStatus("coordination provisioning", status); err != nil {
+	status, statusMsg := ffiCall(func() C.int32_t { return call(&out) })
+	if err := wrapStatusMsg("coordination provisioning", status, statusMsg); err != nil {
 		var result CoordinationProvisioningError
 		if decodeErr := json.Unmarshal(viewBytes(out.error), &result); decodeErr != nil {
 			return nil, fmt.Errorf("%w (invalid native provisioning error: %v)", err, decodeErr)

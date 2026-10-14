@@ -14,6 +14,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
 	"unsafe"
 )
@@ -210,6 +211,58 @@ func (e *irohErrorWithSentinel) As(target any) bool {
 		return true
 	}
 	return false
+}
+
+// ffiStatus runs one FFI call and converts its status, reading the library's
+// last-error message on the same OS thread. The message lives in a Rust
+// thread-local; without the lock the goroutine can move to another thread
+// between the call and the read and the message comes back empty (seen as a
+// bare "invalid argument (status=1)").
+func ffiStatus(call func() C.int32_t) error {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	return statusError(call())
+}
+
+// ffiCall runs one FFI call on a locked OS thread and returns its status with
+// the last-error message read on that same thread, for callers that inspect
+// the status before converting it (statusErrorMsg / wrapStatusMsg).
+func ffiCall(call func() C.int32_t) (C.int32_t, string) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	code := call()
+	if code == 0 {
+		return code, ""
+	}
+	return code, lastErrorMessage()
+}
+
+// statusErrorMsg is statusError with a message already read by ffiCall.
+func statusErrorMsg(code C.int32_t, msg string) error {
+	if code == 0 {
+		return nil
+	}
+	base := errorFromStatus(C.int(code))
+	if msg != "" {
+		base = errorf(base.code, "%s: %s", base.message, msg)
+	}
+	return &irohErrorWithSentinel{base, statusToError[int32(code)]}
+}
+
+// wrapStatusMsg is wrapStatus with a message already read by ffiCall.
+func wrapStatusMsg(what string, code C.int32_t, msg string) error {
+	if err := statusErrorMsg(code, msg); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return nil
+}
+
+// wrapCall is ffiStatus with wrapStatus's "<what>: " prefix.
+func wrapCall(what string, call func() C.int32_t) error {
+	if err := ffiStatus(call); err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	return nil
 }
 
 // statusError converts a non-OK status from a synchronous FFI call into an

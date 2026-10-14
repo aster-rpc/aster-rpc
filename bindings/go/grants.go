@@ -58,7 +58,7 @@ type NamespaceCapability struct {
 
 func bytesOut(name string, f func(out *C.struct_aster_bytes_t) C.int32_t) ([]byte, error) {
 	var out C.struct_aster_bytes_t
-	if err := statusError(f(&out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return f(&out) }); err != nil {
 		return nil, fmt.Errorf("%s: %w", name, err)
 	}
 	return nonNil(takeRustBytes(out)), nil
@@ -90,7 +90,7 @@ func GrantKey(prefix, recipient string) (string, error) {
 func GrantCheckRole(role string, canWrite bool) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("aster_grant_check_role", C.aster_grant_check_role(a.str(role), boolToUint32(canWrite)))
+	return wrapCall("aster_grant_check_role", func() C.int32_t { return C.aster_grant_check_role(a.str(role), boolToUint32(canWrite)) })
 }
 
 // GrantSeal seals plaintext to ctx.Recipient's identity-derived X25519 key.
@@ -145,7 +145,7 @@ func DecodeNamespaceCapability(b []byte) (NamespaceCapability, error) {
 	defer a.free()
 	var access C.uint32_t
 	out, get := cOutKey(&a)
-	if err := statusError(C.aster_namespace_capability_decode(a.bytes(b), &access, out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_namespace_capability_decode(a.bytes(b), &access, out) }); err != nil {
 		return NamespaceCapability{}, fmt.Errorf("aster_namespace_capability_decode: %w", err)
 	}
 	return NamespaceCapability{Access: LocalAccess(access), Key: get()}, nil
@@ -167,7 +167,9 @@ func NamespaceGrantOpen(identitySecret Key, ctx GrantContext, envelope []byte) (
 	defer a.free()
 	var access C.uint32_t
 	out, get := cOutKey(&a)
-	if err := statusError(C.aster_namespace_grant_open(cKey(&a, identitySecret), ctx.toC(&a), a.bytes(envelope), &access, out)); err != nil {
+	if err := ffiStatus(func() C.int32_t {
+		return C.aster_namespace_grant_open(cKey(&a, identitySecret), ctx.toC(&a), a.bytes(envelope), &access, out)
+	}); err != nil {
 		return NamespaceCapability{}, fmt.Errorf("aster_namespace_grant_open: %w", err)
 	}
 	return NamespaceCapability{Access: LocalAccess(access), Key: get()}, nil
@@ -213,7 +215,7 @@ func DecodeGrantRecord(b []byte) (GrantRecord, error) {
 	var a cArena
 	defer a.free()
 	var c C.aster_grant_record_t
-	if err := statusError(C.aster_grant_record_decode(a.bytes(b), &c)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_grant_record_decode(a.bytes(b), &c) }); err != nil {
 		return GrantRecord{}, fmt.Errorf("aster_grant_record_decode: %w", err)
 	}
 	defer C.aster_grant_record_release(&c)
@@ -270,12 +272,15 @@ func reconcile(name string, identitySecret Key, ctx GrantContext, record []byte,
 	var out C.aster_grant_outcome_t
 	out.struct_size = C.uint32_t(unsafe.Sizeof(out))
 	var r C.int32_t
+	var rMsg string
 	if namespace {
-		r = C.aster_namespace_grant_reconcile(cKey(&a, identitySecret), ctx.toC(&a), rec, &out)
+		r, rMsg = ffiCall(func() C.int32_t {
+			return C.aster_namespace_grant_reconcile(cKey(&a, identitySecret), ctx.toC(&a), rec, &out)
+		})
 	} else {
-		r = C.aster_grant_reconcile(cKey(&a, identitySecret), ctx.toC(&a), rec, &out)
+		r, rMsg = ffiCall(func() C.int32_t { return C.aster_grant_reconcile(cKey(&a, identitySecret), ctx.toC(&a), rec, &out) })
 	}
-	if err := statusError(r); err != nil {
+	if err := statusErrorMsg(r, rMsg); err != nil {
 		return GrantOutcome{}, fmt.Errorf("%s: %w", name, err)
 	}
 	defer C.aster_grant_outcome_release(&out)

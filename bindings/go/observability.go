@@ -205,7 +205,7 @@ func initLocked(cfg ObservabilityConfig) error {
 	c.log_queue_capacity = C.uint32_t(cfg.LogQueueCapacity)
 	c.binding = C.ASTER_BINDING_GO
 
-	if err := statusError(C.aster_observability_init(c)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_observability_init(c) }); err != nil {
 		return fmt.Errorf("aster_observability_init: %w", err)
 	}
 	obs.refs++
@@ -234,7 +234,7 @@ func EnsureObservability() {
 
 // FlushObservability flushes every signal, waiting at most timeout.
 func FlushObservability(timeout time.Duration) error {
-	if err := statusError(C.aster_observability_flush(C.uint32_t(timeout.Milliseconds()))); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_observability_flush(C.uint32_t(timeout.Milliseconds())) }); err != nil {
 		return fmt.Errorf("aster_observability_flush: %w", err)
 	}
 	return nil
@@ -259,7 +259,7 @@ func ShutdownObservability(timeout time.Duration) (bool, error) {
 	held := false
 	var err error
 	for obs.refs > 0 {
-		s := C.aster_observability_shutdown(C.uint32_t(timeout.Milliseconds()))
+		s, sMsg := ffiCall(func() C.int32_t { return C.aster_observability_shutdown(C.uint32_t(timeout.Milliseconds())) })
 		if s == C.ASTER_STATUS_ALREADY_CLOSED {
 			break
 		}
@@ -267,7 +267,7 @@ func ShutdownObservability(timeout time.Duration) (bool, error) {
 			held = true // Native consumed the reference; shutdown continues in the background.
 		}
 		if s != C.ASTER_STATUS_OK {
-			err = fmt.Errorf("aster_observability_shutdown: %w", statusError(s))
+			err = fmt.Errorf("aster_observability_shutdown: %w", statusErrorMsg(s, sMsg))
 			break
 		}
 		held = true
@@ -295,7 +295,7 @@ func LogsDropped() uint64 {
 // prometheus. Without one it returns an error matching ErrNotFound.
 func MetricsPrometheus() (string, error) {
 	var out C.struct_aster_bytes_t
-	if err := statusError(C.aster_metrics_prometheus(&out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_metrics_prometheus(&out) }); err != nil {
 		return "", fmt.Errorf("aster_metrics_prometheus: %w", err)
 	}
 	return string(takeRustBytes(out)), nil
@@ -333,8 +333,8 @@ func (p *logPoller) sync() (string, error) {
 	directive := levelDirective(level)
 	d := []byte(directive)
 	pp, n := cBytesArg(d)
-	if s := C.aster_log_set_filter(pp, n); s != C.ASTER_STATUS_OK {
-		return "", fmt.Errorf("aster_log_set_filter: %w", statusError(s))
+	if s, sMsg := ffiCall(func() C.int32_t { return C.aster_log_set_filter(pp, n) }); s != C.ASTER_STATUS_OK {
+		return "", fmt.Errorf("aster_log_set_filter: %w", statusErrorMsg(s, sMsg))
 	}
 	p.mu.Lock()
 	p.lastSync, p.synced = level, true
@@ -383,7 +383,7 @@ func (p *logPoller) run() {
 	for !p.closing.Load() {
 		start := time.Now()
 		var cn C.uint32_t
-		st := C.aster_log_poll(&recs[0], C.uint32_t(size), logBatch, logPollMs, &cn)
+		st, stMsg := ffiCall(func() C.int32_t { return C.aster_log_poll(&recs[0], C.uint32_t(size), logBatch, logPollMs, &cn) })
 		n := int(cn)
 		for i := 0; i < n; i++ {
 			rec := readLogRecord(&recs[i])
@@ -400,7 +400,7 @@ func (p *logPoller) run() {
 			return
 		case C.ASTER_STATUS_ALREADY_EXISTS, C.ASTER_STATUS_INVALID_ARGUMENT, C.ASTER_STATUS_UNSUPPORTED:
 			if !p.closing.Load() {
-				currentLogger().Warn("aster: log poller stopped", "reason", statusError(st))
+				currentLogger().Warn("aster: log poller stopped", "reason", statusErrorMsg(st, stMsg))
 			}
 			return
 		default:

@@ -92,7 +92,7 @@ func (c *Connection) RelayStream(ctx context.Context, req RelayStreamRequest) (*
 		Headers: headers, Body: HTTPBody{Stream: true},
 	})
 	var opts C.aster_http_relay_options_t
-	if err := wrapStatus("aster_http_relay_options_init", C.aster_http_relay_options_init(&opts)); err != nil {
+	if err := wrapCall("aster_http_relay_options_init", func() C.int32_t { return C.aster_http_relay_options_init(&opts) }); err != nil {
 		return nil, err
 	}
 	opts.max_chunk = C.uint64_t(req.MaxChunk)
@@ -106,8 +106,10 @@ func (c *Connection) RelayStream(ctx context.Context, req RelayStreamRequest) (*
 	defer a.free()
 	var up C.aster_http_upload_t
 	var resp C.aster_http_response_t
-	if err := wrapStatus("aster_expose_relay_stream", C.aster_expose_relay_stream(C.uint64_t(c.runtime.handle),
-		C.uint64_t(c.handle), a.bytes(c4), &opts, &up, &resp)); err != nil {
+	if err := wrapCall("aster_expose_relay_stream", func() C.int32_t {
+		return C.aster_expose_relay_stream(C.uint64_t(c.runtime.handle),
+			C.uint64_t(c.handle), a.bytes(c4), &opts, &up, &resp)
+	}); err != nil {
 		return nil, err
 	}
 	x := &relayExchange{rt: c.runtime, upload: uint64(up), response: uint64(resp), done: make(chan struct{}),
@@ -225,7 +227,7 @@ func (x *relayExchange) reportUploadErr(err error) {
 // call returns.
 func (x *relayExchange) awaitReady(what string, arm func(op *C.aster_operation_t) C.int32_t, onAbort func()) (int32, error) {
 	var op C.aster_operation_t
-	if err := wrapStatus(what, arm(&op)); err != nil {
+	if err := wrapCall(what, func() C.int32_t { return arm(&op) }); err != nil {
 		return 0, err
 	}
 	ch := make(chan *Event, 1)

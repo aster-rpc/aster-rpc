@@ -142,7 +142,7 @@ type HTTPBodies struct {
 // NewHTTPBodies creates a body table on rt.
 func NewHTTPBodies(rt *Runtime) (*HTTPBodies, error) {
 	var h C.aster_http_bodies_t
-	if err := wrapStatus("aster_http_bodies_new", C.aster_http_bodies_new(C.uint64_t(rt.handle), &h)); err != nil {
+	if err := wrapCall("aster_http_bodies_new", func() C.int32_t { return C.aster_http_bodies_new(C.uint64_t(rt.handle), &h) }); err != nil {
 		return nil, err
 	}
 	return &HTTPBodies{rt: rt, handle: uint64(h)}, nil
@@ -156,7 +156,7 @@ func (b *HTTPBodies) Handle() uint64 { return b.handle }
 // OpenCount is the number of open exchanges (leak checks and tests).
 func (b *HTTPBodies) OpenCount() (uint64, error) {
 	var n C.uint64_t
-	if err := wrapStatus("aster_http_bodies_open_count", C.aster_http_bodies_open_count(b.rtH(), C.uint64_t(b.handle), &n)); err != nil {
+	if err := wrapCall("aster_http_bodies_open_count", func() C.int32_t { return C.aster_http_bodies_open_count(b.rtH(), C.uint64_t(b.handle), &n) }); err != nil {
 		return 0, err
 	}
 	return uint64(n), nil
@@ -247,7 +247,7 @@ func (b *HTTPBodies) Close() error {
 	if b.closed.Swap(true) {
 		return nil
 	}
-	return wrapStatus("aster_http_bodies_free", C.aster_http_bodies_free(b.rtH(), C.uint64_t(b.handle)))
+	return wrapCall("aster_http_bodies_free", func() C.int32_t { return C.aster_http_bodies_free(b.rtH(), C.uint64_t(b.handle)) })
 }
 
 // ─── expose registry ─────────────────────────────────────────────────────
@@ -294,7 +294,9 @@ type Expose struct {
 // started with the ALPN(s) the consumers connect on.
 func NewExpose(node *Node) (*Expose, error) {
 	var h C.aster_expose_t
-	if err := wrapStatus("aster_expose_new", C.aster_expose_new(C.uint64_t(node.runtime.handle), C.uint64_t(node.handle), &h)); err != nil {
+	if err := wrapCall("aster_expose_new", func() C.int32_t {
+		return C.aster_expose_new(C.uint64_t(node.runtime.handle), C.uint64_t(node.handle), &h)
+	}); err != nil {
 		return nil, err
 	}
 	return &Expose{node: node, rt: node.runtime, handle: uint64(h), http: map[string]*Upcalls{}}, nil
@@ -310,8 +312,10 @@ func (e *Expose) rtH() C.uint64_t { return C.uint64_t(e.rt.handle) }
 // connection, before the peer opens streams on it; the Connection stays
 // usable and owned by the caller.
 func (e *Expose) HandleConnection(conn *Connection) error {
-	return wrapStatus("aster_expose_handle_connection",
-		C.aster_expose_handle_connection(e.rtH(), C.uint64_t(e.handle), C.uint64_t(conn.handle)))
+	return wrapCall("aster_expose_handle_connection",
+		func() C.int32_t {
+			return C.aster_expose_handle_connection(e.rtH(), C.uint64_t(e.handle), C.uint64_t(conn.handle))
+		})
 }
 
 // Serve owns the node's accept loop for expose: it accepts inbound
@@ -332,8 +336,10 @@ func (e *Expose) Serve(alpns ...string) error {
 	var a cArena
 	defer a.free()
 	var op C.aster_operation_t
-	if err := wrapStatus("aster_expose_serve", C.aster_expose_serve(e.rtH(), C.uint64_t(e.node.handle),
-		C.uint64_t(e.handle), a.list(alpns), 0, &op)); err != nil {
+	if err := wrapCall("aster_expose_serve", func() C.int32_t {
+		return C.aster_expose_serve(e.rtH(), C.uint64_t(e.node.handle),
+			C.uint64_t(e.handle), a.list(alpns), 0, &op)
+	}); err != nil {
 		return err
 	}
 	e.serveOp = uint64(op)
@@ -382,7 +388,7 @@ func (e *Expose) Err() error {
 func (e *Expose) Unexpose(serviceID string) error {
 	var a cArena
 	defer a.free()
-	err := wrapStatus("aster_expose_unexpose", C.aster_expose_unexpose(e.rtH(), C.uint64_t(e.handle), a.str(serviceID)))
+	err := wrapCall("aster_expose_unexpose", func() C.int32_t { return C.aster_expose_unexpose(e.rtH(), C.uint64_t(e.handle), a.str(serviceID)) })
 	e.mu.Lock()
 	up := e.http[serviceID]
 	delete(e.http, serviceID)
@@ -408,8 +414,10 @@ func (e *Expose) ExposeSocket(serviceID, addr string, authorizer *Upcalls) error
 	if authorizer != nil {
 		auth = C.uint64_t(authorizer.handle)
 	}
-	return wrapStatus("aster_expose_socket",
-		C.aster_expose_socket(e.rtH(), C.uint64_t(e.handle), a.str(serviceID), a.str(addr), auth))
+	return wrapCall("aster_expose_socket",
+		func() C.int32_t {
+			return C.aster_expose_socket(e.rtH(), C.uint64_t(e.handle), a.str(serviceID), a.str(addr), auth)
+		})
 }
 
 // ExposeRoutePolicy accepts route registrations (acts as an edge) node-wide,
@@ -422,8 +430,10 @@ func (e *Expose) ExposeRoutePolicy(up *Upcalls, policy RoutePolicyFunc) error {
 	if err := up.ServeRoutePolicy(policy); err != nil {
 		return err
 	}
-	return wrapStatus("aster_expose_route_policy_foreign",
-		C.aster_expose_route_policy_foreign(e.rtH(), C.uint64_t(e.handle), C.uint64_t(up.handle)))
+	return wrapCall("aster_expose_route_policy_foreign",
+		func() C.int32_t {
+			return C.aster_expose_route_policy_foreign(e.rtH(), C.uint64_t(e.handle), C.uint64_t(up.handle))
+		})
 }
 
 // abandon drops op's registration and discards its completion when it
@@ -453,7 +463,7 @@ func (e *Expose) Close() error {
 		<-done
 		e.rt.abandon(serveOp)
 	}
-	return wrapStatus("aster_expose_free", C.aster_expose_free(e.rtH(), C.uint64_t(e.handle)))
+	return wrapCall("aster_expose_free", func() C.int32_t { return C.aster_expose_free(e.rtH(), C.uint64_t(e.handle)) })
 }
 
 // ─── consumer side ───────────────────────────────────────────────────────
@@ -560,7 +570,9 @@ func (r *RouteRegistration) Close() error {
 	if r == nil || r.closed.Swap(true) {
 		return nil
 	}
-	err := wrapStatus("aster_route_registration_free", C.aster_route_registration_free(C.uint64_t(r.rt.handle), C.uint64_t(r.handle)))
+	err := wrapCall("aster_route_registration_free", func() C.int32_t {
+		return C.aster_route_registration_free(C.uint64_t(r.rt.handle), C.uint64_t(r.handle))
+	})
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}

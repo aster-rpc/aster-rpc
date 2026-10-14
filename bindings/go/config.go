@@ -166,7 +166,7 @@ func DefaultConfig() AsterConfig {
 // variables. A malformed variable is an error (ErrInvalidArgument).
 func ConfigFromEnv() (AsterConfig, error) {
 	var n C.aster_config_t
-	if err := statusError(C.aster_config_from_env(&n)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_config_from_env(&n) }); err != nil {
 		return AsterConfig{}, fmt.Errorf("aster_config_from_env: %w", err)
 	}
 	defer C.aster_config_release(&n)
@@ -177,7 +177,7 @@ func ConfigFromEnv() (AsterConfig, error) {
 		return AsterConfig{}, err
 	}
 	var trust C.aster_bytes_t
-	if err := wrapStatus("aster_config_enrollment_from_env", C.aster_config_enrollment_from_env(&trust)); err != nil {
+	if err := wrapCall("aster_config_enrollment_from_env", func() C.int32_t { return C.aster_config_enrollment_from_env(&trust) }); err != nil {
 		return AsterConfig{}, err
 	}
 	if err := c.applyTrustJSON(trust); err != nil {
@@ -193,7 +193,7 @@ func ConfigFromTOML(path string) (AsterConfig, error) {
 	var a cArena
 	defer a.free()
 	var n C.aster_config_t
-	if err := statusError(C.aster_config_from_toml(a.str(path), &n)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_config_from_toml(a.str(path), &n) }); err != nil {
 		return AsterConfig{}, fmt.Errorf("aster_config_from_toml(%s): %w", path, err)
 	}
 	defer C.aster_config_release(&n)
@@ -207,7 +207,7 @@ func ConfigFromTOML(path string) (AsterConfig, error) {
 		return AsterConfig{}, err
 	}
 	var trust C.aster_bytes_t
-	if err := wrapStatus("aster_config_enrollment_from_toml", C.aster_config_enrollment_from_toml(a.str(path), &trust)); err != nil {
+	if err := wrapCall("aster_config_enrollment_from_toml", func() C.int32_t { return C.aster_config_enrollment_from_toml(a.str(path), &trust) }); err != nil {
 		return AsterConfig{}, fmt.Errorf("%s: %w", path, err)
 	}
 	if err := c.applyTrustJSON(trust); err != nil {

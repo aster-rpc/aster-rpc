@@ -139,7 +139,7 @@ func NewUpcalls(rt *Runtime, capacity uint32) (*Upcalls, error) {
 		return nil, fmt.Errorf("upcalls: nil runtime: %w", ErrInvalidArgument)
 	}
 	var h C.aster_upcalls_t
-	if err := wrapStatus("aster_upcalls_new", C.aster_upcalls_new(C.uint64_t(rt.handle), C.uint32_t(capacity), &h)); err != nil {
+	if err := wrapCall("aster_upcalls_new", func() C.int32_t { return C.aster_upcalls_new(C.uint64_t(rt.handle), C.uint32_t(capacity), &h) }); err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -174,14 +174,18 @@ func (u *Upcalls) SetPolicy(kind UpcallKind, timeout time.Duration, mode Failure
 	if kind == UpcallCancel {
 		return fmt.Errorf("upcalls: CANCEL has no policy: %w", ErrInvalidArgument)
 	}
-	return wrapStatus("aster_upcall_set_policy",
-		C.aster_upcall_set_policy(u.rtH(), C.uint64_t(u.handle), C.uint32_t(kind), millis32(timeout), C.uint32_t(mode)))
+	return wrapCall("aster_upcall_set_policy",
+		func() C.int32_t {
+			return C.aster_upcall_set_policy(u.rtH(), C.uint64_t(u.handle), C.uint32_t(kind), millis32(timeout), C.uint32_t(mode))
+		})
 }
 
 // SetDefaultPolicy sets the policy of every kind without its own.
 func (u *Upcalls) SetDefaultPolicy(timeout time.Duration, mode FailureMode) error {
-	return wrapStatus("aster_upcall_set_default_policy",
-		C.aster_upcall_set_default_policy(u.rtH(), C.uint64_t(u.handle), millis32(timeout), C.uint32_t(mode)))
+	return wrapCall("aster_upcall_set_default_policy",
+		func() C.int32_t {
+			return C.aster_upcall_set_default_policy(u.rtH(), C.uint64_t(u.handle), millis32(timeout), C.uint32_t(mode))
+		})
 }
 
 func millis32(d time.Duration) C.uint32_t {
@@ -349,7 +353,7 @@ func (u *Upcalls) Respond(id uint64, status UpcallStatus, payload []byte) bool {
 // (decisions take their failure mode) and each gets a CANCEL{shutdown}.
 // Handlers and the poll goroutine keep running; use Close to stop them.
 func (u *Upcalls) CloseTable() error {
-	return wrapStatus("aster_upcalls_close", C.aster_upcalls_close(u.rtH(), C.uint64_t(u.handle)))
+	return wrapCall("aster_upcalls_close", func() C.int32_t { return C.aster_upcalls_close(u.rtH(), C.uint64_t(u.handle)) })
 }
 
 // Close fails pending upcalls (decisions take their failure mode), stops the
@@ -374,8 +378,8 @@ func (u *Upcalls) Close() error {
 			// A handler ignoring its context cannot stop us freeing the
 			// table; its late respond is a no-op (closing, then NOT_FOUND).
 		}
-		if st := C.aster_upcalls_free(u.rtH(), C.uint64_t(u.handle)); st != 0 && u.closeErr == nil {
-			if err := statusError(st); !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrAlreadyClosed) {
+		if st, stMsg := ffiCall(func() C.int32_t { return C.aster_upcalls_free(u.rtH(), C.uint64_t(u.handle)) }); st != 0 && u.closeErr == nil {
+			if err := statusErrorMsg(st, stMsg); !errors.Is(err, ErrNotFound) && !errors.Is(err, ErrAlreadyClosed) {
 				u.closeErr = fmt.Errorf("aster_upcalls_free: %w", err)
 			}
 		}
@@ -560,7 +564,7 @@ const lateCompletionWait = 5 * time.Minute
 func startOwnedOp(ctx context.Context, rt *Runtime, what string,
 	call func(op *C.aster_operation_t) C.int32_t, cleanup func(*Event)) (*Event, error) {
 	var op C.aster_operation_t
-	if err := wrapStatus(what, call(&op)); err != nil {
+	if err := wrapCall(what, func() C.int32_t { return call(&op) }); err != nil {
 		return nil, err
 	}
 	id := uint64(op)

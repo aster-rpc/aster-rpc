@@ -59,7 +59,7 @@ func ParseID(kind IDKind, text string) (Key, error) {
 	var a cArena
 	defer a.free()
 	out, get := cOutKey(&a)
-	if err := statusError(C.aster_id_parse(C.uint32_t(kind), a.str(text), out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_id_parse(C.uint32_t(kind), a.str(text), out) }); err != nil {
 		return Key{}, fmt.Errorf("aster_id_parse: %w", err)
 	}
 	return get(), nil
@@ -70,7 +70,7 @@ func FormatID(kind IDKind, id Key) (string, error) {
 	var a cArena
 	defer a.free()
 	out := (*C.uint8_t)(a.alloc(65))
-	if err := statusError(C.aster_id_format(C.uint32_t(kind), cKey(&a, id), out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_id_format(C.uint32_t(kind), cKey(&a, id), out) }); err != nil {
 		return "", fmt.Errorf("aster_id_format: %w", err)
 	}
 	return C.GoStringN((*C.char)(unsafe.Pointer(out)), 64), nil
@@ -80,7 +80,7 @@ func FormatID(kind IDKind, id Key) (string, error) {
 func ValidateID(kind IDKind, id Key) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("aster_id_validate", C.aster_id_validate(C.uint32_t(kind), cKey(&a, id)))
+	return wrapCall("aster_id_validate", func() C.int32_t { return C.aster_id_validate(C.uint32_t(kind), cKey(&a, id)) })
 }
 
 // GenerateSecretKey returns a fresh 32-byte Ed25519 secret key.
@@ -89,7 +89,7 @@ func GenerateSecretKey() (Key, error) {
 	defer a.free()
 	out, get := cOutKey(&a)
 	var n C.uintptr_t
-	if err := statusError(C.aster_secret_key_generate(out, 32, &n)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_secret_key_generate(out, 32, &n) }); err != nil {
 		return Key{}, fmt.Errorf("aster_secret_key_generate: %w", err)
 	}
 	return get(), nil
@@ -100,7 +100,7 @@ func SecretKeyPublicKey(secret Key) (Key, error) {
 	var a cArena
 	defer a.free()
 	out, get := cOutKey(&a)
-	if err := statusError(C.aster_secret_key_public_key(cKey(&a, secret), out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_secret_key_public_key(cKey(&a, secret), out) }); err != nil {
 		return Key{}, fmt.Errorf("aster_secret_key_public_key: %w", err)
 	}
 	return get(), nil
@@ -111,7 +111,7 @@ func NamespaceSecretID(secret Key) (Key, error) {
 	var a cArena
 	defer a.free()
 	out, get := cOutKey(&a)
-	if err := statusError(C.aster_namespace_secret_id(cKey(&a, secret), out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_namespace_secret_id(cKey(&a, secret), out) }); err != nil {
 		return Key{}, fmt.Errorf("aster_namespace_secret_id: %w", err)
 	}
 	return get(), nil
@@ -125,7 +125,7 @@ func HPKEGenerateKeypair() (private, public Key, err error) {
 	defer a.free()
 	priv, getPriv := cOutKey(&a)
 	pub, getPub := cOutKey(&a)
-	if err := statusError(C.aster_hpke_generate_keypair(priv, pub)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_hpke_generate_keypair(priv, pub) }); err != nil {
 		return Key{}, Key{}, fmt.Errorf("aster_hpke_generate_keypair: %w", err)
 	}
 	return getPriv(), getPub(), nil
@@ -135,7 +135,7 @@ func keyToKey(name string, in Key, f func(*C.uint8_t, *C.uint8_t) C.int32_t) (Ke
 	var a cArena
 	defer a.free()
 	out, get := cOutKey(&a)
-	if err := statusError(f(cKey(&a, in), out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return f(cKey(&a, in), out) }); err != nil {
 		return Key{}, fmt.Errorf("%s: %w", name, err)
 	}
 	return get(), nil
@@ -169,7 +169,7 @@ func X25519PublicFromNodeID(nodeID string) (Key, error) {
 	var a cArena
 	defer a.free()
 	out, get := cOutKey(&a)
-	if err := statusError(C.aster_hpke_x25519_public_from_node_id(a.str(nodeID), out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_hpke_x25519_public_from_node_id(a.str(nodeID), out) }); err != nil {
 		return Key{}, fmt.Errorf("aster_hpke_x25519_public_from_node_id: %w", err)
 	}
 	return get(), nil
@@ -181,7 +181,9 @@ func HPKESeal(recipientPublic Key, aad, plaintext []byte) ([]byte, error) {
 	var a cArena
 	defer a.free()
 	var out C.struct_aster_bytes_t
-	if err := statusError(C.aster_hpke_seal(cKey(&a, recipientPublic), a.bytes(aad), a.bytes(plaintext), &out)); err != nil {
+	if err := ffiStatus(func() C.int32_t {
+		return C.aster_hpke_seal(cKey(&a, recipientPublic), a.bytes(aad), a.bytes(plaintext), &out)
+	}); err != nil {
 		return nil, fmt.Errorf("aster_hpke_seal: %w", err)
 	}
 	return takeRustBytes(out), nil
@@ -193,7 +195,9 @@ func HPKEOpen(recipientPrivate Key, aad, envelope []byte) ([]byte, error) {
 	var a cArena
 	defer a.free()
 	var out C.struct_aster_bytes_t
-	if err := statusError(C.aster_hpke_open(cKey(&a, recipientPrivate), a.bytes(aad), a.bytes(envelope), &out)); err != nil {
+	if err := ffiStatus(func() C.int32_t {
+		return C.aster_hpke_open(cKey(&a, recipientPrivate), a.bytes(aad), a.bytes(envelope), &out)
+	}); err != nil {
 		return nil, fmt.Errorf("aster_hpke_open: %w", err)
 	}
 	return nonNil(takeRustBytes(out)), nil

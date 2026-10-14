@@ -86,11 +86,13 @@ func (s *DocSubscription) Close() error {
 		return nil
 	}
 	defer s.runtime.release()
-	status := C.aster_doc_event_receiver_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle))
+	status, statusMsg := ffiCall(func() C.int32_t {
+		return C.aster_doc_event_receiver_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle))
+	})
 	if status == C.ASTER_STATUS_NOT_FOUND {
 		return nil
 	}
-	return wrapStatus("aster_doc_event_receiver_free", status)
+	return wrapStatusMsg("aster_doc_event_receiver_free", status, statusMsg)
 }
 
 // Recv returns the next event or io.EOF when closed. A timeout does not consume
@@ -106,11 +108,13 @@ func (s *DocSubscription) Recv(ctx context.Context) (*DocEvent, error) {
 	s.runtime.retain()
 	defer s.runtime.release()
 	var op C.aster_operation_t
-	status := C.aster_doc_event_recv(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), 0, &op)
+	status, statusMsg := ffiCall(func() C.int32_t {
+		return C.aster_doc_event_recv(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), 0, &op)
+	})
 	if status == C.ASTER_STATUS_NOT_FOUND {
 		return nil, io.EOF
 	}
-	if err := wrapStatus("aster_doc_event_recv", status); err != nil {
+	if err := wrapStatusMsg("aster_doc_event_recv", status, statusMsg); err != nil {
 		return nil, err
 	}
 	ch := make(chan *Event, 1)

@@ -83,12 +83,15 @@ func (r *Runtime) startRawWT(ctx context.Context, up *Upcalls, cfg RawWTConfig) 
 	c := C.aster_raw_wt_config_t{struct_size: C.uint32_t(unsafe.Sizeof(C.aster_raw_wt_config_t{})), bind_addr: a.str(cfg.BindAddr), certificate_pem: a.bytes(cfg.CertificatePEM), private_key_pem: a.bytes(cfg.PrivateKeyPEM), path: a.str(cfg.Path), max_sessions: C.uint32_t(cfg.MaxSessions), max_streams: C.uint32_t(cfg.MaxStreams), max_datagrams: C.uint32_t(cfg.MaxDatagrams), max_datagram_bytes: C.uint32_t(cfg.MaxDatagramBytes), max_read_bytes: C.uint32_t(cfg.MaxReadBytes), max_pending_auth: C.uint32_t(cfg.MaxPendingAuth), max_auth_payload_bytes: C.uint32_t(cfg.MaxAuthPayloadBytes)}
 	var h C.uint64_t
 	var status C.int32_t
+	var statusMsg string
 	if up == nil {
-		status = C.aster_raw_wt_listener_start_public(C.uint64_t(r.handle), &c, &h)
+		status, statusMsg = ffiCall(func() C.int32_t { return C.aster_raw_wt_listener_start_public(C.uint64_t(r.handle), &c, &h) })
 	} else {
-		status = C.aster_raw_wt_listener_start(C.uint64_t(r.handle), C.uint64_t(up.handle), &c, &h)
+		status, statusMsg = ffiCall(func() C.int32_t {
+			return C.aster_raw_wt_listener_start(C.uint64_t(r.handle), C.uint64_t(up.handle), &c, &h)
+		})
 	}
-	if err := wrapStatus("raw WT start", status); err != nil {
+	if err := wrapStatusMsg("raw WT start", status, statusMsg); err != nil {
 		return nil, err
 	}
 	l := &RawWTListener{runtime: r.retain(), upcalls: up, handle: uint64(h)}
@@ -102,7 +105,7 @@ func (r *Runtime) startRawWT(ctx context.Context, up *Upcalls, cfg RawWTConfig) 
 		return fail(err)
 	}
 	var span C.aster_bytes_t
-	if err := wrapStatus("raw WT address", C.aster_raw_wt_listener_addr(C.uint64_t(r.handle), h, &span)); err != nil {
+	if err := wrapCall("raw WT address", func() C.int32_t { return C.aster_raw_wt_listener_addr(C.uint64_t(r.handle), h, &span) }); err != nil {
 		return fail(err)
 	}
 	defer C.aster_string_release(span.ptr, span.len)
@@ -139,9 +142,11 @@ func (l *RawWTListener) Stop(grace time.Duration) error {
 		ms++
 	}
 	ms = min(ms, uint64(1<<32-1))
-	status := C.aster_raw_wt_listener_stop(C.uint64_t(l.runtime.handle), C.uint64_t(l.handle), C.uint32_t(ms))
+	status, statusMsg := ffiCall(func() C.int32_t {
+		return C.aster_raw_wt_listener_stop(C.uint64_t(l.runtime.handle), C.uint64_t(l.handle), C.uint32_t(ms))
+	})
 	if status != C.ASTER_STATUS_NOT_FOUND && status != C.ASTER_STATUS_ALREADY_CLOSED {
-		if err := wrapStatus("raw WT stop", status); err != nil {
+		if err := wrapStatusMsg("raw WT stop", status, statusMsg); err != nil {
 			return err
 		}
 	}
@@ -160,7 +165,7 @@ func rawWTOp(ctx context.Context, rt *Runtime, what string, call func(*C.aster_o
 	rt.retain()
 	defer rt.release()
 	var op C.aster_operation_t
-	if err := wrapStatus(what, call(&op)); err != nil {
+	if err := wrapCall(what, func() C.int32_t { return call(&op) }); err != nil {
 		return nil, err
 	}
 	ch := make(chan *Event, 1)
@@ -241,9 +246,9 @@ type RawWTStats struct {
 
 func rawWTJSON(what string, call func(*C.aster_bytes_t) C.int32_t, out any) error {
 	var span C.aster_bytes_t
-	status := call(&span)
+	status, statusMsg := ffiCall(func() C.int32_t { return call(&span) })
 	defer C.aster_string_release(span.ptr, span.len)
-	if err := wrapStatus(what, status); err != nil {
+	if err := wrapStatusMsg(what, status, statusMsg); err != nil {
 		return err
 	}
 	data := cDataToGoBytes(unsafe.Pointer(span.ptr), uintptr(span.len))
@@ -275,7 +280,9 @@ func (s *RawWTSession) Stats() (RawWTStats, error) {
 func (s *RawWTSession) CloseConnection(code uint32, reason []byte) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("raw WT close", C.aster_raw_wt_session_close(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), C.uint32_t(code), a.bytes(reason)))
+	return wrapCall("raw WT close", func() C.int32_t {
+		return C.aster_raw_wt_session_close(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), C.uint32_t(code), a.bytes(reason))
+	})
 }
 func (s *RawWTSession) Close() error {
 	s.mu.Lock()
@@ -283,9 +290,11 @@ func (s *RawWTSession) Close() error {
 	if s.closed {
 		return nil
 	}
-	status := C.aster_raw_wt_session_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle))
+	status, statusMsg := ffiCall(func() C.int32_t {
+		return C.aster_raw_wt_session_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle))
+	})
 	if status != C.ASTER_STATUS_NOT_FOUND && status != C.ASTER_STATUS_ALREADY_CLOSED {
-		if err := wrapStatus("raw WT free", status); err != nil {
+		if err := wrapStatusMsg("raw WT free", status, statusMsg); err != nil {
 			return err
 		}
 	}
@@ -312,13 +321,17 @@ func (s *RawWTSession) Closed(ctx context.Context) (RawWTCloseInfo, error) {
 func (s *RawWTSession) MaxDatagramSize() (size uint64, available bool, err error) {
 	var n C.uint64_t
 	var some C.uint32_t
-	err = wrapStatus("raw WT datagram size", C.aster_raw_wt_session_max_datagram_size(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), &n, &some))
+	err = wrapCall("raw WT datagram size", func() C.int32_t {
+		return C.aster_raw_wt_session_max_datagram_size(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), &n, &some)
+	})
 	return uint64(n), some != 0, err
 }
 func (s *RawWTSession) SendDatagram(data []byte) error {
 	var a cArena
 	defer a.free()
-	return wrapStatus("raw WT send datagram", C.aster_raw_wt_session_send_datagram(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), a.bytes(data)))
+	return wrapCall("raw WT send datagram", func() C.int32_t {
+		return C.aster_raw_wt_session_send_datagram(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), a.bytes(data))
+	})
 }
 func (s *RawWTSession) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	ev, err := rawWTOp(ctx, s.runtime, "raw WT receive datagram", func(op *C.aster_operation_t) C.int32_t {
@@ -383,9 +396,11 @@ func (s *RawWTStream) Close() error {
 	if s.closed {
 		return nil
 	}
-	status := C.aster_raw_wt_stream_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle))
+	status, statusMsg := ffiCall(func() C.int32_t {
+		return C.aster_raw_wt_stream_free(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle))
+	})
 	if status != C.ASTER_STATUS_NOT_FOUND && status != C.ASTER_STATUS_ALREADY_CLOSED {
-		if err := wrapStatus("raw WT stream free", status); err != nil {
+		if err := wrapStatusMsg("raw WT stream free", status, statusMsg); err != nil {
 			return err
 		}
 	}

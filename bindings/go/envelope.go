@@ -160,7 +160,7 @@ func EncodeStreamHeader(h StreamHeader) ([]byte, error) {
 		metadata_values:    values,
 	}
 	var out C.struct_aster_bytes_t
-	if err := statusError(C.aster_stream_header_encode(&n, &out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_stream_header_encode(&n, &out) }); err != nil {
 		return nil, fmt.Errorf("aster_stream_header_encode: %w", err)
 	}
 	return takeRustBytes(out), nil
@@ -171,7 +171,7 @@ func DecodeStreamHeader(b []byte) (StreamHeader, error) {
 	p, n, free := inputPtr(b)
 	defer free()
 	var h C.aster_stream_header_t
-	if err := statusError(C.aster_stream_header_decode(p, n, &h)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_stream_header_decode(p, n, &h) }); err != nil {
 		return StreamHeader{}, fmt.Errorf("aster_stream_header_decode: %w", err)
 	}
 	defer C.aster_stream_header_release(&h)
@@ -201,7 +201,7 @@ func EncodeCallHeader(h CallHeader) ([]byte, error) {
 		metadata_values: values,
 	}
 	var out C.struct_aster_bytes_t
-	if err := statusError(C.aster_call_header_encode(&n, &out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_call_header_encode(&n, &out) }); err != nil {
 		return nil, fmt.Errorf("aster_call_header_encode: %w", err)
 	}
 	return takeRustBytes(out), nil
@@ -212,7 +212,7 @@ func DecodeCallHeader(b []byte) (CallHeader, error) {
 	p, n, free := inputPtr(b)
 	defer free()
 	var h C.aster_call_header_t
-	if err := statusError(C.aster_call_header_decode(p, n, &h)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_call_header_decode(p, n, &h) }); err != nil {
 		return CallHeader{}, fmt.Errorf("aster_call_header_decode: %w", err)
 	}
 	defer C.aster_call_header_release(&h)
@@ -237,7 +237,7 @@ func EncodeRpcStatus(s RpcStatus) ([]byte, error) {
 		detail_values: values,
 	}
 	var out C.struct_aster_bytes_t
-	if err := statusError(C.aster_rpc_status_encode(&n, &out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_rpc_status_encode(&n, &out) }); err != nil {
 		return nil, fmt.Errorf("aster_rpc_status_encode: %w", err)
 	}
 	return takeRustBytes(out), nil
@@ -248,7 +248,7 @@ func DecodeRpcStatus(b []byte) (RpcStatus, error) {
 	p, n, free := inputPtr(b)
 	defer free()
 	var s C.aster_rpc_status_t
-	if err := statusError(C.aster_rpc_status_decode(p, n, &s)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_rpc_status_decode(p, n, &s) }); err != nil {
 		return RpcStatus{}, fmt.Errorf("aster_rpc_status_decode: %w", err)
 	}
 	defer C.aster_rpc_status_release(&s)
@@ -275,7 +275,7 @@ func ZstdMaybeCompress(payload []byte, threshold int) ([]byte, error) {
 	p, n, free := inputPtr(payload)
 	defer free()
 	var out C.struct_aster_bytes_t
-	if err := statusError(C.aster_zstd_maybe_compress(p, n, C.uintptr_t(threshold), &out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_zstd_maybe_compress(p, n, C.uintptr_t(threshold), &out) }); err != nil {
 		return nil, fmt.Errorf("aster_zstd_maybe_compress: %w", err)
 	}
 	if out.ptr == nil {
@@ -290,7 +290,7 @@ func ZstdDecompress(data []byte) ([]byte, error) {
 	p, n, free := inputPtr(data)
 	defer free()
 	var out C.struct_aster_bytes_t
-	if err := statusError(C.aster_zstd_decompress(p, n, &out)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_zstd_decompress(p, n, &out) }); err != nil {
 		return nil, fmt.Errorf("aster_zstd_decompress: %w", err)
 	}
 	b := takeRustBytes(out)

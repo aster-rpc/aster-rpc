@@ -191,7 +191,7 @@ func emitLog(level uint8, logger, message string, fields []Attr, tsNanos int64, 
 		spanContextToC(*sc, c)
 		rec.context = c
 	}
-	if err := statusError(C.aster_log_emit(rec)); err != nil {
+	if err := ffiStatus(func() C.int32_t { return C.aster_log_emit(rec) }); err != nil {
 		return fmt.Errorf("aster_log_emit: %w", err)
 	}
 	return nil
