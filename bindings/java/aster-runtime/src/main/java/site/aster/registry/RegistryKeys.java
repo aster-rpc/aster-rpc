@@ -18,10 +18,15 @@ import java.util.List;
  */
 public final class RegistryKeys {
 
-  /** Registry download-policy prefixes -- all key namespaces a registry client should sync. */
+  /**
+   * Registry download-policy prefixes -- all key namespaces a registry client should sync. Every
+   * family a builder below writes must be covered, or the entry syncs without its value; {@code
+   * endpoints/} and {@code compatibility/} are spec-reserved families with no builder yet.
+   */
   public static final List<byte[]> REGISTRY_PREFIXES =
       List.of(
           "contracts/".getBytes(StandardCharsets.UTF_8),
+          "manifests/".getBytes(StandardCharsets.UTF_8),
           "services/".getBytes(StandardCharsets.UTF_8),
           "endpoints/".getBytes(StandardCharsets.UTF_8),
           "compatibility/".getBytes(StandardCharsets.UTF_8),

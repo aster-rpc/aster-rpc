@@ -3,6 +3,7 @@ package site.aster.registry;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -38,6 +39,28 @@ final class RegistryKeysTest {
 
   @Test
   void prefixFree() {
+    List<String> keys = familyKeys();
+    for (String a : keys) {
+      for (String b : keys) {
+        assertFalse(!a.equals(b) && b.startsWith(a), a + " is a prefix of " + b);
+      }
+    }
+  }
+
+  /** A client that syncs only REGISTRY_PREFIXES receives every family the builders write. */
+  @Test
+  void prefixesCoverEveryFamily() {
+    List<String> prefixes = RegistryKeys.REGISTRY_PREFIXES.stream().map(p -> s(p)).toList();
+    for (String key : familyKeys()) {
+      assertTrue(prefixes.stream().anyMatch(key::startsWith), "no prefix covers " + key);
+    }
+  }
+
+  /**
+   * Keys from every builder, over segments chosen to provoke prefix collisions. A new key family
+   * belongs here.
+   */
+  private static List<String> familyKeys() {
     String[] leaves = {"1", "10", "stable", "stable2", "x/y", "x", "", "%2F"};
     List<String> keys = new ArrayList<>();
     for (String name : new String[] {"svc", "svc2", "a/b", "a", "50%"}) {
@@ -56,11 +79,7 @@ final class RegistryKeysTest {
         keys.add(s(RegistryKeys.versionKey(name, v)));
       }
     }
-    for (String a : keys) {
-      for (String b : keys) {
-        assertFalse(!a.equals(b) && b.startsWith(a), a + " is a prefix of " + b);
-      }
-    }
+    return keys;
   }
 
   @Test
