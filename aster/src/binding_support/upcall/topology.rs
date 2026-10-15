@@ -18,7 +18,8 @@
 //!   (fail-closed by default: the author is filtered), and the id is queued.
 //!
 //! One background task drains the queue into **batched** upcalls (up to
-//! `max_batch` ids each). A newly seen author therefore counts from the
+//! `max_batch` ids each). An id is asked about once at a time: lookups that
+//! miss while its batch is in flight do not queue it again. A newly seen author therefore counts from the
 //! first view derived after its batch is answered (typically the next view,
 //! ~1 s). A failed batch caches the fallback for `failure_retry` so a dead
 //! binding is not hammered. When admission is revoked, call
@@ -27,7 +28,7 @@
 //! cache with [`prefetch`](ForeignAdmittedFn::prefetch) before
 //! `enable_shared` to avoid the initial fallback window.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -78,11 +79,19 @@ struct Entry {
     expires: Instant,
 }
 
+/// Ids waiting for the refresher, and ids whose batch it has sent but not
+/// yet cached. One lock, so an id moves between them atomically.
+#[derive(Default)]
+struct Pending {
+    queued: BTreeSet<String>,
+    in_flight: HashSet<String>,
+}
+
 struct AdmitInner {
     upcalls: Upcalls,
     opts: AdmittedCacheOptions,
     cache: RwLock<HashMap<String, Entry>>,
-    queued: Mutex<BTreeSet<String>>,
+    pending: Mutex<Pending>,
     wake: Arc<Notify>,
     hits: AtomicU64,
     stale: AtomicU64,
@@ -127,7 +136,7 @@ impl ForeignAdmittedFn {
                 ..opts
             },
             cache: RwLock::new(HashMap::new()),
-            queued: Mutex::new(BTreeSet::new()),
+            pending: Mutex::new(Pending::default()),
             wake: wake.clone(),
             hits: AtomicU64::new(0),
             stale: AtomicU64::new(0),
@@ -169,14 +178,22 @@ impl ForeignAdmittedFn {
             .insert(node_hex.to_string(), Entry { admitted, expires });
     }
 
-    /// Forget one id; the next lookup misses and re-resolves.
+    /// Forget one id; the next lookup misses and re-resolves (with a new
+    /// upcall, even if one for this id is already in flight).
     pub fn invalidate(&self, node_hex: &str) {
         self.inner.cache.write().unwrap().remove(node_hex);
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .in_flight
+            .remove(node_hex);
     }
 
     /// Forget every id.
     pub fn clear(&self) {
         self.inner.cache.write().unwrap().clear();
+        self.inner.pending.lock().unwrap().in_flight.clear();
     }
 
     pub fn stats(&self) -> AdmittedCacheStats {
@@ -213,7 +230,11 @@ fn lookup(inner: &AdmitInner, node: &str) -> bool {
 }
 
 fn enqueue(inner: &AdmitInner, node: &str) {
-    let fresh = inner.queued.lock().unwrap().insert(node.to_string());
+    let fresh = {
+        let mut p = inner.pending.lock().unwrap();
+        // Already being resolved: its answer is on the way.
+        !p.in_flight.contains(node) && p.queued.insert(node.to_string())
+    };
     if fresh {
         inner.wake.notify_one();
     }
@@ -287,10 +308,16 @@ async fn refresher(weak: Weak<AdmitInner>, wake: Arc<Notify>) {
         let notified = wake.notified();
         let batch = {
             let Some(inner) = weak.upgrade() else { return };
-            let mut q = inner.queued.lock().unwrap();
-            let batch: Vec<String> = q.iter().take(inner.opts.max_batch).cloned().collect();
+            let mut p = inner.pending.lock().unwrap();
+            let batch: Vec<String> = p
+                .queued
+                .iter()
+                .take(inner.opts.max_batch)
+                .cloned()
+                .collect();
             for id in &batch {
-                q.remove(id);
+                p.queued.remove(id);
+                p.in_flight.insert(id.clone());
             }
             batch
         };
@@ -299,7 +326,13 @@ async fn refresher(weak: Weak<AdmitInner>, wake: Arc<Notify>) {
             continue;
         }
         let Some(inner) = weak.upgrade() else { return };
-        let _ = resolve(&inner, batch).await;
+        // `resolve` caches every id (answer or fallback) before they leave
+        // `in_flight`, so a lookup in between never misses unqueued.
+        let _ = resolve(&inner, batch.clone()).await;
+        let mut p = inner.pending.lock().unwrap();
+        for id in &batch {
+            p.in_flight.remove(id);
+        }
     }
 }
 

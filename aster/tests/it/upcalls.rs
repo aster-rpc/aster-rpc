@@ -750,6 +750,48 @@ async fn admitted_filter_caches_batches_and_falls_back() {
     eventually("re-resolved", || f(&hex(2))).await;
 }
 
+/// Lookups that miss while an id's batch is in flight must not ask the
+/// binding about it again once that batch is answered.
+#[tokio::test]
+async fn admitted_filter_does_not_requery_in_flight_ids() {
+    let (queue, upcalls) = setup(64);
+    let release = Arc::new(AtomicBool::new(false));
+    let batches = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let (r, b) = (release.clone(), batches.clone());
+    let _foreign = Foreign::start(queue, upcalls.clone(), move |ev| {
+        let ids = codec::decode_topology_admitted_request(&ev.payload).unwrap();
+        b.lock().unwrap().push(ids.clone());
+        // Hold the answer until the test has missed again meanwhile.
+        while !r.load(Ordering::Relaxed) {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        ok(codec::encode_topology_admitted_response(&vec![
+            true;
+            ids.len()
+        ]))
+    });
+    let filter = ForeignAdmittedFn::new(upcalls.clone(), AdmittedCacheOptions::default());
+    let f = filter.admitted_fn();
+
+    assert!(!f(&hex(1)));
+    eventually("batch sent", || batches.lock().unwrap().len() == 1).await;
+    for _ in 0..5 {
+        assert!(!f(&hex(1)), "in flight -> fallback");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    release.store(true, Ordering::Relaxed);
+    eventually("resolved", || f(&hex(1))).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(*batches.lock().unwrap(), vec![vec![hex(1)]]);
+    assert_eq!(filter.stats().upcalls, 1);
+
+    // `invalidate` still forces a fresh upcall.
+    filter.invalidate(&hex(1));
+    assert!(!f(&hex(1)));
+    eventually("re-resolved", || f(&hex(1))).await;
+    assert_eq!(batches.lock().unwrap().len(), 2);
+}
+
 #[tokio::test]
 async fn admitted_filter_prefetch_staleness_and_failures() {
     let (queue, upcalls) = setup(64);
