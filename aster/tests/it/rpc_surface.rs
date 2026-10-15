@@ -576,3 +576,95 @@ async fn retraction_matches_exact_keys() {
     assert_eq!(fetched.contract_id, aster::rpc::contract_id(&v10.contract));
     srv.shutdown().await;
 }
+
+/// Whether the registry holds any live entry.
+async fn any_entry(registry: &aster::Doc) -> bool {
+    !registry
+        .query_key_prefix(Vec::new(), None)
+        .await
+        .unwrap()
+        .is_empty()
+}
+
+/// An activation dropped while it is writing the registry leaves nothing
+/// behind: its entries are retracted, dispatch is off, and calls answer
+/// `UNAVAILABLE`. The future is polled by hand and dropped at the first poll
+/// that leaves it pending after an entry has appeared.
+#[tokio::test]
+async fn cancelled_activation_leaves_nothing_behind() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    for _attempt in 0..20 {
+        let srv = deferred().await;
+        let registry = srv.docs().create().await.unwrap();
+        let (client, conn) = client_of(&srv).await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut activation = Box::pin(
+            srv.activate(
+                RpcSurface::builder()
+                    .service(EchoServer::new(EchoImpl {
+                        calls: calls.clone(),
+                    }))
+                    .service(EchoTenServer::new(EchoImpl {
+                        calls: calls.clone(),
+                    }))
+                    .manifest_publication(ManifestPublication::Strict)
+                    .registry(registry.clone())
+                    .build(),
+            ),
+        );
+        let mut caught = false;
+        loop {
+            let polled = std::future::poll_fn(|cx| Poll::Ready(activation.as_mut().poll(cx))).await;
+            match polled {
+                Poll::Ready(result) => {
+                    // Finished before a write was observed: try again.
+                    result.unwrap();
+                    break;
+                }
+                Poll::Pending if any_entry(&registry).await => {
+                    caught = true;
+                    break;
+                }
+                Poll::Pending => tokio::time::sleep(Duration::from_millis(1)).await,
+            }
+        }
+        drop(activation);
+        if !caught {
+            srv.shutdown().await;
+            client.shutdown().await;
+            continue;
+        }
+
+        // Retraction may run after the drop; give it a bounded moment.
+        let mut clean = false;
+        for _ in 0..100 {
+            if !any_entry(&registry).await {
+                clean = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(clean, "a cancelled activation left registry entries");
+        assert_eq!(srv.surface_state(), SurfaceState::Inactive);
+        assert_eq!(echo_code(&conn).await, Err(StatusCode::Unavailable));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // The server is usable: a later activation succeeds.
+        srv.activate(
+            RpcSurface::builder()
+                .service(EchoServer::new(EchoImpl::default()))
+                .manifest_publication(ManifestPublication::Strict)
+                .registry(registry.clone())
+                .build(),
+        )
+        .await
+        .unwrap();
+        assert!(advertised(&registry).await);
+        srv.shutdown().await;
+        client.shutdown().await;
+        return;
+    }
+    panic!("never caught an activation between registry writes");
+}

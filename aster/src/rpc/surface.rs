@@ -340,10 +340,14 @@ impl SurfaceControl {
         self.slot.install(Arc::new(late));
         // Until the activation commits, any exit -- an error below or the
         // caller dropping this future -- withdraws dispatch again.
-        let rollback = Rollback {
+        #[allow(unused_mut)]
+        let mut rollback = Rollback {
             slot: &self.slot,
             dispatcher: host.dispatcher,
             keys: &keys,
+            armed: true,
+            #[cfg(all(feature = "docs", feature = "blobs"))]
+            advertising: None,
         };
 
         // Phase 3: advertise. Dispatch is already live, so nothing is ever
@@ -359,11 +363,26 @@ impl SurfaceControl {
                     None => own_registry(host.node, &mut state).await,
                 };
                 let outcome = match registry {
-                    Ok(registry) => advertise_all(registry, staged, &mut published).await,
+                    // The writes run in their own task so that dropping this
+                    // future never interrupts one half-way. If it is dropped,
+                    // `rollback` waits for the task and retracts its writes.
+                    Ok(registry) => {
+                        let task = tokio::spawn(advertise_all(registry, staged));
+                        let task = rollback.advertising.insert(task);
+                        let joined = task.await;
+                        rollback.advertising = None;
+                        match joined {
+                            Ok(outcome) => outcome,
+                            Err(err) => Err(Error::Transport(anyhow::anyhow!(
+                                "manifest publication task: {err}"
+                            ))),
+                        }
+                    }
                     Err(err) => Err(err),
                 };
                 match (outcome, surface.publication) {
-                    (Ok(advertised), _) => {
+                    (Ok((advertised, done)), _) => {
+                        published = done;
                         let registry = advertised.registry.clone();
                         (Some(advertised), Some(registry))
                     }
@@ -374,7 +393,6 @@ impl SurfaceControl {
                     }
                     (Err(err), _) => {
                         failures.push(format!("registry: {err}"));
-                        published.clear();
                         (None, None)
                     }
                 }
@@ -398,7 +416,8 @@ impl SurfaceControl {
             degraded = !failures.is_empty(),
             "rpc surface active"
         );
-        std::mem::forget(rollback);
+        rollback.armed = false;
+        drop(rollback);
         state.active = Some(Active {
             keys: keys.clone(),
             #[cfg(all(feature = "docs", feature = "blobs"))]
@@ -451,19 +470,61 @@ impl SurfaceControl {
     }
 }
 
-/// Withdraws a not-yet-committed activation's dispatch when dropped.
+/// Undoes a not-yet-committed activation when dropped: withdraws dispatch at
+/// once and, when the activation was cancelled while its registry writes were
+/// running, retracts them once they finish.
 struct Rollback<'a> {
     slot: &'a LateSlot,
     dispatcher: &'a super::server::Dispatcher,
     keys: &'a [ServiceKey],
+    /// Cleared when the activation commits.
+    armed: bool,
+    /// The registry-write task while the activation is waiting on it.
+    #[cfg(all(feature = "docs", feature = "blobs"))]
+    advertising: Option<tokio::task::JoinHandle<AdvertiseOutcome>>,
 }
 
 impl Drop for Rollback<'_> {
     fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
         self.slot.clear();
         self.dispatcher.session_store().drop_services(self.keys);
+        // Only set when the caller dropped the activation mid-publication: a
+        // drop cannot await, so a task finishes the writes' undo. A failed
+        // task has already retracted its own writes.
+        #[cfg(all(feature = "docs", feature = "blobs"))]
+        if let Some(task) = self.advertising.take() {
+            let retract = async move {
+                if let Ok(Ok((adv, _))) = task.await {
+                    if let Err(err) =
+                        super::publish::retract_keys(&adv.registry, &adv.author, &adv.keys).await
+                    {
+                        tracing::warn!(
+                            target: crate::log_targets::SERVER,
+                            error = %err,
+                            "cancelled rpc surface activation: registry entries not all retracted"
+                        );
+                    }
+                }
+            };
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => {
+                    runtime.spawn(retract);
+                }
+                Err(_) => tracing::warn!(
+                    target: crate::log_targets::SERVER,
+                    "cancelled rpc surface activation outside a runtime: registry entries left"
+                ),
+            }
+        }
     }
 }
+
+/// What the registry-write task reports.
+#[cfg(all(feature = "docs", feature = "blobs"))]
+type AdvertiseOutcome = Result<(Advertised, Vec<PublishedService>)>;
 
 #[cfg(all(feature = "docs", feature = "blobs"))]
 struct Staged {
@@ -527,11 +588,8 @@ async fn stage_all(
 /// Write every staged contract into `registry`. On any failure, retract what
 /// this call wrote and return the error.
 #[cfg(all(feature = "docs", feature = "blobs"))]
-async fn advertise_all(
-    registry: crate::docs::Doc,
-    staged: Staged,
-    published: &mut Vec<PublishedService>,
-) -> Result<Advertised> {
+async fn advertise_all(registry: crate::docs::Doc, staged: Staged) -> AdvertiseOutcome {
+    let mut published = Vec::new();
     let mut keys = Vec::new();
     for contract in &staged.contracts {
         if let Err(err) =
@@ -551,11 +609,14 @@ async fn advertise_all(
             contract_id: contract.published.contract_id.clone(),
         });
     }
-    Ok(Advertised {
-        registry,
-        author: staged.author,
-        keys,
-    })
+    Ok((
+        Advertised {
+            registry,
+            author: staged.author,
+            keys,
+        },
+        published,
+    ))
 }
 
 /// The registry doc this server publishes into when a surface names none:
