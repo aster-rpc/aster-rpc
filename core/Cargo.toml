@@ -41,6 +41,8 @@ base64 = "0.22"
 aws-lc-rs = { version = "1.18", optional = true }
 hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
 rand_core = { version = "0.9", features = ["os_rng"] }
+# Probes whether a persistent node's last bound UDP port is free (bind_ports).
+socket2 = "0.6"
 
 [features]
 # Delegation chains: bundled compact JWS links verified offline in one call.

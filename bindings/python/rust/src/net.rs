@@ -339,6 +339,9 @@ impl EndpointConfig {
             transport_send_fairness: self.transport_send_fairness,
             transport_enable_segmentation_offload: self.transport_enable_segmentation_offload,
             data_dir: self.data_dir.clone(),
+            // Persistent nodes re-bind their last ports by default; the
+            // high-level `AsterConfig.reuse_last_port` turns it off.
+            reuse_last_port: CoreEndpointConfig::default().reuse_last_port,
             // Not yet configurable from Python: the default (on, level 3).
             // See AsterConfig::blob_zstd_level.
             blob_zstd_level: CoreEndpointConfig::default().blob_zstd_level,

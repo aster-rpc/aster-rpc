@@ -275,6 +275,9 @@ required-features = ["coordination-testing"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+# Port-reuse tests probe whether a released UDP port binds again, IPv6-only
+# as the endpoint binds it. Already in the graph through core.
+socket2 = "0.6"
 # Topology integration tests forge raw `topo/v1/…` records to prove readers
 # drop them (attribution rules) — the record encoders live in core.
 aster_transport_core = { path = "../core", version = "=0.3.0", registry = "aster" }

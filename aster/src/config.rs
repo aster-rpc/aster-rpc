@@ -160,6 +160,20 @@ pub struct AsterConfig {
     pub relay_mode: RelayMode,
     /// Local bind address, e.g. `"0.0.0.0:9000"`.
     pub bind_addr: Option<String>,
+    /// On a persistent node, re-bind the UDP ports the node last bound when
+    /// they are still free. Default `true`.
+    ///
+    /// Applies only when [`storage_path`](Self::storage_path) is set and
+    /// [`bind_addr`](Self::bind_addr) leaves the port to the OS (unset, or
+    /// port `0`). The bound IPv4 and IPv6 ports are recorded in
+    /// `bind-ports.json` in the storage directory; on the next start each
+    /// family tries its recorded port first and falls back to a fresh one if
+    /// it is taken. Coming back on the same port keeps peers' cached direct
+    /// addresses and the NAT mapping valid, so they reconnect sooner. An
+    /// explicit non-zero port is always used as given and never recorded.
+    ///
+    /// Env: `ASTER_REUSE_LAST_PORT`; TOML: `[network] reuse_last_port`.
+    pub reuse_last_port: bool,
     /// Enable local-network peer discovery (mDNS).
     pub local_discovery: bool,
     /// Enable connection monitoring / remote-info tracking.
@@ -382,6 +396,9 @@ impl AsterConfig {
             if let Some(value) = toml_string(network, "bind_addr", label)? {
                 self.bind_addr = Some(value);
             }
+            if let Some(value) = toml_bool(network, "reuse_last_port", label)? {
+                self.reuse_last_port = value;
+            }
             if let Some(value) = toml_bool(network, "local_discovery", label)? {
                 self.local_discovery = value;
             }
@@ -551,6 +568,9 @@ impl AsterConfig {
         )?;
         if let Some(value) = env_string("ASTER_BIND_ADDR") {
             self.bind_addr = Some(value);
+        }
+        if let Some(value) = env_bool("ASTER_REUSE_LAST_PORT")? {
+            self.reuse_last_port = value;
         }
         if let Some(value) = env_bool("ASTER_LOCAL_DISCOVERY")? {
             self.local_discovery = value;
@@ -878,6 +898,7 @@ impl AsterConfig {
                 .storage_path
                 .as_ref()
                 .map(|dir| dir.to_string_lossy().into_owned()),
+            reuse_last_port: self.reuse_last_port,
             blob_zstd_level: self.blob_zstd_level.map(i32::from),
         }
     }
@@ -948,6 +969,7 @@ impl Default for AsterConfig {
             secret_key_file: None,
             relay_mode: RelayMode::Default,
             bind_addr: None,
+            reuse_last_port: true,
             local_discovery: false,
             enable_monitoring: false,
             enable_hooks: false,
@@ -1085,6 +1107,13 @@ impl AsterConfigBuilder {
     /// Bind the endpoint to a specific socket address, e.g. `"0.0.0.0:9000"`.
     pub fn bind_addr(mut self, addr: impl Into<String>) -> Self {
         self.config.bind_addr = Some(addr.into());
+        self
+    }
+
+    /// Re-bind the last bound ports on restart (default `true`). See
+    /// [`AsterConfig::reuse_last_port`].
+    pub fn reuse_last_port(mut self, yes: bool) -> Self {
+        self.config.reuse_last_port = yes;
         self
     }
 
@@ -1821,6 +1850,7 @@ mod tests {
         "ASTER_SECRET_KEY",
         "ASTER_RELAY_MODE",
         "ASTER_BIND_ADDR",
+        "ASTER_REUSE_LAST_PORT",
         "ASTER_LOCAL_DISCOVERY",
         "ASTER_ENABLE_MONITORING",
         "ASTER_ENABLE_HOOKS",
@@ -1918,6 +1948,7 @@ mod tests {
         );
         env::set_var("ASTER_RELAY_MODE", "disabled");
         env::set_var("ASTER_BIND_ADDR", "127.0.0.1:0");
+        env::set_var("ASTER_REUSE_LAST_PORT", "false");
         env::set_var("ASTER_LOCAL_DISCOVERY", "on");
         env::set_var("ASTER_ENABLE_MONITORING", "true");
         env::set_var("ASTER_ENABLE_HOOKS", "true");
@@ -1985,6 +2016,7 @@ mod tests {
         assert_eq!(cfg.secret_key.as_ref().unwrap().to_bytes(), secret);
         assert_eq!(cfg.relay_mode, RelayMode::Disabled);
         assert_eq!(cfg.bind_addr.as_deref(), Some("127.0.0.1:0"));
+        assert!(!cfg.reuse_last_port);
         assert!(cfg.local_discovery);
         assert!(cfg.enable_monitoring);
         assert!(cfg.enable_hooks);
@@ -2015,6 +2047,7 @@ mod tests {
         assert_eq!(core.relay_mode.as_deref(), Some("disabled"));
         assert_eq!(core.secret_key.unwrap(), secret.to_vec());
         assert_eq!(core.bind_addr.as_deref(), Some("127.0.0.1:0"));
+        assert!(!core.reuse_last_port);
         assert!(core.enable_discovery);
         assert!(core.enable_monitoring);
         assert!(core.enable_hooks);
@@ -2081,6 +2114,7 @@ path = "{}"
 secret_key = "{}"
 relay_mode = "disabled"
 bind_addr = "127.0.0.1:1111"
+reuse_last_port = false
 enable_hooks = true
 transport_receive_window = 12345
 
@@ -2113,6 +2147,8 @@ mask = false
         assert_eq!(cfg.endpoint_addr.as_deref(), Some("file-endpoint"));
         assert_eq!(cfg.secret_key.as_ref().unwrap().to_bytes(), file_secret);
         assert_eq!(cfg.bind_addr.as_deref(), Some("127.0.0.1:2222"));
+        assert!(!cfg.reuse_last_port);
+        assert!(AsterConfig::default().reuse_last_port);
         assert_eq!(cfg.relay_mode, RelayMode::Staging);
         assert_eq!(cfg.transport_receive_window, Some(12345));
         assert_eq!(cfg.log_format, "json");

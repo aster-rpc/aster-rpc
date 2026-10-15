@@ -220,12 +220,16 @@ pub(crate) unsafe fn lower_config(c: &aster_config_t) -> Result<AsterConfig, Str
     let mut cfg = AsterConfig::default();
     // SAFETY: storage is NULL for caller-built configs, or the library-owned
     // ConfigStorage from fill_config, kept alive until aster_config_release.
-    // Health fields have no public ABI slots; preserve their parsed values here.
+    // Health fields and `reuse_last_port` have no public ABI slots; preserve
+    // their parsed values here.
     if let Some(storage) = c.storage.cast::<ConfigStorage>().as_ref() {
         if let Some(health) = &storage.health {
             cfg.health_port = health.port;
             cfg.health_host.clone_from(&health.host);
             cfg.health_enabled = health.enabled;
+        }
+        if let Some(reuse) = storage.reuse_last_port {
+            cfg.reuse_last_port = reuse;
         }
     }
 
@@ -408,6 +412,9 @@ struct ConfigStorage {
     bufs: Vec<Vec<u8>>,
     lists: Vec<Vec<aster_bytes_t>>,
     health: Option<StoredHealthConfig>,
+    /// `AsterConfig::reuse_last_port` when it differs from the default (an
+    /// `ASTER_REUSE_LAST_PORT` / `[network] reuse_last_port` opt-out).
+    reuse_last_port: Option<bool>,
 }
 
 struct StoredHealthConfig {
@@ -471,6 +478,9 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
             host: cfg.health_host.clone(),
             enabled: cfg.health_enabled,
         });
+    }
+    if cfg.reuse_last_port != defaults.reuse_last_port {
+        st.reuse_last_port = Some(cfg.reuse_last_port);
     }
     let (relay_mode, urls) = match &cfg.relay_mode {
         RelayMode::Default => (aster_relay_mode_t::ASTER_RELAY_MODE_DEFAULT, Vec::new()),
@@ -583,7 +593,11 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
         transport_datagram_send_buffer_size: dsb,
         storage: std::ptr::null_mut(),
     };
-    if !st.bufs.is_empty() || !st.lists.is_empty() || st.health.is_some() {
+    if !st.bufs.is_empty()
+        || !st.lists.is_empty()
+        || st.health.is_some()
+        || st.reuse_last_port.is_some()
+    {
         out.storage = Box::into_raw(Box::new(st)) as *mut c_void;
     }
 }
@@ -1650,6 +1664,23 @@ file = "/etc/aster/.aster-identity"
         assert!(c.storage.is_null());
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn reuse_last_port_opt_out_survives_a_round_trip() {
+        let mut c: aster_config_t = unsafe { std::mem::zeroed() };
+        fill_config(&AsterConfig::default(), &mut c);
+        assert!(c.storage.is_null(), "the default needs no storage");
+        assert!(unsafe { lower_config(&c) }.unwrap().reuse_last_port);
+
+        let original = AsterConfig {
+            reuse_last_port: false,
+            ..Default::default()
+        };
+        fill_config(&original, &mut c);
+        let lowered = unsafe { lower_config(&c) }.unwrap();
+        assert_eq!(unsafe { aster_config_release(&mut c) }, 0);
+        assert!(!lowered.reuse_last_port);
+    }
+
     #[test]
     fn health_config_survives_owned_round_trip_and_public_overrides() {
         for enabled in [None, Some(true), Some(false)] {

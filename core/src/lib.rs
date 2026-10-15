@@ -1,3 +1,4 @@
+pub mod bind_ports;
 pub mod blob_custody;
 pub use blob_custody::{CoreBlobCustody, CoreBlobCustodyError, CoreBlobCustodyLease};
 pub mod canonical;
@@ -94,7 +95,9 @@ use crate::tunnel::{
     DEFAULT_MAX_STREAMS_PER_SERVICE, TUNNEL_SUBTYPE_HTTP_RELAY, TUNNEL_SUBTYPE_TICKET,
 };
 use tokio_stream::StreamExt;
-use tracing::debug;
+use tracing::{debug, info};
+
+use bind_ports::{PortReuse, PreferredPorts};
 use url::Url;
 
 // ============================================================================
@@ -165,6 +168,12 @@ pub struct CoreEndpointConfig {
     pub transport_enable_segmentation_offload: Option<bool>,
     /// Node data directory for persistent state; empty = no persistent state
     pub data_dir: Option<String>,
+    /// On a persistent node whose bind address leaves the port to the OS (no
+    /// `bind_addr`, or port 0), re-bind the ports the node last bound when
+    /// they are free, so peers' cached addresses and NAT mappings stay valid
+    /// across a restart. Default `true`; ignored by in-memory nodes and bare
+    /// endpoints. See [`bind_ports`].
+    pub reuse_last_port: bool,
     /// Serve blobs over zstd-compressed streams at this level, on
     /// [`BLOBS_ZSTD_ALPN`] beside the plain blobs ALPN, and make blob fetches
     /// prefer it. Defaults to [`DEFAULT_BLOB_ZSTD_LEVEL`]; `None` serves the
@@ -204,6 +213,7 @@ impl Default for CoreEndpointConfig {
             transport_send_fairness: None,
             transport_enable_segmentation_offload: None,
             data_dir: None,
+            reuse_last_port: true,
             blob_zstd_level: Some(DEFAULT_BLOB_ZSTD_LEVEL),
         }
     }
@@ -1607,6 +1617,17 @@ fn build_quic_transport_config(config: &CoreEndpointConfig) -> Result<Option<Qui
 }
 
 fn build_endpoint_config(config: &CoreEndpointConfig) -> Result<iroh::endpoint::Builder> {
+    build_endpoint_config_with_ports(config, PreferredPorts::default())
+}
+
+/// [`build_endpoint_config`], binding `ports` in place of an OS-chosen port
+/// for each family that has one (see [`bind_ports`]). Every preferred port is
+/// required: the caller falls back to [`PreferredPorts::default`] when the
+/// bind fails.
+fn build_endpoint_config_with_ports(
+    config: &CoreEndpointConfig,
+    ports: PreferredPorts,
+) -> Result<iroh::endpoint::Builder> {
     let relay_mode = relay_mode_from_config(config)?;
     let mut builder = Endpoint::builder(presets::N0)
         .alpns(config.alpns.clone())
@@ -1632,11 +1653,7 @@ fn build_endpoint_config(config: &CoreEndpointConfig) -> Result<iroh::endpoint::
         builder = builder.clear_relay_transports();
     }
 
-    if let Some(ref addr) = config.bind_addr {
-        builder = builder
-            .bind_addr(addr.as_str())
-            .map_err(|e| anyhow!("invalid bind_addr '{}': {}", addr, e))?;
-    }
+    builder = apply_bind_addrs(builder, config, ports)?;
 
     match config.portmapper_config.as_deref() {
         None | Some("enabled") => {}
@@ -1655,6 +1672,54 @@ fn build_endpoint_config(config: &CoreEndpointConfig) -> Result<iroh::endpoint::
         builder = builder.proxy_from_env();
     }
 
+    Ok(builder)
+}
+
+/// Apply `config.bind_addr`, with a preferred port substituted for its port
+/// and for the default socket of each other family that has one.
+///
+/// `bind_addr` replaces iroh's default socket for its own family only (the
+/// other family keeps `0.0.0.0:0` / `[::]:0`), so a preferred port for the
+/// other family is bound as an explicit unspecified-address socket.
+fn apply_bind_addrs(
+    mut builder: iroh::endpoint::Builder,
+    config: &CoreEndpointConfig,
+    ports: PreferredPorts,
+) -> Result<iroh::endpoint::Builder> {
+    let mut configured_v4 = false;
+    let mut configured_v6 = false;
+    if let Some(ref addr) = config.bind_addr {
+        let parsed = addr.parse::<SocketAddr>().ok();
+        let preferred = parsed.and_then(|parsed| {
+            let port = if parsed.is_ipv4() { ports.v4 } else { ports.v6 };
+            port.map(|port| SocketAddr::new(parsed.ip(), port))
+        });
+        builder = match preferred {
+            Some(preferred) => builder.bind_addr(preferred),
+            None => builder.bind_addr(addr.as_str()),
+        }
+        .map_err(|e| anyhow!("invalid bind_addr '{}': {}", addr, e))?;
+        configured_v4 = parsed.is_some_and(|a| a.is_ipv4());
+        configured_v6 = parsed.is_some_and(|a| a.is_ipv6());
+    }
+    if !config.clear_ip_transports {
+        if let (false, Some(port)) = (configured_v4, ports.v4) {
+            builder = builder
+                .bind_addr(SocketAddr::new(
+                    std::net::Ipv4Addr::UNSPECIFIED.into(),
+                    port,
+                ))
+                .map_err(|e| anyhow!("invalid preferred IPv4 port {port}: {e}"))?;
+        }
+        if let (false, Some(port)) = (configured_v6, ports.v6) {
+            builder = builder
+                .bind_addr(SocketAddr::new(
+                    std::net::Ipv6Addr::UNSPECIFIED.into(),
+                    port,
+                ))
+                .map_err(|e| anyhow!("invalid preferred IPv6 port {port}: {e}"))?;
+        }
+    }
     Ok(builder)
 }
 
@@ -1779,39 +1844,53 @@ impl TopologyRegistration {
 /// all registered protocol ALPNs.
 async fn build_node_endpoint(
     config: Option<CoreEndpointConfig>,
+    port_reuse: Option<&PortReuse>,
 ) -> Result<(
     Endpoint,
     Option<CoreMonitor>,
     Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
 )> {
+    let preferred = port_reuse.map(PortReuse::preferred).unwrap_or_default();
     match config {
-        None => {
+        None if preferred.is_empty() => {
             let endpoint = Endpoint::bind(presets::N0).await?;
+            endpoint.online().await;
+            Ok((endpoint, None, None))
+        }
+        None => {
+            let defaults = CoreEndpointConfig::default();
+            let (endpoint, ()) = bind_preferring(preferred, |ports| {
+                Ok((
+                    apply_bind_addrs(Endpoint::builder(presets::N0), &defaults, ports)?,
+                    (),
+                ))
+            })
+            .await?;
             endpoint.online().await;
             Ok((endpoint, None, None))
         }
         Some(config) => {
             let relay_mode = relay_mode_from_config(&config)?;
-            let mut builder = build_endpoint_config(&config)?;
-
-            let mut monitor = None;
-            let mut hook_receiver = None;
-
-            if config.enable_monitoring {
-                let (hook, mon) = CoreMonitor::new();
-                builder = builder.hooks(hook);
-                monitor = Some(mon);
-            }
-            if config.enable_hooks {
-                let (adapter, receiver) = CoreHooksAdapter::new_with_failure_mode(
-                    config.hook_timeout_ms,
-                    config.hook_failure_mode,
-                );
-                builder = builder.hooks(adapter);
-                hook_receiver = Some(Arc::new(std::sync::Mutex::new(Some(receiver))));
-            }
-
-            let endpoint = builder.bind().await?;
+            let (endpoint, (monitor, hook_receiver)) = bind_preferring(preferred, |ports| {
+                let mut builder = build_endpoint_config_with_ports(&config, ports)?;
+                let mut monitor = None;
+                let mut hook_receiver = None;
+                if config.enable_monitoring {
+                    let (hook, mon) = CoreMonitor::new();
+                    builder = builder.hooks(hook);
+                    monitor = Some(mon);
+                }
+                if config.enable_hooks {
+                    let (adapter, receiver) = CoreHooksAdapter::new_with_failure_mode(
+                        config.hook_timeout_ms,
+                        config.hook_failure_mode,
+                    );
+                    builder = builder.hooks(adapter);
+                    hook_receiver = Some(Arc::new(std::sync::Mutex::new(Some(receiver))));
+                }
+                Ok((builder, (monitor, hook_receiver)))
+            })
+            .await?;
 
             if let Some(mon) = &monitor {
                 mon.spawn_sampler(endpoint.clone());
@@ -1830,6 +1909,29 @@ async fn build_node_endpoint(
             Ok((endpoint, monitor, hook_receiver))
         }
     }
+}
+
+/// Bind the builder `make` returns for `preferred` ports; if that bind fails
+/// (a preferred port was taken after it was probed), bind again with
+/// OS-chosen ports. A failed bind closes every socket it opened, so the
+/// retry starts clean. `make` is called per attempt because a builder's
+/// hooks are consumed by its bind.
+async fn bind_preferring<T>(
+    preferred: PreferredPorts,
+    make: impl Fn(PreferredPorts) -> Result<(iroh::endpoint::Builder, T)>,
+) -> Result<(Endpoint, T)> {
+    if !preferred.is_empty() {
+        let (builder, extra) = make(preferred)?;
+        match builder.bind().await {
+            Ok(endpoint) => return Ok((endpoint, extra)),
+            Err(e) => info!(
+                ?preferred,
+                "could not re-bind the last bound ports, binding fresh ones: {e:#}"
+            ),
+        }
+    }
+    let (builder, extra) = make(PreferredPorts::default())?;
+    Ok((builder.bind().await?, extra))
 }
 
 /// A node's default docs [`Author`] — its own identity key, so `AuthorId == NodeId`.
@@ -1940,7 +2042,7 @@ impl CoreNode {
             .map_or(Some(DEFAULT_BLOB_ZSTD_LEVEL), |config| {
                 config.blob_zstd_level
             });
-        let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
+        let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config, None).await?;
         // The docs engine stores entry content as untagged blobs in this shared
         // store, so GC must protect the docs live-content set or the first sweep
         // deletes synced policy/grant/manifest content. Create the handler/cb
@@ -2008,12 +2110,15 @@ impl CoreNode {
             .map_or(Some(DEFAULT_BLOB_ZSTD_LEVEL), |config| {
                 config.blob_zstd_level
             });
-        let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let root = std::path::PathBuf::from(&path);
         // Create the data directory privately *before* the stores write secret
         // material (notably the node secret in `docs.redb`) into it.
         std::fs::create_dir_all(&root)?;
         harden_dir_private(&root)?;
+        // Re-bind the ports this node last bound when they are free.
+        let port_reuse = PortReuse::for_node(endpoint_config.as_ref(), &root);
+        let (endpoint, monitor, hook_receiver) =
+            build_node_endpoint(endpoint_config, port_reuse.as_ref()).await?;
         // See `memory_with_alpns_and_gc`: protect the docs live-content set so
         // GC never reclaims the untagged blobs backing docs entries.
         let (protect_handler, protect_cb) = ProtectCallbackHandler::new();
@@ -2030,7 +2135,7 @@ impl CoreNode {
             None => FsStore::load(&root).await?,
         };
         let store: BlobStore = fs_store.into();
-        Self::finalize(
+        let node = Self::finalize(
             endpoint,
             store,
             Some(root),
@@ -2039,7 +2144,13 @@ impl CoreNode {
             (hook_receiver, hook_failure_mode),
             (protect_handler, protect_cb),
         )
-        .await
+        .await?;
+        // Record only once the node holds its data directory: a second
+        // process on the same directory fails above and records nothing.
+        if let Some(port_reuse) = &port_reuse {
+            port_reuse.record(&node.inner.endpoint.bound_sockets());
+        }
+        Ok(node)
     }
 
     /// Shared tail of both constructors: wire blobs/docs/gossip protocols +
