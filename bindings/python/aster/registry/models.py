@@ -98,7 +98,7 @@ class ServiceSummary:
 class ArtifactRef:
     """Docs pointer to an immutable Iroh collection (§11.2.1).
 
-    Stored at ``contracts/{contract_id}`` in the registry doc.
+    Stored at ``contracts/{contract_id}/`` in the registry doc.
 
     ``collection_format`` is ``"raw"`` for single-blob (Phase 10 default) or
     ``"index"`` for multi-file collections built by ``publication.upload_collection``.
@@ -129,7 +129,7 @@ class ArtifactRef:
 class EndpointLease:
     """Renewable advertisement for a live endpoint (§11.6).
 
-    Stored at ``services/{name}/contracts/{cid}/endpoints/{eid}``.
+    Stored at ``services/{name}/contracts/{cid}/endpoints/{eid}/``.
     """
 
     endpoint_id: str                    # NodeId hex

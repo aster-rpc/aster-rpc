@@ -18,10 +18,15 @@ from .keys import (
     channel_key,
     config_key,
     contract_key,
+    decode_key_segment,
+    key_segment,
     lease_key,
     lease_prefix,
+    manifest_key,
+    parse_version_key,
     tag_key,
     version_key,
+    version_prefix,
 )
 from .models import (
     ArtifactRef,

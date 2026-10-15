@@ -2214,14 +2214,14 @@ class AsterClient:
 
     async def _summary_from_registry(self, service_name: str) -> "ServiceSummary | None":
         """Build a summary from the registry doc's
-        ``services/{name}/versions/v{n}`` pointer (highest version) and the
+        ``services/{name}/versions/v{n}/`` pointer (highest version) and the
         published manifest."""
-        import re as _re
+        from .registry.keys import parse_version_key, version_prefix
 
         doc = await self._ensure_registry_doc()
         if doc is None:
             return None
-        prefix = f"services/{service_name}/versions/v".encode()
+        prefix = version_prefix(service_name)
         try:
             entries = await doc.query_key_prefix(prefix)
         except Exception as exc:  # noqa: BLE001
@@ -2229,11 +2229,10 @@ class AsterClient:
             return None
         best: tuple[int, str] | None = None
         for entry in entries:
-            key = bytes(entry.key).decode(errors="replace")
-            m = _re.fullmatch(rf"services/{_re.escape(service_name)}/versions/v(\d+)", key)
-            if not m:
+            parsed = parse_version_key(bytes(entry.key))
+            if parsed is None or parsed[0] != service_name:
                 continue
-            version = int(m.group(1))
+            version = parsed[1]
             if best is None or version > best[0]:
                 cid = bytes(await doc.read_entry_content(entry.content_hash)).decode().strip()
                 best = (version, cid)

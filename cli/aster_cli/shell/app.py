@@ -460,7 +460,7 @@ class PeerConnection:
         try:
             from aster import blobs_client, docs_client
             from aster.contract.publication import fetch_from_collection
-            from aster.registry.keys import contract_key
+            from aster.registry.keys import contract_key, manifest_key
 
             bc = blobs_client(self._aster_client._node)
             dc = docs_client(self._aster_client._node)
@@ -497,8 +497,9 @@ class PeerConnection:
                     # without a blob-collection round-trip and works even when
                     # the blob store sync is slow or broken (e.g. cross-language
                     # peers where doc sync is the only reliable transport).
-                    manifest_key = f"manifests/{svc.contract_id}".encode()
-                    shortcut_entries = await doc.query_key_exact(manifest_key)
+                    shortcut_entries = await doc.query_key_exact(
+                        manifest_key(svc.contract_id)
+                    )
                     if shortcut_entries:
                         try:
                             manifest_bytes = await doc.read_entry_content(
@@ -1088,9 +1089,9 @@ class DemoConnection:
 
     async def list_doc_entries(self) -> list[dict[str, Any]]:
         return [
-            {"key": "contracts/a1b2c3d4…", "author": "7f3e9a1b2c…", "hash": "abc123def456…", "size": 256, "timestamp": 1712567890000},
-            {"key": "manifests/a1b2c3d4…", "author": "7f3e9a1b2c…", "hash": "deadbeef0123…", "size": 340, "timestamp": 1712567890000},
-            {"key": "versions/HelloWorld/v1", "author": "7f3e9a1b2c…", "hash": "cafebabe9876…", "size": 64, "timestamp": 1712567890000},
+            {"key": "contracts/a1b2c3d4…/", "author": "7f3e9a1b2c…", "hash": "abc123def456…", "size": 256, "timestamp": 1712567890000},
+            {"key": "manifests/a1b2c3d4…/", "author": "7f3e9a1b2c…", "hash": "deadbeef0123…", "size": 340, "timestamp": 1712567890000},
+            {"key": "services/HelloWorld/versions/v1/", "author": "7f3e9a1b2c…", "hash": "cafebabe9876…", "size": 64, "timestamp": 1712567890000},
         ]
 
     async def read_doc_entry(self, key: str) -> bytes | None:
