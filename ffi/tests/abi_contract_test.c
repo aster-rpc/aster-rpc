@@ -168,7 +168,7 @@ OFF(aster_rpc_status_t, detail_values, 40);
 OFF(aster_rpc_status_t, storage, 56);
 
 /* ABI 3.2: node configuration. */
-LAYOUT(aster_config_t, 288); /* 5.2: +blob_zstd_level, +reuse_last_port */
+LAYOUT(aster_config_t, 288); /* 6.0: +blob_zstd_level, +reuse_last_port */
 OFF(aster_config_t, struct_size, 0);
 OFF(aster_config_t, relay_mode, 4);
 OFF(aster_config_t, relay_urls, 8);
@@ -460,7 +460,32 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 2); /* 5.2: aster_config_t blob_zstd_level + reuse_last_port */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 6 && ASTER_ABI_VERSION_MINOR == 0); /* 6.0: aster_config_t grew 280 -> 288 */
+    {
+        /* A 5.x caller (280-byte aster_config_t, no 6.x handshake) is refused
+         * cleanly and nothing is written past, or into, its struct. This runs
+         * before any runtime exists in this process. */
+        union { aster_config_t align; unsigned char b[280 + 64]; } v5;
+        memset(&v5, 0xa5, sizeof v5);
+        aster_bytes_t nopath = {(const uint8_t *)"/nonexistent/aster.toml", 23};
+        CHECK(aster_config_init((aster_config_t *)&v5) == ASTER_STATUS_ABI_MISMATCH);
+        CHECK(aster_config_from_env((aster_config_t *)&v5) == ASTER_STATUS_ABI_MISMATCH);
+        CHECK(aster_config_from_toml(nopath, (aster_config_t *)&v5) == ASTER_STATUS_ABI_MISMATCH);
+        aster_runtime_t rt5 = 0;
+        CHECK(aster_runtime_new(5, NULL, &rt5) == ASTER_STATUS_ABI_MISMATCH && rt5 == 0);
+        CHECK(aster_abi_accept(5) == ASTER_STATUS_ABI_MISMATCH);
+        CHECK(aster_config_init((aster_config_t *)&v5) == ASTER_STATUS_ABI_MISMATCH);
+        int untouched = 1;
+        for (size_t i = 0; i < sizeof v5.b; i++) untouched &= v5.b[i] == 0xa5;
+        CHECK(untouched);
+        /* A 5.x struct handed to a reader is refused on struct_size. */
+        uint32_t v5size = 280;
+        memcpy(v5.b, &v5size, sizeof v5size);
+        aster_operation_t op5 = 0;
+        CHECK(aster_node_start(0, (const aster_config_t *)&v5, 0, 0, &op5) == ASTER_STATUS_INVALID_ARGUMENT);
+        /* This (6.x) caller passes the handshake. */
+        CHECK(aster_abi_accept(ASTER_ABI_VERSION_MAJOR) == ASTER_STATUS_OK);
+    }
     CHECK(ASTER_EVENT_ENROLLMENT_RESULT == 127);
     CHECK(ASTER_ENROLLMENT_ERROR_DENIED == 2 && ASTER_ENROLLMENT_ERROR_UNAVAILABLE == 4);
     CHECK(ASTER_STATUS_UNAVAILABLE == 19);
@@ -481,7 +506,6 @@ static void test_abi_version(void) {
     CHECK(sizeof(aster_audit_outbox_t) == 8);
     CHECK(ASTER_EVENT_AUDIT_OUTBOX_OPENED == 114);
     CHECK(ASTER_EVENT_AUDIT_OUTBOX_EXPORTED == 117);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 5); /* 5.0: Fory ownership-attestation functions removed */
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
 

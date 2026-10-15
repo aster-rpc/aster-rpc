@@ -15,7 +15,11 @@ and the annotation / codegen modules) are recorded here.
 `ASTER_REUSE_LAST_PORT` / `[network] reuse_last_port` through Rust. Before,
 both settings were lost when the config crossed the C ABI, so neither could
 be turned off from Java. `aster_config_t` is now 288 bytes, and the native
-library must be ABI **5.2** or newer (`IrohLibrary.REQUIRED_ABI_MINOR = 2`).
+library must be C ABI **6.0** or a later 6.x (`IrohLibrary.EXPECTED_ABI_MAJOR = 6`,
+`REQUIRED_ABI_MINOR = 0`). 6.0 is a breaking ABI release because the struct grew
+from 280 to 288 bytes; loading the library also performs the new
+`aster_abi_accept(6)` handshake, without which the library refuses to fill an
+`aster_config_t`.
 
 ### Changed: `SYNC_FINISHED` says how the round ended
 

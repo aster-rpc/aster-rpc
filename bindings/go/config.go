@@ -165,7 +165,9 @@ func bindingDefaults(c *AsterConfig) {
 // DefaultConfig returns the Rust defaults (aster_config_init).
 func DefaultConfig() AsterConfig {
 	var n C.aster_config_t
-	C.aster_config_init(&n)
+	if acceptABI() == nil {
+		C.aster_config_init(&n)
+	}
 	var c AsterConfig
 	bindingDefaults(&c)
 	c.fromNative(&n)
@@ -175,6 +177,9 @@ func DefaultConfig() AsterConfig {
 // ConfigFromEnv is Rust AsterConfig::from_env plus the binding-level ASTER_*
 // variables. A malformed variable is an error (ErrInvalidArgument).
 func ConfigFromEnv() (AsterConfig, error) {
+	if err := acceptABI(); err != nil {
+		return AsterConfig{}, err
+	}
 	var n C.aster_config_t
 	if err := ffiStatus(func() C.int32_t { return C.aster_config_from_env(&n) }); err != nil {
 		return AsterConfig{}, fmt.Errorf("aster_config_from_env: %w", err)
@@ -200,6 +205,9 @@ func ConfigFromEnv() (AsterConfig, error) {
 // overrides) plus the file's [trust] / [connect] / [logging] sections and
 // their env overrides.
 func ConfigFromTOML(path string) (AsterConfig, error) {
+	if err := acceptABI(); err != nil {
+		return AsterConfig{}, err
+	}
 	var a cArena
 	defer a.free()
 	var n C.aster_config_t
@@ -284,7 +292,12 @@ func (c AsterConfig) String() string {
 
 func (c *AsterConfig) toNative(a *cArena, extraALPNs []string) (C.aster_config_t, error) {
 	var n C.aster_config_t
-	C.aster_config_init(&n)
+	if err := acceptABI(); err != nil {
+		return n, err
+	}
+	if err := ffiStatus(func() C.int32_t { return C.aster_config_init(&n) }); err != nil {
+		return n, fmt.Errorf("aster_config_init: %w", err)
+	}
 
 	urls := append([]string(nil), c.RelayURLs...)
 	mode := strings.ToLower(strings.TrimSpace(c.RelayMode))

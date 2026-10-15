@@ -1,7 +1,7 @@
 # Aster .NET binding
 
 The .NET API wraps Aster's shared Rust engine through the C ABI. This checkout
-targets .NET 9 and requires native ABI **5.1 or newer within major 5**.
+targets .NET 9 and requires native C ABI **6.0 or newer within major 6**.
 `Runtime` checks compatibility when it opens. Supply the native library through
 the repository build or an explicit build property:
 
@@ -59,7 +59,7 @@ The Mission Control auth chapter in [`examples/`](examples/README.md) walks
 through it with the Rust `aster` CLI. Changes are listed in
 [`CHANGELOG.md`](CHANGELOG.md).
 
-## Blob compression and port reuse (ABI 5.2)
+## Blob compression and port reuse (C ABI 6.0)
 
 Two node settings are on by default and can be turned off from configuration
 or code, as in the Rust SDK:

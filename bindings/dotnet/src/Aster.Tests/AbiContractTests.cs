@@ -339,7 +339,7 @@ public class AbiContractTests
     public void Runtime_Version_Is_Consistent()
     {
         var (major, minor, patch) = Runtime.Version;
-        Assert.Equal(5, major); // ASTER_ABI_VERSION_MAJOR this binding targets
+        Assert.Equal(6, major); // ASTER_ABI_VERSION_MAJOR this binding targets
         Assert.True(major >= 0);
         Assert.True(minor >= 0);
         Assert.True(patch >= 0);
@@ -498,7 +498,7 @@ public class AbiContractTests
             "aster_server_add_lease_grantor", "aster_lease_serializer_grantor_new",
         ]);
         Assert.Equal(127u, (uint)EventKind.EnrollmentResult);
-        Assert.Equal(2u, Native.RequiredAbiMinor);
+        Assert.Equal(0u, Native.RequiredAbiMinor);
         Assert.Equal(new uint[] { 0, 1, 2, 3, 4 }, Enum.GetValues<AdmissionErrorKind>().Select(k => (uint)k).Order().ToArray());
         Assert.Equal(0u, Native.EnrollmentSideServer);
         Assert.Equal(1u, Native.EnrollmentSideClient);

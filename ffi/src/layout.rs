@@ -256,7 +256,7 @@ mod lp64 {
     });
 
     // ABI 3.2: node configuration (node.rs).
-    // ABI 5.2 appends blob_zstd_level and reuse_last_port.
+    // ABI 6.0 appends blob_zstd_level and reuse_last_port.
     assert_layout!(aster_config_t, size = 288, align = 8, {
         struct_size = 0,
         relay_mode = 4,

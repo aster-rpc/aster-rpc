@@ -53,7 +53,7 @@ internal struct RpcStatusNative
     public IntPtr storage;
 }
 
-/// <summary><c>aster_config_t</c> (288 bytes; ABI 5.2 appended <c>blob_zstd_level</c> and <c>reuse_last_port</c>).</summary>
+/// <summary><c>aster_config_t</c> (288 bytes; C ABI 6.0 appended <c>blob_zstd_level</c> and <c>reuse_last_port</c>).</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal struct ConfigNative
 {

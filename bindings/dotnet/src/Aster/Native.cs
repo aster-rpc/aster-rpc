@@ -19,7 +19,33 @@ internal static partial class Native
     private const string NativeLib = "aster_transport_ffi";
 
     /// <summary>ABI major this binding is written against (<c>ASTER_ABI_VERSION_MAJOR</c>).</summary>
-    public const uint AbiVersionMajor = 5;
+    public const uint AbiVersionMajor = 6;
+
+    /// <summary>
+    /// ABI 6.0 handshake: until a caller proves its major, the library refuses to fill an
+    /// <c>aster_config_t</c> (a 5.x caller's 280-byte struct would be overrun by the 288-byte fill).
+    /// </summary>
+    [LibraryImport(NativeLib, EntryPoint = "aster_abi_accept")]
+    public static partial int aster_abi_accept(uint expectedAbiMajor);
+
+    private static readonly Lazy<string?> AbiCheck = new(() =>
+    {
+        uint loaded = aster_abi_version();
+        if (loaded >> 16 != AbiVersionMajor)
+            return $"native library ABI {loaded >> 16}.{(loaded >> 8) & 0xff}.{loaded & 0xff} " +
+                   $"does not match binding ABI major {AbiVersionMajor}";
+        if (((loaded >> 8) & 0xff) < RequiredAbiMinor)
+            return $"native library ABI {loaded >> 16}.{(loaded >> 8) & 0xff} is too old: this binding needs " +
+                   $"{AbiVersionMajor}.{RequiredAbiMinor}+ (rebuild libaster_transport_ffi or set -p:NativeLibraryPath)";
+        return aster_abi_accept(AbiVersionMajor) == 0 ? null : $"native library refused ABI major {AbiVersionMajor}";
+    });
+
+    /// <summary>Checks the loaded library's ABI and performs the handshake once per process.</summary>
+    public static void EnsureAbi()
+    {
+        if (AbiCheck.Value is { } error)
+            throw new IrohException(Status.AbiMismatch, error);
+    }
 
     // ─── Version / status ───────────────────────────────────────────────────
 

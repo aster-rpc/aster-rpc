@@ -12,9 +12,9 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define ASTER_ABI_VERSION_MAJOR 5
+#define ASTER_ABI_VERSION_MAJOR 6
 
-#define ASTER_ABI_VERSION_MINOR 2
+#define ASTER_ABI_VERSION_MINOR 0
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -194,12 +194,12 @@
 #define ASTER_HTTP_SERVER_WEBTRANSPORT 1
 
 /**
- * `aster_config_t.blob_zstd_level` (ABI 5.2): not set, the default level (3).
+ * `aster_config_t.blob_zstd_level` (ABI 6.0): not set, the default level (3).
  */
 #define ASTER_BLOB_ZSTD_LEVEL_DEFAULT 0
 
 /**
- * `aster_config_t.blob_zstd_level` (ABI 5.2): blob transport compression off.
+ * `aster_config_t.blob_zstd_level` (ABI 6.0): blob transport compression off.
  */
 #define ASTER_BLOB_ZSTD_LEVEL_OFF -1
 
@@ -764,7 +764,7 @@ typedef enum aster_portmapper_t {
 } aster_portmapper_t;
 
 /**
- * `aster_config_t.reuse_last_port` (ABI 5.2).
+ * `aster_config_t.reuse_last_port` (ABI 6.0).
  */
 typedef enum aster_reuse_last_port_t {
   /**
@@ -1934,7 +1934,7 @@ typedef struct aster_config_t {
    */
   void *storage;
   /**
-   * ABI 5.2. zstd level for blob transport (`AsterConfig::blob_zstd_level`):
+   * ABI 6.0. zstd level for blob transport (`AsterConfig::blob_zstd_level`):
    * `ASTER_BLOB_ZSTD_LEVEL_DEFAULT` (0) = the default level (3),
    * `ASTER_BLOB_ZSTD_LEVEL_OFF` (-1) = off (plain blobs ALPN only; fetches
    * default to plain), 1..=19 = that level (larger values are clamped to
@@ -1942,7 +1942,7 @@ typedef struct aster_config_t {
    */
   int32_t blob_zstd_level;
   /**
-   * ABI 5.2. One of `aster_reuse_last_port_t`: re-bind the last UDP ports
+   * ABI 6.0. One of `aster_reuse_last_port_t`: re-bind the last UDP ports
    * of a persistent node (`AsterConfig::reuse_last_port`).
    */
   uint32_t reuse_last_port;
@@ -2913,6 +2913,16 @@ extern "C" {
  * against; `aster_runtime_new` enforces this as well.
  */
 uint32_t aster_abi_version(void);
+
+/**
+ * The ABI handshake without a runtime (ABI 6.0). `expected_abi_major` is the
+ * `ASTER_ABI_VERSION_MAJOR` the caller was built against. On a match this
+ * returns `ASTER_STATUS_OK` and unlocks the functions that write an
+ * `aster_config_t` (`aster_config_init`, `_from_env`, `_from_toml`); on a
+ * mismatch it returns `ASTER_STATUS_ABI_MISMATCH` and sets the last error.
+ * A successful `aster_runtime_new` does the same. Idempotent and thread-safe.
+ */
+int32_t aster_abi_accept(uint32_t expected_abi_major);
 
 /**
  * Exact Aster build version as a process-lifetime, NUL-terminated UTF-8 string.
@@ -5863,6 +5873,12 @@ int32_t aster_http_listener_stop(aster_runtime_t runtime,
  * Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
  * in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
  * overrides, blob zstd level 3, port reuse on). Never allocates (`storage` is NULL).
+ *
+ * Since ABI 6.0 this and `aster_config_from_env` / `_from_toml` return
+ * `ASTER_STATUS_ABI_MISMATCH` without writing `*out` until the process has
+ * passed the ABI handshake (`aster_abi_accept(ASTER_ABI_VERSION_MAJOR)` or a
+ * successful `aster_runtime_new`): a caller built for 5.x has a 280-byte
+ * struct that the 288-byte fill would overrun.
  */
 int32_t aster_config_init(struct aster_config_t *out);
 

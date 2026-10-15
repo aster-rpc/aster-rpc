@@ -8,6 +8,12 @@ package aster
 #include <string.h>
 
 #include "aster_ffi.h"
+
+// This binding is written against C ABI 6.x: building it with another
+// major's aster_ffi.h is a compile error, not a runtime surprise.
+#if ASTER_ABI_VERSION_MAJOR != 6
+#error "sdk.getaster.now/go needs aster_ffi.h from C ABI 6.x (libaster_transport_ffi 6.0 or later 6.x)"
+#endif
 */
 import "C"
 
@@ -578,9 +584,30 @@ func Version() (major, minor, patch uint32) {
 }
 
 // ABIMinorRequired is the lowest ABI minor version (within ABIVersionMajor)
-// this binding runs against: 5.2 grows aster_config_t (blob_zstd_level,
-// reuse_last_port), which aster_config_init fills.
-const ABIMinorRequired = uint32(2)
+// this binding runs against. ABI 6.0 grew aster_config_t to 288 bytes
+// (blob_zstd_level, reuse_last_port); this binding needs native ABI 6.0 or a
+// later 6.x.
+const ABIMinorRequired = uint32(0)
+
+var (
+	abiOnce sync.Once
+	abiErr  error
+)
+
+// acceptABI runs the ABI handshake once per process: CheckABI, then
+// aster_abi_accept, without which the library refuses to fill an
+// aster_config_t (ABI 6.0).
+func acceptABI() error {
+	abiOnce.Do(func() {
+		if abiErr = CheckABI(); abiErr != nil {
+			return
+		}
+		if r := C.aster_abi_accept(C.ASTER_ABI_VERSION_MAJOR); r != C.ASTER_STATUS_OK {
+			abiErr = fmt.Errorf("aster_abi_accept: %w", Error(C.int(r)))
+		}
+	})
+	return abiErr
+}
 
 // CheckABI returns an error if the loaded native library's ABI major version
 // differs from the one this binding was compiled against, or its minor

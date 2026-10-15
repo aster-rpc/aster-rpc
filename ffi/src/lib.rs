@@ -178,14 +178,19 @@ pub mod upcall;
 //   enrolled peers (`aster_server_restrict_peer_roles`,
 //   `aster_server_clear_peer_restriction`). Root operations stay in the Rust
 //   CLI. See `ffi/RENAME_MAP.md` "5.1".
-// - 5.2.0: `aster_config_t` grows from 280 to 288 bytes: `blob_zstd_level`
-//   (`ASTER_BLOB_ZSTD_LEVEL_DEFAULT` 0 / `_OFF` -1 / 1..=19) and
-//   `reuse_last_port` (`aster_reuse_last_port_t`) are appended after
-//   `storage`; existing offsets are unchanged. `struct_size` stays an exact
-//   match, and the library fills all 288 bytes, so callers must be built
-//   against the 5.2 header. See `ffi/RENAME_MAP.md` "5.2".
-pub const ASTER_ABI_VERSION_MAJOR: u32 = 5;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 2;
+// - 6.0.0 (breaking): `aster_config_t` grows from 280 to 288 bytes:
+//   `blob_zstd_level` (`ASTER_BLOB_ZSTD_LEVEL_DEFAULT` 0 / `_OFF` -1 /
+//   1..=19) and `reuse_last_port` (`aster_reuse_last_port_t`) are appended
+//   after `storage`; existing offsets are unchanged. The library writes the
+//   whole struct in `aster_config_init` / `_from_env` / `_from_toml`, so a
+//   5.x caller's 280-byte struct would be overrun: those three functions now
+//   return `ASTER_STATUS_ABI_MISMATCH` without writing until the caller has
+//   proven it was built for 6.x, through the new `aster_abi_accept(6)` or a
+//   successful `aster_runtime_new(6, ...)`. Readers of an `aster_config_t`
+//   check `struct_size` before reading past it. See `ffi/RENAME_MAP.md`
+//   "6.0".
+pub const ASTER_ABI_VERSION_MAJOR: u32 = 6;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 0;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -1539,6 +1544,51 @@ pub extern "C" fn aster_abi_version() -> u32 {
     ASTER_ABI_VERSION
 }
 
+/// Set once a caller proved it was built for this ABI major
+/// (`aster_abi_accept` or a successful `aster_runtime_new`).
+static ABI_ACCEPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn abi_major_matches(expected_abi_major: u32) -> bool {
+    if expected_abi_major == ASTER_ABI_VERSION_MAJOR {
+        ABI_ACCEPTED.store(true, std::sync::atomic::Ordering::Release);
+        return true;
+    }
+    set_last_error(format!(
+        "ABI major mismatch: caller expects {expected_abi_major}, library provides {ASTER_ABI_VERSION_MAJOR}.{ASTER_ABI_VERSION_MINOR}.{ASTER_ABI_VERSION_PATCH}"
+    ));
+    false
+}
+
+/// `ASTER_STATUS_OK` when the process has passed the ABI handshake, else
+/// `ASTER_STATUS_ABI_MISMATCH` with a last-error naming `what`. Functions that
+/// write a struct whose size changed across majors call this first, so a
+/// caller built for an older major is refused before anything is written.
+pub(crate) fn require_abi_accepted(what: &str) -> i32 {
+    if ABI_ACCEPTED.load(std::sync::atomic::Ordering::Acquire) {
+        return aster_status_t::ASTER_STATUS_OK as i32;
+    }
+    set_last_error(format!(
+        "{what}: call aster_abi_accept({ASTER_ABI_VERSION_MAJOR}) or aster_runtime_new first; \
+         this library is ABI {ASTER_ABI_VERSION_MAJOR}.{ASTER_ABI_VERSION_MINOR}.{ASTER_ABI_VERSION_PATCH}"
+    ));
+    aster_status_t::ASTER_STATUS_ABI_MISMATCH as i32
+}
+
+/// The ABI handshake without a runtime (ABI 6.0). `expected_abi_major` is the
+/// `ASTER_ABI_VERSION_MAJOR` the caller was built against. On a match this
+/// returns `ASTER_STATUS_OK` and unlocks the functions that write an
+/// `aster_config_t` (`aster_config_init`, `_from_env`, `_from_toml`); on a
+/// mismatch it returns `ASTER_STATUS_ABI_MISMATCH` and sets the last error.
+/// A successful `aster_runtime_new` does the same. Idempotent and thread-safe.
+#[no_mangle]
+pub extern "C" fn aster_abi_accept(expected_abi_major: u32) -> i32 {
+    if abi_major_matches(expected_abi_major) {
+        aster_status_t::ASTER_STATUS_OK as i32
+    } else {
+        aster_status_t::ASTER_STATUS_ABI_MISMATCH as i32
+    }
+}
+
 /// Exact Aster build version as a process-lifetime, NUL-terminated UTF-8 string.
 /// The returned pointer is borrowed and must not be freed.
 #[no_mangle]
@@ -1574,10 +1624,7 @@ pub unsafe extern "C" fn aster_runtime_new(
     // Opt-in Rust log sink (`ASTER_LOG_STDERR=1`, filter `ASTER_LOG`);
     // idempotent, so every runtime after the first is a no-op.
     aster_otel::init_stderr_from_env();
-    if expected_abi_major != ASTER_ABI_VERSION_MAJOR {
-        set_last_error(format!(
-            "ABI major mismatch: caller expects {expected_abi_major}, library provides {ASTER_ABI_VERSION_MAJOR}.{ASTER_ABI_VERSION_MINOR}.{ASTER_ABI_VERSION_PATCH}"
-        ));
+    if !abi_major_matches(expected_abi_major) {
         return aster_status_t::ASTER_STATUS_ABI_MISMATCH as i32;
     }
     if out_runtime.is_null() {

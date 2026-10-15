@@ -167,6 +167,17 @@ public final class IrohLibrary implements SymbolLookup {
               + REQUIRED_ABI_MINOR
               + " or newer");
     }
+    // ABI 6.0 handshake: until a caller proves its major, the library refuses to fill an
+    // aster_config_t (a 5.x caller's 280-byte struct would be overrun by the 288-byte fill).
+    int accepted =
+        call(
+            "aster_abi_accept",
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT),
+            EXPECTED_ABI_MAJOR);
+    if (accepted != 0) {
+      throw new UnsatisfiedLinkError(
+          "Native library " + LIB_PATH + " refused ABI major " + EXPECTED_ABI_MAJOR);
+    }
   }
 
   public static IrohLibrary getInstance() {
@@ -213,22 +224,21 @@ public final class IrohLibrary implements SymbolLookup {
    * refuses a mismatch with {@link IrohStatus#ABI_MISMATCH}; also checked when the library is
    * loaded.
    */
-  public static final int EXPECTED_ABI_MAJOR = 5;
+  public static final int EXPECTED_ABI_MAJOR = 6;
 
   /**
-   * Lowest C ABI minor version this binding runs against. 5.2 grows {@code aster_config_t} to 288
-   * bytes ({@code blob_zstd_level}, {@code reuse_last_port}), which {@code aster_config_init}
-   * fills, so an older library would write a shorter struct. 5.1 adds Enrollment from configuration
-   * ({@code aster_config_enrollment_from_*}, {@code aster_node_start_enrolled}, {@code
-   * aster_enrollment_*}) and the lease grantor ({@code aster_server_add_lease_grantor}, {@code
-   * aster_lease_serializer_grantor_new}). 5.0 removed the attestation functions and is otherwise
-   * 4.17, which added standalone raw WebTransport. Version 4.16 added topology views and baseline
-   * capability policy. 4.15 added offline coordination provisioning. Version 4.14 adds batch local
-   * Docs content reads. Version 4.13 adds temporary blob custody and verified retained imports.
-   * Version 4.12 adds public listeners and certificate helpers; version 4.11 adds authenticated
-   * listeners and 4.10 adds owned Docs receivers.
+   * Lowest C ABI minor version this binding runs against (6.0). 6.0 is a breaking release: {@code
+   * aster_config_t} grew from 280 to 288 bytes ({@code blob_zstd_level}, {@code reuse_last_port}).
+   * 5.1 added Enrollment from configuration ({@code aster_config_enrollment_from_*}, {@code
+   * aster_node_start_enrolled}, {@code aster_enrollment_*}) and the lease grantor ({@code
+   * aster_server_add_lease_grantor}, {@code aster_lease_serializer_grantor_new}). 5.0 removed the
+   * attestation functions and is otherwise 4.17, which added standalone raw WebTransport. Version
+   * 4.16 added topology views and baseline capability policy. 4.15 added offline coordination
+   * provisioning. Version 4.14 adds batch local Docs content reads. Version 4.13 adds temporary
+   * blob custody and verified retained imports. Version 4.12 adds public listeners and certificate
+   * helpers; version 4.11 adds authenticated listeners and 4.10 adds owned Docs receivers.
    */
-  public static final int REQUIRED_ABI_MINOR = 2;
+  public static final int REQUIRED_ABI_MINOR = 0;
 
   /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
   public int abiVersion() {
@@ -2772,7 +2782,7 @@ public final class IrohLibrary implements SymbolLookup {
   // --- ABI 3.2: node config, aster_node_start, Gate 0, admission (ffi/src/node.rs) ---
 
   /**
-   * aster_config_t (ABI 3.2; 5.2 appends blob_zstd_level and reuse_last_port). Total 288 bytes;
+   * aster_config_t (ABI 3.2; 6.0 appends blob_zstd_level and reuse_last_port). Total 288 bytes;
    * offsets pinned by ffi/src/layout.rs. Built and read by {@link NativeConfig}.
    */
   public static final MemoryLayout ASTER_CONFIG =
@@ -2811,8 +2821,8 @@ public final class IrohLibrary implements SymbolLookup {
           ValueLayout.JAVA_LONG.withName("transport_datagram_receive_buffer_size"), // 256
           ValueLayout.JAVA_LONG.withName("transport_datagram_send_buffer_size"), // 264
           ValueLayout.ADDRESS.withName("storage"), // 272
-          ValueLayout.JAVA_INT.withName("blob_zstd_level"), // 280 (ABI 5.2)
-          ValueLayout.JAVA_INT.withName("reuse_last_port") // 284 (ABI 5.2)
+          ValueLayout.JAVA_INT.withName("blob_zstd_level"), // 280 (ABI 6.0)
+          ValueLayout.JAVA_INT.withName("reuse_last_port") // 284 (ABI 6.0)
           );
 
   /** Pack a borrowed span for a synchronous downcall; native submission copies its input. */

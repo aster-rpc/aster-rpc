@@ -133,6 +133,7 @@ fn bench_operation_submit_cancel(c: &mut Criterion) {
         ptr: b"test".as_ptr(),
         len: 4,
     }];
+    aster_transport_ffi::aster_abi_accept(aster_transport_ffi::ASTER_ABI_VERSION_MAJOR);
     let mut cfg: node::aster_config_t = unsafe { std::mem::zeroed() };
     unsafe { node::aster_config_init(&mut cfg) };
     cfg.alpns = aster_bytes_list_t {

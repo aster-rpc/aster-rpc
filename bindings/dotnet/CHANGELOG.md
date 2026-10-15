@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-### Added: `AsterConfig.BlobZstdLevel` and `ReuseLastPort` (native ABI 5.2)
+### Added: `AsterConfig.BlobZstdLevel` and `ReuseLastPort` (native C ABI 6.0)
 
 Blob transport compression and port reuse on restart can now be set, and in
 particular turned off, from .NET: `BlobZstdLevel` (`null` = default 3, `0` =
@@ -10,8 +10,11 @@ off, 1..19) and `ReuseLastPort` (`null` = default on). `FromEnv` / `FromToml`
 read `ASTER_BLOB_ZSTD_LEVEL` / `[storage] blob_zstd_level` and
 `ASTER_REUSE_LAST_PORT` / `[network] reuse_last_port`. Before, both were lost
 when the native config was copied and rebuilt, so they stayed on. The
-`aster_config_t` mirror grows to 288 bytes; requires native ABI **5.2**
-(`Native.RequiredAbiMinor` = 2).
+`aster_config_t` mirror grows to 288 bytes; requires native C ABI **6.0** or
+a later 6.x (`Native.AbiVersionMajor` = 6, `Native.RequiredAbiMinor` = 0). 6.0
+is a breaking ABI release because the struct grew from 280 to 288 bytes; the
+binding performs the new `aster_abi_accept(6)` handshake (`Native.EnsureAbi`)
+before filling a config, without which the library refuses to write one.
 
 ### Changed: `SyncFinished` says how the round ended
 

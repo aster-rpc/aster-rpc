@@ -46,6 +46,7 @@ struct Loopback {
 const BIND: &[u8] = b"127.0.0.1:0";
 
 fn loopback() -> Loopback {
+    assert_eq!(aster_abi_accept(ASTER_ABI_VERSION_MAJOR), 0);
     let alpns = Box::new([bytes(ALPN)]);
     let mut cfg: aster_config_t = unsafe { std::mem::zeroed() };
     assert_eq!(unsafe { aster_config_init(&mut cfg) }, 0);
@@ -584,7 +585,7 @@ fn accept_on_node_reads_the_alpn_queue() {
     }
 }
 
-/// ABI 5.2: `aster_config_t.blob_zstd_level` reaches core. A node with the
+/// ABI 6.0: `aster_config_t.blob_zstd_level` reaches core. A node with the
 /// default level serves the zstd blobs ALPN; with `ASTER_BLOB_ZSTD_LEVEL_OFF`
 /// it does not, so a dial on that ALPN fails the handshake.
 #[test]
@@ -618,7 +619,7 @@ fn blob_zstd_level_off_drops_the_zstd_alpn() {
     tokio.block_on(dialer.shutdown());
 }
 
-/// ABI 5.2: `aster_config_t.reuse_last_port` reaches core. A persistent node
+/// ABI 6.0: `aster_config_t.reuse_last_port` reaches core. A persistent node
 /// records its bound ports in `bind-ports.json` by default and not when port
 /// reuse is `ASTER_REUSE_LAST_PORT_DISABLED`.
 #[test]

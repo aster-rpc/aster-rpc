@@ -24,7 +24,7 @@ import site.aster.handle.IrohEndpoint;
 import site.aster.server.AsterServer;
 
 /**
- * ABI 5.2: {@code blob_zstd_level} and {@code reuse_last_port} cross the C ABI and reach core, so
+ * C ABI 6.0: {@code blob_zstd_level} and {@code reuse_last_port} cross the C ABI and reach core, so
  * Java can turn each one off.
  */
 final class BlobZstdAndPortReuseTest {

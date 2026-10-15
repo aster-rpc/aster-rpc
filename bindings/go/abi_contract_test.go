@@ -45,7 +45,7 @@ func TestABI_StructSizes(t *testing.T) {
 		"aster_health_config_t":        24,
 		"aster_http_server_config_t":   64,
 		"aster_generated_cert_t":       64,
-		"aster_config_t":               288, // ABI 5.2
+		"aster_config_t":               288, // ABI 6.0
 	}
 	got := cStructSizes()
 	for name, w := range want {
@@ -176,10 +176,9 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	if ASTER_EVENT_TOPOLOGY_SNAPSHOT != 120 {
 		t.Error("topology snapshot event drifted from header")
 	}
-	// ABI 5.0 removed only the attestation functions; 5.1 adds Enrollment;
-	// 5.2 grows aster_config_t.
-	if _, minor, _ := Version(); minor < ABIMinorRequired || ABIMinorRequired != 2 {
-		t.Errorf("library ABI minor %d, binding needs >= 2 (floor %d)", minor, ABIMinorRequired)
+	// ABI 6.0 grew aster_config_t (280 -> 288); the binding needs 6.0+.
+	if major, minor, _ := Version(); major != 6 || ABIVersionMajor != 6 || minor < ABIMinorRequired || ABIMinorRequired != 0 {
+		t.Errorf("library ABI %d.%d, binding needs 6.%d+ (major %d)", major, minor, ABIMinorRequired, ABIVersionMajor)
 	}
 	if ASTER_EVENT_ENROLLMENT_RESULT != 127 || AdmissionErrorNotAdmitted != 1 || AdmissionErrorDenied != 2 ||
 		AdmissionErrorClockSkew != 3 || AdmissionErrorUnavailable != 4 {
@@ -204,8 +203,8 @@ func TestABI_VersionMatchesHeader(t *testing.T) {
 	if got := major<<16 | minor<<8 | patch; got != headerABIVersion {
 		t.Errorf("library ABI %#x != header ASTER_ABI_VERSION %#x", got, headerABIVersion)
 	}
-	if major != 5 || ABIVersionMajor != 5 {
-		t.Errorf("expected ABI major 5, lib=%d binding=%d", major, ABIVersionMajor)
+	if major != 6 || ABIVersionMajor != 6 {
+		t.Errorf("expected ABI major 6, lib=%d binding=%d", major, ABIVersionMajor)
 	}
 	if err := CheckABI(); err != nil {
 		t.Fatal(err)

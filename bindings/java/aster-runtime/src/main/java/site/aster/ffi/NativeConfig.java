@@ -84,7 +84,7 @@ public final class NativeConfig {
   private static final long T_KEEP_ALIVE_OFF = 248;
   private static final long T_DGRAM_RECV_OFF = 256;
   private static final long T_DGRAM_SEND_OFF = 264;
-  // ABI 5.2
+  // C ABI 6.0
   private static final long BLOB_ZSTD_LEVEL = 280;
   private static final long REUSE_LAST_PORT = 284;
 

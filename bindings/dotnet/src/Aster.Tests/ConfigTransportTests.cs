@@ -6,7 +6,7 @@ using System.Threading.Tasks;
 
 namespace Aster.Tests;
 
-/// <summary>ABI 5.2: aster_config_t.blob_zstd_level and reuse_last_port reach core.</summary>
+/// <summary>C ABI 6.0: aster_config_t.blob_zstd_level and reuse_last_port reach core.</summary>
 public class ConfigTransportTests
 {
     private static readonly AsterConfig Loopback = new() { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };

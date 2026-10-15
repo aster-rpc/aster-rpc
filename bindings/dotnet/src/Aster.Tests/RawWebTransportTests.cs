@@ -65,7 +65,7 @@ public class RawWebTransportTests
     [Fact]
     public void LayoutAndStrictPayloadContracts()
     {
-        Assert.Equal(2u, Native.RequiredAbiMinor); Assert.Equal(104, Marshal.SizeOf<RawWTConfigNative>());
+        Assert.Equal(0u, Native.RequiredAbiMinor); Assert.Equal(104, Marshal.SizeOf<RawWTConfigNative>());
         foreach (var (name, offset) in new[] { ("struct_size", 0), ("flags", 4), ("bind_addr", 8), ("certificate_pem", 24), ("private_key_pem", 40), ("path", 56), ("max_sessions", 72), ("max_streams", 76), ("max_datagrams", 80), ("max_datagram_bytes", 84), ("max_read_bytes", 88), ("max_pending_auth", 92), ("max_auth_payload_bytes", 96), ("reserved", 100) }) Assert.Equal(offset, Marshal.OffsetOf<RawWTConfigNative>(name).ToInt32());
         Assert.Equal(121u, (uint)EventKind.RawWTSession); Assert.Equal(126u, (uint)EventKind.RawWTAcked);
         Assert.Null(RawWTStream.DecodePriority(0, [])); Assert.Equal(-10, RawWTStream.DecodePriority(1, [246, 255, 255, 255]));

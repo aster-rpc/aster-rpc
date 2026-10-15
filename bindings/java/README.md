@@ -1,6 +1,6 @@
 # Java and Kotlin runtime
 
-The Java runtime requires JDK 25 and native Aster ABI **5.1 or newer** (within major 5). Set
+The Java runtime requires JDK 25 and native Aster C ABI **6.0 or newer** (within major 6). Set
 `IROH_LIB_PATH` or `-Daster.ffi.lib` to the native library when it is not bundled.
 
 ## Enrollment: who may connect, and with which roles
@@ -70,7 +70,7 @@ are clamped to 19). With `0` the node serves blobs only on the plain ALPN and
 fetches plain. `reuseLastPort` makes a persistent node (`storagePath` set,
 port left to the OS) re-bind the UDP ports it last used, recorded in
 `bind-ports.json`; with `false` it binds fresh ports and records nothing.
-Both cross the C ABI in `aster_config_t` (ABI 5.2).
+Both cross the C ABI in `aster_config_t` (C ABI 6.0).
 
 ```java
 AsterConfig cfg = AsterConfig.builder().blobZstdLevel(0).reuseLastPort(false).build();

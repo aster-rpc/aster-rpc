@@ -29,11 +29,11 @@ public class NodeTests
     }
 
     [Fact]
-    public void Abi_Is_5_x()
+    public void Abi_Is_6_x()
     {
         var (major, minor, _) = Runtime.Version;
-        Assert.Equal(5, major);
-        Assert.True(minor >= (int)Native.RequiredAbiMinor, $"native library ABI 5.{minor} < 5.{Native.RequiredAbiMinor}");
+        Assert.Equal(6, major);
+        Assert.True(minor >= (int)Native.RequiredAbiMinor, $"native library ABI {Native.AbiVersionMajor}.{minor} < {Native.AbiVersionMajor}.{Native.RequiredAbiMinor}");
     }
 
     [Fact]

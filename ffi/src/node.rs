@@ -1,4 +1,6 @@
 //! ABI 3.2: node configuration, `aster_node_start`, Gate 0 and admission.
+//! ABI 6.0 grew `aster_config_t` to 288 bytes; see `lower_config_ptr` and the
+//! ABI handshake on the functions that fill it.
 //!
 //! This is the C ABI over the `aster` crate (plan D1): a node is started from
 //! an [`aster::AsterConfig`] through [`aster::Node::start`], so the C ABI, the
@@ -80,7 +82,7 @@ pub enum aster_portmapper_t {
     ASTER_PORTMAPPER_DISABLED = 2,
 }
 
-/// `aster_config_t.reuse_last_port` (ABI 5.2).
+/// `aster_config_t.reuse_last_port` (ABI 6.0).
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum aster_reuse_last_port_t {
@@ -90,9 +92,9 @@ pub enum aster_reuse_last_port_t {
     ASTER_REUSE_LAST_PORT_DISABLED = 2,
 }
 
-/// `aster_config_t.blob_zstd_level` (ABI 5.2): not set, the default level (3).
+/// `aster_config_t.blob_zstd_level` (ABI 6.0): not set, the default level (3).
 pub const ASTER_BLOB_ZSTD_LEVEL_DEFAULT: i32 = 0;
-/// `aster_config_t.blob_zstd_level` (ABI 5.2): blob transport compression off.
+/// `aster_config_t.blob_zstd_level` (ABI 6.0): blob transport compression off.
 pub const ASTER_BLOB_ZSTD_LEVEL_OFF: i32 = -1;
 /// Highest `aster_config_t.blob_zstd_level`; larger levels are clamped to it.
 pub const ASTER_BLOB_ZSTD_LEVEL_MAX: i32 = 19;
@@ -182,13 +184,13 @@ pub struct aster_config_t {
     pub transport_datagram_send_buffer_size: u64,
     /// Library-owned storage of a filled config; NULL for caller-built ones.
     pub storage: *mut c_void,
-    /// ABI 5.2. zstd level for blob transport (`AsterConfig::blob_zstd_level`):
+    /// ABI 6.0. zstd level for blob transport (`AsterConfig::blob_zstd_level`):
     /// `ASTER_BLOB_ZSTD_LEVEL_DEFAULT` (0) = the default level (3),
     /// `ASTER_BLOB_ZSTD_LEVEL_OFF` (-1) = off (plain blobs ALPN only; fetches
     /// default to plain), 1..=19 = that level (larger values are clamped to
     /// 19). Other negative values are rejected.
     pub blob_zstd_level: i32,
-    /// ABI 5.2. One of `aster_reuse_last_port_t`: re-bind the last UDP ports
+    /// ABI 6.0. One of `aster_reuse_last_port_t`: re-bind the last UDP ports
     /// of a persistent node (`AsterConfig::reuse_last_port`).
     pub reuse_last_port: u32,
 }
@@ -232,6 +234,26 @@ fn flag(v: u32, field: &str) -> Result<bool, String> {
         1 => Ok(true),
         _ => Err(format!("aster_config_t.{field} must be 0 or 1, got {v}")),
     }
+}
+
+/// Lower a caller's config pointer (NULL = defaults). `struct_size` is read on
+/// its own first, so a struct of another size (an older major's 280 bytes) is
+/// refused before anything past it is read.
+pub(crate) unsafe fn lower_config_ptr(
+    config: *const aster_config_t,
+) -> Result<AsterConfig, String> {
+    if config.is_null() {
+        return Ok(AsterConfig::default());
+    }
+    let size = config.cast::<u32>().read_unaligned();
+    let expected = std::mem::size_of::<aster_config_t>() as u32;
+    if size != expected {
+        return Err(format!(
+            "aster_config_t.struct_size is {size}, expected {expected} (ABI {}.x)",
+            crate::ASTER_ABI_VERSION_MAJOR
+        ));
+    }
+    lower_config(&*config)
 }
 
 /// Validate and lower a C config to an [`AsterConfig`].
@@ -645,11 +667,22 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
 /// Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
 /// in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
 /// overrides, blob zstd level 3, port reuse on). Never allocates (`storage` is NULL).
+///
+/// Since ABI 6.0 this and `aster_config_from_env` / `_from_toml` return
+/// `ASTER_STATUS_ABI_MISMATCH` without writing `*out` until the process has
+/// passed the ABI handshake (`aster_abi_accept(ASTER_ABI_VERSION_MAJOR)` or a
+/// successful `aster_runtime_new`): a caller built for 5.x has a 280-byte
+/// struct that the 288-byte fill would overrun.
 #[no_mangle]
 pub unsafe extern "C" fn aster_config_init(out: *mut aster_config_t) -> i32 {
-    let Some(out) = out.as_mut() else {
+    if out.is_null() {
         return invalid("aster_config_init: out is NULL");
-    };
+    }
+    let status = crate::require_abi_accepted("aster_config_init");
+    if status != aster_status_t::ASTER_STATUS_OK as i32 {
+        return status;
+    }
+    let out = &mut *out;
     fill_config(&AsterConfig::default(), out);
     aster_status_t::ASTER_STATUS_OK as i32
 }
@@ -661,9 +694,14 @@ pub unsafe extern "C" fn aster_config_init(out: *mut aster_config_t) -> i32 {
 /// `*out` zeroed.
 #[no_mangle]
 pub unsafe extern "C" fn aster_config_from_env(out: *mut aster_config_t) -> i32 {
-    let Some(out) = out.as_mut() else {
+    if out.is_null() {
         return invalid("aster_config_from_env: out is NULL");
-    };
+    }
+    let status = crate::require_abi_accepted("aster_config_from_env");
+    if status != aster_status_t::ASTER_STATUS_OK as i32 {
+        return status;
+    }
+    let out = &mut *out;
     *out = std::mem::zeroed();
     match AsterConfig::from_env() {
         Ok(cfg) => {
@@ -683,9 +721,14 @@ pub unsafe extern "C" fn aster_config_from_toml(
     path: aster_bytes_t,
     out: *mut aster_config_t,
 ) -> i32 {
-    let Some(out) = out.as_mut() else {
+    if out.is_null() {
         return invalid("aster_config_from_toml: out is NULL");
-    };
+    }
+    let status = crate::require_abi_accepted("aster_config_from_toml");
+    if status != aster_status_t::ASTER_STATUS_OK as i32 {
+        return status;
+    }
+    let out = &mut *out;
     *out = std::mem::zeroed();
     let path = match opt_str(&path, "path") {
         Ok(Some(p)) => p,
@@ -707,9 +750,19 @@ pub unsafe extern "C" fn aster_config_from_toml(
 /// struct.
 #[no_mangle]
 pub unsafe extern "C" fn aster_config_release(config: *mut aster_config_t) -> i32 {
-    let Some(c) = config.as_mut() else {
+    if config.is_null() {
         return invalid("aster_config_release: config is NULL");
-    };
+    }
+    // Zero is a struct the library zeroed after a failed fill; anything else
+    // must be this major's size before the pointer fields are touched.
+    let size = config.cast::<u32>().read_unaligned();
+    if size != 0 && size != std::mem::size_of::<aster_config_t>() as u32 {
+        return invalid(format!(
+            "aster_config_release: aster_config_t.struct_size is {size}, expected {}",
+            std::mem::size_of::<aster_config_t>()
+        ));
+    }
+    let c = &mut *config;
     if !c.storage.is_null() {
         drop(Box::from_raw(c.storage as *mut ConfigStorage));
         c.storage = std::ptr::null_mut();
@@ -1141,12 +1194,9 @@ pub unsafe extern "C" fn aster_node_start(
     if out_operation.is_null() {
         return invalid("aster_node_start: out_operation is NULL");
     }
-    let mut cfg = match config.as_ref() {
-        None => AsterConfig::default(),
-        Some(c) => match lower_config(c) {
-            Ok(cfg) => cfg,
-            Err(e) => return invalid(e),
-        },
+    let mut cfg = match lower_config_ptr(config) {
+        Ok(cfg) => cfg,
+        Err(e) => return invalid(e),
     };
     let bridge = try_status!(bridge_for(runtime));
     let gate_entry = if gate == 0 {
@@ -1404,6 +1454,7 @@ mod tests {
 
     #[test]
     fn config_round_trips_every_knob() {
+        crate::aster_abi_accept(crate::ASTER_ABI_VERSION_MAJOR);
         let full = full_config();
         assert_same(&full, &round_trip(&full));
         let default = AsterConfig::default();
@@ -1416,6 +1467,7 @@ mod tests {
 
     #[test]
     fn init_matches_rust_defaults_without_allocating() {
+        crate::aster_abi_accept(crate::ASTER_ABI_VERSION_MAJOR);
         let mut c: aster_config_t = unsafe { std::mem::zeroed() };
         assert_eq!(unsafe { aster_config_init(&mut c) }, 0);
         assert!(c.storage.is_null());
@@ -1439,6 +1491,7 @@ mod tests {
 
     #[test]
     fn lower_rejects_malformed_configs() {
+        crate::aster_abi_accept(crate::ASTER_ABI_VERSION_MAJOR);
         let mut base: aster_config_t = unsafe { std::mem::zeroed() };
         unsafe { aster_config_init(&mut base) };
         let check = |mutate: &dyn Fn(&mut aster_config_t), needle: &str| {
@@ -1534,6 +1587,7 @@ mod tests {
 
     #[test]
     fn config_from_env_fills_the_struct() {
+        crate::aster_abi_accept(crate::ASTER_ABI_VERSION_MAJOR);
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         std::env::set_var("ASTER_RELAY_MODE", "disabled");
@@ -1597,6 +1651,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "touches the filesystem; Miri isolation forbids mkdir")]
     fn config_from_toml_fills_every_section() {
+        crate::aster_abi_accept(crate::ASTER_ABI_VERSION_MAJOR);
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         clear_env();
         let dir = std::env::temp_dir().join(format!("aster-ffi-toml-{}", std::process::id()));
@@ -1729,6 +1784,7 @@ file = "/etc/aster/.aster-identity"
     }
     #[test]
     fn blob_zstd_level_and_reuse_last_port_encode_default_off_and_values() {
+        crate::aster_abi_accept(crate::ASTER_ABI_VERSION_MAJOR);
         let mut c: aster_config_t = unsafe { std::mem::zeroed() };
         unsafe { aster_config_init(&mut c) };
         let lower = |level: i32, reuse: aster_reuse_last_port_t| {
@@ -1772,6 +1828,7 @@ file = "/etc/aster/.aster-identity"
 
     #[test]
     fn health_config_survives_owned_round_trip_and_public_overrides() {
+        crate::aster_abi_accept(crate::ASTER_ABI_VERSION_MAJOR);
         for enabled in [None, Some(true), Some(false)] {
             let original = AsterConfig {
                 health_port: 18080,

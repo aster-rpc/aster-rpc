@@ -1,33 +1,59 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x changelog (current: 5.2)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x changelog (current: 6.0)
 
-## New in 5.2 (blob compression level and port reuse in `aster_config_t`)
+## 6.0 (breaking: `aster_config_t` grew; blob compression level and port reuse)
 
-Two `AsterConfig` settings that had no public slot in `aster_config_t` now
-have one, so a binding that builds or copies the struct can set them, and in
-particular turn them off. Before 5.2 `aster_config_from_env` /
+**Why a major release.** `aster_config_t` grew from 280 to 288 bytes, and the
+library writes the whole struct in `aster_config_init`, `aster_config_from_env`
+and `aster_config_from_toml`. A caller built against a 5.x header allocates 280
+bytes, so a 6.0 library filling it would write 8 bytes past the caller's struct.
+A minor bump cannot prevent that: a 5.x caller would pass a "same major, minor
+>= required" check. 6.0 makes the refusal clean instead:
+
+- `aster_runtime_new(5, ...)` returns `ASTER_STATUS_ABI_MISMATCH` (as for any
+  other major).
+- New `aster_abi_accept(uint32_t expected_abi_major)`: the ABI handshake without
+  a runtime. `OK` when `expected_abi_major` is 6, else `ABI_MISMATCH` with the
+  last error set. A successful `aster_runtime_new(6, ...)` counts as well.
+- `aster_config_init` / `_from_env` / `_from_toml` return `ASTER_STATUS_ABI_MISMATCH`
+  **without writing `*out`** until the process has passed the handshake, so a
+  5.x caller (which never calls `aster_abi_accept(6)` and whose
+  `aster_runtime_new(5)` is refused) never has its struct written.
+- Functions that read an `aster_config_t` (`aster_node_start`,
+  `aster_node_start_enrolled`, `aster_config_release`) read `struct_size` on its
+  own first and refuse a 280-byte struct (`INVALID_ARGUMENT`) before reading
+  past it.
+
+Covered by `ffi/tests/abi_handshake.rs` (its own process, simulating a 5.x
+caller with a guarded 280-byte buffer) and the first block of
+`test_abi_version` in `ffi/tests/abi_contract_test.c`.
+
+**What changed in the struct.** Two `AsterConfig` settings that had no public
+slot now have one, so a binding that builds or copies the struct can set them,
+and in particular turn them off. Before, `aster_config_from_env` /
 `aster_config_from_toml` carried `reuse_last_port` in the opaque `storage`
-(and `blob_zstd_level` not at all), so a binding that copied the fields into
-its own struct and rebuilt it lost both, leaving them at their defaults (on).
-
-`aster_config_t` grows from 280 to 288 bytes. The new fields are appended
-after `storage`, so every existing offset is unchanged:
+(and `blob_zstd_level` not at all), so a binding that copied the fields into its
+own struct and rebuilt it lost both, leaving them at their defaults (on). The
+new fields are appended after `storage`, so every existing offset is unchanged:
 
 | Offset | Field | Encoding |
 |---|---|---|
 | 280 | `int32_t blob_zstd_level` | `ASTER_BLOB_ZSTD_LEVEL_DEFAULT` (0) = the default level (3); `ASTER_BLOB_ZSTD_LEVEL_OFF` (-1) = off: the node serves only the plain blobs ALPN and fetches default to plain; 1..=19 = that level, larger values clamped to `ASTER_BLOB_ZSTD_LEVEL_MAX` (19); other negative values are `INVALID_ARGUMENT`. Rust `AsterConfig::blob_zstd_level`, env `ASTER_BLOB_ZSTD_LEVEL`, TOML `[storage] blob_zstd_level`. |
 | 284 | `uint32_t reuse_last_port` | `aster_reuse_last_port_t`: `ASTER_REUSE_LAST_PORT_DEFAULT` (0) = on, `_ENABLED` (1), `_DISABLED` (2); other values are `INVALID_ARGUMENT`. Rust `AsterConfig::reuse_last_port`, env `ASTER_REUSE_LAST_PORT`, TOML `[network] reuse_last_port`. |
 
-Zero means "not set" for both, like `portmapper` and `relay_mode`, so a
-zeroed tail keeps the defaults. `aster_config_init` / `_from_env` /
-`_from_toml` write explicit values (`blob_zstd_level` = 3 or -1,
-`reuse_last_port` = ENABLED or DISABLED); `storage` no longer carries
-`reuse_last_port`.
+Zero means "not set" for both, like `portmapper` and `relay_mode`, so a zeroed
+tail keeps the defaults. The fill functions write explicit values
+(`blob_zstd_level` = 3 or -1, `reuse_last_port` = ENABLED or DISABLED);
+`storage` no longer carries `reuse_last_port`. `struct_size` remains an exact
+match.
 
-`struct_size` remains an exact match: a 280-byte struct is refused with
-`INVALID_ARGUMENT`. The library writes all 288 bytes in `aster_config_init` /
-`_from_env` / `_from_toml`, so a caller must be built against the 5.2 header
-and must not run against a 5.1 library (Go: `ABIMinorRequired = 2`). Java and
-.NET pin the 288-byte layout and require minor 2.
+Nothing else changed: a binding moves from 5.1 to 6.0 by updating its expected
+major, mirroring the 288-byte layout and calling `aster_abi_accept(6)` (or
+creating a runtime) before filling a config. Go (`ABIVersionMajor` 6 from the
+header, `ABIMinorRequired` 0, plus a compile-time `#error` for another
+major's header), Java (`IrohLibrary.EXPECTED_ABI_MAJOR` 6,
+`REQUIRED_ABI_MINOR` 0) and .NET (`Native.AbiVersionMajor` 6,
+`RequiredAbiMinor` 0, `Native.EnsureAbi`) require 6.0. Python and TypeScript
+do not use the C ABI.
 
 ## New in 5.1 (Enrollment from configuration, lease grantor, role restriction; additive)
 

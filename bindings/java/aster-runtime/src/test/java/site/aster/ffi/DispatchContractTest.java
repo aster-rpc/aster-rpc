@@ -48,9 +48,9 @@ final class DispatchContractTest {
   }
 
   @Test
-  void libraryIsAbi5() {
+  void libraryIsAbi6() {
     int v = IrohLibrary.getInstance().abiVersion();
-    assertEquals(5, v >> 16);
+    assertEquals(6, v >> 16);
     assertEquals(IrohLibrary.EXPECTED_ABI_MAJOR, v >> 16);
   }
 

@@ -536,12 +536,9 @@ pub unsafe extern "C" fn aster_node_start_enrolled(
         x if x == aster_enrollment_side_t::ASTER_ENROLLMENT_SIDE_CLIENT as u32 => Side::Client,
         other => return invalid(format!("unknown enrollment side {other}")),
     };
-    let mut cfg = match config.as_ref() {
-        None => AsterConfig::default(),
-        Some(c) => match node::lower_config(c) {
-            Ok(cfg) => cfg,
-            Err(e) => return invalid(e),
-        },
+    let mut cfg = match node::lower_config_ptr(config) {
+        Ok(cfg) => cfg,
+        Err(e) => return invalid(e),
     };
     let trust: TrustJson = attempt!(parse_json(
         attempt!(in_slice(&trust_json, "trust_json")),

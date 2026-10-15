@@ -218,7 +218,7 @@ same env and TOML names and the same defaults:
 
 | Binding | Blob compression | Port reuse |
 |---|---|---|
-| C ABI (5.2) | `aster_config_t.blob_zstd_level`: `0` = default, `-1` = off, 1..19 | `aster_config_t.reuse_last_port`: `aster_reuse_last_port_t` (`DEFAULT` / `ENABLED` / `DISABLED`) |
+| C ABI (6.0) | `aster_config_t.blob_zstd_level`: `0` = default, `-1` = off, 1..19 | `aster_config_t.reuse_last_port`: `aster_reuse_last_port_t` (`DEFAULT` / `ENABLED` / `DISABLED`) |
 | Go | `AsterConfig.BlobZstdLevel *int` (nil = 3, `0` = off) | `AsterConfig.ReuseLastPort *bool` (nil = on) |
 | Python | `AsterConfig(blob_zstd_level=0)` | `AsterConfig(reuse_last_port=False)` |
 | TypeScript | `blobZstdLevel: 0` | `reuseLastPort: false` |

@@ -50,15 +50,7 @@ public sealed class Runtime : IDisposable
     /// </summary>
     public Runtime(RuntimeConfig config)
     {
-        uint loaded = Native.aster_abi_version();
-        if (loaded >> 16 != Native.AbiVersionMajor)
-            throw new IrohException(Status.AbiMismatch,
-                $"native library ABI {loaded >> 16}.{(loaded >> 8) & 0xff}.{loaded & 0xff} " +
-                $"does not match binding ABI major {Native.AbiVersionMajor}");
-        if (((loaded >> 8) & 0xff) < Native.RequiredAbiMinor)
-            throw new IrohException(Status.AbiMismatch,
-                $"native library ABI {loaded >> 16}.{(loaded >> 8) & 0xff} is too old: this binding needs " +
-                $"{Native.AbiVersionMajor}.{Native.RequiredAbiMinor}+ (rebuild libaster_transport_ffi or set -p:NativeLibraryPath)");
+        Native.EnsureAbi();
 
         config.struct_size = (uint)Marshal.SizeOf<RuntimeConfig>();
         int r = Native.aster_runtime_new(Native.AbiVersionMajor, in config, out _handle);

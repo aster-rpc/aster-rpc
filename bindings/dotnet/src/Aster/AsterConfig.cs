@@ -168,6 +168,7 @@ public sealed record AsterConfig
     public static unsafe AsterConfig Default()
     {
         ConfigNative n = default;
+        Native.EnsureAbi();
         Native.Check(Native.aster_config_init(&n), "aster_config_init");
         return FromNative(in n, new AsterConfig());
     }
@@ -180,6 +181,7 @@ public sealed record AsterConfig
     public static unsafe AsterConfig FromEnv()
     {
         ConfigNative n = default;
+        Native.EnsureAbi();
         Native.Check(Native.aster_config_from_env(&n), "aster_config_from_env");
         AsterConfig c;
         try { c = FromNative(in n, new AsterConfig()).WithBindingEnv(); }
@@ -198,6 +200,7 @@ public sealed record AsterConfig
     {
         ConfigNative n = default;
         Bytes trust = default;
+        Native.EnsureAbi();
         using (var scope = new NativeScope())
             Native.Check(Native.aster_config_from_toml(scope.Utf8(path), &n), "aster_config_from_toml");
         AsterConfig c;
@@ -265,7 +268,7 @@ public sealed record AsterConfig
 
     // ── aster_config_t marshalling ────────────────────────────────────────
 
-    // ASTER_BLOB_ZSTD_LEVEL_* and aster_reuse_last_port_t (ABI 5.2).
+    // ASTER_BLOB_ZSTD_LEVEL_* and aster_reuse_last_port_t (C ABI 6.0).
     private const int BlobZstdLevelDefault = 0, BlobZstdLevelOff = -1, BlobZstdLevelMax = 19;
     private const uint ReuseLastPortDefault = 0, ReuseLastPortEnabled = 1, ReuseLastPortDisabled = 2;
 
@@ -277,6 +280,7 @@ public sealed record AsterConfig
     internal unsafe ConfigNative ToNative(NativeScope scope, IEnumerable<string>? extraAlpns = null)
     {
         ConfigNative n = default;
+        Native.EnsureAbi();
         Native.Check(Native.aster_config_init(&n), "aster_config_init");
 
         var urls = RelayUrls.ToList();
