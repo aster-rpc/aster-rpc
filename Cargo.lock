@@ -3064,8 +3064,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-blobs"
-version = "0.103.7"
-source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=f04ca2cdf28194bafd5bf7fb2732cc67e39a6799#f04ca2cdf28194bafd5bf7fb2732cc67e39a6799"
+version = "0.103.8"
+source = "git+https://forge.emrul.dev/Aster/iroh-blobs.git?rev=4971183ce58e5f55385825a879b94c991d383f57#4971183ce58e5f55385825a879b94c991d383f57"
 dependencies = [
  "arrayvec",
  "bao-tree",
@@ -3100,6 +3100,7 @@ dependencies = [
  "smallvec",
  "tokio",
  "tracing",
+ "zstd",
 ]
 
 [[package]]
