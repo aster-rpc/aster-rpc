@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # preflight.sh -- run CI's fast checks (scripts/ci/checks.sh) on linbox, in the
 # pinned CI image, before pushing to main. A main push costs a ~34-minute gate
-# run; this catches lint, feature-graph, advisory and test-collection failures
+# run (suspended for now: docs/_internal/cicd.md, "Push CI suspended"); this catches lint, feature-graph, advisory and test-collection failures
 # in minutes instead.
 #
 #   scripts/ci/preflight.sh                  checks.sh preflight
