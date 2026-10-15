@@ -197,9 +197,12 @@ func GossipEventFromJSON(s string) (*GossipEvent, error) {
 // ─── Key helpers (§11.2, §12.4) ─────────────────────────────────────────────
 
 // RegistryPrefixes lists the key namespaces a registry client should sync (applied
-// via set_download_policy "nothing_except").
+// via set_download_policy "nothing_except"). Every family a key helper below
+// writes must be covered, or the entry syncs without its value; "endpoints/" and
+// "compatibility/" are spec-reserved families with no helper yet.
 var RegistryPrefixes = [][]byte{
 	[]byte("contracts/"),
+	[]byte("manifests/"),
 	[]byte("services/"),
 	[]byte("endpoints/"),
 	[]byte("compatibility/"),

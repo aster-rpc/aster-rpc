@@ -30,6 +30,19 @@ func TestRegistryKeyFormat(t *testing.T) {
 // iroh-docs lets a write at a key supersede the same author's older entries
 // whose keys extend it, so no registry key may be a byte prefix of another.
 func TestRegistryKeysArePrefixFree(t *testing.T) {
+	keys := familyKeys()
+	for _, a := range keys {
+		for _, b := range keys {
+			if !bytes.Equal(a, b) && bytes.HasPrefix(b, a) {
+				t.Fatalf("%q is a prefix of %q", a, b)
+			}
+		}
+	}
+}
+
+// familyKeys returns keys from every helper, over segments chosen to provoke
+// prefix collisions. A new key family belongs here.
+func familyKeys() [][]byte {
 	leaves := []string{"1", "10", "stable", "stable2", "x/y", "x", "", "%2F"}
 	var keys [][]byte
 	for _, name := range []string{"svc", "svc2", "a/b", "a", "50%"} {
@@ -44,11 +57,18 @@ func TestRegistryKeysArePrefixFree(t *testing.T) {
 			keys = append(keys, VersionKey(name, v))
 		}
 	}
-	for _, a := range keys {
-		for _, b := range keys {
-			if !bytes.Equal(a, b) && bytes.HasPrefix(b, a) {
-				t.Fatalf("%q is a prefix of %q", a, b)
-			}
+	return keys
+}
+
+// A client that syncs only RegistryPrefixes receives every family the helpers write.
+func TestRegistryPrefixesCoverEveryFamily(t *testing.T) {
+	for _, key := range familyKeys() {
+		covered := false
+		for _, p := range RegistryPrefixes {
+			covered = covered || bytes.HasPrefix(key, p)
+		}
+		if !covered {
+			t.Fatalf("no RegistryPrefixes entry covers %q", key)
 		}
 	}
 }
