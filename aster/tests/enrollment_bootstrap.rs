@@ -901,8 +901,9 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
         }
 
         let copied = node(8).await;
-        // Local credential validation also rejects a credential copied to a
-        // different persisted key, before it could be put on the network.
+        // Local credential validation also drops a credential copied to a
+        // different persisted key, so it is never put on the network; the
+        // node could be admitted only by a registration of its own.
         let copied_store = Arc::new(
             EnrollmentPolicyStore::open(
                 files.path().join("copied.json"),
@@ -912,17 +913,19 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
             )
             .unwrap(),
         );
-        assert!(Enrollment::install(
+        let copied_enroll = Enrollment::install(
             &copied,
             copied_store,
             JwtEnrollmentVerifier::new(public(1), FLEET).unwrap(),
             Some(reusable),
             Arc::new(PolicyExpressionV1::Predicate(
-                PolicyPredicate::TolerateStalePolicy
+                PolicyPredicate::TolerateStalePolicy,
             )),
-            Default::default()
+            Default::default(),
         )
-        .is_err());
+        .unwrap();
+        assert!(copied_enroll.credential().is_none());
+        drop(copied_enroll);
         copied.shutdown().await;
 
         let replay = node(7).await;

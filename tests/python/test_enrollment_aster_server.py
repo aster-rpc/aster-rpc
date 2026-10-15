@@ -361,16 +361,13 @@ async def test_misconfiguration_fails_closed_with_a_clear_error(root, tmp_path):
         base(2, enrollment_credential_chain=chain, enrollment={**good, "state_path": None}),
         "keeps denials durably",
     )
-    await refused(base(2, enrollment=good), "no credential")
+    # A server with no credential, or one that does not verify for its key,
+    # starts: only a root registration admits it (aster/tests/
+    # enrollment_aster_server.rs registered_server_restarts_without_a_valid_credential).
     # A file path where the inline chain belongs.
     await refused(
         base(2, enrollment_credential_chain="/etc/aster/server.cred", enrollment=good),
         "ASTER_ENROLLMENT_CREDENTIAL)",
-    )
-    # A credential issued for another key.
-    await refused(
-        base(2, enrollment_credential_chain=credential(3), enrollment=good),
-        "enrollment:",
     )
     await refused(
         base(2, enrollment_credential_chain=chain, enrollment={**good, "policy": "allow_everyone"}),

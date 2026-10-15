@@ -684,7 +684,9 @@ fn misconfiguration_fails_closed() {
         );
         let mut no_credential = trust(namespace, &credential, good.clone());
         no_credential["enrollment_credential_chain"] = Value::Null;
-        refused(no_credential, SERVER, "no credential");
+        // Only a client must hold a credential; a registered server starts
+        // without one (aster-enrollment.md §4).
+        refused(no_credential, CLIENT, "no credential");
         refused(
             trust(namespace, "/etc/aster/node.cred", good.clone()),
             SERVER,
@@ -725,11 +727,13 @@ fn misconfiguration_fails_closed() {
             INVALID
         );
 
-        // A credential issued for another key: the node starts, install
-        // refuses it, and the node is closed again.
-        let (code, message) =
-            start(rt, 6, &trust(namespace, &credential, json!({})), CLIENT).unwrap_err();
-        assert_eq!(code, INVALID, "{message}");
+        // A credential issued for another key does not verify for this node:
+        // install drops it rather than refusing (a registered node needs no
+        // valid credential), so the node starts and never presents it.
+        let (node, enrollment) =
+            start(rt, 6, &trust(namespace, &credential, json!({})), CLIENT).unwrap();
+        assert_ne!(enrollment, 0);
+        close_node(rt, node);
 
         // Not enabled (the root alone does not enable it): a plain node.
         let (node, enrollment) = start(

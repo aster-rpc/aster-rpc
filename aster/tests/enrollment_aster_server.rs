@@ -215,6 +215,16 @@ impl Root {
 
     /// Publish a revoked registration for `subject` in the fleet namespace.
     async fn revoke(&self, subject: [u8; 32]) {
+        self.publish(subject, NodeRegistrationStatus::Revoked).await;
+    }
+
+    /// Promote `subject`: publish an active registration in the fleet
+    /// namespace, as `aster enroll promote` does.
+    async fn register(&self, subject: [u8; 32]) {
+        self.publish(subject, NodeRegistrationStatus::Active).await;
+    }
+
+    async fn publish(&self, subject: [u8; 32], status: NodeRegistrationStatus) {
         let record = NodeRegistrationV1 {
             version: 1,
             issuer: hex::encode(public(1)),
@@ -224,7 +234,7 @@ impl Root {
             issued_at: now() - 60,
             not_before: None,
             expires_at: None,
-            status: NodeRegistrationStatus::Revoked,
+            status,
             claims: role_claims(None),
             mandatory: vec![],
             reauthorizes_revision: None,
@@ -264,6 +274,20 @@ async fn start_server(config: AsterConfig) -> aster::Result<AsterServer> {
         .await?;
     wait_for_addr(server.node()).await;
     Ok(server)
+}
+
+/// [`start_server`] for a restart in the same process: the previous
+/// instance's tasks release the policy store's lock shortly after shutdown.
+async fn restart_server(config: AsterConfig) -> aster::Result<AsterServer> {
+    for _ in 0..100 {
+        match start_server(config.clone()).await {
+            Err(error) if error.to_string().contains("lock acquisition failed") => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            result => return result,
+        }
+    }
+    start_server(config).await
 }
 
 fn client_config(root: &Root, seed: u8, chain: String) -> AsterConfig {
@@ -395,6 +419,107 @@ async fn credential_roles_gate_requires_and_root_revocation_closes_the_connectio
             client.close().await;
         }
         server.shutdown().await;
+        root.node.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
+/// A credential admits a persistent node only until the root registers it
+/// (design §4), so a registered server restarts with its credential expired,
+/// or with none, and its replica admits it by the registration. While it ran
+/// past expiry it stopped presenting the expired chain (declared locality
+/// falls back to the record). An unregistered node with an expired
+/// credential is still refused.
+#[tokio::test]
+async fn registered_server_restarts_without_a_valid_credential() {
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let enrollment = EnrollmentConfig {
+            replicas: vec![root.ticket()],
+            ..server_enrollment(&root, files.path())
+        };
+        let expires = now() + 4;
+        let short = {
+            let request = EnrollmentIssueRequest::new(public(2), FLEET, expires);
+            issue_credential(&key(1), &request, now())
+                .unwrap()
+                .into_chain()
+        };
+        let config = |chain: Option<String>| {
+            let mut builder = base(2).enrollment(enrollment.clone());
+            if let Some(chain) = chain {
+                builder = builder.enrollment_credential_chain(chain);
+            }
+            builder.build()
+        };
+        let source = |peer: [u8; 32]| {
+            root.enrollment
+                .peer_session(&peer)
+                .map(|(_, evidence)| evidence.source())
+        };
+
+        // Admitted on its credential; the root then promotes it.
+        let server = start_server(config(Some(short.clone()))).await.unwrap();
+        assert!(matches!(
+            source(public(2)),
+            Some(AdmissionEvidenceSource::PresentedChain { .. })
+        ));
+        root.register(public(2)).await;
+        let locality = server.enrollment().unwrap().topology_locality();
+        assert!((locality.own_chain)().is_some());
+        while now() <= expires {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(
+            (locality.own_chain)().is_none(),
+            "an expired chain is no longer presented"
+        );
+        // The locality source holds the enrollment; release it so the
+        // restart below can take the policy store's lock.
+        drop(locality);
+        server.shutdown().await;
+
+        // Restarts with the expired credential, then with none at all.
+        for chain in [Some(short.clone()), None] {
+            let server = restart_server(config(chain)).await.unwrap();
+            assert!(server.enrollment().unwrap().credential().is_none());
+            assert!(matches!(
+                source(public(2)),
+                Some(AdmissionEvidenceSource::RootAuthoredRecord { .. })
+            ));
+            server.shutdown().await;
+        }
+
+        // Not registered: the expired credential starts nothing the replica
+        // admits, so the server cannot attach policy and does not start.
+        let expired = {
+            let request = EnrollmentIssueRequest::new(public(4), FLEET, now() - 60);
+            issue_credential(&key(1), &request, now() - 3600)
+                .unwrap()
+                .into_chain()
+        };
+        let refused = start_server(
+            base(4)
+                .enrollment_credential_chain(expired)
+                .enrollment(EnrollmentConfig {
+                    state_path: Some(files.path().join("unregistered.json")),
+                    ..enrollment.clone()
+                })
+                .build(),
+        )
+        .await;
+        let error = refused
+            .err()
+            .expect("an unregistered expired node is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("enrolling with the policy replicas"),
+            "{error}"
+        );
+        assert!(source(public(4)).is_none());
         root.node.shutdown().await;
     })
     .await
@@ -645,7 +770,13 @@ async fn misconfiguration_fails_closed_with_a_clear_error() {
             "keeps denials durably",
         )
         .await;
-        refused(base(2).enrollment(good.clone()).build(), "no credential").await;
+        // A server without a credential starts: only a root registration
+        // can admit it (`registered_server_restarts_without_a_valid_credential`).
+        let uncredentialed = restart_server(base(2).enrollment(good.clone()).build())
+            .await
+            .unwrap();
+        assert!(uncredentialed.enrollment().unwrap().credential().is_none());
+        uncredentialed.shutdown().await;
         // A file path where the inline chain belongs.
         refused(
             base(2)
@@ -655,15 +786,18 @@ async fn misconfiguration_fails_closed_with_a_clear_error() {
             "ASTER_ENROLLMENT_CREDENTIAL)",
         )
         .await;
-        // A credential issued for another key.
-        refused(
+        // A credential issued for another key does not verify for this node:
+        // it is dropped and never presented, like an expired one.
+        let foreign = restart_server(
             base(2)
                 .enrollment_credential_chain(credential(3, None))
                 .enrollment(good.clone())
                 .build(),
-            "enrollment:",
         )
-        .await;
+        .await
+        .unwrap();
+        assert!(foreign.enrollment().unwrap().credential().is_none());
+        foreign.shutdown().await;
         refused(
             server_base()
                 .enrollment(EnrollmentConfig {
@@ -697,7 +831,7 @@ async fn misconfiguration_fails_closed_with_a_clear_error() {
         .await;
 
         // A client: no credential, and server-only issuer settings.
-        let server = start_server(server_base().enrollment(good.clone()).build())
+        let server = restart_server(server_base().enrollment(good.clone()).build())
             .await
             .unwrap();
         let mut no_credential = client_config(&root, 5, String::new());

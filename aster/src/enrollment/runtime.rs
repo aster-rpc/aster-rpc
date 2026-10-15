@@ -273,7 +273,7 @@ pub struct Plan {
     root: [u8; 32],
     namespace: [u8; 32],
     audience: String,
-    credential: String,
+    credential: Option<String>,
     policy: Arc<dyn AdmissionPolicy>,
     options: EnrollmentOptions,
     leeway: Option<u64>,
@@ -342,9 +342,13 @@ pub fn plan(config: &mut AsterConfig, side: Side, overrides: Overrides) -> Resul
                      (ASTER_ENROLLMENT_CREDENTIAL)",
                 ));
             }
-            chain
+            Some(chain)
         }
-        (None, Some(path)) => read_text(path, "enrollment_credential")?,
+        (None, Some(path)) => Some(read_text(path, "enrollment_credential")?),
+        // A registered server needs no credential: the root's registration
+        // admits it, and its credential, once expired, is dropped anyway
+        // (design §4). A client always enrolls with a credential.
+        (None, None) if side == Side::Server => None,
         (None, None) => {
             return Err(invalid(
                 "this node has no credential: set [trust] enrollment_credential (a file) or \
@@ -353,7 +357,7 @@ pub fn plan(config: &mut AsterConfig, side: Side, overrides: Overrides) -> Resul
             ))
         }
     };
-    if credential.is_empty() {
+    if credential.as_ref().is_some_and(String::is_empty) {
         return Err(invalid("the credential is empty"));
     }
 
@@ -485,7 +489,8 @@ impl Plan {
     }
 
     /// Install on `node` (started with fail-closed hooks and the enrollment
-    /// ALPN). Refuses a credential that does not verify for this node.
+    /// ALPN). A credential that no longer verifies is dropped with a warning:
+    /// peers then admit the node only by its root registration.
     pub fn install(&self, node: &Node) -> Result<Installed> {
         let path = self.state_path();
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -509,7 +514,7 @@ impl Plan {
             node,
             Arc::new(store),
             verifier,
-            Some(self.credential.clone()),
+            self.credential.clone(),
             self.policy.clone(),
             self.options.clone(),
         )

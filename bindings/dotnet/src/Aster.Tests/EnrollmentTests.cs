@@ -306,12 +306,11 @@ public class EnrollmentTests
         await Refused("no audience", new() { Config = With(e => e with { Audience = null }) }, "audience is required");
         await Refused("no root", new() { Config = Good() with { RootPubkey = null } }, "no trusted root");
         await Refused("no state", new() { Config = With(e => e with { StatePath = null }) }, "keeps denials durably");
-        await Refused("no credential", new() { Config = Good() with { EnrollmentCredentialChain = null, Enrollment = Good().Enrollment with { Enabled = true } } },
-            "no credential");
+        // A server with no credential, or one that does not verify for its key,
+        // starts: only a root registration admits it (aster/tests/
+        // enrollment_aster_server.rs registered_server_restarts_without_a_valid_credential).
         await Refused("a path where the chain belongs", new() { Config = Good() with { EnrollmentCredentialChain = "/etc/aster/server.cred" } },
             "ASTER_ENROLLMENT_CREDENTIAL)");
-        await Refused("a credential for another key", new() { Config = Good() with { EnrollmentCredentialChain = CredentialFor(3, "") } },
-            "enrollment:");
         await Refused("unknown policy", new() { Config = With(e => e with { Policy = EnrollmentPolicy.FromJson("\"allow_everyone\"") }) }, "policy");
         await Refused("policy override", new() { Config = Good(), EnrollmentPolicy = EnrollmentPolicy.AllOf() }, "policy");
         await Refused("namespace", new() { Config = With(e => e with { FleetNamespace = "not-hex" }) }, "fleet_namespace");

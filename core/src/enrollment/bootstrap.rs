@@ -563,18 +563,37 @@ impl EnrollmentService {
             &options.applied_rotations,
         )?;
         let own = identity(&node.node_id())?;
-        // A credential anchored at a root this node has since rotated away
-        // from is not presented; the node is admitted by records instead.
+        // A credential only admits a node until the root registers it (design
+        // §4), so a node never needs a valid one to start: one that no longer
+        // verifies (expired, revoked issuer path, anchored at a root this node
+        // rotated away from) is dropped and never presented, and peers admit
+        // the node by its registration or refuse it. Dropping confers nothing:
+        // the decision stays with each peer's own records. A credential that
+        // is only early (`ClockSkew`) still fails, since the local clock, not
+        // the credential, is what needs fixing.
         let own_evidence = match credential.as_deref() {
             Some(token) => match verifier.verify(token, &own, unix_now()) {
                 Ok(evidence) => Some(evidence),
+                Err(error @ EnrollmentError::ClockSkew { .. }) => return Err(error.into()),
                 Err(error) if rotation.as_ref().is_some_and(|r| r.root.seq > 0) => {
                     tracing::warn!(?error, "enrollment: credential predates the current root");
                     None
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    tracing::warn!(
+                        ?error,
+                        "enrollment: this node's credential does not verify and is not \
+                         presented; peers admit it only by a root registration"
+                    );
+                    None
+                }
             },
-            None => None,
+            None => {
+                tracing::info!(
+                    "enrollment: no credential; peers admit this node only by a root registration"
+                );
+                None
+            }
         };
         let credential = credential.filter(|_| own_evidence.is_some());
         let hooks =
@@ -934,12 +953,24 @@ impl EnrollmentService {
         self.trust.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// The chain this node presents: its credential while unexpired. An
+    /// expired chain admits nothing, and presenting one would only shadow the
+    /// registration a peer falls back to (declared locality, for one).
     fn own_chain(&self) -> Option<String> {
-        self.own
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .chain
-            .clone()
+        let own = self.own.read().unwrap_or_else(|e| e.into_inner());
+        let current = own
+            .evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.expires_at().is_none_or(|exp| unix_now() < exp));
+        own.chain.clone().filter(|_| current)
+    }
+
+    /// The credential chain this node presents to peers now: its credential
+    /// while unexpired, `None` once it expired or was dropped at install.
+    /// [`Self::credential`] keeps returning an expired credential so renewal
+    /// can tell expiry from absence.
+    pub fn presented_chain(&self) -> Option<String> {
+        self.own_chain()
     }
 
     fn own_evidence(&self) -> Option<VerifiedAdmissionEvidence> {

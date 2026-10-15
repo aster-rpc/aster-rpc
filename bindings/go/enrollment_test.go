@@ -476,16 +476,12 @@ func TestEnrollment_MisconfigurationFailsClosed(t *testing.T) {
 	c = good()
 	c.Enrollment.StatePath = ""
 	refused("no state", ServerOptions{Config: c}, "keeps denials durably")
-	c = good()
-	c.EnrollmentCredentialChain = ""
-	c.Enrollment.Enabled = ptrBool(true)
-	refused("no credential", ServerOptions{Config: c}, "no credential")
+	// A server with no credential, or one that does not verify for its key,
+	// starts: only a root registration admits it (aster/tests/
+	// enrollment_aster_server.rs registered_server_restarts_without_a_valid_credential).
 	c = good()
 	c.EnrollmentCredentialChain = "/etc/aster/server.cred"
 	refused("a path where the chain belongs", ServerOptions{Config: c}, "ASTER_ENROLLMENT_CREDENTIAL)")
-	c = good()
-	c.EnrollmentCredentialChain = credentialFor(t, 3, "")
-	refused("a credential for another key", ServerOptions{Config: c}, "enrollment:")
 	c = good()
 	c.Enrollment.Policy = &Policy{"allow_everyone"}
 	refused("unknown policy", ServerOptions{Config: c}, "policy")

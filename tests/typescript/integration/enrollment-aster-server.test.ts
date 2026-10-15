@@ -365,11 +365,11 @@ describe.skipIf(!available)('Enrollment on AsterServer / AsterClient from AsterC
     await refusedStart({ ...good, enrollment: { ...good.enrollment, audience: undefined } }, 'audience is required');
     await refusedStart(without('rootPubkey'), 'no trusted root');
     await refusedStart({ ...good, enrollment: { ...good.enrollment, statePath: undefined } }, 'keeps denials durably');
-    await refusedStart(without('enrollmentCredentialChain'), 'no credential');
+    // A server with no credential, or one that does not verify for its key,
+    // starts: only a root registration admits it (aster/tests/
+    // enrollment_aster_server.rs registered_server_restarts_without_a_valid_credential).
     // A file path where the inline chain belongs.
     await refusedStart({ ...good, enrollmentCredentialChain: '/etc/aster/server.cred' }, 'ASTER_ENROLLMENT_CREDENTIAL)');
-    // A credential issued for another key.
-    await refusedStart({ ...good, enrollmentCredentialChain: root.issue(SecretKey.nodeId(SecretKey.generate())) }, 'enrollment:');
     await refusedStart({ ...good, enrollment: { ...good.enrollment, policy: 'allow_everyone' as any } }, 'policy');
     await refusedStart({ ...good, enrollment: { ...good.enrollment, fleetNamespace: 'not-hex' } }, 'fleet_namespace');
     // Enabled with nothing else set: still refused, never open.
