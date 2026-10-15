@@ -59,6 +59,21 @@ The Mission Control auth chapter in [`examples/`](examples/README.md) walks
 through it with the Rust `aster` CLI. Changes are listed in
 [`CHANGELOG.md`](CHANGELOG.md).
 
+## Blob compression and port reuse (ABI 5.2)
+
+Two node settings are on by default and can be turned off from configuration
+or code, as in the Rust SDK:
+
+| `AsterConfig` | Env | TOML | Meaning |
+|---|---|---|---|
+| `BlobZstdLevel` (`int?`) | `ASTER_BLOB_ZSTD_LEVEL` | `[storage] blob_zstd_level` | zstd level for blob transport. `null` = default (3); `0` (env/TOML also `off`) = off: the node serves and fetches blobs on the plain ALPN only; 1..19 = that level (larger values clamp to 19). |
+| `ReuseLastPort` (`bool?`) | `ASTER_REUSE_LAST_PORT` | `[network] reuse_last_port` | A persistent node re-binds its last UDP ports on restart (recorded in `bind-ports.json` in `StoragePath`). `null` = default (on). |
+
+```csharp
+var config = AsterConfig.FromEnv() with { BlobZstdLevel = 0, ReuseLastPort = false };
+await using var server = await AsterServer.StartAsync(new AsterServerOptions { Config = config });
+```
+
 ## Authenticated HTTPS and WebTransport serving
 
 An existing `AsterServer` can serve its registered RPC services through HTTPS

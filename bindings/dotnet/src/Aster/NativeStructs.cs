@@ -53,7 +53,7 @@ internal struct RpcStatusNative
     public IntPtr storage;
 }
 
-/// <summary><c>aster_config_t</c> (280 bytes).</summary>
+/// <summary><c>aster_config_t</c> (288 bytes; ABI 5.2 appended <c>blob_zstd_level</c> and <c>reuse_last_port</c>).</summary>
 [StructLayout(LayoutKind.Sequential)]
 internal struct ConfigNative
 {
@@ -91,6 +91,10 @@ internal struct ConfigNative
     public ulong transport_datagram_receive_buffer_size;
     public ulong transport_datagram_send_buffer_size;
     public IntPtr storage;
+    /// <summary>0 = default (3), -1 = off, 1..=19 = level.</summary>
+    public int blob_zstd_level;
+    /// <summary><c>aster_reuse_last_port_t</c>: 0 = default (on), 1 = enabled, 2 = disabled.</summary>
+    public uint reuse_last_port;
 }
 
 /// <summary><c>aster_grant_context_t</c> (104 bytes).</summary>

@@ -7,10 +7,10 @@
 **C header:** `ffi/aster_ffi.h`, ABI 5.x (`aster_*` symbols; `aster_runtime_new(5, ...)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 5.1, 2026-10-13)
+## STATUS (ABI 5.2, 2026-10-15)
 
 - **ABI:** needs `libaster_transport_ffi` ABI 5.x (`Native.AbiVersionMajor` = 5,
-  `Native.RequiredAbiMinor` = 1; 5.1 adds Enrollment from configuration and the lease grantor (`Native.Enrollment.cs`); 5.0 removed the Fory attestation functions and is otherwise 4.17: owned raw WebTransport and media controls, with 4.12 for explicit public listeners and certificate helpers (4.11 added owned authenticated HTTPS/WebTransport listeners, 4.10 added independently owned Doc event receivers, 4.6 added observability and health, and 4.5 added cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
+  `Native.RequiredAbiMinor` = 2; 5.2 grows `aster_config_t` to 288 bytes (`blob_zstd_level`, `reuse_last_port`; `AsterConfig.BlobZstdLevel` / `ReuseLastPort`); 5.1 adds Enrollment from configuration and the lease grantor (`Native.Enrollment.cs`); 5.0 removed the Fory attestation functions and is otherwise 4.17: owned raw WebTransport and media controls, with 4.12 for explicit public listeners and certificate helpers (4.11 added owned authenticated HTTPS/WebTransport listeners, 4.10 added independently owned Doc event receivers, 4.6 added observability and health, and 4.5 added cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.

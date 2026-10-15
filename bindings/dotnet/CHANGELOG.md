@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added: `AsterConfig.BlobZstdLevel` and `ReuseLastPort` (native ABI 5.2)
+
+Blob transport compression and port reuse on restart can now be set, and in
+particular turned off, from .NET: `BlobZstdLevel` (`null` = default 3, `0` =
+off, 1..19) and `ReuseLastPort` (`null` = default on). `FromEnv` / `FromToml`
+read `ASTER_BLOB_ZSTD_LEVEL` / `[storage] blob_zstd_level` and
+`ASTER_REUSE_LAST_PORT` / `[network] reuse_last_port`. Before, both were lost
+when the native config was copied and rebuilt, so they stayed on. The
+`aster_config_t` mirror grows to 288 bytes; requires native ABI **5.2**
+(`Native.RequiredAbiMinor` = 2).
+
 ### Changed: `SyncFinished` says how the round ended
 
 A `DocEventKind.SyncFinished` event now carries `Sync`, a `DocSyncResult`

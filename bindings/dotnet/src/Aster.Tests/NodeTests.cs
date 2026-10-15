@@ -20,7 +20,7 @@ public class NodeTests
         Assert.Equal(96, sizeof(StreamHeaderNative));
         Assert.Equal(72, sizeof(CallHeaderNative));
         Assert.Equal(64, sizeof(RpcStatusNative));
-        Assert.Equal(280, sizeof(ConfigNative));
+        Assert.Equal(288, sizeof(ConfigNative));
         Assert.Equal(104, sizeof(GrantContextNative));
         Assert.Equal(72, sizeof(GrantRecordNative));
         Assert.Equal(72, sizeof(GrantOutcomeNative));

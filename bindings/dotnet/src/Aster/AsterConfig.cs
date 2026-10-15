@@ -81,6 +81,19 @@ public sealed record AsterConfig
     public bool ClearRelayTransports { get; init; }
     public Portmapper Portmapper { get; init; }
     public TransportConfig Transport { get; init; } = new();
+    /// <summary>
+    /// zstd level for blob transport (Rust <c>AsterConfig::blob_zstd_level</c>): <c>null</c> = the
+    /// default (3), 0 = off (the node serves and fetches blobs on the plain ALPN only), 1..19 = that
+    /// level (larger values are clamped to 19). Env <c>ASTER_BLOB_ZSTD_LEVEL</c>; TOML
+    /// <c>[storage] blob_zstd_level</c>.
+    /// </summary>
+    public int? BlobZstdLevel { get; init; }
+    /// <summary>
+    /// Re-bind a persistent node's last UDP ports on restart (Rust
+    /// <c>AsterConfig::reuse_last_port</c>): <c>null</c> = the default (on). Env
+    /// <c>ASTER_REUSE_LAST_PORT</c>; TOML <c>[network] reuse_last_port</c>.
+    /// </summary>
+    public bool? ReuseLastPort { get; init; }
 
     // ── Trust and Enrollment ([trust], [enrollment]; design §15.3) ────────
     //
@@ -252,6 +265,10 @@ public sealed record AsterConfig
 
     // ── aster_config_t marshalling ────────────────────────────────────────
 
+    // ASTER_BLOB_ZSTD_LEVEL_* and aster_reuse_last_port_t (ABI 5.2).
+    private const int BlobZstdLevelDefault = 0, BlobZstdLevelOff = -1, BlobZstdLevelMax = 19;
+    private const uint ReuseLastPortDefault = 0, ReuseLastPortEnabled = 1, ReuseLastPortDisabled = 2;
+
     private const uint TBidi = 1, TUni = 1 << 1, TStreamRecv = 1 << 2, TRecv = 1 << 3, TSend = 1 << 4,
         TIdle = 1 << 5, TKeepAlive = 1 << 6, TMtu = 1 << 7, TDgramRecv = 1 << 8, TDgramSend = 1 << 9,
         TFairness = 1 << 10, TGso = 1 << 11;
@@ -293,6 +310,19 @@ public sealed record AsterConfig
         n.clear_relay_transports = ClearRelayTransports ? 1u : 0u;
         n.portmapper = (uint)Portmapper;
         n.proxy_from_env = ProxyFromEnv ? 1u : 0u;
+        n.blob_zstd_level = BlobZstdLevel switch
+        {
+            null => BlobZstdLevelDefault,
+            < 0 => throw new ArgumentException($"BlobZstdLevel must be 0 (off) or a level, got {BlobZstdLevel}", nameof(BlobZstdLevel)),
+            0 => BlobZstdLevelOff,
+            int level => Math.Min(level, BlobZstdLevelMax),
+        };
+        n.reuse_last_port = ReuseLastPort switch
+        {
+            null => ReuseLastPortDefault,
+            true => ReuseLastPortEnabled,
+            false => ReuseLastPortDisabled,
+        };
 
         uint set = 0;
         var t = Transport;
@@ -345,6 +375,18 @@ public sealed record AsterConfig
             ClearRelayTransports = n.clear_relay_transports != 0,
             Portmapper = (Portmapper)n.portmapper,
             ProxyFromEnv = n.proxy_from_env != 0,
+            BlobZstdLevel = n.blob_zstd_level switch
+            {
+                BlobZstdLevelOff => 0,
+                > 0 => n.blob_zstd_level,
+                _ => null,
+            },
+            ReuseLastPort = n.reuse_last_port switch
+            {
+                ReuseLastPortEnabled => true,
+                ReuseLastPortDisabled => false,
+                _ => null,
+            },
             Transport = new TransportConfig
             {
                 MaxConcurrentBidiStreams = U64(TBidi, n.transport_max_concurrent_bidi_streams),
