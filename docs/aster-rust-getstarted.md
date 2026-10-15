@@ -577,6 +577,14 @@ struct Chunk {
 - `VecDeque<u8>` and `#[fory(array)] Vec<u8>` cannot be binary, so they are
   rejected unless the field is marked `#[aster(uint8_list)]`. Fory 1.7 has no
   `bytes::Bytes` support, so `Bytes` cannot be a field type.
+- Spell byte arrays and containers out in the field; don't use a type alias.
+  Both derives classify these fields by how they are written, so
+  `hash: Hash32` with `type Hash32 = [u8; 32]` is not recognised as
+  binary. `AsterType` fails the build ("`[u8; 32]` is not an Aster wire
+  type"), and Fory alone fails at runtime ("carrier serializers selected by a
+  field must use canonical carrier syntax"). Write `hash: [u8; 32]`; the
+  alias can still name the type everywhere else. The same holds for aliases of
+  `Vec<_>`, sets and maps. An alias of your own struct is fine.
 
 Nested payload types — a struct field of another payload type, `Vec<Segment>`,
 `Option<Foo>`, `HashMap<String, Bar>`, and so on at any depth — are registered

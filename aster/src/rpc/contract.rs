@@ -72,6 +72,21 @@ impl Leaf {
 
 /// Describes how a Rust type appears as a contract field leaf. Implemented for
 /// scalars below and for user payload types via `#[derive(AsterType)]`.
+///
+/// Byte buffers and containers (`[u8; N]`, `Vec<T>`, sets, maps) have no impl:
+/// the derive recognises them by how the field is written. A field declared
+/// through a type alias (`type Hash32 = [u8; 32]`) reaches this trait instead,
+/// so the diagnostic below says to spell the type out. Fory 1.7 classifies
+/// fields by syntax too, and refuses such an alias when it builds its type
+/// resolver, so an impl here would only move the failure to runtime.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not an Aster wire type",
+    label = "no Aster contract mapping for `{Self}`",
+    note = "if this field is written through a type alias of a byte array, `Vec`, set or map \
+            (e.g. `type Hash32 = [u8; 32]`), spell the type out in the field: `#[derive(AsterType)]` \
+            and Fory both classify byte buffers and containers by their written syntax",
+    note = "if `{Self}` is your own struct or enum, derive `AsterType` for it"
+)]
 pub trait WireField {
     fn leaf() -> Leaf;
 
