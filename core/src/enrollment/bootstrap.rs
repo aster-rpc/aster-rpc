@@ -50,6 +50,15 @@ const UNAVAILABLE_REASON: &str = "enrollment unavailable";
 /// transport, a timeout or a busy responder).
 const FAILED_REASON: &str = "enrollment failed";
 const MAX_RATE_KEYS: usize = 8192;
+/// Target of the per-connection Gate-0 decision events, shared with the
+/// facade's own admission log (`aster::log_targets::ADMISSION`).
+const ADMISSION_TARGET: &str = "aster::admission";
+/// A denied peer gets at most one info-level line per interval; the rest of
+/// its denials log at debug. Remote peers choose how often they dial.
+const DENY_LOG_PEER_INTERVAL: Duration = Duration::from_secs(10);
+/// Info-level denial lines per second across all peers, so fresh identities
+/// cannot flood the log either.
+const DENY_LOG_PER_SECOND: u32 = 32;
 
 #[derive(Clone, Debug)]
 pub struct EnrollmentOptions {
@@ -322,6 +331,94 @@ struct RateState {
     sources: BTreeMap<IpAddr, u32>,
 }
 
+/// Bounds info-level Gate-0 denial lines (see [`DENY_LOG_PEER_INTERVAL`]).
+struct DenyLog {
+    window: Instant,
+    lines: u32,
+    /// When each recently denied peer last got an info line.
+    peers: BTreeMap<[u8; 32], Instant>,
+    /// Denials logged at debug only since the last info line.
+    suppressed: u64,
+}
+
+impl DenyLog {
+    fn new() -> Self {
+        Self {
+            window: Instant::now(),
+            lines: 0,
+            peers: BTreeMap::new(),
+            suppressed: 0,
+        }
+    }
+
+    /// Whether this denial gets an info line; if so, how many were demoted
+    /// to debug since the previous one.
+    fn permit(&mut self, peer: &[u8; 32]) -> Option<u64> {
+        let now = Instant::now();
+        if now.duration_since(self.window) >= Duration::from_secs(1) {
+            self.window = now;
+            self.lines = 0;
+        }
+        if self.peers.len() >= MAX_RATE_KEYS {
+            self.peers
+                .retain(|_, last| now.duration_since(*last) < DENY_LOG_PEER_INTERVAL);
+        }
+        let recent = self
+            .peers
+            .get(peer)
+            .is_some_and(|last| now.duration_since(*last) < DENY_LOG_PEER_INTERVAL);
+        if recent || self.lines >= DENY_LOG_PER_SECOND || self.peers.len() >= MAX_RATE_KEYS {
+            self.suppressed += 1;
+            return None;
+        }
+        self.lines += 1;
+        self.peers.insert(*peer, now);
+        Some(std::mem::take(&mut self.suppressed))
+    }
+}
+
+/// Why Gate 0 refused a connection, for its decision log.
+struct GateDenial {
+    reason: &'static str,
+    detail: Option<String>,
+}
+
+impl GateDenial {
+    fn new(reason: &'static str) -> Self {
+        Self {
+            reason,
+            detail: None,
+        }
+    }
+
+    fn from_admission(error: AdmissionError) -> Self {
+        let reason = match &error {
+            AdmissionError::Denied(
+                DenialReason::NodeRevoked
+                | DenialReason::CredentialRevoked
+                | DenialReason::IssuerRevoked
+                | DenialReason::RootRotated,
+            ) => "revoked",
+            AdmissionError::Denied(_) => "denied by policy",
+            AdmissionError::ClockSkew { .. } => "clock skew",
+            AdmissionError::Unavailable(_) => "policy unavailable",
+            AdmissionError::NotAdmitted => "no session",
+        };
+        Self {
+            reason,
+            detail: Some(error.to_string()),
+        }
+    }
+}
+
+/// The admission source a Gate-0 allow rests on, for its decision log.
+fn source_label(source: &AdmissionEvidenceSource) -> &'static str {
+    match source {
+        AdmissionEvidenceSource::PresentedChain { .. } => "credential",
+        AdmissionEvidenceSource::RootAuthoredRecord { .. } => "registration",
+    }
+}
+
 /// Enrollment connections waiting for their probe, oldest first.
 #[derive(Default)]
 struct PendingProbes {
@@ -441,6 +538,7 @@ pub struct EnrollmentService {
     handshake_counts: Mutex<HandshakeCounts>,
     pending_probes: Mutex<PendingProbes>,
     rate: Mutex<RateState>,
+    deny_log: Mutex<DenyLog>,
     next_generation: AtomicU64,
     revoked: broadcast::Sender<EnrollmentRevoked>,
 }
@@ -666,6 +764,7 @@ impl EnrollmentService {
                 peers: BTreeMap::new(),
                 sources: BTreeMap::new(),
             }),
+            deny_log: Mutex::new(DenyLog::new()),
             next_generation: AtomicU64::new(1),
             revoked,
         })
@@ -692,30 +791,53 @@ impl EnrollmentService {
     }
 
     /// Enrollment connections are only rate limited. Every other ALPN needs an
-    /// admitted session whose policy still allows the observed source.
+    /// admitted session whose policy still allows the observed source. Every
+    /// decision is logged once (see [`Self::log_decision`]).
     fn after_handshake(
         self: Arc<Self>,
         info: CoreHookHandshakeInfo,
         reply: oneshot::Sender<CoreAfterHandshakeDecision>,
     ) {
+        let alpn = info.alpn;
         let Ok(peer) = identity(&info.remote_endpoint_id) else {
+            tracing::info!(
+                target: ADMISSION_TARGET,
+                peer = %info.remote_endpoint_id,
+                alpn = %String::from_utf8_lossy(&alpn),
+                decision = "deny",
+                reason = "invalid peer identity",
+                "gate 0: enrollment refused connection"
+            );
             let _ = reply.send(hook_decision(false));
             return;
         };
         let address = info.observed_peer_addr;
-        if info.alpn == ENROLLMENT_ALPN {
+        if alpn == ENROLLMENT_ALPN {
             let allowed = self.take_rate_slot(peer, address.map(|address| address.ip()));
+            let decision = if allowed {
+                Ok(None)
+            } else {
+                Err(GateDenial::new("rate limited"))
+            };
+            self.log_decision(&peer, &alpn, decision);
             let _ = reply.send(hook_decision(allowed));
             return;
         }
         let permit = if self.has_session(&peer) {
-            self.gate_permits.clone().try_acquire_owned().ok()
+            self.gate_permits
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| GateDenial::new("gate busy"))
         } else {
-            None
+            Err(self.sessionless_denial(&peer))
         };
-        let Some(permit) = permit else {
-            let _ = reply.send(hook_decision(false));
-            return;
+        let permit = match permit {
+            Ok(permit) => permit,
+            Err(denial) => {
+                self.log_decision(&peer, &alpn, Err(denial));
+                let _ = reply.send(hook_decision(false));
+                return;
+            }
         };
         let connection = info.connection;
         tokio::spawn(async move {
@@ -724,37 +846,104 @@ impl EnrollmentService {
                 address: address.ip(),
                 provenance: SourceAddressProvenance::DirectPeer,
             });
-            let allowed = self.gate_connection(&peer, source, connection).await;
+            let decision = self.gate_connection(&peer, source, connection).await;
+            let allowed = decision.is_ok();
+            self.log_decision(&peer, &alpn, decision.map(Some));
             let _ = reply.send(hook_decision(allowed));
         });
     }
 
+    /// Why a peer with no session is refused: a recent definite revocation
+    /// is reported as such, anything else as a missing session.
+    fn sessionless_denial(&self, peer: &[u8; 32]) -> GateDenial {
+        match self.sessionless_standing(peer) {
+            AdmissionError::NotAdmitted => GateDenial::new("no session"),
+            other => GateDenial::from_admission(other),
+        }
+    }
+
+    /// One structured event per Gate-0 decision under `aster::admission`:
+    /// allows at debug, denials at info. A peer gets at most one info-level
+    /// denial per [`DENY_LOG_PEER_INTERVAL`] and all peers together at most
+    /// [`DENY_LOG_PER_SECOND`] a second; the rest log at debug and are
+    /// counted in the next info line's `suppressed`, since a remote decides
+    /// how often it dials.
+    fn log_decision(
+        &self,
+        peer: &[u8; 32],
+        alpn: &[u8],
+        decision: Result<Option<&'static str>, GateDenial>,
+    ) {
+        let peer_hex = hex::encode(peer);
+        let alpn = String::from_utf8_lossy(alpn);
+        match decision {
+            Ok(source) => tracing::debug!(
+                target: ADMISSION_TARGET,
+                peer = %peer_hex,
+                alpn = %alpn,
+                decision = "allow",
+                reason = if source.is_some() { "admitted" } else { "enrollment handshake" },
+                source = source.unwrap_or("none"),
+                "gate 0: enrollment admitted connection"
+            ),
+            Err(denial) => {
+                let permitted = self
+                    .deny_log
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .permit(peer);
+                let detail = denial.detail.as_deref().unwrap_or("");
+                match permitted {
+                    Some(suppressed) => tracing::info!(
+                        target: ADMISSION_TARGET,
+                        peer = %peer_hex,
+                        alpn = %alpn,
+                        decision = "deny",
+                        reason = denial.reason,
+                        detail,
+                        suppressed,
+                        "gate 0: enrollment refused connection"
+                    ),
+                    None => tracing::debug!(
+                        target: ADMISSION_TARGET,
+                        peer = %peer_hex,
+                        alpn = %alpn,
+                        decision = "deny",
+                        reason = denial.reason,
+                        detail,
+                        "gate 0: enrollment refused connection"
+                    ),
+                }
+            }
+        }
+    }
+
     /// Gate 0 for one ordinary connection: admit it only under the session it
     /// was evaluated against, and remember it in the same step so a later
-    /// definite denial closes it.
+    /// definite denial closes it. Returns the admitting evidence's kind.
     async fn gate_connection(
         &self,
         peer: &[u8; 32],
         source: Option<ObservedSourceAddress>,
         connection: CoreWeakConnection,
-    ) -> bool {
+    ) -> Result<&'static str, GateDenial> {
         let Some(session) = self.session(peer) else {
-            return false;
+            return Err(self.sessionless_denial(peer));
         };
-        if self.evaluate(&session.evidence, source).await.is_err() {
-            return false;
-        }
+        self.evaluate(&session.evidence, source)
+            .await
+            .map_err(GateDenial::from_admission)?;
         let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         let Some(current) = sessions
             .get_mut(peer)
             .filter(|current| current.generation == session.generation)
         else {
-            return false;
+            return Err(GateDenial::new("session changed"));
         };
         current.last_used = Instant::now();
         current.admitted.retain(CoreWeakConnection::is_alive);
         current.admitted.push(connection);
-        true
+        Ok(source_label(&session.evidence.source()))
     }
 
     /// Attach a document for a namespace the fleet binds, such as one this
