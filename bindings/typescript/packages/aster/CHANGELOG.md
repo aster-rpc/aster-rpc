@@ -5,6 +5,17 @@ All notable changes to `@aster-rpc/aster` (and its native addon
 
 ## Unreleased
 
+### Added: `blobZstdLevel` and `reuseLastPort` in `AsterConfig`
+
+`AsterConfig.blobZstdLevel` sets the zstd level of blob transport (unset = 3,
+`0` = off: the node serves and fetches blobs on the plain ALPN only, larger
+than 19 is clamped) and `AsterConfig.reuseLastPort` (default `true`) lets a
+persistent node re-bind its last UDP ports on restart. Both mirror the Rust
+`AsterConfig`, including `ASTER_BLOB_ZSTD_LEVEL` / `[storage]
+blob_zstd_level` and `ASTER_REUSE_LAST_PORT` / `[network] reuse_last_port`.
+Before, `fromEnv` / `fromFile` dropped both and every node ran with the
+defaults (on).
+
 ### Changed: `sync_finished` says how the round ended
 
 A `sync_finished` `DocEvent` now sets `syncOrigin` (`'accept'` or

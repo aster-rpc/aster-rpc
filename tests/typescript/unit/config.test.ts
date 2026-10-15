@@ -27,7 +27,7 @@ const ENV_KEYS = Object.keys(process.env).filter((k) => k.startsWith('ASTER_'))
     'ASTER_RELAY_MODE', 'ASTER_RELAY_URLS', 'ASTER_BIND_ADDR', 'ASTER_SECRET_KEY',
     'ASTER_SECRET_KEY_FILE', 'ASTER_STORAGE_PATH', 'ASTER_GC_INTERVAL_MS',
     'ASTER_HOOK_TIMEOUT_MS', 'ASTER_TRANSPORT_RECEIVE_WINDOW', 'ASTER_ENABLE_HOOKS',
-    'ASTER_PORTMAPPER_CONFIG',
+    'ASTER_PORTMAPPER_CONFIG', 'ASTER_BLOB_ZSTD_LEVEL', 'ASTER_REUSE_LAST_PORT',
   ]);
 
 const KEY_A = '11'.repeat(32);
@@ -299,6 +299,40 @@ describe('AsterConfig round trip', () => {
     // `{ ...fromEnv(), relayUrls }` (mode "default") selects custom relays.
     expect(AsterConfig.resolve({ relayMode: 'default', relayUrls: ['https://r'] }).relayMode)
       .toBe('custom');
+  });
+});
+
+describe('blobZstdLevel and reuseLastPort', () => {
+  it('default to level 3 and port reuse on', () => {
+    const c = AsterConfig.fromEnv();
+    expect(c.blobZstdLevel).toBe(3);
+    expect(c.reuseLastPort).toBe(true);
+  });
+
+  it('are read from ASTER_BLOB_ZSTD_LEVEL / ASTER_REUSE_LAST_PORT', () => {
+    process.env.ASTER_BLOB_ZSTD_LEVEL = 'off';
+    process.env.ASTER_REUSE_LAST_PORT = 'false';
+    const c = AsterConfig.fromEnv();
+    expect(c.blobZstdLevel).toBe(0);
+    expect(c.reuseLastPort).toBe(false);
+    process.env.ASTER_BLOB_ZSTD_LEVEL = '7';
+    expect(AsterConfig.fromEnv().blobZstdLevel).toBe(7);
+  });
+
+  it('are read from [storage] blob_zstd_level / [network] reuse_last_port', () => {
+    const path = join(dir, 'aster.toml');
+    writeFileSync(path, '[storage]\nblob_zstd_level = 9\n\n[network]\nreuse_last_port = false\n');
+    const c = AsterConfig.fromFile(path);
+    expect(c.blobZstdLevel).toBe(9);
+    expect(c.reuseLastPort).toBe(false);
+  });
+
+  it('turn off in code and clamp like Rust', () => {
+    const off = AsterConfig.resolve({ blobZstdLevel: 0, reuseLastPort: false });
+    expect(off.blobZstdLevel).toBe(0);
+    expect(off.reuseLastPort).toBe(false);
+    expect(AsterConfig.resolve({ blobZstdLevel: 40 }).blobZstdLevel).toBe(19);
+    expect(AsterConfig.resolve({}).blobZstdLevel).toBe(3);
   });
 });
 

@@ -421,6 +421,26 @@ preserve their exact `documentBytes` for persistence/forwarding. Summary ids and
 hashes are lowercase hex. Failures throw `ProvisioningError` with stable native
 `code` and diagnostic `detail`. These helpers do not sign or host a voter.
 
+## Blob compression and port reuse
+
+Two `AsterConfig` knobs that are on by default can be turned off, in code or
+from the environment / `aster.toml` like every other knob:
+
+```ts
+const server = new AsterServer({
+  services: [...],
+  config: {
+    storagePath: '/var/lib/my-app',
+    blobZstdLevel: 0,      // ASTER_BLOB_ZSTD_LEVEL=off, [storage] blob_zstd_level
+    reuseLastPort: false,  // ASTER_REUSE_LAST_PORT=false, [network] reuse_last_port
+  },
+});
+```
+
+`blobZstdLevel` is the zstd level of blob transport (unset = 3, `0` = off,
+1–19). `reuseLastPort` lets a persistent node re-bind the UDP ports recorded
+in `bind-ports.json` on restart, so peers' cached addresses stay valid.
+
 ## Observability
 
 Logs (into pino, winston or your own sink), custom metrics, tracing and the

@@ -189,3 +189,58 @@ describe('AsterServer / AsterClientWrapper on Node + AsterConfig', () => {
     await client.close();
   });
 });
+
+describe('blobZstdLevel and reuseLastPort reach the node', () => {
+  // aster::alpns::BLOBS_ZSTD: served beside the plain blobs ALPN unless
+  // blobZstdLevel is 0.
+  const ZSTD_ALPN = '/iroh-bytes/4+zstd/1';
+
+  async function ready(node: Node): Promise<void> {
+    for (let i = 0; i < 200 && node.directAddresses().length === 0; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+
+  async function dials(blobZstdLevel: number | undefined): Promise<boolean> {
+    await using server = await Node.start({ ...OFFLINE, blobZstdLevel });
+    await using client = await Node.start(OFFLINE);
+    await ready(server);
+    try {
+      const conn = await client.connect(server.addr, ZSTD_ALPN);
+      conn.close(0, 'done');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  it('blobZstdLevel 0 drops the zstd blobs ALPN', async () => {
+    expect(await dials(undefined)).toBe(true);
+    expect(await dials(0)).toBe(false);
+  });
+
+  it('reuseLastPort false records no bind-ports.json (config-driven AsterServer)', async () => {
+    for (const [reuseLastPort, recorded] of [[undefined, true], [false, false]] as const) {
+      const storagePath = join(dir, `srv-${String(reuseLastPort)}`);
+      const server = new AsterServer({ services: [], config: { storagePath, reuseLastPort } });
+      await server.start();
+      await server.close();
+      expect(existsSync(join(storagePath, 'bind-ports.json'))).toBe(recorded);
+    }
+  });
+
+  it('ASTER_REUSE_LAST_PORT=false reaches an AsterServer with no explicit config', async () => {
+    const storagePath = join(dir, 'srv-env');
+    process.env.ASTER_STORAGE_PATH = storagePath;
+    process.env.ASTER_REUSE_LAST_PORT = 'false';
+    try {
+      const server = new AsterServer({ services: [] });
+      await server.start();
+      await server.close();
+    } finally {
+      delete process.env.ASTER_STORAGE_PATH;
+      delete process.env.ASTER_REUSE_LAST_PORT;
+    }
+    expect(existsSync(join(storagePath, 'bind-ports.json'))).toBe(false);
+  });
+});

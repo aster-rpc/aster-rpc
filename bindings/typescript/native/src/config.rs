@@ -70,6 +70,11 @@ pub struct JsAsterConfig {
     /// Blob GC interval in milliseconds; `0` / unset disables GC.
     /// `ASTER_GC_INTERVAL_MS`, `[storage] gc_interval_ms`.
     pub gc_interval_ms: Option<Either<f64, BigInt>>,
+    /// zstd level for blob transport: unset = the default (3), `0` = off (the
+    /// node serves and fetches blobs on the plain ALPN only), `1`..`19` = that
+    /// level (larger values are clamped to 19). `ASTER_BLOB_ZSTD_LEVEL`
+    /// (also `off`), `[storage] blob_zstd_level`.
+    pub blob_zstd_level: Option<u32>,
     // ── Identity ─────────────────────────────────────────────────────────
     /// Node secret key, 64 hex characters. `ASTER_SECRET_KEY`,
     /// `[network] secret_key` (which also accept base64).
@@ -88,6 +93,9 @@ pub struct JsAsterConfig {
     pub relay_urls: Option<Vec<String>>,
     /// Local bind address, e.g. `"0.0.0.0:9000"`. `ASTER_BIND_ADDR`.
     pub bind_addr: Option<String>,
+    /// Re-bind a persistent node's last UDP ports on restart (default true).
+    /// `ASTER_REUSE_LAST_PORT`, `[network] reuse_last_port`.
+    pub reuse_last_port: Option<bool>,
     /// mDNS local discovery. `ASTER_LOCAL_DISCOVERY`.
     pub local_discovery: Option<bool>,
     /// Connection monitoring / remote-info tracking. `ASTER_ENABLE_MONITORING`.
@@ -472,6 +480,10 @@ impl JsAsterConfig {
             let ms = u64_in("gcIntervalMs", v)?;
             c.gc_interval = (ms > 0).then(|| Duration::from_millis(ms));
         }
+        if let Some(level) = self.blob_zstd_level {
+            // Same rule as `ASTER_BLOB_ZSTD_LEVEL` / `.blob_zstd_level(n)`.
+            c.blob_zstd_level = (level > 0).then(|| level.min(19) as u8);
+        }
         if let Some(v) = &self.secret_key {
             c.secret_key =
                 Some(SecretKey::from_hex(v).map_err(|e| invalid(format!("secretKey: {e}")))?);
@@ -482,6 +494,9 @@ impl JsAsterConfig {
             c.relay_mode = mode;
         }
         c.bind_addr = self.bind_addr.clone();
+        if let Some(v) = self.reuse_last_port {
+            c.reuse_last_port = v;
+        }
         if let Some(v) = self.local_discovery {
             c.local_discovery = v;
         }
@@ -614,12 +629,14 @@ impl JsAsterConfig {
                 c.gc_interval
                     .map_or(0, |d| d.as_millis().min(u64::MAX as u128) as u64),
             )),
+            blob_zstd_level: Some(c.blob_zstd_level.map_or(0, u32::from)),
             secret_key: c.secret_key.as_ref().map(SecretKey::to_hex),
             secret_key_file: path(&c.secret_key_file),
             identity_file: path(&c.identity_file),
             relay_mode: Some(relay_mode.to_string()),
             relay_urls,
             bind_addr: c.bind_addr.clone(),
+            reuse_last_port: Some(c.reuse_last_port),
             local_discovery: Some(c.local_discovery),
             enable_monitoring: Some(c.enable_monitoring),
             enable_hooks: Some(c.enable_hooks),

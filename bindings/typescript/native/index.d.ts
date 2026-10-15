@@ -1718,6 +1718,13 @@ export interface AsterConfig {
    */
   gcIntervalMs?: number | bigint
   /**
+   * zstd level for blob transport: unset = the default (3), `0` = off (the
+   * node serves and fetches blobs on the plain ALPN only), `1`..`19` = that
+   * level (larger values are clamped to 19). `ASTER_BLOB_ZSTD_LEVEL`
+   * (also `off`), `[storage] blob_zstd_level`.
+   */
+  blobZstdLevel?: number
+  /**
    * Node secret key, 64 hex characters. `ASTER_SECRET_KEY`,
    * `[network] secret_key` (which also accept base64).
    */
@@ -1741,6 +1748,11 @@ export interface AsterConfig {
   relayUrls?: Array<string>
   /** Local bind address, e.g. `"0.0.0.0:9000"`. `ASTER_BIND_ADDR`. */
   bindAddr?: string
+  /**
+   * Re-bind a persistent node's last UDP ports on restart (default true).
+   * `ASTER_REUSE_LAST_PORT`, `[network] reuse_last_port`.
+   */
+  reuseLastPort?: boolean
   /** mDNS local discovery. `ASTER_LOCAL_DISCOVERY`. */
   localDiscovery?: boolean
   /** Connection monitoring / remote-info tracking. `ASTER_ENABLE_MONITORING`. */
