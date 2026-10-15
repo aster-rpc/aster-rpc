@@ -90,6 +90,10 @@ public final class AsterConfig {
   private String proxyUrl;
   private boolean proxyFromEnv;
   private boolean localDiscovery;
+  private Boolean reuseLastPort;
+
+  // ── Blob transport ([storage] blob_zstd_level) ─────────────────────────
+  private Integer blobZstdLevel;
 
   // ── Logging ────────────────────────────────────────────────────────────
   private String logFormat = "text";
@@ -256,6 +260,24 @@ public final class AsterConfig {
   /** {@code null} (transport default), {@code "enabled"} or {@code "disabled"}. */
   public String portmapperConfig() {
     return portmapperConfig;
+  }
+
+  /**
+   * zstd level for blob transport (Rust {@code AsterConfig::blob_zstd_level}): {@code null} = the
+   * default (3), {@code 0} = off (the node serves and fetches blobs on the plain ALPN only), 1..19
+   * = that level. Env {@code ASTER_BLOB_ZSTD_LEVEL}; TOML {@code [storage] blob_zstd_level}.
+   */
+  public Integer blobZstdLevel() {
+    return blobZstdLevel;
+  }
+
+  /**
+   * Re-bind a persistent node's last UDP ports on restart (Rust {@code
+   * AsterConfig::reuse_last_port}): {@code null} = the default (on). Env {@code
+   * ASTER_REUSE_LAST_PORT}; TOML {@code [network] reuse_last_port}.
+   */
+  public Boolean reuseLastPort() {
+    return reuseLastPort;
   }
 
   public String proxyUrl() {
@@ -511,6 +533,28 @@ public final class AsterConfig {
     /** {@code null}, {@code "enabled"} or {@code "disabled"}. */
     public Builder portmapperConfig(String value) {
       c.portmapperConfig = value;
+      return this;
+    }
+
+    /**
+     * zstd level for blob transport: {@code null} = default (3), {@code 0} = off, 1..19 = that
+     * level (larger values are clamped to 19). See {@link AsterConfig#blobZstdLevel()}.
+     */
+    public Builder blobZstdLevel(Integer level) {
+      if (level != null && level < 0) {
+        throw new IllegalArgumentException(
+            "blobZstdLevel must be 0 (off) or a zstd level, got " + level);
+      }
+      c.blobZstdLevel = level == null ? null : Math.min(level, 19);
+      return this;
+    }
+
+    /**
+     * Re-bind a persistent node's last ports on restart; {@code null} = default (on). See {@link
+     * AsterConfig#reuseLastPort()}.
+     */
+    public Builder reuseLastPort(Boolean v) {
+      c.reuseLastPort = v;
       return this;
     }
 

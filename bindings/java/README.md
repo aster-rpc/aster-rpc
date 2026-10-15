@@ -55,6 +55,27 @@ authenticated node id.
 
 See [CHANGELOG.md](CHANGELOG.md) for the retired consumer admission.
 
+## Blob compression and port reuse
+
+Two node settings are on by default and can be turned off from `AsterConfig`,
+the environment or `aster.toml`, as in Rust:
+
+| Builder | Env | TOML | Default | Off |
+| --- | --- | --- | --- | --- |
+| `blobZstdLevel(Integer)` | `ASTER_BLOB_ZSTD_LEVEL` | `[storage] blob_zstd_level` | `null` = level 3 | `0` (env/TOML also `off`) |
+| `reuseLastPort(Boolean)` | `ASTER_REUSE_LAST_PORT` | `[network] reuse_last_port` | `null` = on | `false` |
+
+`blobZstdLevel` sets the zstd level of blob transport (1..19; larger values
+are clamped to 19). With `0` the node serves blobs only on the plain ALPN and
+fetches plain. `reuseLastPort` makes a persistent node (`storagePath` set,
+port left to the OS) re-bind the UDP ports it last used, recorded in
+`bind-ports.json`; with `false` it binds fresh ports and records nothing.
+Both cross the C ABI in `aster_config_t` (ABI 5.2).
+
+```java
+AsterConfig cfg = AsterConfig.builder().blobZstdLevel(0).reuseLastPort(false).build();
+```
+
 ## Authenticated HTTPS and WebTransport listeners
 
 `AsterServer.startHttp(upcalls, config)` exposes the server's registered services

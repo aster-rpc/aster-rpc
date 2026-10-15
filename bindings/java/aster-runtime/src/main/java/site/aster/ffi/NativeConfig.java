@@ -23,7 +23,7 @@ import site.aster.handle.IrohRuntime;
 public final class NativeConfig {
 
   /** {@code sizeof(aster_config_t)}. */
-  public static final long SIZE = 280;
+  public static final long SIZE = 288;
 
   /** {@code aster_enrollment_side_t}: a server (durable state; may run an issuer). */
   public static final int ENROLLMENT_SIDE_SERVER = 0;
@@ -84,6 +84,17 @@ public final class NativeConfig {
   private static final long T_KEEP_ALIVE_OFF = 248;
   private static final long T_DGRAM_RECV_OFF = 256;
   private static final long T_DGRAM_SEND_OFF = 264;
+  // ABI 5.2
+  private static final long BLOB_ZSTD_LEVEL = 280;
+  private static final long REUSE_LAST_PORT = 284;
+
+  // ASTER_BLOB_ZSTD_LEVEL_* (blob_zstd_level) and aster_reuse_last_port_t
+  static final int BLOB_ZSTD_LEVEL_DEFAULT = 0;
+  static final int BLOB_ZSTD_LEVEL_OFF = -1;
+  static final int BLOB_ZSTD_LEVEL_MAX = 19;
+  static final int REUSE_LAST_PORT_DEFAULT = 0;
+  static final int REUSE_LAST_PORT_ENABLED = 1;
+  static final int REUSE_LAST_PORT_DISABLED = 2;
 
   private NativeConfig() {}
 
@@ -138,6 +149,14 @@ public final class NativeConfig {
         PORTMAPPER,
         pm == null ? 0 : (pm.trim().equalsIgnoreCase("disabled") ? 2 : 1));
     seg.set(ValueLayout.JAVA_INT, PROXY_FROM_ENV, c.proxyFromEnv() ? 1 : 0);
+    seg.set(ValueLayout.JAVA_INT, BLOB_ZSTD_LEVEL, blobZstdLevelToNative(c.blobZstdLevel()));
+    Boolean reuse = c.reuseLastPort();
+    seg.set(
+        ValueLayout.JAVA_INT,
+        REUSE_LAST_PORT,
+        reuse == null
+            ? REUSE_LAST_PORT_DEFAULT
+            : (reuse ? REUSE_LAST_PORT_ENABLED : REUSE_LAST_PORT_DISABLED));
 
     int set = 0;
     set |= putLong(seg, T_BIDI, T_BIDI_OFF, c.transportMaxConcurrentBidiStreams());
@@ -199,6 +218,14 @@ public final class NativeConfig {
     int pm = seg.get(ValueLayout.JAVA_INT, PORTMAPPER);
     b.portmapperConfig(pm == 0 ? null : (pm == 2 ? "disabled" : "enabled"));
     b.proxyFromEnv(seg.get(ValueLayout.JAVA_INT, PROXY_FROM_ENV) != 0);
+    int level = seg.get(ValueLayout.JAVA_INT, BLOB_ZSTD_LEVEL);
+    b.blobZstdLevel(
+        level == BLOB_ZSTD_LEVEL_DEFAULT ? null : (level == BLOB_ZSTD_LEVEL_OFF ? 0 : level));
+    int reuse = seg.get(ValueLayout.JAVA_INT, REUSE_LAST_PORT);
+    b.reuseLastPort(
+        reuse == REUSE_LAST_PORT_ENABLED
+            ? Boolean.TRUE
+            : (reuse == REUSE_LAST_PORT_DISABLED ? Boolean.FALSE : null));
     int set = seg.get(ValueLayout.JAVA_INT, TRANSPORT_SET);
     b.transportMaxConcurrentBidiStreams(getLong(seg, set, T_BIDI, T_BIDI_OFF));
     b.transportMaxConcurrentUniStreams(getLong(seg, set, T_UNI, T_UNI_OFF));
@@ -427,6 +454,16 @@ public final class NativeConfig {
   }
 
   // ── helpers ───────────────────────────────────────────────────────────
+
+  /** {@code null} = default (0), {@code 0} = off (-1), a level clamped to 1..=19. */
+  static int blobZstdLevelToNative(Integer level) {
+    if (level == null) return BLOB_ZSTD_LEVEL_DEFAULT;
+    if (level < 0) {
+      throw new IllegalArgumentException(
+          "blobZstdLevel must be 0 (off) or a zstd level, got " + level);
+    }
+    return level == 0 ? BLOB_ZSTD_LEVEL_OFF : Math.min(level, BLOB_ZSTD_LEVEL_MAX);
+  }
 
   static void check(int status, String what) {
     if (status != 0) {

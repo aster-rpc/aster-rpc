@@ -5,6 +5,18 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Added: blob compression level and port reuse in `AsterConfig`
+
+`AsterConfig.blobZstdLevel()` (`null` = level 3, `0` = off, 1..19) and
+`AsterConfig.reuseLastPort()` (`null` = on), with builder setters
+`blobZstdLevel(Integer)` and `reuseLastPort(Boolean)`, mirror Rust
+`AsterConfig::blob_zstd_level` / `reuse_last_port`. `fromEnv()` and
+`fromFile()` read `ASTER_BLOB_ZSTD_LEVEL` / `[storage] blob_zstd_level` and
+`ASTER_REUSE_LAST_PORT` / `[network] reuse_last_port` through Rust. Before,
+both settings were lost when the config crossed the C ABI, so neither could
+be turned off from Java. `aster_config_t` is now 288 bytes, and the native
+library must be ABI **5.2** or newer (`IrohLibrary.REQUIRED_ABI_MINOR = 2`).
+
 ### Changed: `SYNC_FINISHED` says how the round ended
 
 `DocEvent` gains a `sync()` component, a `DocSyncResult` with `origin()`

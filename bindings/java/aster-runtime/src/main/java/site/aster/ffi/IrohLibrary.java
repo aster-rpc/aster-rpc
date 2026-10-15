@@ -216,7 +216,9 @@ public final class IrohLibrary implements SymbolLookup {
   public static final int EXPECTED_ABI_MAJOR = 5;
 
   /**
-   * Lowest C ABI minor version this binding runs against. 5.1 adds Enrollment from configuration
+   * Lowest C ABI minor version this binding runs against. 5.2 grows {@code aster_config_t} to 288
+   * bytes ({@code blob_zstd_level}, {@code reuse_last_port}), which {@code aster_config_init}
+   * fills, so an older library would write a shorter struct. 5.1 adds Enrollment from configuration
    * ({@code aster_config_enrollment_from_*}, {@code aster_node_start_enrolled}, {@code
    * aster_enrollment_*}) and the lease grantor ({@code aster_server_add_lease_grantor}, {@code
    * aster_lease_serializer_grantor_new}). 5.0 removed the attestation functions and is otherwise
@@ -226,7 +228,7 @@ public final class IrohLibrary implements SymbolLookup {
    * Version 4.12 adds public listeners and certificate helpers; version 4.11 adds authenticated
    * listeners and 4.10 adds owned Docs receivers.
    */
-  public static final int REQUIRED_ABI_MINOR = 1;
+  public static final int REQUIRED_ABI_MINOR = 2;
 
   /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
   public int abiVersion() {
@@ -2770,8 +2772,8 @@ public final class IrohLibrary implements SymbolLookup {
   // --- ABI 3.2: node config, aster_node_start, Gate 0, admission (ffi/src/node.rs) ---
 
   /**
-   * aster_config_t (ABI 3.2). Total 280 bytes; offsets pinned by ffi/src/layout.rs. Built and read
-   * by {@link NativeConfig}.
+   * aster_config_t (ABI 3.2; 5.2 appends blob_zstd_level and reuse_last_port). Total 288 bytes;
+   * offsets pinned by ffi/src/layout.rs. Built and read by {@link NativeConfig}.
    */
   public static final MemoryLayout ASTER_CONFIG =
       MemoryLayout.structLayout(
@@ -2808,7 +2810,9 @@ public final class IrohLibrary implements SymbolLookup {
           ValueLayout.JAVA_LONG.withName("transport_keep_alive_interval_ms"), // 248
           ValueLayout.JAVA_LONG.withName("transport_datagram_receive_buffer_size"), // 256
           ValueLayout.JAVA_LONG.withName("transport_datagram_send_buffer_size"), // 264
-          ValueLayout.ADDRESS.withName("storage") // 272
+          ValueLayout.ADDRESS.withName("storage"), // 272
+          ValueLayout.JAVA_INT.withName("blob_zstd_level"), // 280 (ABI 5.2)
+          ValueLayout.JAVA_INT.withName("reuse_last_port") // 284 (ABI 5.2)
           );
 
   /** Pack a borrowed span for a synchronous downcall; native submission copies its input. */
