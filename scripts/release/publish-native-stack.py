@@ -67,7 +67,7 @@ PACKAGES = [
     Package("iroh-mdns-address-lookup", "0.4.0", "bridge", "iroh-mdns-address-lookup"),
     Package("iroh-tickets", "1.0.0", "bridge", "iroh-tickets"),
     Package("iroh-util", "0.6.2", "fork", "iroh-util", "Cargo.toml"),
-    Package("iroh-gossip", "0.101.0", "fork", "iroh-gossip", "Cargo.toml"),
+    Package("iroh-gossip", "0.101.1", "fork", "iroh-gossip", "Cargo.toml"),
     Package("iroh-blobs", "0.103.8", "fork", "iroh-blobs", "Cargo.toml"),
     Package("iroh-docs", "0.101.5", "fork", "iroh-docs", "Cargo.toml"),
     Package("h3", "0.0.9", "vendor", "salvo", "vendor/h3/Cargo.toml"),
