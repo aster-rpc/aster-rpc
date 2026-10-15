@@ -168,7 +168,7 @@ OFF(aster_rpc_status_t, detail_values, 40);
 OFF(aster_rpc_status_t, storage, 56);
 
 /* ABI 3.2: node configuration. */
-LAYOUT(aster_config_t, 280);
+LAYOUT(aster_config_t, 288); /* 5.2: +blob_zstd_level, +reuse_last_port */
 OFF(aster_config_t, struct_size, 0);
 OFF(aster_config_t, relay_mode, 4);
 OFF(aster_config_t, relay_urls, 8);
@@ -203,6 +203,10 @@ OFF(aster_config_t, transport_keep_alive_interval_ms, 248);
 OFF(aster_config_t, transport_datagram_receive_buffer_size, 256);
 OFF(aster_config_t, transport_datagram_send_buffer_size, 264);
 OFF(aster_config_t, storage, 272);
+OFF(aster_config_t, blob_zstd_level, 280);
+OFF(aster_config_t, reuse_last_port, 284);
+_Static_assert(ASTER_BLOB_ZSTD_LEVEL_DEFAULT == 0 && ASTER_BLOB_ZSTD_LEVEL_OFF == -1 && ASTER_BLOB_ZSTD_LEVEL_MAX == 19, "zstd level encoding");
+_Static_assert(ASTER_REUSE_LAST_PORT_DEFAULT == 0 && ASTER_REUSE_LAST_PORT_ENABLED == 1 && ASTER_REUSE_LAST_PORT_DISABLED == 2, "reuse_last_port values");
 
 /* ABI 3.3: connection paths (data.rs). */
 _Static_assert(sizeof(aster_blob_format_t) == 4, "enum size");
@@ -456,7 +460,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MINOR == 1); /* 5.1: Enrollment (additive) */
+    CHECK(ASTER_ABI_VERSION_MINOR == 2); /* 5.2: aster_config_t blob_zstd_level + reuse_last_port */
     CHECK(ASTER_EVENT_ENROLLMENT_RESULT == 127);
     CHECK(ASTER_ENROLLMENT_ERROR_DENIED == 2 && ASTER_ENROLLMENT_ERROR_UNAVAILABLE == 4);
     CHECK(ASTER_STATUS_UNAVAILABLE == 19);
@@ -719,6 +723,8 @@ static void test_config(void) {
     CHECK(c.hook_timeout_ms == 5000);
     CHECK(c.hook_failure_mode == ASTER_HOOK_FAILURE_FAIL_OPEN);
     CHECK(c.transport_set == 0 && c.bind_addr.ptr == NULL && c.alpns.len == 0);
+    CHECK(c.blob_zstd_level == 3);
+    CHECK(c.reuse_last_port == ASTER_REUSE_LAST_PORT_ENABLED);
     CHECK(aster_config_release(&c) == ASTER_STATUS_OK);
 
     aster_config_t f;

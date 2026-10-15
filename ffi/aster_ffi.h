@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 5
 
-#define ASTER_ABI_VERSION_MINOR 1
+#define ASTER_ABI_VERSION_MINOR 2
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -192,6 +192,21 @@
  * Enable WebTransport on the TCP listener's exact bound address and port.
  */
 #define ASTER_HTTP_SERVER_WEBTRANSPORT 1
+
+/**
+ * `aster_config_t.blob_zstd_level` (ABI 5.2): not set, the default level (3).
+ */
+#define ASTER_BLOB_ZSTD_LEVEL_DEFAULT 0
+
+/**
+ * `aster_config_t.blob_zstd_level` (ABI 5.2): blob transport compression off.
+ */
+#define ASTER_BLOB_ZSTD_LEVEL_OFF -1
+
+/**
+ * Highest `aster_config_t.blob_zstd_level`; larger levels are clamped to it.
+ */
+#define ASTER_BLOB_ZSTD_LEVEL_MAX 19
 
 #define ASTER_TRANSPORT_MAX_CONCURRENT_BIDI_STREAMS (1 << 0)
 
@@ -747,6 +762,18 @@ typedef enum aster_portmapper_t {
   ASTER_PORTMAPPER_ENABLED = 1,
   ASTER_PORTMAPPER_DISABLED = 2,
 } aster_portmapper_t;
+
+/**
+ * `aster_config_t.reuse_last_port` (ABI 5.2).
+ */
+typedef enum aster_reuse_last_port_t {
+  /**
+   * Not set: the default (enabled).
+   */
+  ASTER_REUSE_LAST_PORT_DEFAULT = 0,
+  ASTER_REUSE_LAST_PORT_ENABLED = 1,
+  ASTER_REUSE_LAST_PORT_DISABLED = 2,
+} aster_reuse_last_port_t;
 
 /**
  * Blob wire format (`format` argument of the 3.3 blob downloads).
@@ -1906,6 +1933,19 @@ typedef struct aster_config_t {
    * Library-owned storage of a filled config; NULL for caller-built ones.
    */
   void *storage;
+  /**
+   * ABI 5.2. zstd level for blob transport (`AsterConfig::blob_zstd_level`):
+   * `ASTER_BLOB_ZSTD_LEVEL_DEFAULT` (0) = the default level (3),
+   * `ASTER_BLOB_ZSTD_LEVEL_OFF` (-1) = off (plain blobs ALPN only; fetches
+   * default to plain), 1..=19 = that level (larger values are clamped to
+   * 19). Other negative values are rejected.
+   */
+  int32_t blob_zstd_level;
+  /**
+   * ABI 5.2. One of `aster_reuse_last_port_t`: re-bind the last UDP ports
+   * of a persistent node (`AsterConfig::reuse_last_port`).
+   */
+  uint32_t reuse_last_port;
 } aster_config_t;
 
 /**
@@ -5822,7 +5862,7 @@ int32_t aster_http_listener_stop(aster_runtime_t runtime,
 /**
  * Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
  * in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
- * overrides). Never allocates (`storage` is NULL).
+ * overrides, blob zstd level 3, port reuse on). Never allocates (`storage` is NULL).
  */
 int32_t aster_config_init(struct aster_config_t *out);
 

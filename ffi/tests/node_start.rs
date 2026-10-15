@@ -583,3 +583,67 @@ fn accept_on_node_reads_the_alpn_queue() {
         close_runtime(rt);
     }
 }
+
+/// ABI 5.2: `aster_config_t.blob_zstd_level` reaches core. A node with the
+/// default level serves the zstd blobs ALPN; with `ASTER_BLOB_ZSTD_LEVEL_OFF`
+/// it does not, so a dial on that ALPN fails the handshake.
+#[test]
+fn blob_zstd_level_off_drops_the_zstd_alpn() {
+    let tokio = tokio::runtime::Runtime::new().unwrap();
+    let dialer = client(&tokio);
+    unsafe {
+        let rt = runtime();
+        for (level, served) in [
+            (ASTER_BLOB_ZSTD_LEVEL_DEFAULT, true),
+            (5, true),
+            (ASTER_BLOB_ZSTD_LEVEL_OFF, false),
+        ] {
+            let mut lb = loopback();
+            lb.cfg.blob_zstd_level = level;
+            let node = start(rt, &lb.cfg, 0);
+            let to = addr(rt, node);
+            let dialed = tokio.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    dialer.connect_addr(to, aster::alpns::BLOBS_ZSTD),
+                )
+                .await
+                .expect("dial timed out")
+            });
+            assert_eq!(dialed.is_ok(), served, "level {level}: {:?}", dialed.err());
+            close(rt, node);
+        }
+        close_runtime(rt);
+    }
+    tokio.block_on(dialer.shutdown());
+}
+
+/// ABI 5.2: `aster_config_t.reuse_last_port` reaches core. A persistent node
+/// records its bound ports in `bind-ports.json` by default and not when port
+/// reuse is `ASTER_REUSE_LAST_PORT_DISABLED`.
+#[test]
+fn reuse_last_port_disabled_records_no_bind_ports() {
+    let dir = std::env::temp_dir().join(format!("aster-ffi-reuse-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    unsafe {
+        let rt = runtime();
+        for (reuse, recorded) in [
+            (aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_DEFAULT, true),
+            (
+                aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_DISABLED,
+                false,
+            ),
+        ] {
+            let data = dir.join(format!("{reuse:?}"));
+            let data_str = data.to_string_lossy().into_owned();
+            let mut lb = loopback();
+            lb.cfg.storage_path = bytes(data_str.as_bytes());
+            lb.cfg.reuse_last_port = reuse as u32;
+            let node = start(rt, &lb.cfg, 0);
+            close(rt, node);
+            assert_eq!(data.join("bind-ports.json").exists(), recorded, "{reuse:?}");
+        }
+        close_runtime(rt);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -178,8 +178,14 @@ pub mod upcall;
 //   enrolled peers (`aster_server_restrict_peer_roles`,
 //   `aster_server_clear_peer_restriction`). Root operations stay in the Rust
 //   CLI. See `ffi/RENAME_MAP.md` "5.1".
+// - 5.2.0: `aster_config_t` grows from 280 to 288 bytes: `blob_zstd_level`
+//   (`ASTER_BLOB_ZSTD_LEVEL_DEFAULT` 0 / `_OFF` -1 / 1..=19) and
+//   `reuse_last_port` (`aster_reuse_last_port_t`) are appended after
+//   `storage`; existing offsets are unchanged. `struct_size` stays an exact
+//   match, and the library fills all 288 bytes, so callers must be built
+//   against the 5.2 header. See `ffi/RENAME_MAP.md` "5.2".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 5;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 1;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 2;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

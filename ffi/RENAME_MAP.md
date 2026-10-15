@@ -1,4 +1,33 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x changelog (current: 5.1)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x changelog (current: 5.2)
+
+## New in 5.2 (blob compression level and port reuse in `aster_config_t`)
+
+Two `AsterConfig` settings that had no public slot in `aster_config_t` now
+have one, so a binding that builds or copies the struct can set them, and in
+particular turn them off. Before 5.2 `aster_config_from_env` /
+`aster_config_from_toml` carried `reuse_last_port` in the opaque `storage`
+(and `blob_zstd_level` not at all), so a binding that copied the fields into
+its own struct and rebuilt it lost both, leaving them at their defaults (on).
+
+`aster_config_t` grows from 280 to 288 bytes. The new fields are appended
+after `storage`, so every existing offset is unchanged:
+
+| Offset | Field | Encoding |
+|---|---|---|
+| 280 | `int32_t blob_zstd_level` | `ASTER_BLOB_ZSTD_LEVEL_DEFAULT` (0) = the default level (3); `ASTER_BLOB_ZSTD_LEVEL_OFF` (-1) = off: the node serves only the plain blobs ALPN and fetches default to plain; 1..=19 = that level, larger values clamped to `ASTER_BLOB_ZSTD_LEVEL_MAX` (19); other negative values are `INVALID_ARGUMENT`. Rust `AsterConfig::blob_zstd_level`, env `ASTER_BLOB_ZSTD_LEVEL`, TOML `[storage] blob_zstd_level`. |
+| 284 | `uint32_t reuse_last_port` | `aster_reuse_last_port_t`: `ASTER_REUSE_LAST_PORT_DEFAULT` (0) = on, `_ENABLED` (1), `_DISABLED` (2); other values are `INVALID_ARGUMENT`. Rust `AsterConfig::reuse_last_port`, env `ASTER_REUSE_LAST_PORT`, TOML `[network] reuse_last_port`. |
+
+Zero means "not set" for both, like `portmapper` and `relay_mode`, so a
+zeroed tail keeps the defaults. `aster_config_init` / `_from_env` /
+`_from_toml` write explicit values (`blob_zstd_level` = 3 or -1,
+`reuse_last_port` = ENABLED or DISABLED); `storage` no longer carries
+`reuse_last_port`.
+
+`struct_size` remains an exact match: a 280-byte struct is refused with
+`INVALID_ARGUMENT`. The library writes all 288 bytes in `aster_config_init` /
+`_from_env` / `_from_toml`, so a caller must be built against the 5.2 header
+and must not run against a 5.1 library (Go: `ABIMinorRequired = 2`). Java and
+.NET pin the 288-byte layout and require minor 2.
 
 ## New in 5.1 (Enrollment from configuration, lease grantor, role restriction; additive)
 

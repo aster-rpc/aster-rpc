@@ -80,6 +80,23 @@ pub enum aster_portmapper_t {
     ASTER_PORTMAPPER_DISABLED = 2,
 }
 
+/// `aster_config_t.reuse_last_port` (ABI 5.2).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum aster_reuse_last_port_t {
+    /// Not set: the default (enabled).
+    ASTER_REUSE_LAST_PORT_DEFAULT = 0,
+    ASTER_REUSE_LAST_PORT_ENABLED = 1,
+    ASTER_REUSE_LAST_PORT_DISABLED = 2,
+}
+
+/// `aster_config_t.blob_zstd_level` (ABI 5.2): not set, the default level (3).
+pub const ASTER_BLOB_ZSTD_LEVEL_DEFAULT: i32 = 0;
+/// `aster_config_t.blob_zstd_level` (ABI 5.2): blob transport compression off.
+pub const ASTER_BLOB_ZSTD_LEVEL_OFF: i32 = -1;
+/// Highest `aster_config_t.blob_zstd_level`; larger levels are clamped to it.
+pub const ASTER_BLOB_ZSTD_LEVEL_MAX: i32 = 19;
+
 // Bits of `aster_config_t.transport_set`: a `transport_*` field is applied only
 // when its bit is set (so 0 stays a real value where QUIC allows it).
 pub const ASTER_TRANSPORT_MAX_CONCURRENT_BIDI_STREAMS: u32 = 1 << 0;
@@ -165,6 +182,15 @@ pub struct aster_config_t {
     pub transport_datagram_send_buffer_size: u64,
     /// Library-owned storage of a filled config; NULL for caller-built ones.
     pub storage: *mut c_void,
+    /// ABI 5.2. zstd level for blob transport (`AsterConfig::blob_zstd_level`):
+    /// `ASTER_BLOB_ZSTD_LEVEL_DEFAULT` (0) = the default level (3),
+    /// `ASTER_BLOB_ZSTD_LEVEL_OFF` (-1) = off (plain blobs ALPN only; fetches
+    /// default to plain), 1..=19 = that level (larger values are clamped to
+    /// 19). Other negative values are rejected.
+    pub blob_zstd_level: i32,
+    /// ABI 5.2. One of `aster_reuse_last_port_t`: re-bind the last UDP ports
+    /// of a persistent node (`AsterConfig::reuse_last_port`).
+    pub reuse_last_port: u32,
 }
 
 // ── lowering: aster_config_t -> AsterConfig ─────────────────────────────────
@@ -220,18 +246,32 @@ pub(crate) unsafe fn lower_config(c: &aster_config_t) -> Result<AsterConfig, Str
     let mut cfg = AsterConfig::default();
     // SAFETY: storage is NULL for caller-built configs, or the library-owned
     // ConfigStorage from fill_config, kept alive until aster_config_release.
-    // Health fields and `reuse_last_port` have no public ABI slots; preserve
-    // their parsed values here.
+    // Health fields have no public ABI slots; preserve their parsed values.
     if let Some(storage) = c.storage.cast::<ConfigStorage>().as_ref() {
         if let Some(health) = &storage.health {
             cfg.health_port = health.port;
             cfg.health_host.clone_from(&health.host);
             cfg.health_enabled = health.enabled;
         }
-        if let Some(reuse) = storage.reuse_last_port {
-            cfg.reuse_last_port = reuse;
-        }
     }
+    cfg.blob_zstd_level = match c.blob_zstd_level {
+        ASTER_BLOB_ZSTD_LEVEL_DEFAULT => AsterConfig::default().blob_zstd_level,
+        ASTER_BLOB_ZSTD_LEVEL_OFF => None,
+        n if n > 0 => Some(n.min(ASTER_BLOB_ZSTD_LEVEL_MAX) as u8),
+        n => {
+            return Err(format!(
+                "aster_config_t.blob_zstd_level must be -1 (off), 0 (default) or a level, got {n}"
+            ))
+        }
+    };
+    cfg.reuse_last_port = match c.reuse_last_port {
+        x if x == aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_DEFAULT as u32 => {
+            AsterConfig::default().reuse_last_port
+        }
+        x if x == aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_ENABLED as u32 => true,
+        x if x == aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_DISABLED as u32 => false,
+        other => return Err(format!("unknown reuse_last_port {other}")),
+    };
 
     let mut urls = Vec::new();
     for (i, u) in list_view(&c.relay_urls).iter().enumerate() {
@@ -412,9 +452,6 @@ struct ConfigStorage {
     bufs: Vec<Vec<u8>>,
     lists: Vec<Vec<aster_bytes_t>>,
     health: Option<StoredHealthConfig>,
-    /// `AsterConfig::reuse_last_port` when it differs from the default (an
-    /// `ASTER_REUSE_LAST_PORT` / `[network] reuse_last_port` opt-out).
-    reuse_last_port: Option<bool>,
 }
 
 struct StoredHealthConfig {
@@ -478,9 +515,6 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
             host: cfg.health_host.clone(),
             enabled: cfg.health_enabled,
         });
-    }
-    if cfg.reuse_last_port != defaults.reuse_last_port {
-        st.reuse_last_port = Some(cfg.reuse_last_port);
     }
     let (relay_mode, urls) = match &cfg.relay_mode {
         RelayMode::Default => (aster_relay_mode_t::ASTER_RELAY_MODE_DEFAULT, Vec::new()),
@@ -592,12 +626,16 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
         transport_datagram_receive_buffer_size: drb,
         transport_datagram_send_buffer_size: dsb,
         storage: std::ptr::null_mut(),
+        blob_zstd_level: cfg
+            .blob_zstd_level
+            .map_or(ASTER_BLOB_ZSTD_LEVEL_OFF, i32::from),
+        reuse_last_port: if cfg.reuse_last_port {
+            aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_ENABLED
+        } else {
+            aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_DISABLED
+        } as u32,
     };
-    if !st.bufs.is_empty()
-        || !st.lists.is_empty()
-        || st.health.is_some()
-        || st.reuse_last_port.is_some()
-    {
+    if !st.bufs.is_empty() || !st.lists.is_empty() || st.health.is_some() {
         out.storage = Box::into_raw(Box::new(st)) as *mut c_void;
     }
 }
@@ -606,7 +644,7 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
 
 /// Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
 /// in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
-/// overrides). Never allocates (`storage` is NULL).
+/// overrides, blob zstd level 3, port reuse on). Never allocates (`storage` is NULL).
 #[no_mangle]
 pub unsafe extern "C" fn aster_config_init(out: *mut aster_config_t) -> i32 {
     let Some(out) = out.as_mut() else {
@@ -1277,6 +1315,8 @@ mod tests {
             .transport_send_fairness(false)
             .transport_enable_segmentation_offload(true)
             .identity_file("/tmp/aster-ffi-test/.aster-identity")
+            .blob_zstd_level(7)
+            .reuse_last_port(false)
             .build();
         cfg.gc_interval = Some(Duration::from_millis(1500));
         cfg
@@ -1344,6 +1384,8 @@ mod tests {
             a.transport_enable_segmentation_offload,
             b.transport_enable_segmentation_offload
         );
+        assert_eq!(a.blob_zstd_level, b.blob_zstd_level);
+        assert_eq!(a.reuse_last_port, b.reuse_last_port);
         // And the lowered endpoint config the node actually starts with.
         assert_eq!(
             format!("{:?}", a.core_endpoint_config()),
@@ -1383,6 +1425,11 @@ mod tests {
         );
         assert_eq!(c.hook_timeout_ms, 5000);
         assert_eq!(c.transport_set, 0);
+        assert_eq!(c.blob_zstd_level, 3);
+        assert_eq!(
+            c.reuse_last_port,
+            aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_ENABLED as u32
+        );
         assert_same(
             &AsterConfig::default(),
             &unsafe { lower_config(&c) }.unwrap(),
@@ -1431,6 +1478,8 @@ mod tests {
         check(&|c| c.hook_failure_mode = 2, "hook_failure_mode");
         check(&|c| c.portmapper = 3, "portmapper");
         check(&|c| c.enable_hooks = 2, "enable_hooks");
+        check(&|c| c.blob_zstd_level = -2, "blob_zstd_level");
+        check(&|c| c.reuse_last_port = 3, "reuse_last_port");
         check(&|c| c.transport_set = 1 << 20, "transport_set");
         check(
             &|c| {
@@ -1473,6 +1522,8 @@ mod tests {
         "ASTER_HEALTH_PORT",
         "ASTER_HEALTH_HOST",
         "ASTER_HEALTH_ENABLED",
+        "ASTER_BLOB_ZSTD_LEVEL",
+        "ASTER_REUSE_LAST_PORT",
     ];
 
     fn clear_env() {
@@ -1496,6 +1547,8 @@ mod tests {
         std::env::set_var("ASTER_HEALTH_PORT", "18080");
         std::env::set_var("ASTER_HEALTH_HOST", "0.0.0.0");
         std::env::set_var("ASTER_HEALTH_ENABLED", "false");
+        std::env::set_var("ASTER_BLOB_ZSTD_LEVEL", "off");
+        std::env::set_var("ASTER_REUSE_LAST_PORT", "false");
         let mut c: aster_config_t = unsafe { std::mem::zeroed() };
         let status = unsafe { aster_config_from_env(&mut c) };
         clear_env();
@@ -1518,6 +1571,11 @@ mod tests {
         assert_eq!(c.transport_set, ASTER_TRANSPORT_INITIAL_MTU);
         assert_eq!(c.transport_initial_mtu, 1300);
         assert_eq!(unsafe { view(&c.secret_key) }, &[7u8; 32]);
+        assert_eq!(c.blob_zstd_level, ASTER_BLOB_ZSTD_LEVEL_OFF);
+        assert_eq!(
+            c.reuse_last_port,
+            aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_DISABLED as u32
+        );
         let health = unsafe { lower_config(&c) }.unwrap();
         assert_eq!(health.health_port, 18080);
         assert_eq!(health.health_host, "0.0.0.0");
@@ -1550,6 +1608,7 @@ mod tests {
 [storage]
 path = "/var/lib/aster-test"
 gc_interval_ms = 60000
+blob_zstd_level = 9
 
 [network]
 relay_urls = ["https://relay.example"]
@@ -1567,6 +1626,7 @@ proxy_from_env = true
 transport_max_concurrent_bidi_streams = 512
 transport_keep_alive_interval_ms = 2000
 transport_send_fairness = true
+reuse_last_port = false
 
 [health]
 port = 18081
@@ -1616,6 +1676,9 @@ file = "/etc/aster/.aster-identity"
         assert_eq!(cfg.transport_keep_alive_interval_ms, Some(2000));
         assert_eq!(cfg.transport_send_fairness, Some(true));
         assert_eq!(cfg.transport_initial_mtu, None);
+        assert_eq!(c.blob_zstd_level, 9);
+        assert_eq!(cfg.blob_zstd_level, Some(9));
+        assert!(!cfg.reuse_last_port);
         assert_eq!(
             cfg.identity_file,
             Some(PathBuf::from("/etc/aster/.aster-identity"))
@@ -1665,19 +1728,45 @@ file = "/etc/aster/.aster-identity"
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
-    fn reuse_last_port_opt_out_survives_a_round_trip() {
+    fn blob_zstd_level_and_reuse_last_port_encode_default_off_and_values() {
         let mut c: aster_config_t = unsafe { std::mem::zeroed() };
-        fill_config(&AsterConfig::default(), &mut c);
-        assert!(c.storage.is_null(), "the default needs no storage");
-        assert!(unsafe { lower_config(&c) }.unwrap().reuse_last_port);
-
-        let original = AsterConfig {
-            reuse_last_port: false,
-            ..Default::default()
+        unsafe { aster_config_init(&mut c) };
+        let lower = |level: i32, reuse: aster_reuse_last_port_t| {
+            let mut c = c;
+            c.blob_zstd_level = level;
+            c.reuse_last_port = reuse as u32;
+            let cfg = unsafe { lower_config(&c) }.unwrap();
+            let core = cfg.core_endpoint_config();
+            assert_eq!(core.blob_zstd_level, cfg.blob_zstd_level.map(i32::from));
+            assert_eq!(core.reuse_last_port, cfg.reuse_last_port);
+            (cfg.blob_zstd_level, cfg.reuse_last_port)
         };
+        use aster_reuse_last_port_t::*;
+        // Zero is "not set": the defaults (level 3, reuse on).
+        assert_eq!(
+            lower(ASTER_BLOB_ZSTD_LEVEL_DEFAULT, ASTER_REUSE_LAST_PORT_DEFAULT),
+            (Some(3), true)
+        );
+        assert_eq!(
+            lower(ASTER_BLOB_ZSTD_LEVEL_OFF, ASTER_REUSE_LAST_PORT_DISABLED),
+            (None, false)
+        );
+        assert_eq!(lower(1, ASTER_REUSE_LAST_PORT_ENABLED), (Some(1), true));
+        assert_eq!(lower(19, ASTER_REUSE_LAST_PORT_ENABLED), (Some(19), true));
+        // Clamped like `ASTER_BLOB_ZSTD_LEVEL` / `.blob_zstd_level(n)`.
+        assert_eq!(lower(40, ASTER_REUSE_LAST_PORT_ENABLED), (Some(19), true));
+
+        // Off survives a fill / lower round trip without library storage.
+        let original = AsterConfig::builder()
+            .blob_zstd_level(0)
+            .reuse_last_port(false)
+            .build();
         fill_config(&original, &mut c);
+        assert!(c.storage.is_null(), "both fields are public slots");
+        assert_eq!(c.blob_zstd_level, ASTER_BLOB_ZSTD_LEVEL_OFF);
+        assert_eq!(c.reuse_last_port, ASTER_REUSE_LAST_PORT_DISABLED as u32);
         let lowered = unsafe { lower_config(&c) }.unwrap();
-        assert_eq!(unsafe { aster_config_release(&mut c) }, 0);
+        assert_eq!(lowered.blob_zstd_level, None);
         assert!(!lowered.reuse_last_port);
     }
 

@@ -256,7 +256,8 @@ mod lp64 {
     });
 
     // ABI 3.2: node configuration (node.rs).
-    assert_layout!(aster_config_t, size = 280, align = 8, {
+    // ABI 5.2 appends blob_zstd_level and reuse_last_port.
+    assert_layout!(aster_config_t, size = 288, align = 8, {
         struct_size = 0,
         relay_mode = 4,
         relay_urls = 8,
@@ -291,6 +292,8 @@ mod lp64 {
         transport_datagram_receive_buffer_size = 256,
         transport_datagram_send_buffer_size = 264,
         storage = 272,
+        blob_zstd_level = 280,
+        reuse_last_port = 284,
     });
 
     // ABI 3.3: connection paths (data.rs).
