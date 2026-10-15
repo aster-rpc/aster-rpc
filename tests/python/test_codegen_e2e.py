@@ -187,7 +187,7 @@ async def _fetch_manifests_from_server(server: AsterServer) -> dict[str, dict]:
     """Connect a client to the server and pull the published manifests.
 
     Goes through the same path the CLI uses: PeerConnection's background
-    manifest fetcher reads the manifests/{contract_id} shortcut from the
+    manifest fetcher reads the manifests/{contract_id}/ shortcut from the
     registry doc.
     """
     from aster_cli.shell.app import PeerConnection

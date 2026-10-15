@@ -140,7 +140,7 @@ public final class ContractPublisher {
 
     // Use the unified aster_registry_publish FFI — one Rust call writes the ArtifactRef +
     // version pointer + (optional) channel alias + gossip in a single op. Matches the
-    // `Published contract` step in Python's _publish_contracts, minus the manifests/<id>
+    // `Published contract` step in Python's _publish_contracts, minus the manifests/<id>/
     // fast-access key, which we write separately below.
     return RegistryAsync.publishAsync(
         registryDoc,

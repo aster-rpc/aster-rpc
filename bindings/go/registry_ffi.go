@@ -306,7 +306,7 @@ func (d *Doc) RenewLeaseAsync(
 }
 
 // AclAddWriterAsync adds an author to the per-doc registry ACL writer
-// set, persisting the updated list under _aster/acl/writers.
+// set, persisting the updated list under _aster/acl/writers/.
 func (d *Doc) AclAddWriterAsync(ctx context.Context, authorID, writerID string) error {
 	return d.aclMutateWriter(ctx, authorID, writerID, true)
 }

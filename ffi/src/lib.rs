@@ -8260,7 +8260,7 @@ pub unsafe extern "C" fn aster_registry_renew_lease(
 }
 
 /// Add an author to the per-doc registry ACL writer set, persisting it to the
-/// doc under `_aster/acl/writers`. Switches the ACL out of open mode if it was
+/// doc under `_aster/acl/writers/`. Switches the ACL out of open mode if it was
 /// in open mode. Emits `ASTER_EVENT_REGISTRY_ACL_UPDATED` on success.
 #[no_mangle]
 pub unsafe extern "C" fn aster_registry_acl_add_writer(

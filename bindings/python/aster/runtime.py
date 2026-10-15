@@ -1673,7 +1673,7 @@ class AsterClient:
         self, service_name: str, version: int, summary: "ServiceSummary | None" = None
     ) -> Any | None:
         """Fetch and cache the contract manifest for (name, version). Uses the
-        ``manifests/{contract_id}`` fast-path shortcut when available, falls
+        ``manifests/{contract_id}/`` fast-path shortcut when available, falls
         back to the slow blob-collection path. Returns ``None`` if the
         producer didn't publish a manifest (e.g. an older producer).
         """

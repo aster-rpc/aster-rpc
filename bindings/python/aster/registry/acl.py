@@ -4,9 +4,9 @@ aster.registry.acl -- ACL enforcement for the Aster service registry.
 Spec reference: Aster-SPEC.md §11.2.3.
 
 ACL entries are stored in the registry doc at:
-  _aster/acl/writers  → JSON list[str] of trusted writer AuthorIds
-  _aster/acl/readers  → JSON list[str] of reader AuthorIds
-  _aster/acl/admins   → JSON list[str] of admin AuthorIds
+  _aster/acl/writers/  → JSON list[str] of trusted writer AuthorIds
+  _aster/acl/readers/  → JSON list[str] of reader AuthorIds
+  _aster/acl/admins/   → JSON list[str] of admin AuthorIds
 
 Phase 10 filters at READ TIME (post-read filter). Untrusted writes persist
 locally but are excluded from all registry reads. True sync-time rejection
@@ -92,7 +92,7 @@ class RegistryACL:
         )
 
     async def _read_list(self, subkey: str) -> list[str] | None:
-        """Read a JSON list from the doc at ``_aster/acl/{subkey}``.
+        """Read a JSON list from the doc at ``_aster/acl/{subkey}/``.
 
         Returns None if the key does not exist.
         """

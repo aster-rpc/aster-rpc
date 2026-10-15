@@ -152,7 +152,7 @@ public static partial class Registry
 
     /// <summary>
     /// Add an author to the per-doc registry ACL writer set, persisting the
-    /// updated list to the doc under <c>_aster/acl/writers</c>. Switches the
+    /// updated list to the doc under <c>_aster/acl/writers/</c>. Switches the
     /// ACL out of open mode if it was in open mode.
     /// </summary>
     public static Task AclAddWriterAsync(
