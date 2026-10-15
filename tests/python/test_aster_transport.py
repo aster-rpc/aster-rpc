@@ -562,6 +562,9 @@ class TestIrohTransportIntegration:
                 trailer = RpcStatus(code=StatusCode.OK, message="")
                 await write_frame(send, trailer.encode(), flags=TRAILER)
                 await send.finish()
+                # Closing now could discard the unacknowledged response, so the
+                # client would see the stream end first; it closes when done.
+                await asyncio.wait_for(conn.closed(), timeout=10)
             finally:
                 conn.close(0, b"done")
 
