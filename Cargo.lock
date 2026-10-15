@@ -2998,8 +2998,8 @@ dependencies = [
 
 [[package]]
 name = "iroh"
-version = "1.3.0"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=1974e95825313f09e0870ef5bef11c6bc9fd97d9#1974e95825313f09e0870ef5bef11c6bc9fd97d9"
+version = "1.3.1"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=32d0a63fff1f9afd0c3c8bef656074cb9f4fd470#32d0a63fff1f9afd0c3c8bef656074cb9f4fd470"
 dependencies = [
  "backon",
  "blake3",
@@ -3047,8 +3047,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.3.0"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=1974e95825313f09e0870ef5bef11c6bc9fd97d9#1974e95825313f09e0870ef5bef11c6bc9fd97d9"
+version = "1.3.1"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=32d0a63fff1f9afd0c3c8bef656074cb9f4fd470#32d0a63fff1f9afd0c3c8bef656074cb9f4fd470"
 dependencies = [
  "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
@@ -3106,8 +3106,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.3.0"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=1974e95825313f09e0870ef5bef11c6bc9fd97d9#1974e95825313f09e0870ef5bef11c6bc9fd97d9"
+version = "1.3.1"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=32d0a63fff1f9afd0c3c8bef656074cb9f4fd470#32d0a63fff1f9afd0c3c8bef656074cb9f4fd470"
 dependencies = [
  "arc-swap",
  "cfg_aliases 0.2.2",
@@ -3252,8 +3252,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.3.0"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=1974e95825313f09e0870ef5bef11c6bc9fd97d9#1974e95825313f09e0870ef5bef11c6bc9fd97d9"
+version = "1.3.1"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=32d0a63fff1f9afd0c3c8bef656074cb9f4fd470#32d0a63fff1f9afd0c3c8bef656074cb9f4fd470"
 dependencies = [
  "blake3",
  "bytes",

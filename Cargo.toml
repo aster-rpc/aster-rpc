@@ -18,7 +18,7 @@ rust-version = "1.96"
 # Each forked direct dependency has two locations: the public Forgejo Git
 # source used in this workspace, and a version used when packaging for Aster's
 # Cargo registry. [patch.crates-io] below still unifies transitive references.
-iroh        = { version = "=1.3.0", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh.git", rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
+iroh        = { version = "=1.3.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh.git", rev = "32d0a63fff1f9afd0c3c8bef656074cb9f4fd470" }
 iroh-blobs  = { version = "0.103.8", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "4971183ce58e5f55385825a879b94c991d383f57" }
 iroh-docs   = { version = "0.101.5", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
 iroh-gossip = { version = "0.101.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
@@ -55,9 +55,9 @@ crossbeam-utils = "0.8"
 # iroh from crates.io) must also resolve to the fork. A regular dep override
 # only affects the top-level use; [patch] rewires every resolution.
 [patch.crates-io]
-iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
-iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
-iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "1974e95825313f09e0870ef5bef11c6bc9fd97d9" }
+iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "32d0a63fff1f9afd0c3c8bef656074cb9f4fd470" }
+iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "32d0a63fff1f9afd0c3c8bef656074cb9f4fd470" }
+iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "32d0a63fff1f9afd0c3c8bef656074cb9f4fd470" }
 iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "4971183ce58e5f55385825a879b94c991d383f57" }
 iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
