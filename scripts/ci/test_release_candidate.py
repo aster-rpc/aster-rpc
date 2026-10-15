@@ -518,6 +518,9 @@ class CandidateTests(unittest.TestCase):
         # the tree; release-candidate.py refuses an unstamped build off a push.
         unstamped = {job for job, block in blocks.items() if 'ASTER_UNSTAMPED_VERSION=' in block}
         self.assertEqual(unstamped, {"rust-tests", "test", "typescript"})
+        # The native version must match too, or verify-python-install fails.
+        for job in unstamped:
+            self.assertIn('echo "ASTER_BUILD_VERSION=$unstamped"', blocks[job])
         # The dispatch names its commit and lint refuses any other checkout.
         self.assertIn("  workflow_dispatch:\n    inputs:\n      sha:", workflow)
         self.assertIn('CANDIDATE_SHA: ${{ forgejo.event.inputs.sha }}', blocks["lint"])
