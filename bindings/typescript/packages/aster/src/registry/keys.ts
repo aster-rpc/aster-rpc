@@ -94,9 +94,13 @@ export function configKey(subkey: string): string {
   return `_aster/config/${keySegment(subkey)}/`;
 }
 
-/** Well-known registry key prefixes. */
+/** The registry key families a client syncs (a `nothing_except` download
+ * policy keeps these). Every family a builder above writes must be covered, or
+ * the entry syncs without its value; `endpoints/` and `compatibility/` are
+ * spec-reserved families with no builder yet. */
 export const REGISTRY_PREFIXES = [
   'contracts/',
+  'manifests/',
   'services/',
   'endpoints/',
   'compatibility/',

@@ -29,6 +29,23 @@ import {
 
 // -- Keys ---
 
+/** Keys from every builder, over segments chosen to provoke prefix collisions.
+ * A new key family belongs here. */
+function familyKeys(): Set<string> {
+  const leaves = ['1', '10', 'stable', 'stable2', 'x/y', 'x', '', '%2F'];
+  const keys = new Set<string>();
+  for (const name of ['svc', 'svc2', 'a/b', 'a', '50%']) {
+    for (const leaf of leaves) {
+      [contractKey(leaf), manifestKey(leaf), aclKey(leaf), configKey(leaf)].forEach(k => keys.add(k));
+      keys.add(channelKey(name, leaf));
+      keys.add(tagKey(name, leaf));
+      for (const eid of leaves) keys.add(leaseKey(name, leaf, eid));
+    }
+    for (const v of [1, 10, 100, -1]) keys.add(versionKey(name, v));
+  }
+  return keys;
+}
+
 describe('registry keys', () => {
   it('contractKey', () => {
     expect(contractKey('abc123')).toBe('contracts/abc123/');
@@ -85,26 +102,17 @@ describe('registry keys', () => {
     }
   });
   it('keys are prefix-free (iroh-docs supersedes extensions of a written key)', () => {
-    const leaves = ['1', '10', 'stable', 'stable2', 'x/y', 'x', '', '%2F'];
-    const keys = new Set<string>();
-    for (const name of ['svc', 'svc2', 'a/b', 'a', '50%']) {
-      for (const leaf of leaves) {
-        [contractKey(leaf), manifestKey(leaf), aclKey(leaf), configKey(leaf)].forEach(k => keys.add(k));
-        keys.add(channelKey(name, leaf));
-        keys.add(tagKey(name, leaf));
-        for (const eid of leaves) keys.add(leaseKey(name, leaf, eid));
-      }
-      for (const v of [1, 10, 100, -1]) keys.add(versionKey(name, v));
-    }
+    const keys = familyKeys();
     for (const a of keys) {
       for (const b of keys) {
         if (a !== b) expect(b.startsWith(a), `${a} prefixes ${b}`).toBe(false);
       }
     }
   });
-  it('REGISTRY_PREFIXES has expected entries', () => {
-    expect(REGISTRY_PREFIXES).toContain('contracts/');
-    expect(REGISTRY_PREFIXES).toContain('_aster/');
+  it('REGISTRY_PREFIXES covers every key family the builders write', () => {
+    for (const key of familyKeys()) {
+      expect(REGISTRY_PREFIXES.some(p => key.startsWith(p)), key).toBe(true);
+    }
   });
 });
 
