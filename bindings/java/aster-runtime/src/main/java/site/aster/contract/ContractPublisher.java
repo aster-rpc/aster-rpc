@@ -32,9 +32,9 @@ import site.aster.server.spi.ServiceDispatcher;
  *   <li>One shared registry doc + author for the whole server.
  *   <li>Per service: upload a HashSeq collection containing {@code contract.bin}, {@code
  *       types/<hash>.bin}, {@code manifest.json}; write an {@link ArtifactRef} to {@code
- *       contracts/<contract_id>}; write the manifest JSON directly to {@code
- *       manifests/<contract_id>} so shell / fast-access readers can skip the blob fetch; bump the
- *       {@code services/<name>/versions/v<n>} pointer via {@link RegistryAsync#publishAsync}.
+ *       contracts/<contract_id>/}; write the manifest JSON directly to {@code
+ *       manifests/<contract_id>/} so shell / fast-access readers can skip the blob fetch; bump the
+ *       {@code services/<name>/versions/v<n>/} pointer via {@link RegistryAsync#publishAsync}.
  *   <li>Doc shared read-only so remote consumers can join + sync the namespace.
  * </ul>
  *
@@ -155,7 +155,7 @@ public final class ContractPublisher {
 
   private static CompletableFuture<Void> writeManifestBytes(
       Doc registryDoc, AuthorId author, ContractManifestBuilder.PublicationArtifacts artifacts) {
-    String manifestKey = "manifests/" + artifacts.contractId();
+    byte[] manifestKey = RegistryKeys.manifestKey(artifacts.contractId());
     return registryDoc
         .setBytesAsync(author, manifestKey, artifacts.manifestJsonBytes())
         .thenApply(v -> null);

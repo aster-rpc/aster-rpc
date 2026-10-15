@@ -9,7 +9,7 @@ import java.util.List;
 /**
  * Renewable advertisement for a live endpoint (Aster-SPEC.md §11.6).
  *
- * <p>Stored at {@code services/{name}/contracts/{cid}/endpoints/{eid}}.
+ * <p>Stored at {@code services/{name}/contracts/{cid}/endpoints/{eid}/}.
  */
 @JsonInclude(JsonInclude.Include.ALWAYS)
 public final class EndpointLease {

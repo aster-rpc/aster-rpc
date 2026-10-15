@@ -7,7 +7,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 /**
  * Docs pointer to an immutable Iroh collection (Aster-SPEC.md §11.2.1).
  *
- * <p>Stored at {@code contracts/{contract_id}} in the registry doc. {@code collectionFormat} is
+ * <p>Stored at {@code contracts/{contract_id}/} in the registry doc. {@code collectionFormat} is
  * {@code "raw"} for single-blob (Phase 10 default) or {@code "index"} for multi-file collections.
  * Old records without the field default to {@code "raw"} on deserialization.
  */
