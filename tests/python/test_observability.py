@@ -239,6 +239,12 @@ def test_rust_records_carry_the_span_trace_id_end_to_end():
                 logging.getLogger("app").warning("inside the handler")
                 return Resp(text=req.text)
 
+        @service(name="O6Other", version=1)
+        class O6Other:
+            @rpc()
+            async def ping(self, req: Req) -> Resp:
+                return Resp(text=req.text)
+
         class Cap(logging.Handler):
             def __init__(self):
                 super().__init__(0)
@@ -250,25 +256,44 @@ def test_rust_records_carry_the_span_trace_id_end_to_end():
             observability.init(traces=True, otlp_endpoint="http://127.0.0.1:9",
                                log_filter="warn,aster=trace")
             cap = Cap()
-            async with AsterServer(services=[O6Echo()]) as server:
+            async with AsterServer(services=[O6Echo(), O6Other()]) as server:
                 server.serve()
                 async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as client:
                     svc = await client.client(O6Echo)
-                    # Capture after connect: only the traced call's records.
+                    other = await client.client(O6Other)
                     logging.getLogger("aster").addHandler(cap)
                     logging.getLogger("aster").setLevel(5)
                     with tracing.span("client.work") as outer:
                         reply = await svc.echo(Req(text="hi"))
                         client_trace = outer.trace_id
+                    # Unrelated traced activity in the same window, as other
+                    # work in a busy process would be: its own root trace.
+                    await other.ping(Req(text="x"))
                     await asyncio.sleep(0.5)
             rust = [r for r in cap.records if getattr(r, "aster_origin", "") == "rust"]
+            # The capture holds records of other traces too: the ping above,
+            # and, under load, records of earlier work (connect, contract
+            # fetch) that the bridge's drain thread delivers late. Judge the
+            # client's trace on its own, and separately show no echo record
+            # carries another.
+            ours = [r for r in rust if r.trace_id == client_trace]
+            def is_echo(r):
+                return (getattr(r, "rpc_service", ""), getattr(r, "rpc_method", "")) == ("O6Echo", "echo")
             print(json.dumps({
                 "client_trace": client_trace,
                 "reply": reply.text,
                 "handler_trace": seen["handler_trace"],
                 "rust_traces": sorted({r.trace_id for r in rust if r.trace_id}),
-                "with_trace": [r.getMessage() for r in rust if r.trace_id],
-                "service_field": sorted({getattr(r, "rpc_service", "") for r in rust if r.trace_id}),
+                "with_trace": [r.getMessage() for r in ours],
+                "service_field": sorted({getattr(r, "rpc_service", "") for r in ours}),
+                "echo_records": sum(1 for r in ours if is_echo(r)),
+                "echo_elsewhere": [
+                    [r.trace_id, r.getMessage()] for r in rust if is_echo(r) and r.trace_id != client_trace
+                ],
+                "other": [
+                    [r.trace_id, r.name, r.getMessage(), getattr(r, "rpc_service", ""), getattr(r, "rpc_method", "")]
+                    for r in rust if r.trace_id and r.trace_id != client_trace
+                ],
             }))
 
         asyncio.run(main())
@@ -278,9 +303,15 @@ def test_rust_records_carry_the_span_trace_id_end_to_end():
     trace = out["client_trace"]
     assert trace and len(trace) == 32 and set(trace) <= set("0123456789abcdef")
     assert out["handler_trace"] == trace  # traceparent crossed the wire
-    assert out["rust_traces"] == [trace], out  # Rust events inside the server span
-    assert "rpc completed" in out["with_trace"]
-    assert out["service_field"] == ["O6Echo"]
+    # Rust events inside the server span carry the client's trace...
+    assert trace in out["rust_traces"], out
+    assert "rpc completed" in out["with_trace"], out
+    assert out["service_field"] == ["O6Echo"], out
+    assert out["echo_records"] >= 1, out
+    # ...and no record of the echo call carries any other trace, while the
+    # unrelated ping's records stay off the client's trace.
+    assert out["echo_elsewhere"] == [], out
+    assert any(o[3] == "O6Other" for o in out["other"]), out
 
 
 _BAGGAGE_CHILD = """
