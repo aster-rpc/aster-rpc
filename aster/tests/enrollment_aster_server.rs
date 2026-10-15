@@ -428,8 +428,8 @@ async fn credential_roles_gate_requires_and_root_revocation_closes_the_connectio
 /// A credential admits a persistent node only until the root registers it
 /// (design §4), so a registered server restarts with its credential expired,
 /// or with none, and its replica admits it by the registration. While it ran
-/// past expiry it stopped presenting the expired chain (declared locality
-/// falls back to the record). An unregistered node with an expired
+/// past expiry it stopped publishing the expired credential's locality
+/// statement (declared locality falls back to the record). An unregistered node with an expired
 /// credential is still refused.
 #[tokio::test]
 async fn registered_server_restarts_without_a_valid_credential() {
@@ -442,7 +442,19 @@ async fn registered_server_restarts_without_a_valid_credential() {
         };
         let expires = now() + 4;
         let short = {
-            let request = EnrollmentIssueRequest::new(public(2), FLEET, expires);
+            let mut request = EnrollmentIssueRequest::new(public(2), FLEET, expires);
+            // Locality claims, so the node has a statement to publish (and to
+            // stop publishing once the credential expires).
+            request.claims.attributes = Some(std::collections::BTreeMap::from([
+                (
+                    aster::topology::REGION_ATTRIBUTE.to_string(),
+                    TypedAttribute::String("eu-west".into()),
+                ),
+                (
+                    aster::topology::ZONE_ATTRIBUTE.to_string(),
+                    TypedAttribute::String("eu-west-1a".into()),
+                ),
+            ]));
             issue_credential(&key(1), &request, now())
                 .unwrap()
                 .into_chain()
@@ -468,13 +480,13 @@ async fn registered_server_restarts_without_a_valid_credential() {
         ));
         root.register(public(2)).await;
         let locality = server.enrollment().unwrap().topology_locality();
-        assert!((locality.own_chain)().is_some());
+        assert!((locality.own_statement)().is_some());
         while now() <= expires {
             tokio::time::sleep(Duration::from_millis(200)).await;
         }
         assert!(
-            (locality.own_chain)().is_none(),
-            "an expired chain is no longer presented"
+            (locality.own_statement)().is_none(),
+            "an expired credential's locality statement is no longer published"
         );
         // The locality source holds the enrollment; release it so the
         // restart below can take the policy store's lock.
