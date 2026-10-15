@@ -629,6 +629,10 @@ pub struct CoreTransportSnapshot {
 pub struct CoreHookConnectInfo {
     pub remote_endpoint_id: String,
     pub alpn: Vec<u8>,
+    /// The address material the dial was given (id, relay, direct
+    /// addresses), so a hook can reach the same peer on another ALPN first.
+    #[cfg(feature = "enrollment")]
+    pub remote_addr: CoreNodeAddr,
 }
 
 /// Information about a completed handshake, passed to hooks
@@ -1257,6 +1261,8 @@ impl EndpointHooks for CoreHooksAdapter {
         let info = CoreHookConnectInfo {
             remote_endpoint_id: remote_addr.id.to_string(),
             alpn: alpn.to_vec(),
+            #[cfg(feature = "enrollment")]
+            remote_addr: endpoint_addr_to_core(remote_addr.clone()),
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if self.before_connect_tx.send((info, reply_tx)).await.is_err() {
@@ -1546,6 +1552,11 @@ impl ProtocolHandler for AsterQueueHandler {
     }
 }
 
+/// A node's hook receiver, taken once by its consumer.
+type SharedHookReceiver = Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>;
+/// The inbound hook failure mode and the hook timeout a node was built with.
+type HookSettings = (trust::HookFailureMode, Duration);
+
 /// Internal capacity for the aster-accept queue. Generous for admission +
 /// RPC; if an aster consumer wedges, back-pressure only hits the per-ALPN
 /// Router task, not blobs/docs/gossip.
@@ -1559,6 +1570,10 @@ pub struct CoreNode {
 struct CoreNodeInner {
     #[cfg(feature = "enrollment")]
     enrollment_hook_failure_mode: trust::HookFailureMode,
+    /// How long a hook may take before its failure mode decides; on-demand
+    /// enrollment from a hook must finish well within it.
+    #[cfg(feature = "enrollment")]
+    enrollment_hook_timeout: Duration,
     endpoint: Endpoint,
     router: Router,
     #[allow(dead_code)]
@@ -1778,8 +1793,13 @@ impl CoreNode {
     ) -> Result<Self> {
         let hook_failure_mode = endpoint_config
             .as_ref()
-            .map(|config| config.hook_failure_mode)
-            .unwrap_or_default();
+            .map(|config| {
+                (
+                    config.hook_failure_mode,
+                    Duration::from_millis(config.hook_timeout_ms),
+                )
+            })
+            .unwrap_or_else(|| (Default::default(), Duration::from_millis(5000)));
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         // The docs engine stores entry content as untagged blobs in this shared
         // store, so GC must protect the docs live-content set or the first sweep
@@ -1836,8 +1856,13 @@ impl CoreNode {
     ) -> Result<Self> {
         let hook_failure_mode = endpoint_config
             .as_ref()
-            .map(|config| config.hook_failure_mode)
-            .unwrap_or_default();
+            .map(|config| {
+                (
+                    config.hook_failure_mode,
+                    Duration::from_millis(config.hook_timeout_ms),
+                )
+            })
+            .unwrap_or_else(|| (Default::default(), Duration::from_millis(5000)));
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let root = std::path::PathBuf::from(&path);
         // Create the data directory privately *before* the stores write secret
@@ -1887,16 +1912,13 @@ impl CoreNode {
         docs_root: Option<std::path::PathBuf>,
         aster_alpns: Vec<Vec<u8>>,
         monitor: Option<CoreMonitor>,
-        hooks: (
-            Option<Arc<std::sync::Mutex<Option<CoreHookReceiver>>>>,
-            trust::HookFailureMode,
-        ),
+        hooks: (SharedHookReceiver, HookSettings),
         // The docs GC protection bridge, created together by
         // `ProtectCallbackHandler::new()`: the handler half drives the docs
         // engine, the callback half is stored for manual `gc_run_once` sweeps.
         gc_protect: (ProtectCallbackHandler, ProtectCb),
     ) -> Result<Self> {
-        let (hook_receiver, _hook_failure_mode) = hooks;
+        let (hook_receiver, (_hook_failure_mode, _hook_timeout)) = hooks;
         let (protect_handler, protect_cb) = gc_protect;
         let downloader = Downloader::new(&store, &endpoint);
         let blobs = BlobsProtocol::new(&store, None);
@@ -1958,6 +1980,8 @@ impl CoreNode {
             inner: Arc::new(CoreNodeInner {
                 #[cfg(feature = "enrollment")]
                 enrollment_hook_failure_mode: _hook_failure_mode,
+                #[cfg(feature = "enrollment")]
+                enrollment_hook_timeout: _hook_timeout,
                 endpoint,
                 router,
                 blobs,

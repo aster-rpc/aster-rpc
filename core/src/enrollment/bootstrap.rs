@@ -15,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, ensure, Result};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, oneshot, Semaphore, SemaphorePermit};
+use tokio::sync::{broadcast, oneshot, watch, Semaphore, SemaphorePermit};
 use tokio::task::AbortHandle;
 
 use super::rotation::{verified_history, RotationJournal, RotationPin, MAX_FORWARDED_ROTATIONS};
@@ -31,8 +31,9 @@ use crate::delegation::{
     claimed_rotation_seq, verify_root_rotation, ChainError, RootState, MAX_ROTATION_BYTES,
 };
 use crate::{
-    CoreAfterHandshakeDecision, CoreConnection, CoreDoc, CoreHookHandshakeInfo, CoreHookReceiver,
-    CoreNode, CoreNodeAddr, CoreRecvStream, CoreSendStream, CoreWeakConnection,
+    CoreAfterHandshakeDecision, CoreConnection, CoreDoc, CoreHookConnectInfo,
+    CoreHookHandshakeInfo, CoreHookReceiver, CoreNode, CoreNodeAddr, CoreRecvStream,
+    CoreSendStream, CoreWeakConnection,
 };
 
 pub const ENROLLMENT_ALPN: &[u8] = b"aster.enrollment/1";
@@ -59,6 +60,11 @@ const DENY_LOG_PEER_INTERVAL: Duration = Duration::from_secs(10);
 /// Info-level denial lines per second across all peers, so fresh identities
 /// cannot flood the log either.
 const DENY_LOG_PER_SECOND: u32 = 32;
+/// After an on-demand handshake with a peer fails, further dials to or from
+/// it fail at once for this long instead of handshaking again, so a protocol
+/// that redials in a loop (or a stranger that keeps dialling) costs at most
+/// one handshake per interval.
+const ON_DEMAND_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Debug)]
 pub struct EnrollmentOptions {
@@ -331,6 +337,16 @@ struct RateState {
     sources: BTreeMap<IpAddr, u32>,
 }
 
+/// The outcome of one on-demand handshake, shared by every dial waiting on it.
+type OnDemand = watch::Receiver<Option<std::result::Result<(), String>>>;
+
+/// On-demand handshakes in flight per peer, and recent failures.
+#[derive(Default)]
+struct OnDemandHandshakes {
+    in_flight: BTreeMap<[u8; 32], OnDemand>,
+    failed: BTreeMap<[u8; 32], Instant>,
+}
+
 /// Bounds info-level Gate-0 denial lines (see [`DENY_LOG_PEER_INTERVAL`]).
 struct DenyLog {
     window: Instant,
@@ -539,6 +555,7 @@ pub struct EnrollmentService {
     pending_probes: Mutex<PendingProbes>,
     rate: Mutex<RateState>,
     deny_log: Mutex<DenyLog>,
+    on_demand: Mutex<OnDemandHandshakes>,
     next_generation: AtomicU64,
     revoked: broadcast::Sender<EnrollmentRevoked>,
 }
@@ -765,6 +782,7 @@ impl EnrollmentService {
                 sources: BTreeMap::new(),
             }),
             deny_log: Mutex::new(DenyLog::new()),
+            on_demand: Mutex::new(OnDemandHandshakes::default()),
             next_generation: AtomicU64::new(1),
             revoked,
         })
@@ -775,8 +793,12 @@ impl EnrollmentService {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    Some((_, reply)) = hooks.before_connect_rx.recv() => {
-                        let _ = reply.send(true);
+                    Some((info, reply)) = hooks.before_connect_rx.recv() => {
+                        let Some(service) = weak.upgrade() else {
+                            let _ = reply.send(false);
+                            break;
+                        };
+                        service.before_connect(info, reply);
                     }
                     Some((info, reply)) = hooks.after_handshake_rx.recv() => {
                         let Some(service) = weak.upgrade() else {
@@ -823,34 +845,171 @@ impl EnrollmentService {
             let _ = reply.send(hook_decision(allowed));
             return;
         }
-        let permit = if self.has_session(&peer) {
-            self.gate_permits
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| GateDenial::new("gate busy"))
-        } else {
-            Err(self.sessionless_denial(&peer))
-        };
-        let permit = match permit {
-            Ok(permit) => permit,
-            Err(denial) => {
-                self.log_decision(&peer, &alpn, Err(denial));
+        let connection = info.connection;
+        let source = address.map(|address| ObservedSourceAddress {
+            address: address.ip(),
+            provenance: SourceAddressProvenance::DirectPeer,
+        });
+        if self.has_session(&peer) {
+            let Ok(permit) = self.gate_permits.clone().try_acquire_owned() else {
+                self.log_decision(&peer, &alpn, Err(GateDenial::new("gate busy")));
                 let _ = reply.send(hook_decision(false));
                 return;
-            }
-        };
-        let connection = info.connection;
-        tokio::spawn(async move {
-            let _permit = permit;
-            let source = address.map(|address| ObservedSourceAddress {
-                address: address.ip(),
-                provenance: SourceAddressProvenance::DirectPeer,
+            };
+            tokio::spawn(async move {
+                let _permit = permit;
+                let decision = self.gate_connection(&peer, source, connection).await;
+                let allowed = decision.is_ok();
+                self.log_decision(&peer, &alpn, decision.map(Some));
+                let _ = reply.send(hook_decision(allowed));
             });
-            let decision = self.gate_connection(&peer, source, connection).await;
+            return;
+        }
+        // No session: a known definite denial is final. Otherwise this node
+        // has lost the session (it restarted, or evicted an idle one) while
+        // the dialer still holds its own, so enroll with the dialer now,
+        // within the hook's deadline, and gate the connection on the result.
+        // That costs the same handshake budget as an inbound enrollment
+        // connection from this peer and source.
+        let denial = self.sessionless_denial(&peer);
+        if denial.reason != "no session" {
+            self.log_decision(&peer, &alpn, Err(denial));
+            let _ = reply.send(hook_decision(false));
+            return;
+        }
+        if !self.take_rate_slot(peer, address.map(|address| address.ip())) {
+            self.log_decision(&peer, &alpn, Err(GateDenial::new("rate limited")));
+            let _ = reply.send(hook_decision(false));
+            return;
+        }
+        let dial_back = CoreNodeAddr {
+            endpoint_id: hex::encode(peer),
+            relay_url: None,
+            direct_addresses: address
+                .map(|address| vec![address.to_string()])
+                .unwrap_or_default(),
+        };
+        tokio::spawn(async move {
+            let decision = match self.ensure_session(peer, dial_back).await {
+                Err(error) => Err(GateDenial {
+                    reason: "enrollment failed",
+                    detail: Some(error),
+                }),
+                Ok(()) => match self.gate_permits.clone().try_acquire_owned() {
+                    Err(_) => Err(GateDenial::new("gate busy")),
+                    Ok(_permit) => self.gate_connection(&peer, source, connection).await,
+                },
+            };
             let allowed = decision.is_ok();
             self.log_decision(&peer, &alpn, decision.map(Some));
             let _ = reply.send(hook_decision(allowed));
         });
+    }
+
+    /// Outbound Gate 0. A dial on an ordinary ALPN to a peer this node holds
+    /// no session with (after either side restarted, or before any explicit
+    /// `connect`) first runs the enrollment handshake with that peer, which
+    /// leaves both sides with sessions; the dial proceeds only if it
+    /// succeeds. Enrollment dials themselves pass straight through.
+    fn before_connect(self: Arc<Self>, info: CoreHookConnectInfo, reply: oneshot::Sender<bool>) {
+        if info.alpn == ENROLLMENT_ALPN {
+            let _ = reply.send(true);
+            return;
+        }
+        let Ok(peer) = identity(&info.remote_endpoint_id) else {
+            let _ = reply.send(false);
+            return;
+        };
+        if self.has_session(&peer) {
+            let _ = reply.send(true);
+            return;
+        }
+        tokio::spawn(async move {
+            let result = self.ensure_session(peer, info.remote_addr).await;
+            if let Err(error) = &result {
+                tracing::debug!(
+                    target: ADMISSION_TARGET,
+                    peer = %hex::encode(peer),
+                    alpn = %String::from_utf8_lossy(&info.alpn),
+                    %error,
+                    "outbound connect blocked: on-demand enrollment failed"
+                );
+            }
+            let _ = reply.send(result.is_ok());
+        });
+    }
+
+    /// How long an on-demand handshake may take: the handshake deadline, cut
+    /// to leave a fifth of the hook timeout for the decision itself, since a
+    /// hook that runs out falls back to its failure mode (open, for an
+    /// outbound dial).
+    fn on_demand_deadline(&self) -> Duration {
+        let hook = self.node.inner.enrollment_hook_timeout;
+        self.options
+            .handshake_timeout
+            .min(hook.saturating_sub(hook / 5))
+    }
+
+    /// Run the enrollment handshake with `peer` unless a session exists.
+    /// Concurrent callers for one peer share one handshake, which runs to
+    /// completion in its own task even if they give up, and is bounded by
+    /// [`Self::on_demand_deadline`]. A failure is remembered for
+    /// [`ON_DEMAND_RETRY_BACKOFF`].
+    async fn ensure_session(
+        self: &Arc<Self>,
+        peer: [u8; 32],
+        address: CoreNodeAddr,
+    ) -> std::result::Result<(), String> {
+        if self.has_session(&peer) {
+            return Ok(());
+        }
+        let deadline = self.on_demand_deadline();
+        let mut outcome = {
+            let mut on_demand = self.on_demand.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(waiting) = on_demand.in_flight.get(&peer) {
+                waiting.clone()
+            } else {
+                if let Some(failed) = on_demand.failed.get(&peer) {
+                    if failed.elapsed() < ON_DEMAND_RETRY_BACKOFF {
+                        return Err("a recent enrollment handshake with this peer failed".into());
+                    }
+                }
+                let (sender, receiver) = watch::channel(None);
+                on_demand.in_flight.insert(peer, receiver.clone());
+                let service = self.clone();
+                tokio::spawn(async move {
+                    let result =
+                        match tokio::time::timeout(deadline, service.connect(address)).await {
+                            Ok(Ok(_)) => Ok(()),
+                            Ok(Err(error)) => Err(format!("{error:#}")),
+                            Err(_) => Err("enrollment handshake timeout".to_string()),
+                        };
+                    let mut on_demand = service.on_demand.lock().unwrap_or_else(|e| e.into_inner());
+                    on_demand.in_flight.remove(&peer);
+                    if result.is_ok() {
+                        on_demand.failed.remove(&peer);
+                    } else {
+                        if on_demand.failed.len() >= MAX_RATE_KEYS {
+                            on_demand
+                                .failed
+                                .retain(|_, at| at.elapsed() < ON_DEMAND_RETRY_BACKOFF);
+                        }
+                        if on_demand.failed.len() < MAX_RATE_KEYS {
+                            on_demand.failed.insert(peer, Instant::now());
+                        }
+                    }
+                    drop(on_demand);
+                    let _ = sender.send(Some(result));
+                });
+                receiver
+            }
+        };
+        let waited = tokio::time::timeout(deadline, outcome.wait_for(Option::is_some)).await;
+        match waited {
+            Ok(Ok(result)) => result.clone().unwrap_or(Ok(())),
+            Ok(Err(_)) => Err("enrollment handshake abandoned".into()),
+            Err(_) => Err("enrollment handshake timeout".into()),
+        }
     }
 
     /// Why a peer with no session is refused: a recent definite revocation

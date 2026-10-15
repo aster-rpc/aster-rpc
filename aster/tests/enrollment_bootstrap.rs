@@ -861,17 +861,13 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
                 Some(reusable.clone()),
             );
             fresh.add_peer(&replica).unwrap();
-            // Gate-0 rejects ordinary traffic from the not-yet-enrolled identity.
+            // Gate 0 admits ordinary traffic only after the reciprocal
+            // handshake: the not-yet-enrolled identity's first ordinary dial
+            // runs it on demand, and the replica then holds its session.
             if attempt == 0 {
-                let connection = fresh.connect(&replica.id(), NORMAL).await;
-                if let Ok(connection) = connection {
-                    assert!(
-                        tokio::time::timeout(Duration::from_secs(3), connection.open_bi())
-                            .await
-                            .unwrap()
-                            .is_err()
-                    );
-                }
+                assert!(replica_enroll.peer_session(&public(4)).is_none());
+                fresh.connect(&replica.id(), NORMAL).await.unwrap();
+                assert!(replica_enroll.peer_session(&public(4)).is_some());
             }
             assert_eq!(sync(&fresh_enroll, replica.addr()).await.peer, public(2));
             if attempt == 0 {

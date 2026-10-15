@@ -108,12 +108,12 @@ async fn node(seed: u8, hooks: bool) -> Node {
             .hooks(true)
             .hook_failure_mode(aster::HookFailureMode::FailClosed);
     }
-    Node::start_with_alpns(
-        config.build(),
-        vec![ENROLLMENT_ALPN.to_vec(), APP_ALPN.to_vec()],
-    )
-    .await
-    .unwrap()
+    // A stranger does not speak enrollment at all.
+    let mut alpns = vec![APP_ALPN.to_vec()];
+    if hooks {
+        alpns.push(ENROLLMENT_ALPN.to_vec());
+    }
+    Node::start_with_alpns(config.build(), alpns).await.unwrap()
 }
 
 fn enrollment(node: &Node, path: &std::path::Path, seed: u8) -> Enrollment {
@@ -154,8 +154,9 @@ async fn every_gate_zero_decision_is_logged_under_aster_admission() {
         serve(gate.clone(), gate_enroll.clone());
         let gate_hex = hex::encode(public(2));
 
-        // A stranger that never enrolled dials an application ALPN: denied
-        // at info, naming the peer, the ALPN and why.
+        // A stranger that never enrolled dials an application ALPN. The gate
+        // tries to enroll with it on demand, which fails, so it is denied at
+        // info, naming the peer, the ALPN and why.
         let stranger = node(7, false).await;
         let stranger_hex = hex::encode(public(7));
         if let Ok(connection) = stranger.connect_addr(gate.addr(), APP_ALPN).await {
@@ -169,7 +170,7 @@ async fn every_gate_zero_decision_is_logged_under_aster_admission() {
         assert_eq!(denied.level, tracing::Level::INFO, "{denied:?}");
         for field in [
             "alpn=admission-log/1;",
-            "reason=no session;",
+            "reason=enrollment failed;",
             "suppressed=0;",
         ] {
             assert!(denied.fields.contains(field), "{field} in {denied:?}");

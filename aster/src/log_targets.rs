@@ -16,7 +16,7 @@
 //! | [`DISPATCH`] | warn | a corrupt request frame -- one that does not inflate, or a client-stream / bidi request that does not decode (the call fails with `INVALID_ARGUMENT`) |
 //! | [`SESSION`] | debug | session opened, sessions reaped with their connection, HTTP session ended |
 //! | [`FOREIGN`] | debug / trace | foreign (binding) dispatch: call delivered (trace), cancelled / expired / abandoned (debug) |
-//! | [`ADMISSION`] | debug / info | Gate 0: inbound peer accepted (debug) or rejected (info); outbound dial allowed / blocked (debug). With Enrollment, one event per connection decision (fields `peer`, `alpn`, `decision`, `reason`, `source` or `detail`): allows at debug, denials at info, at most one info line per denied peer per 10 s and 32 a second overall (the rest at debug, counted in `suppressed`) |
+//! | [`ADMISSION`] | debug / info | Gate 0: inbound peer accepted (debug) or rejected (info); outbound dial allowed / blocked (debug). With Enrollment, one event per connection decision (fields `peer`, `alpn`, `decision`, `reason`, `source` or `detail`): allows at debug, denials at info, at most one info line per denied peer per 10 s and 32 a second overall (the rest at debug, counted in `suppressed`); an outbound dial blocked because on-demand enrollment failed (debug) |
 //! | [`UPCALL`] | trace / debug / warn | binding upcalls: issued / answered (trace), cancelled or late answers (debug), a decision upcall that fell back to its failure mode (warn) |
 //! | [`OPS`] | info / debug | ops (health/metrics) listener bound and shut down (info); per-connection serve errors (debug) |
 //!
