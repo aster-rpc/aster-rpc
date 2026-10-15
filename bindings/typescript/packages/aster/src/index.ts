@@ -690,7 +690,6 @@ export {
 // Registry
 export {
   RegistryClient,
-  registryKey,
   type RegistryArtifactRef,
   type EndpointLease as RegistryEndpointLease,
 } from './registry/client.js';
@@ -705,8 +704,13 @@ export {
   RegistryGossip,
 } from './registry/gossip.js';
 export {
+  keySegment,
+  decodeKeySegment,
   contractKey,
+  manifestKey,
   versionKey,
+  versionPrefix,
+  parseVersionKey,
   channelKey,
   tagKey,
   leaseKey,

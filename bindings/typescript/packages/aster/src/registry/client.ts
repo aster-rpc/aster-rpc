@@ -9,11 +9,6 @@
 import type { ContractManifest } from '../contract/manifest.js';
 import { manifestFromJson } from '../contract/manifest.js';
 
-/** Registry key encoding: "contracts/{service_name}/v{version}" */
-export function registryKey(serviceName: string, version: number): string {
-  return `contracts/${serviceName}/v${version}`;
-}
-
 /** Artifact reference stored in the registry doc. */
 export interface RegistryArtifactRef {
   contractId: string;

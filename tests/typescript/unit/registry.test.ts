@@ -4,8 +4,13 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+  keySegment,
+  decodeKeySegment,
   contractKey,
+  manifestKey,
   versionKey,
+  versionPrefix,
+  parseVersionKey,
   channelKey,
   tagKey,
   leaseKey,
@@ -18,8 +23,6 @@ import {
   isLeaseFresh,
   isLeaseRoutable,
   RegistryACL,
-  RegistryClient,
-  registryKey,
   RegistryPublisher,
   type EndpointLease,
 } from '@aster-rpc/aster';
@@ -28,28 +31,76 @@ import {
 
 describe('registry keys', () => {
   it('contractKey', () => {
-    expect(contractKey('abc123')).toBe('contracts/abc123');
+    expect(contractKey('abc123')).toBe('contracts/abc123/');
+  });
+  it('manifestKey', () => {
+    expect(manifestKey('abc123')).toBe('manifests/abc123/');
   });
   it('versionKey', () => {
-    expect(versionKey('Echo', 2)).toBe('services/Echo/versions/v2');
+    expect(versionKey('Echo', 2)).toBe('services/Echo/versions/v2/');
+    expect(versionPrefix('Echo')).toBe('services/Echo/versions/');
   });
   it('channelKey', () => {
-    expect(channelKey('Echo', 'stable')).toBe('services/Echo/channels/stable');
+    expect(channelKey('Echo', 'stable')).toBe('services/Echo/channels/stable/');
   });
   it('tagKey', () => {
-    expect(tagKey('Echo', 'latest')).toBe('services/Echo/tags/latest');
+    expect(tagKey('Echo', 'latest')).toBe('services/Echo/tags/latest/');
   });
   it('leaseKey', () => {
-    expect(leaseKey('Echo', 'cid', 'eid')).toBe('services/Echo/contracts/cid/endpoints/eid');
+    expect(leaseKey('Echo', 'cid', 'eid')).toBe('services/Echo/contracts/cid/endpoints/eid/');
   });
   it('leasePrefix', () => {
     expect(leasePrefix('Echo', 'cid')).toBe('services/Echo/contracts/cid/endpoints/');
   });
   it('aclKey', () => {
-    expect(aclKey('writers')).toBe('_aster/acl/writers');
+    expect(aclKey('writers')).toBe('_aster/acl/writers/');
   });
   it('configKey', () => {
-    expect(configKey('version')).toBe('_aster/config/version');
+    expect(configKey('version')).toBe('_aster/config/version/');
+  });
+  it('segments escape slash and percent', () => {
+    expect(keySegment('a/b%c')).toBe('a%2Fb%25c');
+    expect(decodeKeySegment('a%2Fb%25c')).toBe('a/b%c');
+    expect(decodeKeySegment('%252F')).toBe('%2F');
+    expect(channelKey('x', 'a/b')).toBe('services/x/channels/a%2Fb/');
+    for (const bad of ['a/b', '%', '%2', '%41', '50%']) {
+      expect(decodeKeySegment(bad)).toBeNull();
+    }
+  });
+  it('version keys parse strictly', () => {
+    expect(parseVersionKey(versionKey('a/b', 10))).toEqual(['a/b', 10]);
+    expect(parseVersionKey(versionKey('svc', -3))).toEqual(['svc', -3]);
+    for (const bad of [
+      'services/svc/versions/v1',
+      'services/svc/versions/v01/',
+      'services/svc/versions/v+1/',
+      'services/svc/versions/v-0/',
+      'services/svc/versions/1/',
+      'services/svc/versions/v1/x/',
+      'services/a/b/versions/v1/',
+      'services/svc/channels/v1/',
+      'services/svc/versions/v2147483648/',
+    ]) {
+      expect(parseVersionKey(bad)).toBeNull();
+    }
+  });
+  it('keys are prefix-free (iroh-docs supersedes extensions of a written key)', () => {
+    const leaves = ['1', '10', 'stable', 'stable2', 'x/y', 'x', '', '%2F'];
+    const keys = new Set<string>();
+    for (const name of ['svc', 'svc2', 'a/b', 'a', '50%']) {
+      for (const leaf of leaves) {
+        [contractKey(leaf), manifestKey(leaf), aclKey(leaf), configKey(leaf)].forEach(k => keys.add(k));
+        keys.add(channelKey(name, leaf));
+        keys.add(tagKey(name, leaf));
+        for (const eid of leaves) keys.add(leaseKey(name, leaf, eid));
+      }
+      for (const v of [1, 10, 100, -1]) keys.add(versionKey(name, v));
+    }
+    for (const a of keys) {
+      for (const b of keys) {
+        if (a !== b) expect(b.startsWith(a), `${a} prefixes ${b}`).toBe(false);
+      }
+    }
   });
   it('REGISTRY_PREFIXES has expected entries', () => {
     expect(REGISTRY_PREFIXES).toContain('contracts/');
@@ -148,14 +199,6 @@ describe('RegistryACL', () => {
   });
 });
 
-// -- RegistryClient ---
-
-describe('RegistryClient', () => {
-  it('registryKey format', () => {
-    expect(registryKey('Echo', 1)).toBe('contracts/Echo/v1');
-  });
-});
-
 // -- Publisher ---
 
 describe('RegistryPublisher', () => {
@@ -180,8 +223,8 @@ describe('RegistryPublisher', () => {
       'Echo', 1,
     );
 
-    expect(writes.some(([k]) => k === 'contracts/cid123')).toBe(true);
-    expect(writes.some(([k]) => k === 'services/Echo/versions/v1')).toBe(true);
+    expect(writes.some(([k]) => k === 'contracts/cid123/')).toBe(true);
+    expect(writes.some(([k]) => k === 'services/Echo/versions/v1/')).toBe(true);
     pub.close();
   });
 });

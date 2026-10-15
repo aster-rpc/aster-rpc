@@ -53,7 +53,7 @@ export class RegistryPublisher {
   async publishContract(artifact: ArtifactRef, serviceName: string, version: number): Promise<void> {
     const encoder = new TextEncoder();
 
-    // Write artifact to contracts/{contract_id}
+    // Write artifact to contracts/{contract_id}/
     const artifactJson = JSON.stringify(artifact);
     await this.doc.setBytes(this.authorId, contractKey(artifact.contractId), encoder.encode(artifactJson));
 
