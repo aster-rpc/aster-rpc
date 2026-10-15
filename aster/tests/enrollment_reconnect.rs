@@ -37,8 +37,9 @@ fn credential(seed: u8) -> String {
         .into_chain()
 }
 
-/// A persistent enrolled server: same key, port, storage and state on
-/// restart, as a deployed server keeps them.
+/// A persistent enrolled server: same key, storage and state on restart, as
+/// a deployed server keeps them. Port `0` leaves the port to the OS; a
+/// persistent node then re-binds the port it last bound.
 fn config(seed: u8, fleet: &str, storage: &std::path::Path, port: u16) -> AsterConfig {
     AsterConfig::builder()
         .relay(RelayMode::Disabled)
@@ -83,12 +84,41 @@ async fn start(config: AsterConfig) -> AsterServer {
 /// state), then check the state every step starts from: `a` still holds a
 /// session for `b`, the restarted `b` holds none for `a`.
 async fn restart(b: AsterServer, a: &AsterServer, config: &AsterConfig) -> AsterServer {
+    let bound = b.node().native_endpoint().bound_sockets();
     b.shutdown().await;
+    // A new process finds the old sockets closed; in-process, wait for the
+    // previous instance to release them.
+    released(&bound).await;
     let b = start(config.clone()).await;
+    let rebound = b.node().native_endpoint().bound_sockets();
+    let v4 = |addrs: &[std::net::SocketAddr]| addrs.iter().find(|a| a.is_ipv4()).map(|a| a.port());
+    assert_eq!(v4(&rebound), v4(&bound), "b comes back on the same port");
     introduce(a.node(), b.node());
     assert!(session(a, public(3)), "a keeps its session for b");
     assert!(!session(&b, public(2)), "a restarted b holds no session");
     b
+}
+
+async fn released(addrs: &[std::net::SocketAddr]) {
+    let bindable = |addr: &std::net::SocketAddr| {
+        let socket = socket2::Socket::new(
+            socket2::Domain::for_address(*addr),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )
+        .unwrap();
+        if addr.is_ipv6() {
+            socket.set_only_v6(true).unwrap();
+        }
+        socket.bind(&(*addr).into()).is_ok()
+    };
+    for _ in 0..250 {
+        if addrs.iter().all(bindable) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("{addrs:?} were not released after shutdown");
 }
 
 /// Address books only: Iroh discovery is off in these tests.
@@ -164,8 +194,25 @@ async fn fetch(from: &Node, to: &Node, content: &[u8]) {
     assert_eq!(bytes, content);
 }
 
+/// B keeps a fixed, explicit port across restarts.
 #[tokio::test]
 async fn admitted_peers_reconnect_after_a_restart_without_explicit_enrollment() {
+    let free_port = std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    reconnect_after_restarts(free_port).await;
+}
+
+/// B binds an OS-chosen port with persistent storage, so each restart
+/// re-binds the port it recorded (`AsterConfig::reuse_last_port`).
+#[tokio::test]
+async fn admitted_peers_reconnect_after_a_restart_on_an_ephemeral_port() {
+    reconnect_after_restarts(0).await;
+}
+
+async fn reconnect_after_restarts(b_port: u16) {
     tokio::time::timeout(Duration::from_secs(240), async {
         let files = tempfile::tempdir().unwrap();
         let fleet = {
@@ -182,15 +229,8 @@ async fn admitted_peers_reconnect_after_a_restart_without_explicit_enrollment() 
             root.shutdown().await;
             id
         };
-        let free_port = || {
-            std::net::UdpSocket::bind("127.0.0.1:0")
-                .unwrap()
-                .local_addr()
-                .unwrap()
-                .port()
-        };
         let a_config = config(2, &fleet, files.path(), 0);
-        let b_config = config(3, &fleet, files.path(), free_port());
+        let b_config = config(3, &fleet, files.path(), b_port);
         let a = start(a_config).await;
         let mut b = start(b_config.clone()).await;
         introduce(a.node(), b.node());
