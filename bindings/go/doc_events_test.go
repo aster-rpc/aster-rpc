@@ -88,7 +88,12 @@ func TestDocJoinWithEvents(t *testing.T) {
 	if err := doc.SetBytes(ctx, author, "remote-key", []byte("remote-value")); err != nil {
 		t.Fatal(err)
 	}
-	for {
+	nodeID, err := node.NodeID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sawInsert, sawSync := false, false
+	for !sawInsert || !sawSync {
 		event, err := events.Recv(ctx)
 		if err != nil {
 			t.Fatal(err)
@@ -97,7 +102,13 @@ func TestDocJoinWithEvents(t *testing.T) {
 			if event.From == "" || event.Entry.Author != author || event.Entry.ContentLen != 12 {
 				t.Fatalf("remote event: %+v", event)
 			}
-			break
+			sawInsert = true
+		}
+		if event.Type == DOC_EVENT_SYNC_FINISHED && event.Sync != nil && event.Sync.OK {
+			if event.Peer != nodeID || event.Sync.Error != "" {
+				t.Fatalf("sync event: %+v %+v", event, event.Sync)
+			}
+			sawSync = true
 		}
 	}
 }
@@ -158,5 +169,30 @@ func TestDocSubscriptionRuntimeShutdown(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("runtime shutdown stranded receive")
+	}
+}
+
+// The byte vectors match the FFI encoder's test
+// (ffi/src/lib.rs doc_event_encoding_tests).
+func TestDocEventDecodesSyncFinished(t *testing.T) {
+	ok, err := decodeDocEvent(DOC_EVENT_SYNC_FINISHED, []byte{2, 0, 0, 0, 'a', 'b', 1, 1, 0, 0, 0, 0})
+	if err != nil || ok.Peer != "ab" || ok.Sync == nil || *ok.Sync != (DocSyncResult{Origin: DOC_SYNC_ORIGIN_CONNECT, OK: true}) {
+		t.Fatalf("completed round = %+v, %v", ok, err)
+	}
+	failed, err := decodeDocEvent(DOC_EVENT_SYNC_FINISHED, []byte{2, 0, 0, 0, 'a', 'b', 0, 0, 2, 0, 0, 0, 'n', 'o'})
+	if err != nil || failed.Peer != "ab" || failed.Sync == nil || *failed.Sync != (DocSyncResult{Origin: DOC_SYNC_ORIGIN_ACCEPT, Error: "no"}) {
+		t.Fatalf("failed round = %+v, %v", failed, err)
+	}
+	for _, data := range [][]byte{
+		nil,
+		{2, 0, 0, 0, 'a', 'b'},
+		{2, 0, 0, 0, 'a', 'b', 2, 1, 0, 0, 0, 0},
+		{2, 0, 0, 0, 'a', 'b', 1, 1, 1, 0, 0, 0, 'x'},
+		{2, 0, 0, 0, 'a', 'b', 1, 0, 9, 0, 0, 0, 'x'},
+		{2, 0, 0, 0, 'a', 'b', 1, 1, 0, 0, 0, 0, 0},
+	} {
+		if _, err := decodeDocEvent(DOC_EVENT_SYNC_FINISHED, data); err == nil {
+			t.Fatalf("accepted malformed sync result: %x", data)
+		}
 	}
 }

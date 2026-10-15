@@ -16,13 +16,33 @@ import (
 )
 
 // DocEvent is a live change. Entry is populated for inserts, From for remote
-// inserts, Hash for content-ready, and Peer for neighbor/sync events.
+// inserts, Hash for content-ready, Peer for neighbor/sync events, and Sync for
+// sync-finished events.
 type DocEvent struct {
 	Type  DocEventType
 	Entry *DocEntry
 	From  string
 	Hash  BlobID
 	Peer  string
+	Sync  *DocSyncResult
+}
+
+// DocSyncOrigin says which side started a sync round.
+type DocSyncOrigin uint8
+
+const (
+	// DOC_SYNC_ORIGIN_ACCEPT: the peer dialled this node and it accepted.
+	DOC_SYNC_ORIGIN_ACCEPT DocSyncOrigin = 0
+	// DOC_SYNC_ORIGIN_CONNECT: this node dialled the peer.
+	DOC_SYNC_ORIGIN_CONNECT DocSyncOrigin = 1
+)
+
+// DocSyncResult is how a sync round ended. OK is false for a failed round,
+// with Error carrying the document layer's message.
+type DocSyncResult struct {
+	Origin DocSyncOrigin
+	OK     bool
+	Error  string
 }
 
 // DocSubscription owns a native document event receiver. Close it when done.
@@ -192,10 +212,35 @@ func decodeDocEvent(kind DocEventType, data []byte) (*DocEvent, error) {
 		if len(data) != 0 {
 			return nil, fmt.Errorf("doc event: unexpected pending-content payload")
 		}
-	case DOC_EVENT_NEIGHBOR_UP, DOC_EVENT_NEIGHBOR_DOWN, DOC_EVENT_SYNC_FINISHED:
+	case DOC_EVENT_NEIGHBOR_UP, DOC_EVENT_NEIGHBOR_DOWN:
 		event.Peer = string(data)
+	case DOC_EVENT_SYNC_FINISHED:
+		peer, rest, ok := cutLengthPrefixed(data)
+		if !ok || len(rest) < 2 || rest[0] > 1 || rest[1] > 1 {
+			return nil, fmt.Errorf("doc event: malformed sync result")
+		}
+		sync := &DocSyncResult{Origin: DocSyncOrigin(rest[0]), OK: rest[1] == 1}
+		msg, rest, ok := cutLengthPrefixed(rest[2:])
+		if !ok || len(rest) != 0 || (sync.OK && len(msg) != 0) {
+			return nil, fmt.Errorf("doc event: malformed sync result")
+		}
+		sync.Error = string(msg)
+		event.Peer = string(peer)
+		event.Sync = sync
 	default:
 		return nil, fmt.Errorf("doc event: unknown type %d", kind)
 	}
 	return event, nil
+}
+
+// cutLengthPrefixed splits a u32-LE-length-prefixed field off data.
+func cutLengthPrefixed(data []byte) (field, rest []byte, ok bool) {
+	if len(data) < 4 {
+		return nil, nil, false
+	}
+	n := uint64(binary.LittleEndian.Uint32(data))
+	if n > uint64(len(data)-4) {
+		return nil, nil, false
+	}
+	return data[4 : 4+n], data[4+n:], true
 }

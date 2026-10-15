@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Changed: `SyncFinished` says how the round ended
+
+A `DocEventKind.SyncFinished` event now carries `Sync`, a `DocSyncResult`
+with `Origin` (`DocSyncOrigin.Accept` or `Connect`), `Succeeded`, and the
+document layer's `Error` for a failed round. Before, a failed round and a
+completed one looked the same. The native payload for this event changed
+(length-prefixed peer, origin, ok flag, length-prefixed error), so this
+binding needs the matching native library.
+
 ### Changed: the credential sets the maximum roles; runtime can only restrict
 
 For a peer with a live enrollment session, the roles Gate 3 checks are now the

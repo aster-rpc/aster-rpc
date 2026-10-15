@@ -230,6 +230,29 @@ describe('docs', () => {
     expect(Buffer.from(ins.entry!.key).toString()).toBe('ev');
     expect(ins.entry!.author).toBe(author);
   });
+
+  it('sync_finished carries origin and result on both ends', async () => {
+    const doc = await a.docs().create();
+    const eventsA = await doc.subscribe();
+    await doc.setBytes(await a.docs().defaultAuthor(), 'k', Buffer.from('v'));
+    const joined = await b.docs().joinAndSubscribe(await doc.shareWithAddr('read'));
+    const eventsB = joined.takeEvents();
+    const firstCompleted = (events: AsyncIterable<DocEvent>, peer: string) =>
+      within((async () => {
+        for await (const ev of events) {
+          if (ev.kind === 'sync_finished' && ev.peer === peer && ev.syncOk) return ev;
+        }
+        throw new Error('event stream ended');
+      })(), 10_000, 'sync_finished');
+    const evA = await firstCompleted(eventsA, b.id);
+    const evB = await firstCompleted(eventsB, a.id);
+    for (const ev of [evA, evB]) {
+      expect(ev.syncError).toBeUndefined();
+      expect(['accept', 'connect']).toContain(ev.syncOrigin);
+    }
+    // One end accepted what the other dialled.
+    expect(new Set([evA.syncOrigin, evB.syncOrigin])).toEqual(new Set(['accept', 'connect']));
+  });
 });
 
 describe('gossip', () => {

@@ -5697,7 +5697,25 @@ fn encode_doc_event(ev: &aster_transport_core::CoreDocEvent) -> (u32, Vec<u8>) {
         PendingContentReady => (3, Vec::new()),
         NeighborUp { peer } => (4, peer.as_bytes().to_vec()),
         NeighborDown { peer } => (5, peer.as_bytes().to_vec()),
-        SyncFinished { peer } => (6, peer.as_bytes().to_vec()),
+        SyncFinished {
+            peer,
+            origin,
+            result,
+        } => {
+            let peer = peer.as_bytes();
+            let error = result.as_ref().err().map_or(&[][..], |e| e.as_bytes());
+            let mut payload = Vec::with_capacity(10 + peer.len() + error.len());
+            payload.extend_from_slice(&(peer.len() as u32).to_le_bytes());
+            payload.extend_from_slice(peer);
+            payload.push(match origin {
+                aster_transport_core::CoreSyncOrigin::Accept => 0,
+                aster_transport_core::CoreSyncOrigin::Connect => 1,
+            });
+            payload.push(u8::from(result.is_ok()));
+            payload.extend_from_slice(&(error.len() as u32).to_le_bytes());
+            payload.extend_from_slice(error);
+            (6, payload)
+        }
     }
 }
 
@@ -5851,8 +5869,10 @@ pub unsafe extern "C" fn aster_doc_event_receiver_free(
 /// 0=InsertLocal, 1=InsertRemote, 2=ContentReady, 3=PendingContentReady,
 /// 4=NeighborUp, 5=NeighborDown, 6=SyncFinished. Entry events use the DOC_QUERY
 /// metadata layout; InsertRemote appends a length-prefixed peer ID. ContentReady
-/// carries the hash string; neighbor/sync events carry the peer string.
-/// PendingContentReady has an empty payload.
+/// carries the hash string; neighbor events carry the peer string.
+/// SyncFinished carries a u32-length-prefixed peer ID, a u8 origin (0=Accept,
+/// 1=Connect), a u8 ok flag (1=completed, 0=failed) and a u32-length-prefixed
+/// UTF-8 error message (empty when ok). PendingContentReady has an empty payload.
 ///
 /// Receives on one receiver are serialized. Cancelling an operation wakes its
 /// wait without consuming a later event; if cancellation wins after a stream
@@ -8982,6 +9002,38 @@ mod event_buffer_tests {
         assert_eq!(
             unsafe { aster_runtime_close(handle) },
             aster_status_t::ASTER_STATUS_OK as i32
+        );
+    }
+}
+
+#[cfg(test)]
+mod doc_event_encoding_tests {
+    use super::*;
+
+    /// The SyncFinished layout the Go, .NET and Java decoders read; their
+    /// tests decode these same bytes.
+    #[test]
+    fn sync_finished_encodes_peer_origin_and_result() {
+        let ok = CoreDocEvent::SyncFinished {
+            peer: "ab".into(),
+            origin: CoreSyncOrigin::Connect,
+            result: Ok(()),
+        };
+        assert_eq!(
+            encode_doc_event(&ok),
+            (6, vec![2, 0, 0, 0, b'a', b'b', 1, 1, 0, 0, 0, 0])
+        );
+        let failed = CoreDocEvent::SyncFinished {
+            peer: "ab".into(),
+            origin: CoreSyncOrigin::Accept,
+            result: Err("no".into()),
+        };
+        assert_eq!(
+            encode_doc_event(&failed),
+            (
+                6,
+                vec![2, 0, 0, 0, b'a', b'b', 0, 0, 2, 0, 0, 0, b'n', b'o']
+            )
         );
     }
 }

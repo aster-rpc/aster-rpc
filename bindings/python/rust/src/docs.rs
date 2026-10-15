@@ -99,7 +99,8 @@ impl From<aster::DocEntry> for DocEntry {
 ///   "pending_content_ready" -- all queued downloads done
 ///   "neighbor_up"      -- peer joined the swarm       (peer populated)
 ///   "neighbor_down"    -- peer left the swarm         (peer populated)
-///   "sync_finished"    -- sync with peer complete     (peer populated)
+///   "sync_finished"    -- sync round with peer ended  (peer, sync_origin, sync_ok
+///                         populated; sync_error too when the round failed)
 #[pyclass(frozen)]
 pub struct DocEvent {
     #[pyo3(get)]
@@ -112,6 +113,15 @@ pub struct DocEvent {
     pub hash: Option<String>,
     #[pyo3(get)]
     pub peer: Option<String>,
+    /// `sync_finished`: "accept" (the peer dialled us) or "connect" (we dialled).
+    #[pyo3(get)]
+    pub sync_origin: Option<String>,
+    /// `sync_finished`: whether the round completed.
+    #[pyo3(get)]
+    pub sync_ok: Option<bool>,
+    /// `sync_finished`: why the round failed; None when it completed.
+    #[pyo3(get)]
+    pub sync_error: Option<String>,
 }
 
 fn event_to_py(py: Python<'_>, ev: aster::DocEvent) -> PyResult<DocEvent> {
@@ -121,6 +131,9 @@ fn event_to_py(py: Python<'_>, ev: aster::DocEvent) -> PyResult<DocEvent> {
         from_peer: None,
         hash: None,
         peer: None,
+        sync_origin: None,
+        sync_ok: None,
+        sync_error: None,
     };
     match ev {
         aster::DocEvent::InsertLocal { entry } => {
@@ -145,9 +158,22 @@ fn event_to_py(py: Python<'_>, ev: aster::DocEvent) -> PyResult<DocEvent> {
             out.kind = "neighbor_down".into();
             out.peer = Some(peer.into_string());
         }
-        aster::DocEvent::SyncFinished { peer } => {
+        aster::DocEvent::SyncFinished {
+            peer,
+            origin,
+            result,
+        } => {
             out.kind = "sync_finished".into();
             out.peer = Some(peer.into_string());
+            out.sync_origin = Some(
+                match origin {
+                    aster::SyncOrigin::Accept => "accept",
+                    aster::SyncOrigin::Connect => "connect",
+                }
+                .into(),
+            );
+            out.sync_ok = Some(result.is_ok());
+            out.sync_error = result.err();
         }
     }
     Ok(out)

@@ -15,8 +15,20 @@ public enum DocEventKind : uint
     SyncFinished = 6,
 }
 
-/// <summary>A live event; insertion events carry metadata, remote insertions and neighbor/sync events carry a peer ID.</summary>
-public sealed record DocEvent(DocEventKind Kind, DocEntry? Entry = null, string? PeerId = null, string? ContentHash = null);
+/// <summary>Which side started a document sync round.</summary>
+public enum DocSyncOrigin : byte
+{
+    /// <summary>The peer dialled this node and it accepted.</summary>
+    Accept = 0,
+    /// <summary>This node dialled the peer.</summary>
+    Connect = 1,
+}
+
+/// <summary>How a sync round ended. A failed round has <c>Succeeded</c> false and the document layer's message in <c>Error</c>.</summary>
+public sealed record DocSyncResult(DocSyncOrigin Origin, bool Succeeded, string? Error = null);
+
+/// <summary>A live event; insertion events carry metadata, remote insertions and neighbor/sync events carry a peer ID, and sync-finished events carry <c>Sync</c>.</summary>
+public sealed record DocEvent(DocEventKind Kind, DocEntry? Entry = null, string? PeerId = null, string? ContentHash = null, DocSyncResult? Sync = null);
 
 public sealed partial class Doc
 {
@@ -141,8 +153,21 @@ public sealed class DocEventReceiver : IDisposable, IAsyncDisposable
                 return new(kind, ContentHash: Encoding.UTF8.GetString(payload));
             case DocEventKind.NeighborUp:
             case DocEventKind.NeighborDown:
-            case DocEventKind.SyncFinished:
                 return new(kind, PeerId: Encoding.UTF8.GetString(payload));
+            case DocEventKind.SyncFinished:
+            {
+                string peer = Encoding.UTF8.GetString(DocMetadata.ReadField(ref rest, "peer"));
+                if (rest.Length < 2 || rest[0] > 1 || rest[1] > 1)
+                    throw new IrohException(Status.Internal, "document event: malformed sync result");
+                var origin = (DocSyncOrigin)rest[0];
+                bool succeeded = rest[1] == 1;
+                rest = rest[2..];
+                var error = DocMetadata.ReadField(ref rest, "sync error");
+                if (succeeded && !error.IsEmpty)
+                    throw new IrohException(Status.Internal, "document event: completed sync carries an error");
+                ev = new(kind, PeerId: peer, Sync: new(origin, succeeded, succeeded ? null : Encoding.UTF8.GetString(error)));
+                break;
+            }
             case DocEventKind.PendingContentReady:
                 ev = new(kind);
                 break;

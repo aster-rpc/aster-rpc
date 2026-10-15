@@ -146,7 +146,7 @@ pub use blobs::{
 #[cfg(feature = "docs")]
 pub use docs::{
     default_author_id, AuthorityFingerprint, AuthorityReport, Doc, DocEntry, DocEvent, DocEvents,
-    Docs, DownloadPolicy, LocalAccess, RetireOutcome, ShareMode,
+    Docs, DownloadPolicy, LocalAccess, RetireOutcome, ShareMode, SyncOrigin,
 };
 #[cfg(feature = "expose")]
 pub use expose::Expose;

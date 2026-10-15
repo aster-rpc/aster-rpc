@@ -4,7 +4,8 @@
 //! live `InsertRemote { from }` event.
 
 use aster::{
-    AsterConfig, AuthorId, BlobFormat, Doc, DocEvent, DocEvents, Node, RelayMode, ShareMode,
+    AsterConfig, AuthorId, BlobFormat, Doc, DocEvent, DocEvents, Node, NodeId, RelayMode,
+    ShareMode, SyncOrigin,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -229,6 +230,78 @@ async fn doc_entry_syncs_with_insert_remote_event() {
     .await
     .expect("content never became readable on B");
     assert_eq!(val, b"v");
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// The first `SyncFinished` with `peer` whose success matches `want_ok`, as
+/// `(origin, result)`.
+async fn next_sync_finished(
+    events: &DocEvents,
+    peer: NodeId,
+    want_ok: bool,
+) -> (SyncOrigin, Result<(), String>) {
+    timeout(Duration::from_secs(20), async {
+        loop {
+            match events.recv().await.expect("doc event stream") {
+                Some(DocEvent::SyncFinished {
+                    peer: p,
+                    origin,
+                    result,
+                }) if p == peer && result.is_ok() == want_ok => return (origin, result),
+                Some(_) => continue,
+                None => panic!("doc event stream ended before SyncFinished"),
+            }
+        }
+    })
+    .await
+    .expect("SyncFinished did not arrive in time")
+}
+
+#[tokio::test]
+async fn sync_finished_reports_origin_and_success_on_both_sides() {
+    let (a, b) = node_pair().await;
+    let doc_a = a.docs().create().await.expect("create doc");
+    let events_a = doc_a.subscribe().await.expect("subscribe a");
+    let author = a.docs().default_author().await.expect("author");
+    doc_a
+        .set_bytes(&author, b"k".to_vec(), b"v".to_vec())
+        .await
+        .expect("set");
+
+    let ticket = doc_a.share_with_addr(ShareMode::Read).await.expect("share");
+    let (_doc_b, events_b) = b.docs().join_and_subscribe(ticket).await.expect("join");
+
+    // A completed round is one exchange seen from both ends: the side that
+    // dialled reports Connect, the other Accept. Which side wins a
+    // simultaneous dial is iroh-docs' tie-break, so assert the pairing.
+    let (origin_a, result_a) = next_sync_finished(&events_a, b.id(), true).await;
+    let (origin_b, result_b) = next_sync_finished(&events_b, a.id(), true).await;
+    assert_eq!(result_a, Ok(()));
+    assert_eq!(result_b, Ok(()));
+    assert_ne!(
+        origin_a, origin_b,
+        "one side accepts what the other dialled: a={origin_a:?} b={origin_b:?}"
+    );
+
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+#[tokio::test]
+async fn sync_finished_reports_a_failed_round() {
+    let (a, b) = node_pair().await;
+    let doc_a = a.docs().create().await.expect("create doc");
+    let ticket = doc_a.share_with_addr(ShareMode::Read).await.expect("share");
+    // A stops syncing the namespace, so it refuses B's sync request.
+    doc_a.leave().await.expect("leave");
+
+    let (_doc_b, events_b) = b.docs().join_and_subscribe(ticket).await.expect("join");
+    let (origin, result) = next_sync_finished(&events_b, a.id(), false).await;
+    assert_eq!(origin, SyncOrigin::Connect);
+    let error = result.expect_err("a refused round fails");
+    assert!(!error.is_empty());
 
     a.shutdown().await;
     b.shutdown().await;

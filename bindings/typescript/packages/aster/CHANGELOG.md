@@ -5,6 +5,13 @@ All notable changes to `@aster-rpc/aster` (and its native addon
 
 ## Unreleased
 
+### Changed: `sync_finished` says how the round ended
+
+A `sync_finished` `DocEvent` now sets `syncOrigin` (`'accept'` or
+`'connect'`), `syncOk`, and `syncError` (the document layer's message, absent
+when the round completed). Before, a failed round and a completed one looked
+the same.
+
 ### Changed: the credential sets the maximum roles; runtime can only restrict
 
 For a peer with a live enrollment session, the roles Gate 3 checks are now the

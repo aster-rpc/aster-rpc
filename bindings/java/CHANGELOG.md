@@ -5,6 +5,15 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Changed: `SYNC_FINISHED` says how the round ended
+
+`DocEvent` gains a `sync()` component, a `DocSyncResult` with `origin()`
+(`DocSyncOrigin.ACCEPT` or `CONNECT`), `succeeded()`, and the document
+layer's `error()` for a failed round; it is null for other event types.
+Before, a failed round and a completed one looked the same. The record's
+constructor gained the component, and the native payload for this event
+changed, so this binding needs the matching native library.
+
 ### Changed: the credential sets the maximum roles; runtime can only restrict
 
 For a peer with a live enrollment session, the roles Gate 3 checks are now the

@@ -8,6 +8,7 @@ use std::time::Duration;
 use aster_transport_core::{
     CoreAuthorityFingerprint, CoreAuthorityReport, CoreDoc, CoreDocEntry, CoreDocEvent,
     CoreDocEventReceiver, CoreDocsClient, CoreDownloadPolicy, CoreLocalAccess, CoreRetireOutcome,
+    CoreSyncOrigin,
 };
 
 /// The default-docs [`AuthorId`] for a node with this secret — the same value
@@ -119,8 +120,33 @@ pub enum DocEvent {
     NeighborUp { peer: NodeId },
     /// A peer left this document's swarm.
     NeighborDown { peer: NodeId },
-    /// A sync with a peer finished.
-    SyncFinished { peer: NodeId },
+    /// A sync round with a peer ended. `result` says whether it completed:
+    /// a failed round (an unreachable peer, a refused or aborted exchange)
+    /// ends with `Err` carrying the document layer's message.
+    SyncFinished {
+        peer: NodeId,
+        /// Which side started the round.
+        origin: SyncOrigin,
+        result: std::result::Result<(), String>,
+    },
+}
+
+/// Which side started a document sync round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOrigin {
+    /// The peer connected to this node and this node accepted.
+    Accept,
+    /// This node dialled the peer.
+    Connect,
+}
+
+impl From<CoreSyncOrigin> for SyncOrigin {
+    fn from(origin: CoreSyncOrigin) -> Self {
+        match origin {
+            CoreSyncOrigin::Accept => SyncOrigin::Accept,
+            CoreSyncOrigin::Connect => SyncOrigin::Connect,
+        }
+    }
 }
 
 impl From<CoreDocEvent> for DocEvent {
@@ -143,8 +169,14 @@ impl From<CoreDocEvent> for DocEvent {
             CoreDocEvent::NeighborDown { peer } => DocEvent::NeighborDown {
                 peer: NodeId::from_hex(peer),
             },
-            CoreDocEvent::SyncFinished { peer } => DocEvent::SyncFinished {
+            CoreDocEvent::SyncFinished {
+                peer,
+                origin,
+                result,
+            } => DocEvent::SyncFinished {
                 peer: NodeId::from_hex(peer),
+                origin: origin.into(),
+                result,
             },
         }
     }

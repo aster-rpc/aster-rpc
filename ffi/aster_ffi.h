@@ -3472,8 +3472,10 @@ int32_t aster_doc_event_receiver_free(aster_runtime_t runtime, uint64_t receiver
  * 0=InsertLocal, 1=InsertRemote, 2=ContentReady, 3=PendingContentReady,
  * 4=NeighborUp, 5=NeighborDown, 6=SyncFinished. Entry events use the DOC_QUERY
  * metadata layout; InsertRemote appends a length-prefixed peer ID. ContentReady
- * carries the hash string; neighbor/sync events carry the peer string.
- * PendingContentReady has an empty payload.
+ * carries the hash string; neighbor events carry the peer string.
+ * SyncFinished carries a u32-length-prefixed peer ID, a u8 origin (0=Accept,
+ * 1=Connect), a u8 ok flag (1=completed, 0=failed) and a u32-length-prefixed
+ * UTF-8 error message (empty when ok). PendingContentReady has an empty payload.
  *
  * Receives on one receiver are serialized. Cancelling an operation wakes its
  * wait without consuming a later event; if cancellation wins after a stream

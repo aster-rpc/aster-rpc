@@ -5041,8 +5041,32 @@ pub enum CoreDocEvent {
     NeighborUp { peer: String },
     /// A peer left the swarm for this document.
     NeighborDown { peer: String },
-    /// A set-reconciliation sync with a peer finished.
-    SyncFinished { peer: String },
+    /// A set-reconciliation sync round with a peer ended, completed or failed.
+    SyncFinished {
+        peer: String,
+        /// Which side started the round.
+        origin: CoreSyncOrigin,
+        /// `Ok` if the round completed; otherwise iroh-docs' error message.
+        result: std::result::Result<(), String>,
+    },
+}
+
+/// Which side started a sync round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoreSyncOrigin {
+    /// A peer connected to us and we accepted.
+    Accept,
+    /// We dialled the peer (join, new neighbor, sync report or resync).
+    Connect,
+}
+
+impl From<&iroh_docs::engine::Origin> for CoreSyncOrigin {
+    fn from(origin: &iroh_docs::engine::Origin) -> Self {
+        match origin {
+            iroh_docs::engine::Origin::Accept => CoreSyncOrigin::Accept,
+            iroh_docs::engine::Origin::Connect(_) => CoreSyncOrigin::Connect,
+        }
+    }
 }
 
 fn live_event_to_core(ev: LiveEvent) -> CoreDocEvent {
@@ -5078,6 +5102,8 @@ fn live_event_to_core(ev: LiveEvent) -> CoreDocEvent {
         },
         LiveEvent::SyncFinished(ev) => CoreDocEvent::SyncFinished {
             peer: ev.peer.to_string(),
+            origin: CoreSyncOrigin::from(&ev.origin),
+            result: ev.result.map(|_| ()),
         },
     }
 }
@@ -5366,6 +5392,45 @@ mod role_swap_shutdown_tests {
         let text = format!("{err:#}");
         assert!(text.contains("leave timed out"), "{text}");
         assert!(text.contains("close timed out"), "{text}");
+    }
+}
+
+#[cfg(test)]
+mod doc_event_conversion_tests {
+    use super::*;
+    use iroh_docs::engine::{Origin, SyncDetails, SyncEvent, SyncReason};
+
+    fn sync_event(origin: Origin, result: std::result::Result<SyncDetails, String>) -> LiveEvent {
+        LiveEvent::SyncFinished(SyncEvent {
+            peer: SecretKey::from_bytes(&[7; 32]).public(),
+            origin,
+            finished: std::time::SystemTime::now(),
+            started: std::time::SystemTime::now(),
+            result,
+        })
+    }
+
+    #[test]
+    fn sync_finished_carries_origin_and_result() {
+        let peer = SecretKey::from_bytes(&[7; 32]).public().to_string();
+        let ok = live_event_to_core(sync_event(
+            Origin::Connect(SyncReason::DirectJoin),
+            Ok(SyncDetails {
+                entries_received: 1,
+                entries_sent: 2,
+            }),
+        ));
+        assert!(matches!(
+            ok,
+            CoreDocEvent::SyncFinished { peer: p, origin: CoreSyncOrigin::Connect, result: Ok(()) }
+                if p == peer
+        ));
+        let failed = live_event_to_core(sync_event(Origin::Accept, Err("aborted".into())));
+        assert!(matches!(
+            failed,
+            CoreDocEvent::SyncFinished { origin: CoreSyncOrigin::Accept, result: Err(e), .. }
+                if e == "aborted"
+        ));
     }
 }
 

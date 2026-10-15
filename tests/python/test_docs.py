@@ -679,3 +679,41 @@ async def test_join_and_subscribe_receives_event_after_write():
 
     await node1.shutdown()
     await node2.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_sync_finished_carries_origin_and_result():
+    """Both ends of a completed round report it: one accepted, one dialled."""
+    import asyncio
+    from aster import Node, docs_client
+
+    node1 = await Node.start()
+    node2 = await Node.start()
+    node1.add_node_addr(node2)
+    node2.add_node_addr(node1)
+
+    dc1 = docs_client(node1)
+    dc2 = docs_client(node2)
+    doc1 = await dc1.create()
+    events1 = await doc1.subscribe()
+    author1 = await dc1.create_author()
+    await doc1.set_bytes(author1, b"k", b"v")
+    ticket = await doc1.share("write")
+    _doc2, events2 = await dc2.join_and_subscribe(ticket)
+
+    async def first_completed(receiver, peer):
+        while True:
+            event = await asyncio.wait_for(receiver.recv(), timeout=10.0)
+            assert event is not None
+            if event.kind == "sync_finished" and event.peer == peer and event.sync_ok:
+                return event
+
+    ev1 = await first_completed(events1, node2.node_id())
+    ev2 = await first_completed(events2, node1.node_id())
+    for ev in (ev1, ev2):
+        assert ev.sync_error is None
+        assert ev.sync_origin in ("accept", "connect")
+    assert {ev1.sync_origin, ev2.sync_origin} == {"accept", "connect"}
+
+    await node1.shutdown()
+    await node2.shutdown()

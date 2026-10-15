@@ -711,6 +711,14 @@ pub struct DocEvent {
     pub peer: Option<String>,
     /// `content_ready`: the content hash now available locally.
     pub hash: Option<String>,
+    /// `sync_finished`: `'accept'` (the peer dialled us) or `'connect'` (we
+    /// dialled).
+    #[napi(ts_type = "'accept' | 'connect'")]
+    pub sync_origin: Option<String>,
+    /// `sync_finished`: whether the round completed.
+    pub sync_ok: Option<bool>,
+    /// `sync_finished`: why the round failed; absent when it completed.
+    pub sync_error: Option<String>,
 }
 
 impl From<aster::DocEvent> for DocEvent {
@@ -720,6 +728,9 @@ impl From<aster::DocEvent> for DocEvent {
             entry: None,
             peer: None,
             hash: None,
+            sync_origin: None,
+            sync_ok: None,
+            sync_error: None,
         };
         match e {
             aster::DocEvent::InsertLocal { entry } => DocEvent {
@@ -744,8 +755,21 @@ impl From<aster::DocEvent> for DocEvent {
                 peer: Some(peer.into_string()),
                 ..ev("neighbor_down")
             },
-            aster::DocEvent::SyncFinished { peer } => DocEvent {
+            aster::DocEvent::SyncFinished {
+                peer,
+                origin,
+                result,
+            } => DocEvent {
                 peer: Some(peer.into_string()),
+                sync_origin: Some(
+                    match origin {
+                        aster::SyncOrigin::Accept => "accept",
+                        aster::SyncOrigin::Connect => "connect",
+                    }
+                    .into(),
+                ),
+                sync_ok: Some(result.is_ok()),
+                sync_error: result.err(),
                 ..ev("sync_finished")
             },
         }

@@ -5,6 +5,13 @@ the repository; entries under **Unreleased** ship with the next tag.
 
 ## Unreleased
 
+### Changed: `sync_finished` says how the round ended
+
+A `sync_finished` `DocEvent` now sets `sync_origin` (`"accept"` or
+`"connect"`), `sync_ok`, and `sync_error` (the document layer's message, or
+`None` when the round completed). Before, a failed round and a completed one
+looked the same.
+
 ### Changed: the credential sets the maximum roles; runtime can only restrict
 
 For a peer with a live enrollment session, the roles Gate 3 checks are now the

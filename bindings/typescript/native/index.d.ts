@@ -2489,6 +2489,15 @@ export interface DocEvent {
   peer?: string
   /** `content_ready`: the content hash now available locally. */
   hash?: string
+  /**
+   * `sync_finished`: `'accept'` (the peer dialled us) or `'connect'` (we
+   * dialled).
+   */
+  syncOrigin?: 'accept' | 'connect'
+  /** `sync_finished`: whether the round completed. */
+  syncOk?: boolean
+  /** `sync_finished`: why the round failed; absent when it completed. */
+  syncError?: string
 }
 
 /** Which remote entries are downloaded automatically. */

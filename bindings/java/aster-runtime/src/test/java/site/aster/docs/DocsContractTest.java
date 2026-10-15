@@ -233,18 +233,21 @@ final class DocsContractTest {
         assertEquals(doc.docId(), subscription.doc().docId());
         AuthorId author = await(source.docs().createAuthorAsync());
         await(doc.setBytesAsync(author, "joined/live", utf8("remote")));
+        // A sync round may end before or after the insert arrives; wait for both.
         DocEvent remote = null;
-        for (int i = 0; i < 20; i++) {
+        DocEvent sync = null;
+        for (int i = 0; i < 40 && (remote == null || sync == null); i++) {
           DocEvent event = await(subscription.events().nextAsync(Duration.ofSeconds(5)));
           assertNotNull(event);
-          if (event.type() == DocEventType.INSERT_REMOTE) {
-            remote = event;
-            break;
-          }
+          if (event.type() == DocEventType.INSERT_REMOTE) remote = event;
+          if (event.type() == DocEventType.SYNC_FINISHED && event.sync().succeeded()) sync = event;
         }
         assertNotNull(remote);
         assertEquals("joined/live", remote.entry().key());
         assertEquals(source.nodeId(), remote.peer());
+        assertNotNull(sync);
+        assertEquals(source.nodeId(), sync.peer());
+        assertNull(sync.sync().error());
       }
     }
   }
@@ -260,8 +263,22 @@ final class DocsContractTest {
     assertEquals("c3".repeat(32), DocEvent.decode(1, out.toByteArray()).peer());
     assertEquals("d4".repeat(32), DocEvent.decode(2, utf8("d4".repeat(32))).contentHash().hex());
     assertEquals(DocEventType.PENDING_CONTENT_READY, DocEvent.decode(3, new byte[0]).type());
-    for (int subtype : List.of(4, 5, 6))
+    for (int subtype : List.of(4, 5))
       assertEquals("e5".repeat(32), DocEvent.decode(subtype, utf8("e5".repeat(32))).peer());
+    // SyncFinished: length-prefixed peer, origin, ok flag, length-prefixed error.
+    DocEvent completed = DocEvent.decode(6, syncFinished(1, 1, ""));
+    assertEquals("e5".repeat(32), completed.peer());
+    assertEquals(new DocSyncResult(DocSyncOrigin.CONNECT, true, null), completed.sync());
+    assertEquals(
+        new DocSyncResult(DocSyncOrigin.ACCEPT, false, "no"),
+        DocEvent.decode(6, syncFinished(0, 0, "no")).sync());
+    assertThrows(IrohException.class, () -> DocEvent.decode(6, utf8("e5".repeat(32))));
+    assertThrows(IrohException.class, () -> DocEvent.decode(6, syncFinished(2, 1, "")));
+    assertThrows(IrohException.class, () -> DocEvent.decode(6, syncFinished(1, 2, "")));
+    assertThrows(IrohException.class, () -> DocEvent.decode(6, syncFinished(1, 1, "x")));
+    byte[] full = syncFinished(1, 1, "");
+    assertThrows(
+        IrohException.class, () -> DocEvent.decode(6, Arrays.copyOf(full, full.length - 1)));
     assertThrows(IrohException.class, () -> DocEvent.decode(99, new byte[0]));
     assertThrows(
         IrohException.class,
@@ -269,6 +286,19 @@ final class DocsContractTest {
     assertThrows(IrohException.class, () -> DocEvent.decode(1, metadata));
     assertThrows(IrohException.class, () -> DocEvent.decode(2, utf8("bad hash")));
     assertThrows(IrohException.class, () -> DocEvent.decode(3, new byte[] {1}));
+  }
+
+  private static byte[] syncFinished(int origin, int ok, String error) {
+    var out = new ByteArrayOutputStream();
+    out.writeBytes(ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(64).array());
+    out.writeBytes(utf8("e5".repeat(32)));
+    out.write(origin);
+    out.write(ok);
+    byte[] err = utf8(error);
+    out.writeBytes(
+        ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putInt(err.length).array());
+    out.writeBytes(err);
+    return out.toByteArray();
   }
 
   @Test

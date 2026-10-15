@@ -77,11 +77,21 @@ public class DocEventTests
         using var events = joined.Events;
         Assert.Equal(source.Id(), doc.Id());
         await source.SetBytesAsync(author, "remote/key", "payload"u8.ToArray(), ct);
-        var ev = await ReadUntil(events, e => e.Kind == DocEventKind.InsertRemote, ct);
+        // A sync round may end before or after the insert arrives; wait for both.
+        DocEvent? ev = null, sync = null;
+        await foreach (var e in events.ReadAllAsync(ct))
+        {
+            if (e.Kind == DocEventKind.InsertRemote) ev = e;
+            if (e.Kind == DocEventKind.SyncFinished && e.Sync!.Succeeded) sync = e;
+            if (ev is not null && sync is not null) break;
+        }
+        Assert.NotNull(ev);
         Assert.Equal(provider.NodeId(), ev.PeerId);
         Assert.Equal(author, ev.Entry!.AuthorId);
         Assert.Equal("remote/key"u8.ToArray(), ev.Entry.Key);
         Assert.Equal(7ul, ev.Entry.ContentLen);
+        Assert.Equal(provider.NodeId(), sync!.PeerId);
+        Assert.Null(sync.Sync!.Error);
         events.Dispose();
         // Freeing the receiver leaves the document owner intact.
         Assert.Equal(source.Id(), doc.Id());
@@ -110,8 +120,18 @@ public class DocEventTests
         Assert.Equal("peer", remote.PeerId);
         Assert.Equal("hash", DocEventReceiver.Decode(2, "hash"u8.ToArray()).ContentHash);
         Assert.Equal(DocEventKind.PendingContentReady, DocEventReceiver.Decode(3, []).Kind);
-        foreach (uint subtype in new uint[] { 4, 5, 6 })
+        foreach (uint subtype in new uint[] { 4, 5 })
             Assert.Equal("peer", DocEventReceiver.Decode(subtype, "peer"u8.ToArray()).PeerId);
+        // Same vectors as the FFI encoder test (ffi/src/lib.rs doc_event_encoding_tests).
+        var completed = DocEventReceiver.Decode(6, [2, 0, 0, 0, (byte)'a', (byte)'b', 1, 1, 0, 0, 0, 0]);
+        Assert.Equal("ab", completed.PeerId);
+        Assert.Equal(new DocSyncResult(DocSyncOrigin.Connect, true), completed.Sync);
+        var failed = DocEventReceiver.Decode(6, [2, 0, 0, 0, (byte)'a', (byte)'b', 0, 0, 2, 0, 0, 0, (byte)'n', (byte)'o']);
+        Assert.Equal(new DocSyncResult(DocSyncOrigin.Accept, false, "no"), failed.Sync);
+        Assert.Throws<IrohException>(() => DocEventReceiver.Decode(6, "peer"u8.ToArray()));
+        Assert.Throws<IrohException>(() => DocEventReceiver.Decode(6, [2, 0, 0, 0, (byte)'a', (byte)'b', 2, 1, 0, 0, 0, 0]));
+        Assert.Throws<IrohException>(() => DocEventReceiver.Decode(6, [2, 0, 0, 0, (byte)'a', (byte)'b', 1, 1, 1, 0, 0, 0, (byte)'x']));
+        Assert.Throws<IrohException>(() => DocEventReceiver.Decode(6, [2, 0, 0, 0, (byte)'a', (byte)'b', 1, 1, 0, 0, 0, 0, 0]));
         Assert.Throws<IrohException>(() => DocEventReceiver.Decode(99, []));
         Assert.Throws<IrohException>(() => DocEventReceiver.Decode(0, metadata[..^1]));
         Assert.Throws<IrohException>(() => DocEventReceiver.Decode(0, [.. metadata, 1]));
