@@ -20,10 +20,14 @@ public static class RegistryKeys
 {
     /// <summary>
     /// Registry download-policy prefixes: all key namespaces a registry client should sync.
+    /// Every family a builder below writes must be covered, or the entry syncs without its
+    /// value; <c>endpoints/</c> and <c>compatibility/</c> are spec-reserved families with no
+    /// builder yet.
     /// </summary>
     public static readonly byte[][] RegistryPrefixes =
     [
         Encoding.UTF8.GetBytes("contracts/"),
+        Encoding.UTF8.GetBytes("manifests/"),
         Encoding.UTF8.GetBytes("services/"),
         Encoding.UTF8.GetBytes("endpoints/"),
         Encoding.UTF8.GetBytes("compatibility/"),

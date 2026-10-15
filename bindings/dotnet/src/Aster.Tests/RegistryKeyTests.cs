@@ -31,6 +31,25 @@ public class RegistryKeyTests
     [Fact]
     public void PrefixFree()
     {
+        var keys = FamilyKeys();
+        foreach (var a in keys)
+            foreach (var b in keys)
+                Assert.False(a != b && b.StartsWith(a, StringComparison.Ordinal), $"{a} is a prefix of {b}");
+    }
+
+    /// <summary>A client that syncs only RegistryPrefixes receives every family the builders write.</summary>
+    [Fact]
+    public void PrefixesCoverEveryFamily()
+    {
+        var prefixes = RegistryKeys.RegistryPrefixes.Select(S).ToList();
+        foreach (var key in FamilyKeys())
+            Assert.True(prefixes.Any(p => key.StartsWith(p, StringComparison.Ordinal)), $"no prefix covers {key}");
+    }
+
+    /// <summary>Keys from every builder, over segments chosen to provoke prefix collisions.
+    /// A new key family belongs here.</summary>
+    private static List<string> FamilyKeys()
+    {
         string[] leaves = ["1", "10", "stable", "stable2", "x/y", "x", "", "%2F"];
         var keys = new List<string>();
         foreach (var name in new[] { "svc", "svc2", "a/b", "a", "50%" })
@@ -49,9 +68,7 @@ public class RegistryKeyTests
             foreach (var v in new[] { 1, 10, 100, -1 })
                 keys.Add(S(RegistryKeys.VersionKey(name, v)));
         }
-        foreach (var a in keys)
-            foreach (var b in keys)
-                Assert.False(a != b && b.StartsWith(a, StringComparison.Ordinal), $"{a} is a prefix of {b}");
+        return keys;
     }
 
     [Fact]
