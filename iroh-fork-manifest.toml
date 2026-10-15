@@ -15,6 +15,10 @@
 # recv-error log to debug! without throttling; the throttle is still carried.
 # iroh 1.3.1 adds the stand-in fix for upstream n0-computer/iroh#4600 (a new
 # connection pinned to another connection's dead selected path).
+# noq 1.3.2 adds the stand-in fix for upstream n0-computer/noq#437 (a stateless
+# reset on any path closes the connection) and iroh 1.3.2 derives the stateless
+# reset key from the secret key, so a restarted endpoint resets the stale
+# connections of its previous process.
 #
 # Regenerate every upgrade cycle. See docs/iroh-patches.md for the patch ledger
 # and the full upgrade procedure.
@@ -36,23 +40,23 @@ consumer_contract = "Aster version plus Cargo.lock; never copy fork pins"
 [forks.noq]
 repo = "https://forge.emrul.dev/Aster/noq.git"
 upstream_base = "noq-v1.3.0"
-tag = "aster-noq-v1.3.1"
-commit = "867a3a9a33cc75436a52272ee49ba34a007a957b"
+tag = "aster-noq-v1.3.2"
+commit = "e75f3a5550feae0f40df0ffde8bf438f213a5156"
 branch = "upgrade/noq-v1.3.0"
 crates = ["noq", "noq-udp", "noq-proto"]
 registry_crates = ["noq", "noq-udp", "noq-proto"]
-crate_version = "1.3.1"
+crate_version = "1.3.2"
 registry_bridge_crates = ["irpc", "netwatch", "portmapper"]
 
 [forks.iroh]
 repo = "https://forge.emrul.dev/Aster/iroh.git"
 upstream_base = "v1.3.0"
-tag = "aster-iroh-v1.3.1"
-commit = "32d0a63fff1f9afd0c3c8bef656074cb9f4fd470"
+tag = "aster-iroh-v1.3.2"
+commit = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d"
 branch = "upgrade/iroh-v1.3.0"
 crates = ["iroh", "iroh-base", "iroh-relay"]
 registry_crates = ["iroh", "iroh-base", "iroh-dns", "iroh-relay"]
-crate_version = "1.3.1"
+crate_version = "1.3.2"
 registry_bridge_crates = ["iroh-mdns-address-lookup", "iroh-tickets"]
 
 [forks.iroh-blobs]
@@ -201,7 +205,7 @@ portmapper = "0.19.3"                # iroh 1.3.0 (net-tools 0030e57fc70981895bb
 # Workspace version specs ([workspace.dependencies]):
 version_specs = """
 salvo       = "=1.0.4"
-iroh        = "=1.3.1"
+iroh        = "=1.3.2"
 iroh-blobs  = "0.103.8"
 iroh-docs   = "0.101.5"
 iroh-gossip = "0.101.1"
@@ -212,15 +216,15 @@ iroh-mdns-address-lookup = "0.4"
 # Pin block ([patch.crates-io]):
 patch_crates_io = """
 [patch.crates-io]
-iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "32d0a63fff1f9afd0c3c8bef656074cb9f4fd470" }
-iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "32d0a63fff1f9afd0c3c8bef656074cb9f4fd470" }
-iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "32d0a63fff1f9afd0c3c8bef656074cb9f4fd470" }
+iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
+iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
+iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "4971183ce58e5f55385825a879b94c991d383f57" }
 iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
-noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "867a3a9a33cc75436a52272ee49ba34a007a957b" }
-noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "867a3a9a33cc75436a52272ee49ba34a007a957b" }
-noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "867a3a9a33cc75436a52272ee49ba34a007a957b" }
+noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
+noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
+noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
 irpc        = { git = "https://github.com/n0-computer/irpc",           rev = "0ed2b235d5c797b54d8263ecb3b0247272d055f9" }
 netwatch    = { git = "https://github.com/n0-computer/net-tools",      rev = "0030e57fc70981895bb86212ff0f059cc41c8a4e" }
 portmapper  = { git = "https://github.com/n0-computer/net-tools",      rev = "0030e57fc70981895bb86212ff0f059cc41c8a4e" }

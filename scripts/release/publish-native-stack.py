@@ -54,16 +54,16 @@ class Package:
 # out of the Salvo workspace because upstream deliberately excludes vendor/ as
 # workspace members.
 PACKAGES = [
-    Package("noq-proto", "1.3.1", "fork", "noq", "noq-proto/Cargo.toml"),
-    Package("noq-udp", "1.3.1", "fork", "noq", "noq-udp/Cargo.toml"),
-    Package("noq", "1.3.1", "fork", "noq", "noq/Cargo.toml"),
+    Package("noq-proto", "1.3.2", "fork", "noq", "noq-proto/Cargo.toml"),
+    Package("noq-udp", "1.3.2", "fork", "noq", "noq-udp/Cargo.toml"),
+    Package("noq", "1.3.2", "fork", "noq", "noq/Cargo.toml"),
     Package("irpc", "0.17.0", "bridge", "irpc"),
     Package("netwatch", "0.19.3", "bridge", "netwatch"),
     Package("portmapper", "0.19.3", "bridge", "portmapper"),
-    Package("iroh-base", "1.3.1", "fork", "iroh", "iroh-base/Cargo.toml"),
-    Package("iroh-dns", "1.3.1", "fork", "iroh", "iroh-dns/Cargo.toml"),
-    Package("iroh-relay", "1.3.1", "fork", "iroh", "iroh-relay/Cargo.toml"),
-    Package("iroh", "1.3.1", "fork", "iroh", "iroh/Cargo.toml"),
+    Package("iroh-base", "1.3.2", "fork", "iroh", "iroh-base/Cargo.toml"),
+    Package("iroh-dns", "1.3.2", "fork", "iroh", "iroh-dns/Cargo.toml"),
+    Package("iroh-relay", "1.3.2", "fork", "iroh", "iroh-relay/Cargo.toml"),
+    Package("iroh", "1.3.2", "fork", "iroh", "iroh/Cargo.toml"),
     Package("iroh-mdns-address-lookup", "0.4.0", "bridge", "iroh-mdns-address-lookup"),
     Package("iroh-tickets", "1.0.0", "bridge", "iroh-tickets"),
     Package("iroh-util", "0.6.2", "fork", "iroh-util", "Cargo.toml"),

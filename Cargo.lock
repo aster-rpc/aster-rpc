@@ -3000,8 +3000,8 @@ dependencies = [
 
 [[package]]
 name = "iroh"
-version = "1.3.1"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=32d0a63fff1f9afd0c3c8bef656074cb9f4fd470#32d0a63fff1f9afd0c3c8bef656074cb9f4fd470"
+version = "1.3.2"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=a4a9a76b01bcfbad573dfc3186b014efa1c2532d#a4a9a76b01bcfbad573dfc3186b014efa1c2532d"
 dependencies = [
  "backon",
  "blake3",
@@ -3049,8 +3049,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-base"
-version = "1.3.1"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=32d0a63fff1f9afd0c3c8bef656074cb9f4fd470#32d0a63fff1f9afd0c3c8bef656074cb9f4fd470"
+version = "1.3.2"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=a4a9a76b01bcfbad573dfc3186b014efa1c2532d#a4a9a76b01bcfbad573dfc3186b014efa1c2532d"
 dependencies = [
  "curve25519-dalek 5.0.0-rc.0",
  "data-encoding",
@@ -3108,8 +3108,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-dns"
-version = "1.3.1"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=32d0a63fff1f9afd0c3c8bef656074cb9f4fd470#32d0a63fff1f9afd0c3c8bef656074cb9f4fd470"
+version = "1.3.2"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=a4a9a76b01bcfbad573dfc3186b014efa1c2532d#a4a9a76b01bcfbad573dfc3186b014efa1c2532d"
 dependencies = [
  "arc-swap",
  "cfg_aliases 0.2.2",
@@ -3254,8 +3254,8 @@ dependencies = [
 
 [[package]]
 name = "iroh-relay"
-version = "1.3.1"
-source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=32d0a63fff1f9afd0c3c8bef656074cb9f4fd470#32d0a63fff1f9afd0c3c8bef656074cb9f4fd470"
+version = "1.3.2"
+source = "git+https://forge.emrul.dev/Aster/iroh.git?rev=a4a9a76b01bcfbad573dfc3186b014efa1c2532d#a4a9a76b01bcfbad573dfc3186b014efa1c2532d"
 dependencies = [
  "blake3",
  "bytes",
@@ -4072,8 +4072,8 @@ dependencies = [
 
 [[package]]
 name = "noq"
-version = "1.3.1"
-source = "git+https://forge.emrul.dev/Aster/noq.git?rev=867a3a9a33cc75436a52272ee49ba34a007a957b#867a3a9a33cc75436a52272ee49ba34a007a957b"
+version = "1.3.2"
+source = "git+https://forge.emrul.dev/Aster/noq.git?rev=e75f3a5550feae0f40df0ffde8bf438f213a5156#e75f3a5550feae0f40df0ffde8bf438f213a5156"
 dependencies = [
  "bytes",
  "cfg_aliases 0.2.2",
@@ -4093,8 +4093,8 @@ dependencies = [
 
 [[package]]
 name = "noq-proto"
-version = "1.3.1"
-source = "git+https://forge.emrul.dev/Aster/noq.git?rev=867a3a9a33cc75436a52272ee49ba34a007a957b#867a3a9a33cc75436a52272ee49ba34a007a957b"
+version = "1.3.2"
+source = "git+https://forge.emrul.dev/Aster/noq.git?rev=e75f3a5550feae0f40df0ffde8bf438f213a5156#e75f3a5550feae0f40df0ffde8bf438f213a5156"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -4121,8 +4121,8 @@ dependencies = [
 
 [[package]]
 name = "noq-udp"
-version = "1.3.1"
-source = "git+https://forge.emrul.dev/Aster/noq.git?rev=867a3a9a33cc75436a52272ee49ba34a007a957b#867a3a9a33cc75436a52272ee49ba34a007a957b"
+version = "1.3.2"
+source = "git+https://forge.emrul.dev/Aster/noq.git?rev=e75f3a5550feae0f40df0ffde8bf438f213a5156#e75f3a5550feae0f40df0ffde8bf438f213a5156"
 dependencies = [
  "cfg_aliases 0.2.2",
  "libc",
