@@ -42,13 +42,17 @@ token="$(printf 'protocol=https\nhost=%s\n\n' "${FORGE#https://}" | git credenti
 [[ -n "$token" ]] || { echo "ci-watch: no git credential for $FORGE" >&2; exit 2; }
 
 # One line per job for this commit: "<id> <status> <name>", newest run only.
+# Fails (status 1) when the API cannot be read, so a network blip is never
+# mistaken for "no jobs".
 jobs() {
-  local page
+  local page body="" chunk
   for page in 1 2 3; do
-    curl -fsS -H "Authorization: token $token" \
-      "$FORGE/api/v1/repos/$REPO/actions/tasks?limit=100&page=$page"
-    echo
-  done | python3 -c '
+    chunk="$(curl -fsS --retry 3 --retry-delay 5 --retry-all-errors \
+      -H "Authorization: token $token" \
+      "$FORGE/api/v1/repos/$REPO/actions/tasks?limit=100&page=$page")" || return 1
+    body+="$chunk"$'\n'
+  done
+  python3 -c '
 import json, sys
 sha, event = sys.argv[1], sys.argv[2]
 seen = {}
@@ -64,14 +68,14 @@ for line in sys.stdin:
         seen.setdefault(key, t)
 for (workflow, name), t in sorted(seen.items(), key=lambda kv: kv[1]["id"]):
     print(t["id"], t["status"], f"{workflow}:{name}")
-' "$sha" "$event"
+' "$sha" "$event" <<<"$body"
 }
 
 # Status of each workflow run for this commit ("<workflow> <status>"). Tasks
 # are created only as jobs are dispatched, so "nothing running" in the task
 # list is not "finished"; the run status is.
 runs() {
-  curl -fsS -H "Authorization: token $token" \
+  curl -fsS --retry 3 --retry-delay 5 --retry-all-errors -H "Authorization: token $token" \
     "$FORGE/api/v1/repos/$REPO/actions/runs?limit=50" | python3 -c '
 import json, sys
 sha, event = sys.argv[1], sys.argv[2]
@@ -117,7 +121,11 @@ explain() {
 start=$(date +%s)
 echo "ci-watch: $(git log -1 --format='%h %s' "$sha")"
 while true; do
-  out="$(jobs)"
+  if ! out="$(jobs)"; then
+    echo "ci-watch: the Actions API is unreachable; retrying in ${POLL}s" >&2
+    sleep "$POLL"
+    continue
+  fi
   if [[ -z "$out" ]]; then
     if $once || (( $(date +%s) - start > APPEAR_TIMEOUT )); then
       echo "ci-watch: no jobs for $sha"

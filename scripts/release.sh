@@ -63,7 +63,7 @@ else
 
   token="$(printf 'protocol=https\nhost=%s\n\n' "${FORGE#https://}" | git credential fill 2>/dev/null | sed -n 's/^password=//p')"
   [[ -n "$token" ]] || { echo "error: no git credential for $FORGE" >&2; exit 1; }
-  api() { curl -fsS -H "Authorization: token $token" -H "Content-Type: application/json" "$@"; }
+  api() { curl -fsS --retry 3 --retry-delay 5 --retry-all-errors -H "Authorization: token $token" -H "Content-Type: application/json" "$@"; }
 
   # "<id> <status>" for each candidate dispatch run of HEAD on main.
   candidates() {
@@ -111,8 +111,10 @@ for r in json.load(sys.stdin).get("workflow_runs", []):
     exit 0
   fi
 
-  git -C "$repo" tag -a "$tag" -m "Aster $version"
-  echo "created $tag at $(git -C "$repo" rev-parse --short HEAD)"
+  # Tag the commit that was qualified, not whatever HEAD is by now: the
+  # candidate can run for over an hour while the checkout moves on.
+  git -C "$repo" tag -a "$tag" -m "Aster $version" "$head"
+  echo "created $tag at $(git -C "$repo" rev-parse --short "$head")"
 fi
 
 if [[ "$push" == true ]]; then
