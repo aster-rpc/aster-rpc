@@ -5,7 +5,7 @@ namespace Aster.Registry;
 
 /// <summary>
 /// Docs pointer to an immutable Iroh collection (Aster-SPEC.md §11.2.1).
-/// Stored at "contracts/{contract_id}" in the registry doc.
+/// Stored at "contracts/{contract_id}/" in the registry doc.
 /// </summary>
 /// <remarks>
 /// <see cref="CollectionFormat"/> is "raw" for single-blob (Phase 10 default) or "index"
@@ -51,7 +51,7 @@ public sealed class ArtifactRef
 
 /// <summary>
 /// Renewable advertisement for a live endpoint (Aster-SPEC.md §11.6).
-/// Stored at "services/{name}/contracts/{cid}/endpoints/{eid}".
+/// Stored at "services/{name}/contracts/{cid}/endpoints/{eid}/".
 /// </summary>
 public sealed class EndpointLease
 {
