@@ -175,6 +175,7 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `gc_interval(d)` | `ASTER_GC_INTERVAL_MS` | `[storage] gc_interval_ms` | `0` / unset = no GC |
 | `blob_zstd_level(n)` | `ASTER_BLOB_ZSTD_LEVEL` | `[storage] blob_zstd_level` | zstd blob transport, on by default at `3`: served beside plain and preferred when fetching, with plain fallback; `0` / `off` = plain only; `5` suits slow or relayed links (`Blobs::with_transport_compression` overrides per client) |
 | `bind_addr(a)` | `ASTER_BIND_ADDR` | `[network] bind_addr` | e.g. `0.0.0.0:9000` |
+| `reuse_last_port(b)` | `ASTER_REUSE_LAST_PORT` | `[network] reuse_last_port` | default `true`: a persistent node re-binds its last ports when free (see below) |
 | `alpn(bytes)` | — | — | extra inbound ALPNs, merged with `Node::start_with_alpns` |
 | `discovery(b)` | `ASTER_LOCAL_DISCOVERY` | `[network] local_discovery` | mDNS |
 | `monitoring(b)` | `ASTER_ENABLE_MONITORING` | `[network] enable_monitoring` | |
@@ -195,6 +196,24 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `root_rotation(c, seq, statements)` | `ASTER_NEXT_ROOT_COMMITMENT`, `ASTER_ROOT_SEQ`, `ASTER_ROOT_ROTATIONS` | `[trust] next_root_commitment`, `root_seq`, `root_rotations` | the rotation pin, copied from `aster trust show` |
 | `enrollment_credential_file(p)` / `enrollment_credential_chain(c)` | `ASTER_ENROLLMENT_CREDENTIAL` / `ASTER_ENROLLMENT_CREDENTIAL_CHAIN` | `[trust] enrollment_credential` / `enrollment_credential_chain` | this node's credential: the file `aster enroll node --out` writes, or the chain inline |
 | `enrollment(EnrollmentConfig)` | `ASTER_ENROLLMENT_*` | `[enrollment]` | see §3.0 |
+
+**Port reuse on restart.** A persistent node (`persistent(dir)`) whose
+`bind_addr` leaves the port to the OS (unset, or port `0`) records the UDP
+ports it bound in `<dir>/bind-ports.json`, and on the next start re-binds
+them when they are still free. Peers' cached direct addresses and the NAT
+mapping then stay valid, so they reconnect sooner after a restart: Docs sync
+recovers in about a second instead of tens of seconds, and a node behind NAT
+with relays off becomes reachable again instead of never. Each address family
+falls back to a fresh port on its own (logged at `info`) when its port is
+taken, and an unreadable record is ignored with a warning, so the record never
+fails a start. An explicit non-zero port in `bind_addr` is always used as
+given and never recorded. In-memory nodes are unaffected. Turn it off with
+`reuse_last_port(false)` / `ASTER_REUSE_LAST_PORT=false` /
+`[network] reuse_last_port = false`. Two processes must not share one storage directory; if they do, the second never
+takes the first one's port and waits on the store lock without touching the
+record. The Rust facade and the C ABI's `aster_config_from_env` /
+`aster_config_from_toml` carry the opt-out; the other bindings' config
+objects do not have the field yet, so there it is always on.
 
 The `[health]` keys start the `aster::ops` HTTP listener (feature `health`,
 which implies `otel`) automatically under `AsterServer`; with a bare `Node`,
