@@ -202,6 +202,15 @@ pub struct EndpointConfig {
     /// Node data directory for persistent state; empty = no persistent state
     #[pyo3(get, set)]
     pub data_dir: Option<String>,
+    /// Re-bind the last UDP ports of a persistent node (`data_dir`) on
+    /// restart (default: true). See `AsterConfig::reuse_last_port`.
+    #[pyo3(get, set)]
+    pub reuse_last_port: bool,
+    /// zstd level for blob transport: 1..=19, or `None` when off (the node
+    /// serves and fetches blobs on the plain ALPN only). Default 3. See
+    /// `AsterConfig::blob_zstd_level`.
+    #[pyo3(get)]
+    pub blob_zstd_level: Option<u8>,
 }
 
 #[pymethods]
@@ -235,6 +244,8 @@ impl EndpointConfig {
         transport_enable_segmentation_offload=None,
         enable_local_discovery=false,
         data_dir=None,
+        reuse_last_port=true,
+        blob_zstd_level=aster_transport_core::DEFAULT_BLOB_ZSTD_LEVEL as i64,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -265,8 +276,17 @@ impl EndpointConfig {
         transport_enable_segmentation_offload: Option<bool>,
         enable_local_discovery: bool,
         data_dir: Option<String>,
+        reuse_last_port: bool,
+        blob_zstd_level: i64,
     ) -> PyResult<Self> {
         parse_hook_failure_mode(&hook_failure_mode)?;
+        // 0 = off; larger than 19 is clamped (AsterConfig::blob_zstd_level).
+        if blob_zstd_level < 0 {
+            return Err(PyValueError::new_err(format!(
+                "blob_zstd_level: expected 0 (off) or a level, got {blob_zstd_level}"
+            )));
+        }
+        let blob_zstd_level = (blob_zstd_level > 0).then(|| blob_zstd_level.min(19) as u8);
         Ok(Self {
             relay_mode,
             alpns,
@@ -295,7 +315,17 @@ impl EndpointConfig {
             transport_enable_segmentation_offload,
             enable_local_discovery,
             data_dir,
+            reuse_last_port,
+            blob_zstd_level,
         })
+    }
+
+    /// Set the zstd level for blob transport: an int (`0` = off, larger than
+    /// 19 clamped), `None` (off), or `"off"`.
+    #[setter]
+    fn set_blob_zstd_level(&mut self, value: &Bound<'_, PyAny>) -> PyResult<()> {
+        self.blob_zstd_level = crate::config::blob_zstd_level_from_py(value)?;
+        Ok(())
     }
 }
 
@@ -339,12 +369,8 @@ impl EndpointConfig {
             transport_send_fairness: self.transport_send_fairness,
             transport_enable_segmentation_offload: self.transport_enable_segmentation_offload,
             data_dir: self.data_dir.clone(),
-            // Persistent nodes re-bind their last ports by default; the
-            // high-level `AsterConfig.reuse_last_port` turns it off.
-            reuse_last_port: CoreEndpointConfig::default().reuse_last_port,
-            // Not yet configurable from Python: the default (on, level 3).
-            // See AsterConfig::blob_zstd_level.
-            blob_zstd_level: CoreEndpointConfig::default().blob_zstd_level,
+            reuse_last_port: self.reuse_last_port,
+            blob_zstd_level: self.blob_zstd_level.map(i32::from),
         })
     }
 }

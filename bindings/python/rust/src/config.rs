@@ -42,11 +42,13 @@ pub(crate) const FIELDS: &[&str] = &[
     "endpoint_addr",
     "storage_path",
     "gc_interval_ms",
+    "blob_zstd_level",
     "secret_key",
     "secret_key_file",
     "relay_mode",
     "relay_urls",
     "bind_addr",
+    "reuse_last_port",
     "local_discovery",
     "enable_monitoring",
     "enable_hooks",
@@ -127,6 +129,41 @@ fn opt_bool(name: &str, v: &Bound<'_, PyAny>) -> PyResult<Option<bool>> {
         return Ok(None);
     }
     strict_bool(name, v).map(Some)
+}
+
+/// `AsterConfig::blob_zstd_level` from Python: an int (`0` = off, larger
+/// than 19 clamped), `None` (off, as `to_dict` reports it), or a string
+/// (`ASTER_BLOB_ZSTD_LEVEL` syntax: a level, or `off` / `none` / `false` /
+/// `disabled`).
+pub(crate) fn blob_zstd_level_from_py(v: &Bound<'_, PyAny>) -> PyResult<Option<u8>> {
+    const NAME: &str = "blob_zstd_level";
+    if v.is_none() {
+        return Ok(None);
+    }
+    if v.is_instance_of::<pyo3::types::PyBool>() {
+        return Err(PyTypeError::new_err(format!(
+            "{NAME}: expected an int level or \"off\", got bool"
+        )));
+    }
+    let level: i64 = if let Ok(s) = v.extract::<String>() {
+        let s = s.trim().to_ascii_lowercase();
+        if matches!(s.as_str(), "off" | "none" | "false" | "disabled") {
+            return Ok(None);
+        }
+        s.parse().map_err(|_| {
+            PyValueError::new_err(format!(
+                "{NAME}: expected a zstd level or \"off\", got {s:?}"
+            ))
+        })?
+    } else {
+        v.extract()?
+    };
+    if level < 0 {
+        return Err(PyValueError::new_err(format!(
+            "{NAME}: expected 0 (off) or a level, got {level}"
+        )));
+    }
+    Ok((level > 0).then(|| level.min(19) as u8))
 }
 
 fn parse_hook_failure_mode(v: &str) -> PyResult<HookFailureMode> {
@@ -230,6 +267,8 @@ fn apply_field(c: &mut AsterConfig, key: &str, v: &Bound<'_, PyAny>) -> PyResult
             }
         }
         "secret_key_file" => c.secret_key_file = opt_path(v)?,
+        "blob_zstd_level" => c.blob_zstd_level = blob_zstd_level_from_py(v)?,
+        "reuse_last_port" => c.reuse_last_port = strict_bool(key, v)?,
         // relay_mode / relay_urls are combined by the caller.
         "relay_mode" | "relay_urls" => {}
         "bind_addr" => c.bind_addr = opt_str(v)?,
@@ -635,6 +674,8 @@ impl NativeAsterConfig {
                 .map(|k| PyBytes::new(py, &k.to_bytes())),
         )?;
         d.set_item("secret_key_file", path_str(&c.secret_key_file))?;
+        d.set_item("blob_zstd_level", c.blob_zstd_level)?;
+        d.set_item("reuse_last_port", c.reuse_last_port)?;
         let (mode, urls): (&str, Vec<String>) = match &c.relay_mode {
             RelayMode::Default => ("default", Vec::new()),
             RelayMode::Staging => ("staging", Vec::new()),

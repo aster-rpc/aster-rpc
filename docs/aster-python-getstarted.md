@@ -68,6 +68,28 @@ Two spellings differ in Python:
   Setting `relay_urls=[...]` selects `"custom"`, and so does a bare URL passed
   as `relay_mode`.
 
+Two settings are on by default, and you can turn either one off:
+
+- `blob_zstd_level: int | None` (default `3`; `ASTER_BLOB_ZSTD_LEVEL`,
+  `[storage] blob_zstd_level`) is the zstd level for blob transport. `0`,
+  `None` or `"off"` turns compression off, so the node serves and fetches
+  blobs only on the plain ALPN. Levels above 19 are clamped to 19. When
+  compression is off, the resolved value is `None`.
+- `reuse_last_port: bool` (default `True`; `ASTER_REUSE_LAST_PORT`,
+  `[network] reuse_last_port`): a persistent node (`storage_path`) re-binds
+  the UDP ports it last used, which are recorded in
+  `<storage_path>/bind-ports.json`. With `False`, the node binds a fresh port
+  on every start and records nothing.
+
+```python
+config = AsterConfig(storage_path="/var/lib/my-app", blob_zstd_level=0, reuse_last_port=False)
+```
+
+The low-level `EndpointConfig` takes the same two keyword arguments.
+`blob_zstd_level` is an int there, and `0` turns compression off. A bare
+endpoint serves no blobs and records no ports, so on an endpoint these
+settings are only passed through to its config.
+
 Invalid values raise when the config is built: `ValueError` for a bad value,
 `TypeError` for a wrong type or an unknown field, and `FileNotFoundError` when
 `from_file` cannot find its file. `config.print_config()` prints the resolved

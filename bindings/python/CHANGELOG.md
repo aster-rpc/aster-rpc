@@ -5,6 +5,17 @@ the repository; entries under **Unreleased** ship with the next tag.
 
 ## Unreleased
 
+### Added: `blob_zstd_level` and `reuse_last_port` in `AsterConfig`
+
+`AsterConfig` gains `blob_zstd_level` (default `3`; `0`, `None` or `"off"`
+turns blob transport compression off; `ASTER_BLOB_ZSTD_LEVEL`, `[storage]
+blob_zstd_level`) and `reuse_last_port` (default `True`;
+`ASTER_REUSE_LAST_PORT`, `[network] reuse_last_port`). Before this release,
+the env and TOML values were dropped as soon as a config was rebuilt from
+keyword arguments (`replace`, `AsterServer`), and code could not set either
+setting. The low-level `EndpointConfig` takes both keyword arguments as
+well.
+
 ### Changed: `sync_finished` says how the round ended
 
 A `sync_finished` `DocEvent` now sets `sync_origin` (`"accept"` or

@@ -244,6 +244,8 @@ _ENDPOINT_CONFIG_FIELDS = [
     "transport_datagram_send_buffer_size",
     "transport_send_fairness",
     "transport_enable_segmentation_offload",
+    "reuse_last_port",
+    "blob_zstd_level",
 ]
 
 def test_endpoint_config_has_all_fields():

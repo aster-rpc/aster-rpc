@@ -110,7 +110,7 @@ def _toml_section(name: str) -> str:
         return "[enrollment]"
     if name == "endpoint_addr":
         return "[connect]"
-    if name in ("storage_path", "gc_interval_ms"):
+    if name in ("storage_path", "gc_interval_ms", "blob_zstd_level"):
         return "[storage]"
     if name.startswith("log_"):
         return "[logging]"
@@ -327,6 +327,11 @@ class AsterConfig:
     """Persistent node directory; ``None`` = in-memory."""
     gc_interval_ms: int | None = None
     """Blob GC interval in ms; ``None`` / ``0`` = no GC."""
+    blob_zstd_level: int | None = 3
+    """zstd level for blob transport (``ASTER_BLOB_ZSTD_LEVEL``, TOML
+    ``[storage] blob_zstd_level``). ``0``, ``None`` or ``"off"`` turns it off:
+    the node serves and fetches blobs on the plain ALPN only. Levels above 19
+    are clamped; the resolved value is ``None`` when off."""
 
     # -- Identity ------------------------------------------------------------
     secret_key: bytes | None = dc_field(default=None, repr=False)
@@ -338,6 +343,11 @@ class AsterConfig:
     relay_mode: str = "default"
     relay_urls: tuple[str, ...] = ()
     bind_addr: str | None = None
+    reuse_last_port: bool = True
+    """On a persistent node, re-bind the UDP ports it last bound when they are
+    still free (``ASTER_REUSE_LAST_PORT``, TOML ``[network] reuse_last_port``).
+    Applies only when ``bind_addr`` leaves the port to the OS; the ports are
+    recorded in ``bind-ports.json`` in ``storage_path``."""
     local_discovery: bool = False
     """mDNS local discovery (``ASTER_LOCAL_DISCOVERY``)."""
     enable_monitoring: bool = False
@@ -592,6 +602,7 @@ class AsterConfig:
                 ("relay_mode", self.relay_mode),
                 ("relay_urls", ", ".join(self.relay_urls) or "<none>"),
                 ("bind_addr", self.bind_addr or "<any>"),
+                ("reuse_last_port", self.reuse_last_port),
                 ("local_discovery", self.local_discovery),
                 ("enable_monitoring", self.enable_monitoring),
                 ("enable_hooks", self.enable_hooks),
@@ -606,6 +617,7 @@ class AsterConfig:
             "storage": [
                 ("path", self.storage_path or "<in-memory>"),
                 ("gc_interval_ms", self.gc_interval_ms or "<off>"),
+                ("blob_zstd_level", _or(self.blob_zstd_level, "<off>")),
             ],
         }
         source_key = {"path": "storage_path"}
