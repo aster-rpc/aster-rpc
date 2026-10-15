@@ -1514,6 +1514,29 @@ def _method_signature(metadata: dict[str, Any]) -> str:
     return ""
 
 
+def _contract_to_dict(contract: Any) -> dict[str, Any]:
+    """Shape a non-dict contract for ``Display.contract_tree``.
+
+    Accepts a ``ContractManifest`` (or any dataclass or plain object with
+    the same fields). The manifest names the service ``service`` and lists
+    type hashes, where the tree expects ``name`` and ``types`` entries.
+    """
+    import dataclasses
+
+    if dataclasses.is_dataclass(contract) and not isinstance(contract, type):
+        data = dataclasses.asdict(contract)
+    elif hasattr(contract, "__dict__"):
+        data = {k: v for k, v in vars(contract).items() if not k.startswith("_")}
+    else:
+        return {"name": str(contract)}
+    data.setdefault("name", data.get("service") or type(contract).__name__)
+    if "types" not in data:
+        data["types"] = [
+            {"name": h[:16], "hash": h} for h in data.get("type_hashes") or []
+        ]
+    return data
+
+
 def _display_bytes(display: Any, content: Any) -> None:
     """Display bytes content, trying UTF-8 text then hex."""
     if isinstance(content, bytes):

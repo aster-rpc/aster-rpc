@@ -222,6 +222,38 @@ class TestCommands:
         await desc.execute([], populated_ctx)
 
     @pytest.mark.asyncio
+    async def test_describe_non_dict_contract(self, populated_ctx, monkeypatch):
+        """A ContractManifest (not a dict) is converted for the tree."""
+        from aster.contract.manifest import ContractManifest
+
+        manifest = ContractManifest(
+            service="HelloWorld",
+            version=2,
+            contract_id="ab" * 32,
+            type_hashes=["cd" * 32],
+            methods=[{"name": "sayHello", "pattern": "unary"}],
+        )
+
+        async def get_contract(name):
+            return manifest
+
+        shown, errors = [], []
+        monkeypatch.setattr(populated_ctx.connection, "get_contract", get_contract)
+        monkeypatch.setattr(populated_ctx.display, "contract_tree", shown.append)
+        monkeypatch.setattr(populated_ctx.display, "error", errors.append)
+
+        await get_command("describe").execute(["HelloWorld"], populated_ctx)
+
+        assert errors == []
+        assert len(shown) == 1
+        tree = shown[0]
+        assert tree["name"] == "HelloWorld"
+        assert tree["version"] == 2
+        assert tree["contract_id"] == "ab" * 32
+        assert tree["methods"] == [{"name": "sayHello", "pattern": "unary"}]
+        assert tree["types"] == [{"name": "cd" * 8, "hash": "cd" * 32}]
+
+    @pytest.mark.asyncio
     async def test_invoke_unary(self, populated_ctx):
         cd = get_command("cd")
         await cd.execute(["/services/HelloWorld"], populated_ctx)
