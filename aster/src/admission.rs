@@ -41,9 +41,9 @@ pub mod alpns {
     pub const BLOBS: &[u8] = iroh_blobs::ALPN;
 
     /// iroh-blobs over zstd-compressed streams, registered beside [`BLOBS`] by
-    /// a node started with
-    /// [`blob_zstd_level`](crate::AsterConfigBuilder::blob_zstd_level). A
-    /// data-plane ALPN: Gate 0 admits it only for admitted peers, like
+    /// every node unless
+    /// [`blob_zstd_level`](crate::AsterConfigBuilder::blob_zstd_level) is off.
+    /// A data-plane ALPN: Gate 0 admits it only for admitted peers, like
     /// [`BLOBS`].
     #[cfg(feature = "blobs")]
     pub const BLOBS_ZSTD: &[u8] = aster_transport_core::BLOBS_ZSTD_ALPN;

@@ -15,6 +15,7 @@ use tokio::time::timeout;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// `None` keeps the default (zstd on, level 3); `Some(0)` turns it off.
 fn config(zstd_level: Option<u8>, hooks: bool) -> AsterConfig {
     let mut builder = AsterConfig::builder()
         .relay(RelayMode::Disabled)
@@ -25,6 +26,9 @@ fn config(zstd_level: Option<u8>, hooks: bool) -> AsterConfig {
     }
     builder.build()
 }
+
+const OFF: Option<u8> = Some(0);
+const DEFAULT: Option<u8> = None;
 
 async fn start(zstd_level: Option<u8>, hooks: bool) -> Node {
     let node = Node::start(config(zstd_level, hooks))
@@ -60,12 +64,12 @@ fn text() -> Vec<u8> {
     .into_bytes()
 }
 
-/// Two compressing nodes fetch over zstd by default: the same content under
+/// Two default nodes fetch over zstd: the same content under
 /// the same hash, the same payload accounting, fewer bytes on the wire.
 #[tokio::test]
 async fn compressing_nodes_fetch_over_zstd() -> anyhow::Result<()> {
-    let holder = start(Some(3), false).await;
-    let consumer = start(Some(3), false).await;
+    let holder = start(DEFAULT, false).await;
+    let consumer = start(DEFAULT, false).await;
     connect(&consumer, &holder);
     let data = text();
     let hash = holder.blobs().add_bytes(data.clone()).await?;
@@ -108,12 +112,12 @@ async fn compressing_nodes_fetch_over_zstd() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A provider that does not serve zstd is fetched from plain and reported as
+/// A provider configured off is fetched from plain and reported as
 /// plain-only, not as failed. Requiring zstd fails it instead.
 #[tokio::test]
 async fn falls_back_to_a_plain_provider() -> anyhow::Result<()> {
-    let plain = start(None, false).await;
-    let consumer = start(Some(3), false).await;
+    let plain = start(OFF, false).await;
+    let consumer = start(DEFAULT, false).await;
     connect(&consumer, &plain);
     let data = text();
     let hash = plain.blobs().add_bytes(data.clone()).await?;
@@ -194,15 +198,65 @@ async fn falls_back_to_a_plain_provider() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A node configured off neither serves zstd nor offers it: a default node
+/// fetching from it falls back, and its own fetches are plain.
+#[tokio::test]
+async fn off_switch_serves_and_fetches_plain() -> anyhow::Result<()> {
+    let off = start(OFF, false).await;
+    let on = start(DEFAULT, false).await;
+    connect(&off, &on);
+    assert_eq!(
+        off.blobs().transport_compression(),
+        BlobTransportCompression::Off
+    );
+    let hash = on.blobs().add_bytes(text()).await?;
+    let report = timeout(
+        FETCH_TIMEOUT,
+        off.blobs().download_hash_to_store_from(
+            &hash,
+            &[on.id()],
+            BlobFormat::Raw,
+            FetchStrategy::Whole,
+        ),
+    )
+    .await??;
+    assert!(report.plain_only().next().is_none());
+    assert_eq!(
+        off.blobs().transport_compression_stats().fetched_wire_bytes,
+        0
+    );
+    assert_eq!(
+        on.blobs().transport_compression_stats().served_wire_bytes,
+        0
+    );
+
+    let back = off.blobs().add_bytes(b"from the off node".to_vec()).await?;
+    let report = timeout(
+        FETCH_TIMEOUT,
+        on.blobs().download_hash_to_store_from(
+            &back,
+            &[off.id()],
+            BlobFormat::Raw,
+            FetchStrategy::Whole,
+        ),
+    )
+    .await??;
+    assert_eq!(ids(report.plain_only()), vec![off.id().to_string()]);
+
+    off.shutdown().await;
+    on.shutdown().await;
+    Ok(())
+}
+
 /// A zstd provider that accepts a request and stalls with its connection
 /// alive is abandoned after the idle timeout; the next zstd provider serves.
 /// The tracker reports the same as the returned report.
 #[tokio::test]
 async fn ordered_fetch_fails_over_from_a_stalled_zstd_provider() -> anyhow::Result<()> {
     let data = text();
-    let holder = start(Some(3), false).await;
+    let holder = start(DEFAULT, false).await;
     let hash = holder.blobs().add_bytes(data.clone()).await?;
-    let consumer = start(Some(3), false).await;
+    let consumer = start(DEFAULT, false).await;
     connect(&consumer, &holder);
     let stalled = StallingZstdProvider::start(&data, &consumer).await?;
 
@@ -364,7 +418,7 @@ fn compressed_alpn_is_not_an_admission_alpn() {
 /// A server whose post-handshake hook applies a protected [`Gate0`], and
 /// records every ALPN it decided on.
 async fn gated_server() -> (Node, Gate0, Arc<Mutex<Vec<(Vec<u8>, bool)>>>) {
-    let server = start(Some(3), true).await;
+    let server = start(DEFAULT, true).await;
     let gate = Gate0::new();
     let decisions = Arc::new(Mutex::new(Vec::new()));
     let mut admission = server.take_admission().expect("hooks enabled");
@@ -391,7 +445,7 @@ async fn gate0_refuses_an_unadmitted_peer_on_the_compressed_alpn() -> anyhow::Re
     let (server, gate, decisions) = gated_server().await;
     let data = text();
     let hash = server.blobs().add_bytes(data.clone()).await?;
-    let client = start(Some(3), false).await;
+    let client = start(DEFAULT, false).await;
     connect(&client, &server);
 
     for mode in [
@@ -463,7 +517,7 @@ async fn gate0_refuses_an_unadmitted_peer_on_the_compressed_alpn() -> anyhow::Re
 /// Mirrors `admission::rejected_peer_cannot_download` on the compressed ALPN.
 #[tokio::test]
 async fn rejected_peer_cannot_download_compressed() {
-    let server = start(Some(3), true).await;
+    let server = start(DEFAULT, true).await;
     let mut adm = server.take_admission().expect("hooks enabled");
     tokio::spawn(async move {
         while let Some(req) = adm.next_handshake().await {
@@ -475,7 +529,7 @@ async fn rejected_peer_cannot_download_compressed() {
         .add_bytes(b"secret payload".to_vec())
         .await
         .unwrap();
-    let client = start(Some(3), false).await;
+    let client = start(DEFAULT, false).await;
     connect(&client, &server);
 
     let res = timeout(

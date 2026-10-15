@@ -11,19 +11,20 @@ use aster_transport_core::{
 ///
 /// Compression is a transport concern only: the stored bytes, hashes, Bao
 /// verification and [`FetchReport::bytes_transferred`] are those of a plain
-/// fetch. A node serves compressed transfers only when started with
-/// [`AsterConfigBuilder::blob_zstd_level`](crate::AsterConfigBuilder::blob_zstd_level).
+/// fetch. Nodes serve compressed transfers by default; see
+/// [`AsterConfig::blob_zstd_level`](crate::AsterConfig::blob_zstd_level) for
+/// the level and the off switch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum BlobTransportCompression {
-    /// Plain transfers only. The default on a node without
-    /// [`AsterConfig::blob_zstd_level`](crate::AsterConfig::blob_zstd_level).
-    #[default]
+    /// Plain transfers only. The default on a node whose
+    /// [`AsterConfig::blob_zstd_level`](crate::AsterConfig::blob_zstd_level)
+    /// is off.
     Off,
     /// Offer zstd to each provider; one that does not serve it is fetched from
     /// plain, and [`ProviderOutcome::plain_fallbacks`] counts that. A refusal
     /// is remembered for five minutes, so the provider is not offered zstd
-    /// again until then. The default on a node with
-    /// [`AsterConfig::blob_zstd_level`](crate::AsterConfig::blob_zstd_level).
+    /// again until then. The default.
+    #[default]
     PreferZstd,
     /// zstd only: a provider that does not serve it is a failed provider. For
     /// tests and policy experiments.

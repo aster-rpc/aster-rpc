@@ -872,7 +872,6 @@ async fn compressed_blob_transport_requires_a_session_like_plain_blobs() {
         let files = tempfile::tempdir().unwrap();
         let server = start_server(
             server_base()
-                .blob_zstd_level(3)
                 .enrollment(server_enrollment(&root, files.path()))
                 .build(),
         )
@@ -901,9 +900,7 @@ async fn compressed_blob_transport_requires_a_session_like_plain_blobs() {
         };
 
         // No credential, so no session: refused on both blobs ALPNs.
-        let stranger = Node::start(base(9).blob_zstd_level(3).build())
-            .await
-            .unwrap();
+        let stranger = Node::start(base(9).build()).await.unwrap();
         wait_for_addr(&stranger).await;
         stranger.add_peer(server.node()).unwrap();
         for mode in [

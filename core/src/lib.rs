@@ -167,8 +167,9 @@ pub struct CoreEndpointConfig {
     pub data_dir: Option<String>,
     /// Serve blobs over zstd-compressed streams at this level, on
     /// [`BLOBS_ZSTD_ALPN`] beside the plain blobs ALPN, and make blob fetches
-    /// prefer it. `None` (the default) serves the plain ALPN only and fetches
-    /// plain. Ignored by endpoints that are not full nodes.
+    /// prefer it. Defaults to [`DEFAULT_BLOB_ZSTD_LEVEL`]; `None` serves the
+    /// plain ALPN only and fetches plain. Ignored by endpoints that are not
+    /// full nodes.
     pub blob_zstd_level: Option<i32>,
 }
 
@@ -203,7 +204,7 @@ impl Default for CoreEndpointConfig {
             transport_send_fairness: None,
             transport_enable_segmentation_offload: None,
             data_dir: None,
-            blob_zstd_level: None,
+            blob_zstd_level: Some(DEFAULT_BLOB_ZSTD_LEVEL),
         }
     }
 }
@@ -337,6 +338,10 @@ pub const DEFAULT_PROVIDER_IDLE_TIMEOUT: std::time::Duration = std::time::Durati
 /// unadmitted peers.
 pub const BLOBS_ZSTD_ALPN: &[u8] = ZSTD_ALPN;
 
+/// Default zstd level for blob transport ([`CoreEndpointConfig::blob_zstd_level`]):
+/// zstd's own default, fast enough for interactive reads.
+pub const DEFAULT_BLOB_ZSTD_LEVEL: i32 = 3;
+
 /// How long a provider that refused [`BLOBS_ZSTD_ALPN`] is dialed on the plain
 /// ALPN directly, before compression is offered to it again.
 pub const BLOB_PLAIN_ONLY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -348,10 +353,10 @@ pub const BLOB_PLAIN_ONLY_TTL: std::time::Duration = std::time::Duration::from_s
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CoreBlobCompression {
     /// Plain transport only.
-    #[default]
     Off,
     /// Offer zstd; a provider that does not serve it is fetched from plain,
     /// and that is reported per provider ([`CoreProviderOutcome::plain_fallbacks`]).
+    #[default]
     PreferZstd,
     /// zstd only; a provider that does not serve it is a failed provider.
     RequireZstd,
@@ -1925,7 +1930,9 @@ impl CoreNode {
             .unwrap_or_else(|| (Default::default(), Duration::from_millis(5000)));
         let blob_zstd_level = endpoint_config
             .as_ref()
-            .and_then(|config| config.blob_zstd_level);
+            .map_or(Some(DEFAULT_BLOB_ZSTD_LEVEL), |config| {
+                config.blob_zstd_level
+            });
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         // The docs engine stores entry content as untagged blobs in this shared
         // store, so GC must protect the docs live-content set or the first sweep
@@ -1991,7 +1998,9 @@ impl CoreNode {
             .unwrap_or_else(|| (Default::default(), Duration::from_millis(5000)));
         let blob_zstd_level = endpoint_config
             .as_ref()
-            .and_then(|config| config.blob_zstd_level);
+            .map_or(Some(DEFAULT_BLOB_ZSTD_LEVEL), |config| {
+                config.blob_zstd_level
+            });
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let root = std::path::PathBuf::from(&path);
         // Create the data directory privately *before* the stores write secret
@@ -3669,9 +3678,9 @@ impl CoreBlobsClient {
     }
 
     /// Set transport compression for this client's fetches. Defaults to
-    /// [`CoreBlobCompression::PreferZstd`] on a node configured with
-    /// [`CoreEndpointConfig::blob_zstd_level`], [`CoreBlobCompression::Off`]
-    /// otherwise. Fetching compressed does not require the node to serve
+    /// [`CoreBlobCompression::PreferZstd`] on a node that serves zstd (the
+    /// default, see [`CoreEndpointConfig::blob_zstd_level`]), and to
+    /// [`CoreBlobCompression::Off`] on one configured not to. Fetching compressed does not require the node to serve
     /// compressed.
     pub fn with_transport_compression(mut self, compression: CoreBlobCompression) -> Self {
         self.compression = compression;

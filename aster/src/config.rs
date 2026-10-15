@@ -129,8 +129,8 @@ pub struct AsterConfig {
     pub gc_interval: Option<Duration>,
 
     /// Serve blobs over zstd-compressed transport at this level, and make
-    /// blob fetches prefer it. `None` (the default) serves and fetches plain
-    /// only.
+    /// blob fetches prefer it. On by default at level 3; `None` serves and
+    /// fetches plain only.
     ///
     /// The node registers the compressed blobs ALPN
     /// ([`alpns::BLOBS_ZSTD`](crate::admission::alpns::BLOBS_ZSTD)) beside the
@@ -141,8 +141,8 @@ pub struct AsterConfig {
     /// and hashes are unaffected. The level is the sender's; 3 is a good
     /// default, 5 suits slow or relayed links. Levels are clamped to 1..=19.
     ///
-    /// Env: `ASTER_BLOB_ZSTD_LEVEL`; TOML: `[storage] blob_zstd_level`. A
-    /// value of `0` disables compression.
+    /// Env: `ASTER_BLOB_ZSTD_LEVEL`; TOML: `[storage] blob_zstd_level`. `0`
+    /// or `off` turns compression off.
     pub blob_zstd_level: Option<u8>,
 
     /// Stable node identity key.
@@ -341,8 +341,20 @@ impl AsterConfig {
             if let Some(value) = toml_u64(storage, "gc_interval_ms", label)? {
                 self.gc_interval = gc_interval_from_ms(value);
             }
-            if let Some(value) = toml_u64(storage, "blob_zstd_level", label)? {
-                self.blob_zstd_level = blob_zstd_level_from(value);
+            if let Some(value) = storage.get("blob_zstd_level") {
+                self.blob_zstd_level = match value {
+                    toml::Value::Integer(level) if *level >= 0 => {
+                        blob_zstd_level_from(*level as u64)
+                    }
+                    toml::Value::String(text) => {
+                        parse_blob_zstd_level(&format!("{label}: blob_zstd_level"), text)?
+                    }
+                    _ => {
+                        return Err(Error::InvalidArgument(format!(
+                            "{label}: blob_zstd_level must be a non-negative integer or \"off\""
+                        )))
+                    }
+                };
             }
         }
 
@@ -510,8 +522,8 @@ impl AsterConfig {
         if let Some(value) = env_u64("ASTER_GC_INTERVAL_MS")? {
             self.gc_interval = gc_interval_from_ms(value);
         }
-        if let Some(value) = env_u64("ASTER_BLOB_ZSTD_LEVEL")? {
-            self.blob_zstd_level = blob_zstd_level_from(value);
+        if let Some(value) = env_string("ASTER_BLOB_ZSTD_LEVEL") {
+            self.blob_zstd_level = parse_blob_zstd_level("ASTER_BLOB_ZSTD_LEVEL", &value)?;
         }
         if let Some(value) = env_string_allow_empty("ASTER_SECRET_KEY") {
             if value.trim().is_empty() {
@@ -931,7 +943,7 @@ impl Default for AsterConfig {
             endpoint_addr: None,
             storage_path: None,
             gc_interval: None,
-            blob_zstd_level: None,
+            blob_zstd_level: Some(DEFAULT_BLOB_ZSTD_LEVEL),
             secret_key: None,
             secret_key_file: None,
             relay_mode: RelayMode::Default,
@@ -1034,8 +1046,8 @@ impl AsterConfigBuilder {
         self
     }
 
-    /// Serve and prefer zstd-compressed blob transport at `level`. See
-    /// [`AsterConfig::blob_zstd_level`]. `0` disables it.
+    /// Serve and prefer zstd-compressed blob transport at `level` (on by
+    /// default at 3). See [`AsterConfig::blob_zstd_level`]. `0` turns it off.
     pub fn blob_zstd_level(mut self, level: u8) -> Self {
         self.config.blob_zstd_level = blob_zstd_level_from(level.into());
         self
@@ -1405,9 +1417,29 @@ fn gc_interval_from_ms(ms: u64) -> Option<Duration> {
     (ms > 0).then(|| Duration::from_millis(ms))
 }
 
-/// `0` disables; anything else is clamped to zstd's non-"ultra" range.
+/// Default for [`AsterConfig::blob_zstd_level`].
+pub const DEFAULT_BLOB_ZSTD_LEVEL: u8 = 3;
+
+/// `0` turns compression off; anything else is clamped to zstd's non-"ultra"
+/// range.
 fn blob_zstd_level_from(level: u64) -> Option<u8> {
     (level > 0).then(|| level.min(19) as u8)
+}
+
+/// A level, or `off` / `none` / `false` / `disabled` (case-insensitive).
+fn parse_blob_zstd_level(source: &str, value: &str) -> Result<Option<u8>> {
+    let value = value.trim();
+    if matches!(
+        value.to_ascii_lowercase().as_str(),
+        "off" | "none" | "false" | "disabled"
+    ) {
+        return Ok(None);
+    }
+    value.parse::<u64>().map(blob_zstd_level_from).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "{source}: expected a zstd level or \"off\", got {value:?}"
+        ))
+    })
 }
 
 fn parse_relay_mode(value: &str) -> RelayMode {
@@ -2406,7 +2438,13 @@ mod binding_knob_tests {
         env::set_var("ASTER_GC_INTERVAL_MS", "0");
         assert_eq!(AsterConfig::from_env().unwrap().gc_interval, None);
 
-        assert_eq!(AsterConfig::from_env().unwrap().blob_zstd_level, None);
+        assert_eq!(AsterConfig::from_env().unwrap().blob_zstd_level, Some(3));
+        assert_eq!(
+            AsterConfig::default()
+                .to_core_endpoint_config()
+                .blob_zstd_level,
+            Some(3)
+        );
         env::set_var("ASTER_BLOB_ZSTD_LEVEL", "5");
         let cfg = AsterConfig::from_env().unwrap();
         assert_eq!(cfg.blob_zstd_level, Some(5));
@@ -2417,6 +2455,18 @@ mod binding_knob_tests {
         let cfg = AsterConfig::from_env().unwrap();
         assert_eq!(cfg.blob_zstd_level, None);
         assert_eq!(cfg.to_core_endpoint_config().blob_zstd_level, None);
+        for off in ["off", "OFF", " disabled "] {
+            env::set_var("ASTER_BLOB_ZSTD_LEVEL", off);
+            assert_eq!(
+                AsterConfig::from_env().unwrap().blob_zstd_level,
+                None,
+                "{off}"
+            );
+        }
+        env::set_var("ASTER_BLOB_ZSTD_LEVEL", "fast");
+        let err = AsterConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains("ASTER_BLOB_ZSTD_LEVEL"), "{err}");
+        env::remove_var("ASTER_BLOB_ZSTD_LEVEL");
         assert_eq!(
             AsterConfig::builder()
                 .blob_zstd_level(3)
@@ -2435,6 +2485,32 @@ mod binding_knob_tests {
         env::set_var("ASTER_PORTMAPPER_CONFIG", "sometimes");
         let err = AsterConfig::from_env().unwrap_err().to_string();
         assert!(err.contains("ASTER_PORTMAPPER_CONFIG"), "{err}");
+    }
+
+    #[test]
+    fn blob_zstd_level_toml_accepts_a_level_or_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        for (value, want) in [
+            ("0", None),
+            ("\"off\"", None),
+            ("\"5\"", Some(5)),
+            ("7", Some(7)),
+        ] {
+            fs::write(&path, format!("[storage]\nblob_zstd_level = {value}\n")).unwrap();
+            assert_eq!(
+                AsterConfig::from_file(&path).unwrap().blob_zstd_level,
+                want,
+                "{value}"
+            );
+        }
+        fs::write(&path, "[storage]\nblob_zstd_level = true\n").unwrap();
+        assert!(AsterConfig::from_file(&path).is_err());
+        fs::write(&path, "[storage]\npath = \"/tmp/x\"\n").unwrap();
+        assert_eq!(
+            AsterConfig::from_file(&path).unwrap().blob_zstd_level,
+            Some(3)
+        );
     }
 
     #[test]
