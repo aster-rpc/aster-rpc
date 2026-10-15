@@ -52,6 +52,8 @@ type EndpointConfig struct {
 	ProxyFromEnv         bool
 	DataDir              string // -> AsterConfig.StoragePath ("" = in memory)
 	HookFailureMode      uint32
+	BlobZstdLevel        *int  // -> AsterConfig.BlobZstdLevel (nil = 3, 0 = off)
+	ReuseLastPort        *bool // -> AsterConfig.ReuseLastPort (nil = on)
 }
 
 // DefaultEndpointConfig returns a sensible default endpoint configuration.
@@ -94,6 +96,8 @@ func (cfg *EndpointConfig) toAsterConfig() (AsterConfig, error) {
 	c.ProxyURL = cfg.ProxyURL
 	c.ProxyFromEnv = cfg.ProxyFromEnv
 	c.StoragePath = cfg.DataDir
+	c.BlobZstdLevel = cfg.BlobZstdLevel
+	c.ReuseLastPort = cfg.ReuseLastPort
 	c.EnableMonitoring = true // bare endpoints always had monitoring on
 	return c, nil
 }

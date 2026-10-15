@@ -10,11 +10,11 @@ public installation source. See [publication setup](../../deploy/go-vanity/READM
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, ABI 5.x (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Preview status (ABI 5.1 minimum)
+## Preview status (ABI 5.2 minimum)
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
-TypeScript, Java and .NET. The binding requires native ABI 5.1 or newer within
-major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment from config and the lease grantor). Aster 0.3 is a preview release.
+TypeScript, Java and .NET. The binding requires native ABI 5.2 or newer within
+major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment from config and the lease grantor, 5.2 grew `aster_config_t` by `blob_zstd_level` and `reuse_last_port`). Aster 0.3 is a preview release.
 
 - **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
   safe for concurrent use (a pool of Fory instances, no global lock). Payload types implement `aster.WireTyped`
@@ -55,7 +55,14 @@ major version 5 (`ABIMinorRequired` in `runtime.go`; 5.1 added Enrollment from c
   `StartNode(ctx, cfg, NodeOptions{Gate, ExtraALPNs})` uses `aster_node_start`
   (and, like Rust `Node::start`, ignores enrollment); `StartServer` /
   `StartClient` use `aster_node_start_enrolled`; `Node.Ticket`,
-  `Connect`, `Accept`, `AddNodeAddr`, `SetGate`, `Docs()`. (ABI 4.6 removed
+  `Connect`, `Accept`, `AddNodeAddr`, `SetGate`, `Docs()`.
+  `BlobZstdLevel` (nil = 3, `0` = off, 1..19; env `ASTER_BLOB_ZSTD_LEVEL`,
+  TOML `[storage] blob_zstd_level`) sets blob transport compression: with `0`
+  the node serves and fetches blobs on the plain ALPN only.
+  `ReuseLastPort` (nil = on; env `ASTER_REUSE_LAST_PORT`, TOML
+  `[network] reuse_last_port`) re-binds a persistent node's last UDP ports on
+  restart (`bind-ports.json` in `StoragePath`); `false` turns it off. Both are
+  pointers so the zero `AsterConfig` keeps the Rust defaults. (ABI 4.6 removed
   `aster_node_metrics_prometheus`; `MetricsPrometheus()` replaces it, see
   Observability below.)
   `Memory*` / `Persistent*` are convenience wrappers over `aster_node_start`

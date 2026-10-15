@@ -707,7 +707,7 @@ func TestObs_StatusAndABIFloor(t *testing.T) {
 		!errors.Is(wrapError(ASTER_STATUS_ALREADY_EXISTS), ErrAlreadyExists) {
 		t.Fatal("ALREADY_EXISTS (17)")
 	}
-	if ABIMinorRequired != 1 {
+	if ABIMinorRequired != 2 {
 		t.Fatalf("floor %d", ABIMinorRequired)
 	}
 }

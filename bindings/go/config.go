@@ -88,6 +88,16 @@ type AsterConfig struct {
 	ClearRelayTransports bool
 	Portmapper           Portmapper
 	Transport            TransportConfig
+	// BlobZstdLevel is the zstd level for blob transport (Rust
+	// AsterConfig::blob_zstd_level): nil = the default (3), 0 = off (the node
+	// serves and fetches blobs on the plain ALPN only), 1..19 = that level
+	// (larger values are clamped to 19). Env ASTER_BLOB_ZSTD_LEVEL; TOML
+	// [storage] blob_zstd_level.
+	BlobZstdLevel *int
+	// ReuseLastPort re-binds a persistent node's last UDP ports on restart
+	// (Rust AsterConfig::reuse_last_port): nil = the default (on). Env
+	// ASTER_REUSE_LAST_PORT; TOML [network] reuse_last_port.
+	ReuseLastPort *bool
 
 	// ── Trust and Enrollment ([trust], [enrollment]; design §15.3) ──
 	//
@@ -320,6 +330,24 @@ func (c *AsterConfig) toNative(a *cArena, extraALPNs []string) (C.aster_config_t
 	n.clear_relay_transports = boolToUint32(c.ClearRelayTransports)
 	n.portmapper = C.uint32_t(c.Portmapper)
 	n.proxy_from_env = boolToUint32(c.ProxyFromEnv)
+	n.blob_zstd_level = C.ASTER_BLOB_ZSTD_LEVEL_DEFAULT
+	if lvl := c.BlobZstdLevel; lvl != nil {
+		switch {
+		case *lvl < 0:
+			return n, fmt.Errorf("BlobZstdLevel must be 0 (off) or a level, got %d: %w", *lvl, ErrInvalidArgument)
+		case *lvl == 0:
+			n.blob_zstd_level = C.ASTER_BLOB_ZSTD_LEVEL_OFF
+		default:
+			n.blob_zstd_level = C.int32_t(min(*lvl, C.ASTER_BLOB_ZSTD_LEVEL_MAX))
+		}
+	}
+	n.reuse_last_port = C.ASTER_REUSE_LAST_PORT_DEFAULT
+	if c.ReuseLastPort != nil {
+		n.reuse_last_port = C.ASTER_REUSE_LAST_PORT_DISABLED
+		if *c.ReuseLastPort {
+			n.reuse_last_port = C.ASTER_REUSE_LAST_PORT_ENABLED
+		}
+	}
 
 	var set C.uint32_t
 	t := &c.Transport
@@ -397,6 +425,20 @@ func (c *AsterConfig) fromNative(n *C.aster_config_t) {
 	c.ClearRelayTransports = n.clear_relay_transports != 0
 	c.Portmapper = Portmapper(n.portmapper)
 	c.ProxyFromEnv = n.proxy_from_env != 0
+	c.BlobZstdLevel = nil
+	switch lvl := int(n.blob_zstd_level); {
+	case lvl == C.ASTER_BLOB_ZSTD_LEVEL_OFF:
+		off := 0
+		c.BlobZstdLevel = &off
+	case lvl > 0:
+		c.BlobZstdLevel = &lvl
+	}
+	c.ReuseLastPort = nil
+	switch n.reuse_last_port {
+	case C.ASTER_REUSE_LAST_PORT_ENABLED, C.ASTER_REUSE_LAST_PORT_DISABLED:
+		reuse := n.reuse_last_port == C.ASTER_REUSE_LAST_PORT_ENABLED
+		c.ReuseLastPort = &reuse
+	}
 
 	set := n.transport_set
 	u64 := func(bit C.uint32_t, v C.uint64_t) *uint64 {
