@@ -50,9 +50,9 @@ impl FetchedContract {
 }
 
 /// Publish `sc` (+ its `type_defs`) into the `registry` doc: build + upload the
-/// contract collection, then write the ArtifactRef (`contracts/{id}`), the
-/// manifest shortcut (`manifests/{id}`), and the version pointer
-/// (`services/{name}/versions/v{n}`), all authored by `author`.
+/// contract collection, then write the ArtifactRef (`contracts/{id}/`), the
+/// manifest shortcut (`manifests/{id}/`), and the version pointer
+/// (`services/{name}/versions/v{n}/`), all authored by `author`.
 pub async fn publish_contract(
     registry: &Doc,
     blobs: &Blobs,
@@ -146,7 +146,7 @@ pub(crate) async fn advertise_contract(
         ),
     ] {
         written.push(key.clone());
-        set_exact(registry, author, key, value).await?;
+        registry.set_bytes(author, key, value).await?;
     }
     Ok(())
 }
@@ -166,62 +166,11 @@ pub(crate) async fn retract_keys(
     ordered.extend(keys.iter().filter(|k| !k.starts_with(b"services/")));
     let mut first = None;
     for key in ordered {
-        if let Err(err) = delete_exact(registry, author, key).await {
+        if let Err(err) = registry.del(author, key.clone()).await {
             first.get_or_insert(err);
         }
     }
     first.map_or(Ok(()), Err)
-}
-
-/// Entries of `author` whose key strictly extends `key`, with their values.
-///
-/// iroh-docs treats every write at `key` -- a value or a deletion marker --
-/// as superseding all *older* entries of the same author whose key starts
-/// with `key`. Registry keys are not prefix-free (`.../versions/v1` is a
-/// prefix of `.../versions/v10`), so a plain write or delete of one key can
-/// remove another. Reading the extensions first lets the caller restore them.
-async fn extensions_of(
-    registry: &Doc,
-    author: &AuthorId,
-    key: &[u8],
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-    let mut extensions = Vec::new();
-    for entry in registry.query_key_prefix(key.to_vec(), None).await? {
-        if entry.author == *author && entry.key != key && entry.content_len > 0 {
-            let value = registry.read_entry_content(&entry.content_hash).await?;
-            extensions.push((entry.key, value));
-        }
-    }
-    Ok(extensions)
-}
-
-/// Write exactly `(author, key)`, leaving the author's longer keys in place
-/// (see [`extensions_of`]). Nothing is written when an extension cannot be
-/// read.
-async fn set_exact(registry: &Doc, author: &AuthorId, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-    let extensions = extensions_of(registry, author, &key).await?;
-    registry.set_bytes(author, key, value).await?;
-    restore(registry, author, extensions).await
-}
-
-/// Delete exactly `(author, key)`, leaving the author's longer keys in place
-/// (see [`extensions_of`]). Other authors' entries are never touched by a
-/// delete. Nothing is deleted when an extension cannot be read.
-async fn delete_exact(registry: &Doc, author: &AuthorId, key: &[u8]) -> Result<()> {
-    let extensions = extensions_of(registry, author, key).await?;
-    registry.del(author, key.to_vec()).await?;
-    restore(registry, author, extensions).await
-}
-
-async fn restore(
-    registry: &Doc,
-    author: &AuthorId,
-    entries: Vec<(Vec<u8>, Vec<u8>)>,
-) -> Result<()> {
-    for (key, value) in entries {
-        registry.set_bytes(author, key, value).await?;
-    }
-    Ok(())
 }
 
 /// Resolve `(service, version)` in the `registry` doc → fetch the contract

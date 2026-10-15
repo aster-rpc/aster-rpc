@@ -185,47 +185,151 @@ pub struct GossipEvent {
 // ════════════════════════════════════════════════════════════════════════════
 // Key helpers (§11.2, §12.4)
 // ════════════════════════════════════════════════════════════════════════════
+//
+// Registry keys are **prefix-free**: no key this module builds is a byte
+// prefix of another. That matters because iroh-docs treats every write at a
+// key, a value or a deletion marker, as superseding the same author's older
+// entries whose keys *extend* it. With `services/X/versions/v1` a prefix of
+// `.../v10`, publishing or retracting v1 silently removed v10.
+//
+// The scheme makes that impossible:
+//
+// 1. Every key is a sequence of segments, and **every segment, the last one
+//    included, ends in `/`**.
+// 2. Variable segments (names, ids, channels, tags, subkeys) are escaped with
+//    [`key_segment`]: `%` -> `%25`, `/` -> `%2F`. A segment therefore never
+//    contains a raw `/`, so splitting on `/` recovers the segments exactly and
+//    [`decode_key_segment`] inverts the escape.
+// 3. No key's segment list is a proper prefix of another key's: every family
+//    ends at a fixed depth with a distinct literal before its variable leaf
+//    (`versions` / `channels` / `tags` / `contracts`...`endpoints`), and the
+//    interior paths (`services/{name}/`, `services/{name}/contracts/{cid}/`,
+//    ...) are never written themselves.
+//
+// By (1) and (2), key A is a byte prefix of key B only if A's segments are a
+// prefix of B's segments; (3) rules that out. Prefix *queries*
+// ([`lease_prefix`], [`version_prefix`]) end at a segment boundary, so they
+// select exactly one family.
 
+/// Escape a variable key segment: `%` becomes `%25` and `/` becomes `%2F`.
+/// Every other byte is kept, so ordinary names, hex ids and channels are
+/// unchanged.
+pub fn key_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for c in segment.chars() {
+        match c {
+            '%' => out.push_str("%25"),
+            '/' => out.push_str("%2F"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Invert [`key_segment`]. `None` for a segment no builder produces: one with
+/// a raw `/`, or a `%` not followed by `25` or `2F`.
+pub fn decode_key_segment(segment: &str) -> Option<String> {
+    if segment.contains('/') {
+        return None;
+    }
+    let mut out = String::with_capacity(segment.len());
+    let mut rest = segment;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let escape = rest.get(i..i + 3)?;
+        out.push(match escape {
+            "%25" => '%',
+            "%2F" => '/',
+            _ => return None,
+        });
+        rest = &rest[i + 3..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// `contracts/{contract_id}/` -> ArtifactRef JSON.
 pub fn contract_key(contract_id: &str) -> Vec<u8> {
-    format!("contracts/{}", contract_id).into_bytes()
+    format!("contracts/{}/", key_segment(contract_id)).into_bytes()
 }
 
-/// Fast-path docs key holding the `manifest.json` bytes for a contract, so a
-/// consumer can read the manifest without fetching the whole collection.
+/// `manifests/{contract_id}/`: the fast-path entry holding the
+/// `manifest.json` bytes for a contract, so a consumer can read the manifest
+/// without fetching the whole collection.
 pub fn manifest_key(contract_id: &str) -> Vec<u8> {
-    format!("manifests/{}", contract_id).into_bytes()
+    format!("manifests/{}/", key_segment(contract_id)).into_bytes()
 }
 
+/// `services/{name}/versions/v{version}/` -> contract_id.
 pub fn version_key(name: &str, version: i32) -> Vec<u8> {
-    format!("services/{}/versions/v{}", name, version).into_bytes()
+    format!("services/{}/versions/v{}/", key_segment(name), version).into_bytes()
 }
 
+/// `services/{name}/versions/`: every version pointer of `name`, and nothing
+/// else. Parse the keys it returns with [`parse_version_key`].
+pub fn version_prefix(name: &str) -> Vec<u8> {
+    format!("services/{}/versions/", key_segment(name)).into_bytes()
+}
+
+/// The `(name, version)` of a [`version_key`], or `None` for any other key.
+/// Strict: the version must be written exactly as `version_key` writes it (no
+/// sign other than `-`, no leading zeros), so each pointer has one spelling.
+pub fn parse_version_key(key: &[u8]) -> Option<(String, i32)> {
+    let key = std::str::from_utf8(key).ok()?;
+    let parts: Vec<&str> = key.split('/').collect();
+    let ["services", name, "versions", version, ""] = parts.as_slice() else {
+        return None;
+    };
+    let digits = version.strip_prefix('v')?;
+    let version: i32 = digits.parse().ok()?;
+    if version.to_string() != digits {
+        return None;
+    }
+    Some((decode_key_segment(name)?, version))
+}
+
+/// `services/{name}/channels/{channel}/` -> contract_id.
 pub fn channel_key(name: &str, channel: &str) -> Vec<u8> {
-    format!("services/{}/channels/{}", name, channel).into_bytes()
-}
-
-pub fn tag_key(name: &str, tag: &str) -> Vec<u8> {
-    format!("services/{}/tags/{}", name, tag).into_bytes()
-}
-
-pub fn lease_key(name: &str, contract_id: &str, endpoint_id: &str) -> Vec<u8> {
     format!(
-        "services/{}/contracts/{}/endpoints/{}",
-        name, contract_id, endpoint_id
+        "services/{}/channels/{}/",
+        key_segment(name),
+        key_segment(channel)
     )
     .into_bytes()
 }
 
+/// `services/{name}/tags/{tag}/` -> contract_id.
+pub fn tag_key(name: &str, tag: &str) -> Vec<u8> {
+    format!("services/{}/tags/{}/", key_segment(name), key_segment(tag)).into_bytes()
+}
+
+/// `services/{name}/contracts/{contract_id}/endpoints/{endpoint_id}/` ->
+/// EndpointLease JSON.
+pub fn lease_key(name: &str, contract_id: &str, endpoint_id: &str) -> Vec<u8> {
+    let mut key = lease_prefix(name, contract_id);
+    key.extend_from_slice(format!("{}/", key_segment(endpoint_id)).as_bytes());
+    key
+}
+
+/// `services/{name}/contracts/{contract_id}/endpoints/`: every lease of one
+/// contract, for range queries.
 pub fn lease_prefix(name: &str, contract_id: &str) -> Vec<u8> {
-    format!("services/{}/contracts/{}/endpoints/", name, contract_id).into_bytes()
+    format!(
+        "services/{}/contracts/{}/endpoints/",
+        key_segment(name),
+        key_segment(contract_id)
+    )
+    .into_bytes()
 }
 
+/// `_aster/acl/{subkey}/`.
 pub fn acl_key(subkey: &str) -> Vec<u8> {
-    format!("_aster/acl/{}", subkey).into_bytes()
+    format!("_aster/acl/{}/", key_segment(subkey)).into_bytes()
 }
 
+/// `_aster/config/{subkey}/`.
 pub fn config_key(subkey: &str) -> Vec<u8> {
-    format!("_aster/config/{}", subkey).into_bytes()
+    format!("_aster/config/{}/", key_segment(subkey)).into_bytes()
 }
 
 pub const REGISTRY_PREFIXES: &[&[u8]] = &[
@@ -920,21 +1024,101 @@ mod tests {
 
     #[test]
     fn key_helpers_match_python() {
-        assert_eq!(contract_key("abc"), b"contracts/abc");
-        assert_eq!(version_key("svc", 7), b"services/svc/versions/v7");
+        assert_eq!(contract_key("abc"), b"contracts/abc/");
+        assert_eq!(manifest_key("abc"), b"manifests/abc/");
+        assert_eq!(version_key("svc", 7), b"services/svc/versions/v7/");
+        assert_eq!(version_prefix("svc"), b"services/svc/versions/");
         assert_eq!(
             channel_key("svc", "stable"),
-            b"services/svc/channels/stable"
+            b"services/svc/channels/stable/"
         );
+        assert_eq!(tag_key("svc", "latest"), b"services/svc/tags/latest/");
         assert_eq!(
             lease_key("svc", "cid", "eid"),
-            b"services/svc/contracts/cid/endpoints/eid"
+            b"services/svc/contracts/cid/endpoints/eid/"
         );
         assert_eq!(
             lease_prefix("svc", "cid"),
             b"services/svc/contracts/cid/endpoints/"
         );
-        assert_eq!(acl_key("writers"), b"_aster/acl/writers");
+        assert_eq!(acl_key("writers"), b"_aster/acl/writers/");
+        assert_eq!(config_key("version"), b"_aster/config/version/");
+    }
+
+    #[test]
+    fn key_segments_escape_slash_and_percent() {
+        assert_eq!(key_segment("a/b%c"), "a%2Fb%25c");
+        assert_eq!(decode_key_segment("a%2Fb%25c").as_deref(), Some("a/b%c"));
+        assert_eq!(
+            channel_key("x", "a/b"),
+            b"services/x/channels/a%2Fb/".to_vec()
+        );
+        for bad in ["a/b", "%", "%2", "%41", "50%"] {
+            assert_eq!(decode_key_segment(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn version_keys_parse_strictly() {
+        assert_eq!(
+            parse_version_key(&version_key("a/b", 10)),
+            Some(("a/b".to_string(), 10))
+        );
+        assert_eq!(
+            parse_version_key(&version_key("svc", -3)),
+            Some(("svc".to_string(), -3))
+        );
+        for bad in [
+            &b"services/svc/versions/v1"[..],
+            b"services/svc/versions/v01/",
+            b"services/svc/versions/v+1/",
+            b"services/svc/versions/1/",
+            b"services/svc/versions/v1/x/",
+            b"services/a/b/versions/v1/",
+            b"services/svc/channels/v1/",
+        ] {
+            assert_eq!(parse_version_key(bad), None, "{bad:?}");
+        }
+    }
+
+    /// The property iroh-docs needs: no key is a byte prefix of another,
+    /// across every family, including segments that look like a sibling's
+    /// prefix (`v1`/`v10`, `stable`/`stable2`) or that contain the delimiter.
+    #[test]
+    fn registry_keys_are_prefix_free() {
+        let names = ["svc", "svc2", "a/b", "a", "50%"];
+        let leaves = ["1", "10", "stable", "stable2", "x/y", "x", "", "%2F"];
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for leaf in leaves {
+            keys.push(contract_key(leaf));
+            keys.push(manifest_key(leaf));
+            keys.push(acl_key(leaf));
+            keys.push(config_key(leaf));
+        }
+        for name in names {
+            for v in [1, 10, 100, -1] {
+                keys.push(version_key(name, v));
+            }
+            for leaf in leaves {
+                keys.push(channel_key(name, leaf));
+                keys.push(tag_key(name, leaf));
+                for eid in leaves {
+                    keys.push(lease_key(name, leaf, eid));
+                }
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        for a in &keys {
+            for b in &keys {
+                assert!(
+                    a == b || !b.starts_with(a),
+                    "{} is a prefix of {}",
+                    String::from_utf8_lossy(a),
+                    String::from_utf8_lossy(b)
+                );
+            }
+        }
     }
 
     #[test]

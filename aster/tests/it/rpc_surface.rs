@@ -90,7 +90,7 @@ impl ServiceDispatch for Bare {
     }
 }
 
-const VERSION_KEY: &[u8] = b"services/SurfaceEcho/versions/v1";
+const VERSION_KEY: &[u8] = b"services/SurfaceEcho/versions/v1/";
 
 fn cfg() -> AsterConfig {
     AsterConfig::builder()
@@ -502,7 +502,8 @@ async fn surface_cannot_shadow_a_host_service() {
 }
 
 /// The same service name at version 10: its registry key
-/// `services/SurfaceEcho/versions/v10` has v1's key as a prefix.
+/// Under the old key format its pointer `services/SurfaceEcho/versions/v10`
+/// had v1's pointer as a byte prefix.
 #[aster::service(name = "SurfaceEcho", version = 10)]
 trait EchoTen {
     async fn echo(&self, req: EchoRequest) -> Result<EchoResponse>;
@@ -517,7 +518,11 @@ impl EchoTen for EchoImpl {
 
 /// Publishing and retracting a surface's entries touch exactly its keys:
 /// activating and then deactivating a surface that publishes v1 leaves v10,
-/// written by the same node into the same registry, in place.
+/// written by the same node into the same registry, untouched -- present and
+/// never rewritten. iroh-docs lets a write at a key supersede the same
+/// author's older entries whose keys extend it, so this holds only because
+/// registry keys are prefix-free. The keys are discovered from the doc rather
+/// than spelled here, so the test exercises whatever format the builders use.
 #[tokio::test]
 async fn retraction_matches_exact_keys() {
     let srv = deferred().await;
@@ -536,18 +541,16 @@ async fn retraction_matches_exact_keys() {
     )
     .await
     .unwrap();
-    const V10: &[u8] = b"services/SurfaceEcho/versions/v10";
-    let present = |key: &'static [u8]| {
-        let registry = registry.clone();
-        async move {
-            registry
-                .query_latest_exact(key.to_vec())
-                .await
-                .unwrap()
-                .is_some()
-        }
+    // The only service entry so far is v10's version pointer.
+    let pointers = |registry: aster::Doc| async move {
+        registry
+            .query_key_prefix(b"services/".to_vec(), None)
+            .await
+            .unwrap()
     };
-    assert!(present(V10).await);
+    let before = pointers(registry.clone()).await;
+    assert_eq!(before.len(), 1, "one pointer: v10");
+    let v10_entry = before[0].clone();
 
     srv.activate(
         RpcSurface::builder()
@@ -558,12 +561,30 @@ async fn retraction_matches_exact_keys() {
     )
     .await
     .unwrap();
-    assert!(present(VERSION_KEY).await);
-    assert!(present(V10).await, "publishing v1 leaves v10 in place");
+    let during = pointers(registry.clone()).await;
+    assert!(
+        during.iter().any(|e| e.key == v10_entry.key),
+        "publishing v1 leaves v10 in place"
+    );
+    let v1_key = during
+        .iter()
+        .find(|e| e.key != v10_entry.key)
+        .expect("v1's pointer")
+        .key
+        .clone();
     srv.deactivate().await.unwrap();
 
-    assert!(!present(VERSION_KEY).await, "v1 retracted");
-    assert!(present(V10).await, "v10 is not v1's to retract");
+    let after = pointers(registry.clone()).await;
+    assert!(!after.iter().any(|e| e.key == v1_key), "v1 retracted");
+    let survivor = after
+        .iter()
+        .find(|e| e.key == v10_entry.key)
+        .expect("v10 is not v1's to retract");
+    assert_eq!(
+        (survivor.timestamp, &survivor.content_hash),
+        (v10_entry.timestamp, &v10_entry.content_hash),
+        "v10 was never rewritten"
+    );
     let fetched = within(fetch_and_verify_contract(
         &registry,
         &srv.blobs(),
