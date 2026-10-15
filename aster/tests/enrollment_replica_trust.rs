@@ -461,11 +461,14 @@ async fn fresh_node_bootstraps_from_a_credential_less_registered_replica() {
 /// coord-host synchronized from it, local policy still has nothing admitting
 /// it: its RPC and blob requests are refused. Once the root registers it, the
 /// coord-host's replica maintenance learns that from the daemon itself and
-/// the same requests succeed.
+/// the same requests succeed. The root admits only the daemon, so it can
+/// never reach the coord-host: through the fleet document's gossip swarm,
+/// HyParView would otherwise forward the coord-host's join to the root,
+/// which then dials it and could deliver the registration itself.
 #[tokio::test]
 async fn replica_gets_no_application_access_until_registered() {
     tokio::time::timeout(Duration::from_secs(150), async {
-        let root = Root::start().await;
+        let root = Root::start_with_policy(Arc::new(DaemonOnly)).await;
         let files = tempfile::tempdir().unwrap();
         root.register(public(HOST)).await;
         // The root admits the daemon by a short credential to publish into
@@ -512,6 +515,7 @@ async fn replica_gets_no_application_access_until_registered() {
             session_source(&host, DAEMON).is_some()
         })
         .await;
+        // The registration can only have come from the daemon.
         assert!(root.enrollment.peer_session(&public(HOST)).is_none());
         assert!(rpc_reaches(daemon.node(), &host).await);
         assert!(blob_reaches(daemon.node(), &host, &hash).await);
