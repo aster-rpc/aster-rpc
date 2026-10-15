@@ -736,7 +736,14 @@ impl EnrollmentService {
                 let Some(service) = weak.upgrade() else {
                     break;
                 };
-                service.reconcile().await;
+                // A pass reading the Docs store when the node closes may
+                // never finish. It must not keep the service, and with it the
+                // policy store's file lock, alive after the node is gone.
+                let endpoint = service.node.inner.endpoint.clone();
+                tokio::select! {
+                    () = service.reconcile() => {}
+                    () = endpoint.closed() => break,
+                }
             }
         });
         Ok(service)
@@ -1624,9 +1631,13 @@ impl EnrollmentService {
                     break;
                 };
                 if sync.result.is_ok() {
-                    service
-                        .observe_policy_sync(&doc, &sync.peer.to_string())
-                        .await;
+                    // As for reconciliation: never outlive the node.
+                    let endpoint = service.node.inner.endpoint.clone();
+                    let peer = sync.peer.to_string();
+                    tokio::select! {
+                        () = service.observe_policy_sync(&doc, &peer) => {}
+                        () = endpoint.closed() => break,
+                    }
                 }
             }
         });
