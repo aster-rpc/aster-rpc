@@ -41,6 +41,7 @@ pub mod server;
 mod sessions;
 pub mod status;
 pub mod streaming;
+pub mod surface;
 
 // Manifest publication needs docs + blobs as well as rpc.
 #[cfg(all(feature = "docs", feature = "blobs"))]
@@ -61,9 +62,9 @@ pub use codec::{
 };
 pub use contract::{
     contract_id, encode_scalar_default, make_field, make_union_variant, message_type_def,
-    union_type_def, AsterType, ContractManifest, Leaf, ManifestMethod, MethodDef, MethodPattern,
-    PayloadRegistry, ScalarDefault, ScopeKind, ServiceContract, TypeDef, UnionVariantDef,
-    WireField,
+    union_type_def, AsterType, ContractArtifacts, ContractManifest, Leaf, ManifestMethod,
+    MethodDef, MethodPattern, PayloadRegistry, ScalarDefault, ScopeKind, ServiceContract, TypeDef,
+    TypeDefSet, UnionVariantDef, WireField,
 };
 pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationError};
 pub use empty::Empty;
@@ -80,6 +81,10 @@ pub use runtime::{AsterServer, AsterServerBuilder};
 pub use server::{
     AlpnHandler, Call, CallParts, Dispatcher, HttpTransport, PeerProvenance, Route, Routed, Server,
     ServerHandle, ServiceDispatch, DEFAULT_HANDLER_TIMEOUT, RPC_ALPN,
+};
+pub use surface::{
+    ManifestPublication, PublishedService, RpcSurface, RpcSurfaceBuilder, SurfaceActivation,
+    SurfaceState,
 };
 
 /// Reactor frame types, re-exported so a non-Iroh transport can build

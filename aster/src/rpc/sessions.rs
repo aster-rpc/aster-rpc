@@ -196,6 +196,44 @@ impl SessionStore {
         reaped
     }
 
+    /// Drop every live instance of the services in `keys`, on every
+    /// connection and every HTTP principal. Connection graveyards are kept,
+    /// so a closed id still answers `NOT_FOUND` rather than reopening. Used
+    /// when a late-activated RPC surface is withdrawn: its session instances
+    /// must not outlive it, and must not be reused by a later surface that
+    /// serves the same `(name, version)`. Returns how many were dropped.
+    pub(crate) fn drop_services(&self, keys: &[ServiceKey]) -> usize {
+        if keys.is_empty() {
+            return 0;
+        }
+        let mut dropped: Vec<SessionInstance> = Vec::new();
+        {
+            let mut connections = self.connections.lock().unwrap();
+            for state in connections.values_mut() {
+                let stale: Vec<(i32, ServiceKey)> = state
+                    .active
+                    .keys()
+                    .filter(|(_, key)| keys.contains(key))
+                    .cloned()
+                    .collect();
+                dropped.extend(stale.into_iter().filter_map(|k| state.active.remove(&k)));
+            }
+        }
+        {
+            let mut http = self.http.lock().unwrap();
+            let stale: Vec<HttpKey> = http
+                .keys()
+                .filter(|(_, name, version, _)| {
+                    keys.iter().any(|k| k.0 == *name && k.1 == *version)
+                })
+                .cloned()
+                .collect();
+            dropped.extend(stale.into_iter().filter_map(|k| http.remove(&k)));
+        }
+        // Instances (and any `Drop` they run) are released outside the locks.
+        dropped.len()
+    }
+
     /// Drop every HTTP-scoped instance for `session_id`, for any principal.
     pub(crate) fn end_http_session(&self, session_id: &str) {
         let removed: Vec<_> = {

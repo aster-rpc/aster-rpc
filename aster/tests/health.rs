@@ -805,6 +805,41 @@ async fn aster_server_builder_option_and_default_off() {
     srv.shutdown().await;
 }
 
+/// A deferred server is not ready until its RPC surface is active, counts
+/// only host services before that, and is not ready again once the surface
+/// is stopped (`docs/_internal/aster-server-late-activation.md`).
+#[tokio::test]
+async fn deferred_surface_readiness_follows_activation() {
+    use aster::rpc::RpcSurface;
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .health(HealthConfig::new("127.0.0.1", 0))
+        .deferred_surface()
+        .start()
+        .await
+        .unwrap();
+    let addr = srv.health().unwrap().addr();
+    assert_eq!(get(addr, "/healthz").await.status, 200, "the node is live");
+    let r = get(addr, "/readyz").await;
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert_eq!(json(&r)["services"], 0);
+
+    srv.activate(RpcSurface::builder().service(Probe).build())
+        .await
+        .unwrap();
+    let r = get(addr, "/readyz").await;
+    assert_eq!(r.status, 200, "{}", r.body);
+    assert_eq!(json(&r)["services"], 1);
+    assert_eq!(json(&r)["registry"], false);
+
+    srv.deactivate().await.unwrap();
+    let r = get(addr, "/readyz").await;
+    assert_eq!(r.status, 503, "{}", r.body);
+    assert_eq!(json(&r)["services"], 0);
+    assert_eq!(get(addr, "/healthz").await.status, 200);
+    srv.shutdown().await;
+}
+
 #[test]
 fn prometheus_parser_rejects_garbage() {
     let ok = parse_prometheus(

@@ -126,6 +126,16 @@ pub trait ServiceDispatch: Send + Sync + 'static {
     fn method_timeout(&self, _method: &str) -> Option<Duration> {
         None
     }
+    /// The cross-binding contract this service commits to, with the payload
+    /// `TypeDef`s it references, for manifest publication. `None` (default)
+    /// means the service has no publishable contract: a hand-written
+    /// dispatcher. `#[aster::service]` populates it. An
+    /// [`RpcSurface`](super::RpcSurface) under
+    /// [`ManifestPublication::Strict`](super::ManifestPublication::Strict)
+    /// refuses to activate a service that returns `None`.
+    fn contract_artifacts(&self) -> Option<super::contract::ContractArtifacts> {
+        None
+    }
     /// Handle one call. `method` is `StreamHeader.method` (guaranteed to be in
     /// [`methods`](ServiceDispatch::methods) when that table is non-empty). The
     /// handler MUST terminate the call by consuming `call` via [`Call::respond`]
@@ -137,6 +147,51 @@ pub trait ServiceDispatch: Send + Sync + 'static {
 type Registry = HashMap<ServiceKey, Arc<dyn ServiceDispatch>>;
 
 type SessionFactories = HashMap<ServiceKey, SessionFactory>;
+
+/// Services installed on a running server after its acceptor started: the
+/// late-activated RPC surface of an [`AsterServer`](super::AsterServer). The
+/// set is immutable once installed; withdrawing it replaces the whole set.
+pub(crate) struct LateServices {
+    pub(crate) services: Registry,
+    /// Metadata-only probes of the session-scoped services below.
+    pub(crate) session_probes: Registry,
+    pub(crate) session_factories: SessionFactories,
+}
+
+/// The slot a deferred server's dispatchers consult after their own
+/// registry. Generalises coordination's "live but late-bound" endpoints from
+/// one service to a whole service set: the slot is wired into the dispatcher
+/// before the acceptor starts, and until something is installed every call
+/// that no host service claims answers `UNAVAILABLE` -- for every name alike,
+/// so the refusal discloses nothing about what will be served.
+#[derive(Default)]
+pub(crate) struct LateSlot {
+    current: std::sync::RwLock<Option<Arc<LateServices>>>,
+}
+
+impl LateSlot {
+    pub(crate) fn get(&self) -> Option<Arc<LateServices>> {
+        self.current.read().unwrap().clone()
+    }
+
+    /// Install `services`; calls routed after this returns reach them.
+    pub(crate) fn install(&self, services: Arc<LateServices>) {
+        *self.current.write().unwrap() = Some(services);
+    }
+
+    /// Withdraw the installed set; calls routed after this returns answer
+    /// `UNAVAILABLE`. Calls already routed run to completion.
+    pub(crate) fn clear(&self) -> Option<Arc<LateServices>> {
+        self.current.write().unwrap().take()
+    }
+}
+
+/// What a deferred server answers for a service no host service claims while
+/// no surface is active. `UNAVAILABLE` is the status clients (and the default
+/// [`RetryPolicy`](super::RetryPolicy)) treat as transient.
+pub(crate) fn surface_inactive() -> RpcStatus {
+    RpcStatus::error(StatusCode::Unavailable, "rpc surface not active")
+}
 
 /// Handler for an inbound connection on a non-`aster/1` ALPN. Invoked once per
 /// accepted connection from the reactor's single accept loop, so it **must not
@@ -171,6 +226,8 @@ pub struct Server {
     foreign: OnceLock<Arc<Foreign>>,
     /// Telemetry sinks shared by every dispatcher (attribute extractors).
     telemetry: Telemetry,
+    /// Late-bound services (deferred `AsterServer`); `None` = none expected.
+    late: Option<Arc<LateSlot>>,
 }
 
 /// The default cap on how long any handler may run: Python's
@@ -196,7 +253,17 @@ impl Server {
             dispatch_sink: None,
             foreign: OnceLock::new(),
             telemetry: Telemetry::default(),
+            late: None,
         }
+    }
+
+    /// Consult `slot` for any service this server's own registry does not
+    /// serve. Until a set is installed there, such calls answer
+    /// `UNAVAILABLE` instead of `NOT_FOUND`. Used by a deferred
+    /// [`AsterServer`](super::AsterServer).
+    pub(crate) fn late_slot(mut self, slot: Arc<LateSlot>) -> Self {
+        self.late = Some(slot);
+        self
     }
 
     /// Where foreign calls and lifecycle events go (binding support). Set
@@ -441,6 +508,7 @@ impl Server {
             deadlines: self.deadlines.clone(),
             foreign: self.foreign(),
             telemetry: self.telemetry.clone(),
+            late: self.late.clone(),
         }
     }
 
@@ -617,6 +685,9 @@ pub struct Dispatcher {
     /// Foreign services, the sink and the shared call table.
     foreign: Arc<Foreign>,
     telemetry: Telemetry,
+    /// Late-bound services, shared by every clone (so an HTTP transport sees
+    /// an activation too).
+    late: Option<Arc<LateSlot>>,
 }
 
 impl Dispatcher {
@@ -650,6 +721,19 @@ impl Dispatcher {
         }
     }
 
+    /// Whether this dispatcher's own (host) registry serves `key`, natively,
+    /// session-scoped or foreign. Late-bound services are not counted.
+    pub(crate) fn serves_host(&self, key: &ServiceKey) -> bool {
+        self.services.contains_key(key)
+            || self.session_factories.contains_key(key)
+            || self.foreign.service(key).is_some()
+    }
+
+    /// The session store shared by every clone of this dispatcher.
+    pub(crate) fn session_store(&self) -> &SessionStore {
+        &self.sessions
+    }
+
     /// Build the transport's per-method frame-limit resolver from the
     /// registered services.
     ///
@@ -666,6 +750,8 @@ impl Dispatcher {
         // Foreign services answer from their `MethodLimits`, shared and
         // session-scoped alike.
         let foreign = self.foreign.clone();
+        // A late-activated surface's caps apply once it is installed.
+        let late = self.late.clone();
         Arc::new(move |header: &[u8]| match decode_stream_header(header) {
             // Undecodable header: reject the stream rather than fall back to a
             // generous default and read a body behind it.
@@ -674,9 +760,15 @@ impl Dispatcher {
                 let key = (h.service.clone(), h.version);
                 let cap = match services.get(&key).or_else(|| probes.get(&key)) {
                     Some(s) => s.max_frame_size(&h.method),
-                    None => foreign
-                        .service(&key)
-                        .and_then(|s| s.max_frame_size(&h.method)),
+                    None => match foreign.service(&key) {
+                        Some(s) => s.max_frame_size(&h.method),
+                        None => late.as_ref().and_then(|slot| slot.get()).and_then(|l| {
+                            l.services
+                                .get(&key)
+                                .or_else(|| l.session_probes.get(&key))
+                                .and_then(|s| s.max_frame_size(&h.method))
+                        }),
+                    },
                 };
                 match cap {
                     None => reactor::FrameLimit::Default,
@@ -754,7 +846,25 @@ impl Dispatcher {
                 Some(svc.clone()),
             )
         } else {
-            return Route::Reject(not_found(&header));
+            match self.late.as_ref().map(|slot| slot.get()) {
+                // No late slot (every server but a deferred AsterServer).
+                None => return Route::Reject(not_found(&header)),
+                // Deferred and not active: fail closed, the same for every
+                // name, before any service-specific check.
+                Some(None) => return Route::Reject(surface_inactive()),
+                Some(Some(late)) => {
+                    if let Some(s) = late.services.get(&key) {
+                        (s.clone(), None, None)
+                    } else if let (Some(probe), Some(f)) = (
+                        late.session_probes.get(&key),
+                        late.session_factories.get(&key),
+                    ) {
+                        (probe.clone(), Some(f.clone()), None)
+                    } else {
+                        return Route::Reject(not_found(&header));
+                    }
+                }
+            }
         };
 
         // Provenance BEFORE method routing and before any handler runs. A

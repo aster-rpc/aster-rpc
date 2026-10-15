@@ -97,6 +97,8 @@ pub struct AsterServerBuilder {
     // Code overrides of the `[enrollment]` policy and role mapping.
     #[cfg(all(feature = "enrollment", feature = "docs"))]
     enrollment_overrides: crate::enrollment::runtime::Overrides,
+    // Late activation: application services arrive later as an `RpcSurface`.
+    deferred_surface: bool,
 }
 
 impl AsterServerBuilder {
@@ -387,6 +389,24 @@ impl AsterServerBuilder {
         self
     }
 
+    /// Start without the application's RPC surface; hand it over later with
+    /// [`AsterServer::activate`]. See [`surface`](super::surface).
+    ///
+    /// [`start`](Self::start) then brings up the node, its identity, blobs /
+    /// docs / gossip, admission, enrollment and the `aster/1` ALPN as usual,
+    /// and serves only the *host* services: the baselines, the enrollment
+    /// issuer, coordination, and anything added with
+    /// [`service`](Self::service) here. Every call to any other service
+    /// answers `UNAVAILABLE` ("rpc surface not active"), whatever its name,
+    /// until [`activate`](AsterServer::activate) returns, and again after
+    /// [`deactivate`](AsterServer::deactivate). The health listener reports
+    /// not ready while no surface is active. With this set the server may
+    /// start with no service at all.
+    pub fn deferred_surface(mut self) -> Self {
+        self.deferred_surface = true;
+        self
+    }
+
     /// Build the node (RPC + built-in protocol ALPNs registered), start serving
     /// the registered services, and return the running [`AsterServer`].
     pub async fn start(self) -> Result<AsterServer> {
@@ -413,6 +433,7 @@ impl AsterServerBuilder {
             && !self.enable_topology
             && !hosts_coordination
             && !has_foreign
+            && !self.deferred_surface
         {
             return Err(Error::InvalidArgument(
                 "AsterServer requires at least one service (or an enabled baseline service)".into(),
@@ -563,6 +584,14 @@ impl AsterServerBuilder {
 
         let attributes = self.attributes.unwrap_or_default();
         let mut server = Server::new(&node).attributes(attributes.clone());
+        // Deferred: the slot is wired in before the acceptor starts, so no
+        // call can ever see a server without it.
+        let late_slot = self
+            .deferred_surface
+            .then(|| Arc::new(super::server::LateSlot::default()));
+        if let Some(slot) = &late_slot {
+            server = server.late_slot(slot.clone());
+        }
         if let Some(auth) = self.authenticator {
             server = server.authenticator_arc(auth);
         }
@@ -753,9 +782,12 @@ impl AsterServerBuilder {
             }
         };
 
+        // A deferred server is ready only once its surface is active.
         #[cfg(feature = "health")]
         if let Some(health) = &health {
-            health.set_ready(true);
+            if late_slot.is_none() {
+                health.set_ready(true);
+            }
         }
         tracing::info!(
             target: crate::log_targets::SERVER,
@@ -778,6 +810,9 @@ impl AsterServerBuilder {
             health,
             #[cfg(all(feature = "enrollment", feature = "docs"))]
             enrollment,
+            surface: late_slot.map(super::surface::SurfaceControl::new),
+            #[cfg(feature = "health")]
+            host_services: service_count,
         })
     }
 }
@@ -893,6 +928,11 @@ pub struct AsterServer {
     /// Enrollment, when `[enrollment]` is configured.
     #[cfg(all(feature = "enrollment", feature = "docs"))]
     enrollment: Option<ServerEnrollment>,
+    /// The late-activation state machine (`deferred_surface()` only).
+    surface: Option<super::surface::SurfaceControl>,
+    /// Services reported to `/readyz` without a surface.
+    #[cfg(feature = "health")]
+    host_services: u32,
 }
 
 impl AsterServer {
@@ -1019,6 +1059,63 @@ impl AsterServer {
         self.node.topology()
     }
 
+    /// Activate `surface`: install its services, publish its contracts per
+    /// its [`ManifestPublication`](super::ManifestPublication), and report
+    /// ready, as one step. Returns once the services are callable and their
+    /// manifests are in the promised state; on error the server is as it was
+    /// before the call (not callable, nothing advertised).
+    ///
+    /// Fails with `FAILED_PRECONDITION` unless the server was built with
+    /// [`deferred_surface()`](AsterServerBuilder::deferred_surface) or when a
+    /// surface is already active (surfaces are immutable: deactivate first),
+    /// and with `InvalidArgument` when the surface is empty or names a
+    /// service the server already serves.
+    pub async fn activate(&self, surface: super::RpcSurface) -> Result<super::SurfaceActivation> {
+        let control = self.surface_control()?;
+        control.activate(self.surface_host(), surface).await
+    }
+
+    /// Stop the active surface, if any: report not ready, retract its
+    /// registry entries, then stop dispatching to it (later calls answer
+    /// `UNAVAILABLE`; calls already running finish). The node -- blobs, docs,
+    /// gossip, host services -- stays up. A no-op when nothing is active.
+    pub async fn deactivate(&self) -> Result<()> {
+        let control = self.surface_control()?;
+        control.deactivate(self.surface_host()).await
+    }
+
+    /// Whether a surface is active. Always [`Active`](super::SurfaceState::Active)
+    /// for a server built without
+    /// [`deferred_surface()`](AsterServerBuilder::deferred_surface): it serves
+    /// its services from `start`.
+    pub fn surface_state(&self) -> super::SurfaceState {
+        match &self.surface {
+            Some(control) => control.state(),
+            None => super::SurfaceState::Active,
+        }
+    }
+
+    fn surface_control(&self) -> Result<&super::surface::SurfaceControl> {
+        self.surface.as_ref().ok_or_else(|| {
+            Error::rpc(
+                super::StatusCode::FailedPrecondition,
+                "this AsterServer serves its services from start; build it with \
+                 deferred_surface() to activate an rpc surface later",
+            )
+        })
+    }
+
+    fn surface_host(&self) -> super::surface::Host<'_> {
+        super::surface::Host {
+            node: &self.node,
+            dispatcher: &self.dispatcher,
+            #[cfg(feature = "health")]
+            health: self.health.as_ref(),
+            #[cfg(feature = "health")]
+            host_services: self.host_services,
+        }
+    }
+
     /// Serve until the node closes (or the loop is otherwise stopped). Mirrors
     /// `await srv.serve()`.
     pub async fn run(self) {
@@ -1050,6 +1147,17 @@ impl AsterServer {
             node_id = self.node.id().as_str(),
             "aster server shutting down"
         );
+        // An active surface goes first: discovery retracted, dispatch
+        // stopped, before anything below it closes.
+        if let Some(control) = &self.surface {
+            if let Err(err) = control.deactivate(self.surface_host()).await {
+                tracing::warn!(
+                    target: crate::log_targets::SERVER,
+                    error = %err,
+                    "rpc surface did not stop cleanly"
+                );
+            }
+        }
         // Probes see not-ready first, and the port is released before the
         // node goes away.
         #[cfg(feature = "health")]

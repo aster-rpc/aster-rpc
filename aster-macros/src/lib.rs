@@ -71,6 +71,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // type. Scalars resolve to the `WireField` no-op default; nested structs
     // register themselves and recurse further.
     let mut register_children: Vec<TokenStream2> = Vec::new();
+    let mut collect_children: Vec<TokenStream2> = Vec::new();
     for f in fields {
         let fname = f.ident.as_ref().unwrap().to_string();
         let info = analyze_field(f)?;
@@ -88,6 +89,9 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         for child in child_types(&f.ty) {
             register_children.push(quote! {
                 <#child as ::aster::rpc::WireField>::register_payload(__reg);
+            });
+            collect_children.push(quote! {
+                <#child as ::aster::rpc::WireField>::collect_type_defs(__set);
             });
         }
     }
@@ -115,6 +119,14 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 let __td = <Self as ::aster::rpc::AsterType>::aster_type_def();
                 __reg.register::<Self>(&::std::format!("{}.{}", __td.package, __td.name));
                 #(#register_children)*
+            }
+
+            fn collect_type_defs(__set: &mut ::aster::rpc::TypeDefSet) {
+                if !__set.mark_seen::<Self>() {
+                    return;
+                }
+                __set.push(<Self as ::aster::rpc::AsterType>::aster_type_def());
+                #(#collect_children)*
             }
         }
     })
@@ -144,6 +156,7 @@ fn expand_union(
 ) -> syn::Result<TokenStream2> {
     let mut variant_exprs: Vec<TokenStream2> = Vec::new();
     let mut register_children: Vec<TokenStream2> = Vec::new();
+    let mut collect_children: Vec<TokenStream2> = Vec::new();
     let mut implicit_id: i32 = 0;
     for variant in data.variants.iter() {
         // `#[fory(unknown)] Unknown(UnknownCase)` — ForyUnion's runtime
@@ -184,6 +197,9 @@ fn expand_union(
         register_children.push(quote! {
             <#payload as ::aster::rpc::WireField>::register_payload(__reg);
         });
+        collect_children.push(quote! {
+            <#payload as ::aster::rpc::WireField>::collect_type_defs(__set);
+        });
     }
 
     Ok(quote! {
@@ -209,6 +225,14 @@ fn expand_union(
                 let __td = <Self as ::aster::rpc::AsterType>::aster_type_def();
                 __reg.register_union::<Self>(&::std::format!("{}.{}", __td.package, __td.name));
                 #(#register_children)*
+            }
+
+            fn collect_type_defs(__set: &mut ::aster::rpc::TypeDefSet) {
+                if !__set.mark_seen::<Self>() {
+                    return;
+                }
+                __set.push(<Self as ::aster::rpc::AsterType>::aster_type_def());
+                #(#collect_children)*
             }
         }
     })
@@ -973,6 +997,13 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
             }
         }
     }
+    // Contract type collection: the same roots, walked transitively into
+    // the `TypeDef`s a published contract collection carries.
+    let collect_roots: Vec<TokenStream2> = specs
+        .iter()
+        .flat_map(|s| [&s.req_ty, &s.resp_ty])
+        .map(|ty| quote!(<#ty as ::aster::rpc::WireField>::collect_type_defs(&mut __set);))
+        .collect();
     let build_fory = quote! {
         ::std::vec![ #(#fory_exprs),* ]
     };
@@ -1172,6 +1203,16 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
             fn name(&self) -> &str { #svc_name }
             fn version(&self) -> i32 { #svc_version }
             fn methods(&self) -> &[&str] { &[ #(#method_name_lits),* ] }
+            fn contract_artifacts(&self)
+                -> ::core::option::Option<::aster::rpc::ContractArtifacts>
+            {
+                let mut __set = ::aster::rpc::TypeDefSet::new();
+                #(#collect_roots)*
+                ::core::option::Option::Some(::aster::rpc::ContractArtifacts {
+                    contract: #contract_expr,
+                    type_defs: __set.into_defs(),
+                })
+            }
             fn method_requires(&self, method: &str)
                 -> ::core::option::Option<::aster::rpc::CapabilityRequirement>
             {

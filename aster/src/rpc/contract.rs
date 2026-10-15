@@ -85,6 +85,51 @@ pub trait WireField {
     /// request/response type, and this walk pulls in the rest. (Override
     /// callers require `Self: ForyStruct`.)
     fn register_payload(_reg: &mut PayloadRegistry) {}
+
+    /// Add this type's contract `TypeDef` and those of its **transitive**
+    /// payload dependencies to `set`, deduplicating by `TypeId`. The same walk
+    /// as [`register_payload`](WireField::register_payload), collecting the
+    /// `types/{hash}.bin` entries a published contract collection carries.
+    /// Scalars are a no-op (default); `#[derive(AsterType)]` overrides it.
+    fn collect_type_defs(_set: &mut TypeDefSet) {}
+}
+
+/// The payload `TypeDef`s of a contract, collected transitively from each
+/// method's request and response type by [`WireField::collect_type_defs`].
+#[derive(Default)]
+pub struct TypeDefSet {
+    seen: std::collections::HashSet<std::any::TypeId>,
+    defs: Vec<TypeDef>,
+}
+
+impl TypeDefSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record `T`; `false` when it was already collected (the caller then
+    /// skips it and its fields).
+    pub fn mark_seen<T: 'static>(&mut self) -> bool {
+        self.seen.insert(std::any::TypeId::of::<T>())
+    }
+
+    pub fn push(&mut self, def: TypeDef) {
+        self.defs.push(def);
+    }
+
+    /// The collected definitions, in first-visit order.
+    pub fn into_defs(self) -> Vec<TypeDef> {
+        self.defs
+    }
+}
+
+/// What a service publishes: its contract and the payload `TypeDef`s that
+/// contract references. Returned by
+/// [`ServiceDispatch::contract_artifacts`](super::ServiceDispatch::contract_artifacts).
+#[derive(Debug, Clone)]
+pub struct ContractArtifacts {
+    pub contract: ServiceContract,
+    pub type_defs: Vec<TypeDef>,
 }
 
 /// A Fory runtime under construction for **one payload root type** (a method's

@@ -61,6 +61,40 @@ pub async fn publish_contract(
     type_defs: &[TypeDef],
     published_at_epoch_ms: i64,
 ) -> Result<PublishedContract> {
+    let staged = stage_contract(blobs, author, sc, type_defs, published_at_epoch_ms).await?;
+    advertise_contract(registry, author, &staged, &mut Vec::new()).await?;
+    Ok(staged.published)
+}
+
+/// A contract collection uploaded to the blob store but not yet referenced
+/// from any registry doc: content-addressed and unannounced, so staging it
+/// discloses nothing.
+pub(crate) struct StagedContract {
+    pub(crate) published: PublishedContract,
+    name: String,
+    version: i32,
+    artifact_json: Vec<u8>,
+    manifest_json: Vec<u8>,
+}
+
+impl StagedContract {
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn version(&self) -> i32 {
+        self.version
+    }
+}
+
+/// Phase one of publication: build and upload the collection.
+pub(crate) async fn stage_contract(
+    blobs: &Blobs,
+    author: &AuthorId,
+    sc: &ServiceContract,
+    type_defs: &[TypeDef],
+    published_at_epoch_ms: i64,
+) -> Result<StagedContract> {
     let entries = build_contract_collection(sc, type_defs, author.as_str(), published_at_epoch_ms)?;
     let contract_bytes = collection_entry(&entries, "contract.bin")?;
     let manifest_json = collection_entry(&entries, "manifest.json")?;
@@ -80,25 +114,63 @@ pub async fn publish_contract(
     };
     let artifact_json =
         serde_json::to_vec(&artifact).map_err(|e| json_err("artifact encode", e))?;
-
-    registry
-        .set_bytes(author, contract_key(&contract_id), artifact_json)
-        .await?;
-    registry
-        .set_bytes(author, manifest_key(&contract_id), manifest_json)
-        .await?;
-    registry
-        .set_bytes(
-            author,
-            version_key(&sc.name, sc.version),
-            contract_id.clone().into_bytes(),
-        )
-        .await?;
-
-    Ok(PublishedContract {
-        contract_id,
-        collection_hash,
+    Ok(StagedContract {
+        published: PublishedContract {
+            contract_id,
+            collection_hash,
+        },
+        name: sc.name.clone(),
+        version: sc.version,
+        artifact_json,
+        manifest_json,
     })
+}
+
+/// Phase two: reference a staged collection from `registry`. The version
+/// pointer -- the entry a consumer finds the service by -- is written last.
+/// Each key is appended to `written` before it is written, so a caller can
+/// retract a partial advertisement with [`retract_keys`].
+pub(crate) async fn advertise_contract(
+    registry: &Doc,
+    author: &AuthorId,
+    staged: &StagedContract,
+    written: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    let id = &staged.published.contract_id;
+    for (key, value) in [
+        (contract_key(id), staged.artifact_json.clone()),
+        (manifest_key(id), staged.manifest_json.clone()),
+        (
+            version_key(&staged.name, staged.version),
+            id.clone().into_bytes(),
+        ),
+    ] {
+        written.push(key.clone());
+        registry.set_bytes(author, key, value).await?;
+    }
+    Ok(())
+}
+
+/// Delete advertised `keys` from `registry`, version pointers first so a
+/// service stops being discoverable before its artifacts go. Every key is
+/// attempted; the first error is returned.
+pub(crate) async fn retract_keys(
+    registry: &Doc,
+    author: &AuthorId,
+    keys: &[Vec<u8>],
+) -> Result<()> {
+    let mut ordered: Vec<&Vec<u8>> = keys
+        .iter()
+        .filter(|k| k.starts_with(b"services/"))
+        .collect();
+    ordered.extend(keys.iter().filter(|k| !k.starts_with(b"services/")));
+    let mut first = None;
+    for key in ordered {
+        if let Err(err) = registry.del(author, key.clone()).await {
+            first.get_or_insert(err);
+        }
+    }
+    first.map_or(Ok(()), Err)
 }
 
 /// Resolve `(service, version)` in the `registry` doc → fetch the contract

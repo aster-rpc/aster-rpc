@@ -71,6 +71,7 @@ mod rpc_service;
 mod rpc_service_streaming;
 mod rpc_sessions;
 mod rpc_shell;
+mod rpc_surface;
 mod rpc_topology;
 mod storage_perms;
 mod ticket;
