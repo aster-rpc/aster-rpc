@@ -332,8 +332,15 @@ pub fn config_key(subkey: &str) -> Vec<u8> {
     format!("_aster/config/{}/", key_segment(subkey)).into_bytes()
 }
 
+/// The top-level key families a registry client syncs: the prefixes a
+/// `DownloadPolicy::NothingExcept` on the registry doc keeps. Every family a
+/// key builder above writes must be covered, or a client applying the policy
+/// syncs the entry but never downloads its value (`manifests/` was missing,
+/// so the manifest shortcut never arrived). `endpoints/` and `compatibility/`
+/// are spec-reserved (§11.2) families with no builder yet.
 pub const REGISTRY_PREFIXES: &[&[u8]] = &[
     b"contracts/",
+    b"manifests/",
     b"services/",
     b"endpoints/",
     b"compatibility/",
@@ -1086,6 +1093,37 @@ mod tests {
     /// prefix (`v1`/`v10`, `stable`/`stable2`) or that contain the delimiter.
     #[test]
     fn registry_keys_are_prefix_free() {
+        let keys = all_family_keys();
+        for a in &keys {
+            for b in &keys {
+                assert!(
+                    a == b || !b.starts_with(a),
+                    "{} is a prefix of {}",
+                    String::from_utf8_lossy(a),
+                    String::from_utf8_lossy(b)
+                );
+            }
+        }
+    }
+
+    /// A client that syncs only `REGISTRY_PREFIXES` must receive every family
+    /// the builders write. Driven by the same key set as the prefix-free
+    /// check, so a family added there is covered here too.
+    #[test]
+    fn registry_prefixes_cover_every_family() {
+        for key in all_family_keys() {
+            assert!(
+                REGISTRY_PREFIXES.iter().any(|p| key.starts_with(p)),
+                "no REGISTRY_PREFIXES entry covers {}",
+                String::from_utf8_lossy(&key)
+            );
+        }
+    }
+
+    /// Keys from every key builder, over segments chosen to provoke prefix
+    /// collisions (`1`/`10`, `stable`/`stable2`, embedded `/` and `%`). A new
+    /// key family belongs here.
+    fn all_family_keys() -> Vec<Vec<u8>> {
         let names = ["svc", "svc2", "a/b", "a", "50%"];
         let leaves = ["1", "10", "stable", "stable2", "x/y", "x", "", "%2F"];
         let mut keys: Vec<Vec<u8>> = Vec::new();
@@ -1109,16 +1147,7 @@ mod tests {
         }
         keys.sort();
         keys.dedup();
-        for a in &keys {
-            for b in &keys {
-                assert!(
-                    a == b || !b.starts_with(a),
-                    "{} is a prefix of {}",
-                    String::from_utf8_lossy(a),
-                    String::from_utf8_lossy(b)
-                );
-            }
-        }
+        keys
     }
 
     #[test]
