@@ -500,3 +500,79 @@ async fn surface_cannot_shadow_a_host_service() {
     assert_eq!(srv.surface_state(), SurfaceState::Inactive);
     srv.shutdown().await;
 }
+
+/// The same service name at version 10: its registry key
+/// `services/SurfaceEcho/versions/v10` has v1's key as a prefix.
+#[aster::service(name = "SurfaceEcho", version = 10)]
+trait EchoTen {
+    async fn echo(&self, req: EchoRequest) -> Result<EchoResponse>;
+}
+
+#[async_trait]
+impl EchoTen for EchoImpl {
+    async fn echo(&self, req: EchoRequest) -> Result<EchoResponse> {
+        Echo::echo(self, req).await
+    }
+}
+
+/// Publishing and retracting a surface's entries touch exactly its keys:
+/// activating and then deactivating a surface that publishes v1 leaves v10,
+/// written by the same node into the same registry, in place.
+#[tokio::test]
+async fn retraction_matches_exact_keys() {
+    let srv = deferred().await;
+    let registry = srv.docs().create().await.unwrap();
+    let author = srv.docs().default_author().await.unwrap();
+    let v10 = EchoTenServer::new(EchoImpl::default())
+        .contract_artifacts()
+        .unwrap();
+    aster::rpc::publish_contract(
+        &registry,
+        &srv.blobs(),
+        &author,
+        &v10.contract,
+        &v10.type_defs,
+        1_700_000_000_000,
+    )
+    .await
+    .unwrap();
+    const V10: &[u8] = b"services/SurfaceEcho/versions/v10";
+    let present = |key: &'static [u8]| {
+        let registry = registry.clone();
+        async move {
+            registry
+                .query_latest_exact(key.to_vec())
+                .await
+                .unwrap()
+                .is_some()
+        }
+    };
+    assert!(present(V10).await);
+
+    srv.activate(
+        RpcSurface::builder()
+            .service(EchoServer::new(EchoImpl::default()))
+            .manifest_publication(ManifestPublication::Strict)
+            .registry(registry.clone())
+            .build(),
+    )
+    .await
+    .unwrap();
+    assert!(present(VERSION_KEY).await);
+    assert!(present(V10).await, "publishing v1 leaves v10 in place");
+    srv.deactivate().await.unwrap();
+
+    assert!(!present(VERSION_KEY).await, "v1 retracted");
+    assert!(present(V10).await, "v10 is not v1's to retract");
+    let fetched = within(fetch_and_verify_contract(
+        &registry,
+        &srv.blobs(),
+        &srv.id(),
+        "SurfaceEcho",
+        10,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(fetched.contract_id, aster::rpc::contract_id(&v10.contract));
+    srv.shutdown().await;
+}
