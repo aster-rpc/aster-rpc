@@ -70,9 +70,14 @@ static AUDIT_WINDOW_MS: AtomicU64 = AtomicU64::new(AUDIT_DEGRADED_WINDOW.as_mill
 
 /// Shorten the degradation window for this process, so a test can watch
 /// readiness recover without waiting the production 30 s. Test-only.
+///
+/// It also forgets the last drop: a test that restores the 30 s default after
+/// watching recovery under a short window must not leave the process degraded
+/// again for the rest of that 30 s, failing other tests' readiness checks.
 #[cfg(feature = "testing")]
 pub fn set_audit_degraded_window_for_testing(window: Duration) {
     AUDIT_WINDOW_MS.store(window.as_millis() as u64, Ordering::Relaxed);
+    LAST_AUDIT_DROP.store(0, Ordering::Relaxed);
 }
 
 // ── records ─────────────────────────────────────────────────────────────────
