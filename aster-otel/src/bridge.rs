@@ -64,6 +64,17 @@ pub const DROP_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// How long after the last audit drop [`audit_degraded`] stays true (§3.5).
 pub const AUDIT_DEGRADED_WINDOW: Duration = Duration::from_secs(30);
 
+/// The window [`audit_degraded`] applies: [`AUDIT_DEGRADED_WINDOW`] unless a
+/// test shortened it.
+static AUDIT_WINDOW_MS: AtomicU64 = AtomicU64::new(AUDIT_DEGRADED_WINDOW.as_millis() as u64);
+
+/// Shorten the degradation window for this process, so a test can watch
+/// readiness recover without waiting the production 30 s. Test-only.
+#[cfg(feature = "testing")]
+pub fn set_audit_degraded_window_for_testing(window: Duration) {
+    AUDIT_WINDOW_MS.store(window.as_millis() as u64, Ordering::Relaxed);
+}
+
 // ── records ─────────────────────────────────────────────────────────────────
 
 /// Severity, numbered as the C ABI's `aster_log_level_t` (§7.2).
@@ -273,7 +284,7 @@ pub fn audit_degraded() -> bool {
         return false;
     }
     let now = anchor().elapsed().as_millis() as u64 + 1;
-    now.saturating_sub(last) < AUDIT_DEGRADED_WINDOW.as_millis() as u64
+    now.saturating_sub(last) < AUDIT_WINDOW_MS.load(Ordering::Relaxed)
 }
 
 fn note_audit_drop() {

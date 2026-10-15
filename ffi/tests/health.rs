@@ -212,6 +212,9 @@ fn attach_and_readiness_transitions() {
 #[test]
 fn native_audit_drop_fails_and_recovers_c_health_readiness() {
     let _g = serial();
+    // 5 s instead of the production 30 s (restored below); the serial lock
+    // keeps the other tests in this binary from running meanwhile.
+    aster_otel::bridge::set_audit_degraded_window_for_testing(Duration::from_secs(5));
     unsafe {
         let (rt, node) = runtime_and_node();
         let cfg = health_cfg(b"127.0.0.1");
@@ -237,13 +240,13 @@ fn native_audit_drop_fails_and_recovers_c_health_readiness() {
         assert_eq!(status, 503, "{body}");
         assert!(body.contains("\"audit\":false"), "{body}");
 
-        let recovery_deadline = Instant::now() + Duration::from_secs(35);
+        let recovery_deadline = Instant::now() + Duration::from_secs(20);
         while aster_otel::bridge::audit_degraded() && Instant::now() < recovery_deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(
             !aster_otel::bridge::audit_degraded(),
-            "audit readiness did not recover within 35 seconds"
+            "audit readiness did not recover within 20 seconds"
         );
         let (status, body) = get(&a, "/readyz");
         assert_eq!(status, 200, "{body}");
@@ -255,6 +258,9 @@ fn native_audit_drop_fails_and_recovers_c_health_readiness() {
         assert_eq!(aster_node_free(rt, node), OK);
         aster_runtime_close(rt);
     }
+    aster_otel::bridge::set_audit_degraded_window_for_testing(
+        aster_otel::bridge::AUDIT_DEGRADED_WINDOW,
+    );
 }
 
 #[test]

@@ -660,6 +660,10 @@ async fn case_gate0() {
 /// Design §3.5: once a log bridge is open, `/readyz` carries an `audit`
 /// check, and a dropped `aster::audit` record fails readiness.
 fn case_audit_readiness() {
+    // The production window is 30 s. 5 s keeps the drop-then-503 assertions
+    // well inside the window on a loaded runner while not waiting 30 s for the
+    // recovery. This runs in its own child process, so nothing else sees it.
+    aster_otel::bridge::set_audit_degraded_window_for_testing(Duration::from_secs(5));
     let state = aster::ops::HealthState::new(None);
     state.set_ready(true);
     assert!(state.is_ready());
@@ -690,15 +694,15 @@ fn case_audit_readiness() {
     let resp = aster::ops::route(&state, &hyper_get("/readyz"));
     assert_eq!(resp.status(), 503);
 
-    // A continuously drop-free window restores readiness after the documented
-    // 30-second degradation period. Keep the bound loose enough for loaded CI.
-    let recovered_by = std::time::Instant::now() + Duration::from_secs(35);
+    // A continuously drop-free window restores readiness after the
+    // degradation period (5 s here). Keep the bound loose enough for loaded CI.
+    let recovered_by = std::time::Instant::now() + Duration::from_secs(20);
     while aster_otel::bridge::audit_degraded() && std::time::Instant::now() < recovered_by {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert!(
         !aster_otel::bridge::audit_degraded(),
-        "audit readiness did not recover within 35 seconds"
+        "audit readiness did not recover within 20 seconds"
     );
     assert!(state.is_ready());
     assert_eq!(
