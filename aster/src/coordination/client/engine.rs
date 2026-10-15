@@ -92,6 +92,12 @@ pub(crate) struct Engine {
     members: Mutex<BTreeSet<[u8; 32]>>,
     /// The connection the last successful exchange used, and who it is to.
     current: Mutex<Option<([u8; 32], RpcConnection)>>,
+    /// First step of the drive's retry backoff (250 ms; only tests change it).
+    pub(crate) backoff_unit: Duration,
+    /// [`ATTEMPT_DEADLINE`] unless a test shortened it.
+    pub(crate) attempt_deadline: Duration,
+    /// [`STREAM_BASE_DEADLINE`] unless a test shortened it.
+    pub(crate) stream_base_deadline: Duration,
 }
 
 impl Engine {
@@ -101,6 +107,9 @@ impl Engine {
             group,
             members: Mutex::new(seeds),
             current: Mutex::new(None),
+            backoff_unit: Duration::from_millis(250),
+            attempt_deadline: ATTEMPT_DEADLINE,
+            stream_base_deadline: STREAM_BASE_DEADLINE,
         }
     }
 
@@ -130,7 +139,7 @@ impl Engine {
 
     async fn connect(&self, member: [u8; 32]) -> Result<RpcConnection, String> {
         let id = NodeId::from_hex(hex::encode(member));
-        match tokio::time::timeout(ATTEMPT_DEADLINE, self.node.rpc_connect(&id)).await {
+        match tokio::time::timeout(self.attempt_deadline, self.node.rpc_connect(&id)).await {
             Ok(Ok(conn)) => Ok(conn),
             Ok(Err(err)) => Err(format!("dialing {}: {err}", id.as_str())),
             Err(_) => Err(format!("dialing {}: no answer", id.as_str())),
@@ -208,7 +217,7 @@ impl Engine {
             };
 
             let outcome = tokio::time::timeout(
-                ATTEMPT_DEADLINE,
+                self.attempt_deadline,
                 conn.unary(&Self::header(method), request.clone()),
             )
             .await;
@@ -277,7 +286,10 @@ impl Engine {
                 }
                 Err(_) => {
                     *self.current.lock().await = None;
-                    last_ambiguity = Some(format!("{method}: no answer in {ATTEMPT_DEADLINE:?}"));
+                    last_ambiguity = Some(format!(
+                        "{method}: no answer in {:?}",
+                        self.attempt_deadline
+                    ));
                     continue;
                 }
             }
@@ -333,14 +345,18 @@ impl Engine {
                 Err(_) => continue,
             };
             let opened = tokio::time::timeout(
-                ATTEMPT_DEADLINE,
+                self.attempt_deadline,
                 conn.server_stream(&Self::header(method), request.clone()),
             )
             .await;
             match opened {
                 Ok(Ok(response)) => {
                     *self.current.lock().await = Some((member, conn));
-                    return Ok(Ok(BoundedFrames::new(response)));
+                    return Ok(Ok(BoundedFrames::new(
+                        response,
+                        self.stream_base_deadline,
+                        self.attempt_deadline,
+                    )));
                 }
                 Ok(Err(Error::Rpc {
                     code: 14, details, ..
@@ -384,13 +400,16 @@ pub(crate) struct BoundedFrames {
     inner: crate::rpc::ResponseStream,
     /// One absolute deadline for the whole attempt, fixed at the open.
     deadline: tokio::time::Instant,
+    /// The idle bound per frame (the engine's attempt deadline).
+    idle: Duration,
 }
 
 impl BoundedFrames {
-    fn new(inner: crate::rpc::ResponseStream) -> Self {
+    fn new(inner: crate::rpc::ResponseStream, base: Duration, idle: Duration) -> Self {
         Self {
             inner,
-            deadline: tokio::time::Instant::now() + STREAM_BASE_DEADLINE,
+            deadline: tokio::time::Instant::now() + base,
+            idle,
         }
     }
 
@@ -420,7 +439,7 @@ impl BoundedFrames {
                 "the stream did not complete within its absolute budget"
             ))));
         }
-        match tokio::time::timeout(ATTEMPT_DEADLINE.min(remaining), self.inner.next()).await {
+        match tokio::time::timeout(self.idle.min(remaining), self.inner.next()).await {
             Ok(frame) => frame,
             Err(_) => Some(Err(crate::error::Error::Transport(anyhow::anyhow!(
                 "the stream produced no frame within its deadline"

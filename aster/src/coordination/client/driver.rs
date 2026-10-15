@@ -38,8 +38,9 @@ use super::journal::{AckToken, Journal, JournalState};
 /// Attempts one drive makes before returning with the sequence still open.
 const DRIVE_ATTEMPTS: usize = 8;
 
-fn backoff(attempt: usize) -> Duration {
-    Duration::from_millis(u64::min(250 * (1 << attempt.min(4)), 2_000))
+/// 1, 2, 4, 8 then 8 units (250 ms units: 0.25 s doubling to a 2 s cap).
+fn backoff(engine: &Engine, attempt: usize) -> Duration {
+    engine.backoff_unit * (1u32 << attempt.min(3))
 }
 
 /// What a resolved drive delivers.
@@ -125,7 +126,7 @@ async fn drive_pending(engine: &Engine, journal: &mut Journal) -> Result<Option<
                 let Some(reply) = decode_and_check(journal, &payload) else {
                     // A reply that does not echo this request is a malformed
                     // disposition: ambiguous, resend.
-                    tokio::time::sleep(backoff(attempt)).await;
+                    tokio::time::sleep(backoff(engine, attempt)).await;
                     continue;
                 };
                 if reply.disposition_code == 1 {
@@ -155,7 +156,7 @@ async fn drive_pending(engine: &Engine, journal: &mut Journal) -> Result<Option<
                 }
                 // Non-terminal NotConsumed: the exact same action is retried;
                 // a client may never substitute at a sent sequence.
-                tokio::time::sleep(backoff(attempt)).await;
+                tokio::time::sleep(backoff(engine, attempt)).await;
             }
             Ok(CallOutcome::Denied { code, message }) => {
                 // A status-only denial is non-terminal with an unknown reason
@@ -172,7 +173,7 @@ async fn drive_pending(engine: &Engine, journal: &mut Journal) -> Result<Option<
                 });
             }
             Err(CallFailure::Ambiguous(_)) | Err(CallFailure::Unavailable(_)) => {
-                tokio::time::sleep(backoff(attempt)).await;
+                tokio::time::sleep(backoff(engine, attempt)).await;
             }
         }
     }
@@ -234,7 +235,7 @@ async fn retire_until_confirmed(engine: &Engine, journal: &mut Journal) -> Resul
                 let Ok(reply) = payload_fory::<RetireClientReplyWireV1>()
                     .deserialize::<RetireClientReplyWireV1>(&payload)
                 else {
-                    tokio::time::sleep(backoff(attempt)).await;
+                    tokio::time::sleep(backoff(engine, attempt)).await;
                     continue;
                 };
                 // A self-targeted retirement has exactly two §10 answers:
@@ -244,7 +245,7 @@ async fn retire_until_confirmed(engine: &Engine, journal: &mut Journal) -> Resul
                 // fatal reason, a foreign group — neither confirms nor
                 // fatals: it is not this request's answer, and is resent.
                 if super::inbound::validate_retire_reply(engine.group.as_bytes(), &reply).is_err() {
-                    tokio::time::sleep(backoff(attempt)).await;
+                    tokio::time::sleep(backoff(engine, attempt)).await;
                     continue;
                 }
                 if reply.outcome_code == 9 {
@@ -274,7 +275,7 @@ async fn retire_until_confirmed(engine: &Engine, journal: &mut Journal) -> Resul
                     details: Vec::new(),
                 });
             }
-            Err(_) => tokio::time::sleep(backoff(attempt)).await,
+            Err(_) => tokio::time::sleep(backoff(engine, attempt)).await,
         }
     }
     Err(refusal(
@@ -299,7 +300,7 @@ async fn replay_on_tombstone(engine: &Engine, journal: &mut Journal) -> Result<D
         match outcome {
             Ok(CallOutcome::Reply(payload)) => {
                 let Some(reply) = decode_and_check(journal, &payload) else {
-                    tokio::time::sleep(backoff(attempt)).await;
+                    tokio::time::sleep(backoff(engine, attempt)).await;
                     continue;
                 };
                 match (reply.disposition_code, reply.reason_code) {
@@ -334,7 +335,7 @@ async fn replay_on_tombstone(engine: &Engine, journal: &mut Journal) -> Result<D
                     }
                     // A tombstoned session answers nothing else; anything
                     // else is not this session's answer.
-                    _ => tokio::time::sleep(backoff(attempt)).await,
+                    _ => tokio::time::sleep(backoff(engine, attempt)).await,
                 }
             }
             Ok(CallOutcome::Denied { code, message }) => {
@@ -346,7 +347,7 @@ async fn replay_on_tombstone(engine: &Engine, journal: &mut Journal) -> Result<D
                     details: Vec::new(),
                 });
             }
-            Err(_) => tokio::time::sleep(backoff(attempt)).await,
+            Err(_) => tokio::time::sleep(backoff(engine, attempt)).await,
         }
     }
     Err(refusal(

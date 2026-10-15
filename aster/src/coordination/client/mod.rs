@@ -99,6 +99,8 @@ pub struct CoordinationClientBuilder {
     seeds: BTreeSet<[u8; 32]>,
     journal_dir: Option<PathBuf>,
     seed_error: Option<Error>,
+    backoff_unit: Option<std::time::Duration>,
+    deadlines: Option<(std::time::Duration, std::time::Duration)>,
 }
 
 impl CoordinationClientBuilder {
@@ -154,6 +156,47 @@ impl CoordinationClientBuilder {
         self
     }
 
+    /// Shorten the retry backoff's first step (normally 250 ms, doubling to
+    /// 2 s). For tests that must exhaust a drive's attempts: the attempts,
+    /// order and outcomes are unchanged, only the waits between them shrink.
+    #[cfg(feature = "coordination-testing")]
+    pub fn retry_backoff_for_testing(mut self, unit: std::time::Duration) -> Self {
+        self.backoff_unit = Some(unit);
+        self
+    }
+
+    /// Shorten the per-attempt deadline (normally 20 s; also a stream's idle
+    /// bound) and a stream's base absolute budget (normally 60 s). For tests
+    /// that prove a stalled or dripping peer is cut off: the same deadlines
+    /// fire, sooner.
+    #[cfg(feature = "coordination-testing")]
+    pub fn deadlines_for_testing(
+        mut self,
+        attempt: std::time::Duration,
+        stream_base: std::time::Duration,
+    ) -> Self {
+        self.deadlines = Some((attempt, stream_base));
+        self
+    }
+
+    fn engine(
+        node: Node,
+        group: CoordinationGroupId,
+        seeds: BTreeSet<[u8; 32]>,
+        backoff_unit: Option<std::time::Duration>,
+        deadlines: Option<(std::time::Duration, std::time::Duration)>,
+    ) -> Engine {
+        let mut engine = Engine::new(node, group, seeds);
+        if let Some(unit) = backoff_unit {
+            engine.backoff_unit = unit;
+        }
+        if let Some((attempt, stream_base)) = deadlines {
+            engine.attempt_deadline = attempt;
+            engine.stream_base_deadline = stream_base;
+        }
+        engine
+    }
+
     /// Build the full durable client. Requires writable journal storage and
     /// takes the per-actor/group lifetime lock.
     pub fn build(self) -> Result<CoordinationClient> {
@@ -165,7 +208,13 @@ impl CoordinationClientBuilder {
                 "a mutating client requires journal_dir(...); use build_read_only() otherwise",
             )
         })?;
-        let engine = Arc::new(Engine::new(self.node, self.group, self.seeds));
+        let engine = Arc::new(Self::engine(
+            self.node,
+            self.group,
+            self.seeds,
+            self.backoff_unit,
+            self.deadlines,
+        ));
         let actor = engine.local_id()?;
         let journal = Journal::open(dir, actor, self.group, random_id16()?)?;
         Ok(CoordinationClient {
@@ -182,7 +231,13 @@ impl CoordinationClientBuilder {
             return Err(err);
         }
         Ok(CoordinationReadClient {
-            engine: Arc::new(Engine::new(self.node, self.group, self.seeds)),
+            engine: Arc::new(Self::engine(
+                self.node,
+                self.group,
+                self.seeds,
+                self.backoff_unit,
+                self.deadlines,
+            )),
         })
     }
 }
@@ -295,6 +350,8 @@ impl CoordinationClient {
             seeds: BTreeSet::new(),
             journal_dir: None,
             seed_error: None,
+            backoff_unit: None,
+            deadlines: None,
         }
     }
 

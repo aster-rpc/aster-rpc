@@ -54,6 +54,21 @@ async fn start_voter(fixture: &GroupFixture, index: usize, dir: &std::path::Path
     voter
 }
 
+/// These boundary tests make the client exhaust a drive's retries against a
+/// counterfeit server. Production backoff (250 ms doubling to 2 s, 8 attempts)
+/// made each one wait ~12 s per drive and the file take ~4 minutes; the
+/// attempts and outcomes are unchanged, only the waits shrink.
+const FAST_BACKOFF: Duration = Duration::from_millis(10);
+
+/// The stream-boundary test proves a parked peer is cut off at the idle bound
+/// and a dripping one at the absolute budget. Production waits 20 s and 60 s;
+/// these keep the same ordering. The idle bound must stay above the
+/// counterfeit's 3 s drip interval, or the drip would end on the idle bound
+/// instead of the absolute one, and above loopback connect time on a loaded
+/// runner.
+const TEST_ATTEMPT_DEADLINE: Duration = Duration::from_secs(8);
+const TEST_STREAM_BASE_DEADLINE: Duration = Duration::from_secs(15);
+
 async fn client_node(secret: [u8; 32], fixture: &GroupFixture, voter: &AsterServer) -> Node {
     let node = Node::start(
         AsterConfig::builder()
@@ -1362,6 +1377,7 @@ async fn a_foreign_reply_is_refused_at_the_inbound_boundary() {
             aster::coordination::model::authority::canonical_candidate_ticket(&counterfeit_id)
                 .expect("a canonical ticket"),
         ])
+        .retry_backoff_for_testing(FAST_BACKOFF)
         .journal_dir(journal.path())
         .build()
         .expect("the client builds");
@@ -1760,6 +1776,7 @@ async fn a_foreign_retirement_confirmation_is_not_honored() {
             aster::coordination::model::authority::canonical_candidate_ticket(&counterfeit_id)
                 .expect("a canonical ticket"),
         ])
+        .retry_backoff_for_testing(FAST_BACKOFF)
         .journal_dir(journal.path())
         .build()
         .expect("the client builds");
@@ -1881,6 +1898,8 @@ async fn stream_contracts_are_enforced_at_the_boundary() {
             aster::coordination::model::authority::canonical_candidate_ticket(&counterfeit_id)
                 .expect("a canonical ticket"),
         ])
+        .retry_backoff_for_testing(FAST_BACKOFF)
+        .deadlines_for_testing(TEST_ATTEMPT_DEADLINE, TEST_STREAM_BASE_DEADLINE)
         .journal_dir(journal.path())
         .build()
         .expect("the client builds");
