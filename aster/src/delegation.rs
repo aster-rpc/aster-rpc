@@ -3,20 +3,26 @@
 //!
 //! A root delegates to an online issuer ([`issue_delegation`]), the issuer
 //! enrolls nodes ([`issue_enrollment`]), and a principal lets an actor act for
-//! it ([`issue_action`]). [`verify_chain`] is the only way to obtain a
-//! [`VerifiedChain`]: it checks size, structure, attenuation and revocation
-//! before any signature. Root pre-rotation is in [`verify_root_rotation`].
+//! it ([`issue_action`]); an enrollment can carry a separate locality
+//! statement ([`locality_statement`]). [`verify_chain`] is the only way to
+//! obtain a [`VerifiedChain`]: it checks size, structure, attenuation and
+//! revocation before any signature. Root pre-rotation is in
+//! [`verify_root_rotation`].
 
 pub use aster_transport_core::delegation::{
     claimed_rotation_seq, next_root_commitment, verify_applied_rotation, verify_chain,
     verify_root_rotation, ActionGrant, AdmissionClaims, Audience, Chain, ChainError,
-    DelegationGrant, EnrollmentExtensionV1, LeafClaims, LeafKind, LinkKind, NoRevocations,
-    Registration, RevokedDelegates, RootRotation, RootState, RotationReason, TrustContext,
-    TypedAttribute, Validity, VerifiedChain, ACTION_JWT_TYPE, CHAIN_PREFIX, DEFAULT_LEEWAY_SECONDS,
-    DEFAULT_MAX_LINKS, DELEGATION_JWT_TYPE, ENROLLMENT_LINK_TYPE, MAX_CHAIN_BYTES,
-    MAX_LEEWAY_SECONDS, MAX_LINKS, MAX_LINK_BYTES, MAX_LINK_LIFETIME, MAX_ROTATION_BYTES,
-    ROOT_ROTATION_JWT_TYPE,
+    DelegationGrant, EnrollmentExtensionV1, LeafClaims, LeafKind, LinkKind, LocalityClaims,
+    NoRevocations, Registration, RevokedDelegates, RootRotation, RootState, RotationReason,
+    TrustContext, TypedAttribute, Validity, VerifiedChain, ACTION_JWT_TYPE, CHAIN_PREFIX,
+    DEFAULT_LEEWAY_SECONDS, DEFAULT_MAX_LINKS, DELEGATION_JWT_TYPE, ENROLLMENT_LINK_TYPE,
+    LOCALITY_JWT_TYPE, MAX_CHAIN_BYTES, MAX_LEEWAY_SECONDS, MAX_LINKS, MAX_LINK_BYTES,
+    MAX_LINK_LIFETIME, MAX_ROTATION_BYTES, ROOT_ROTATION_JWT_TYPE,
 };
+
+/// The locality statement embedded in an enrollment credential (see
+/// [`issue_enrollment`]), which a node publishes instead of its credential.
+pub use aster_transport_core::delegation::locality_statement;
 
 use aster_transport_core::delegation as core;
 
@@ -44,6 +50,8 @@ pub fn issue_delegation(
 }
 
 /// Enroll `subject`, as an anchor (`parent: None`) or as a delegated issuer.
+/// Claims carrying the reserved `aster.locality.*` attributes also get an
+/// embedded locality statement; see [`locality_statement`].
 pub fn issue_enrollment(
     signer: &SecretKey,
     parent: Option<&Chain>,
@@ -53,6 +61,27 @@ pub fn issue_enrollment(
     validity: Validity,
 ) -> Result<Chain, ChainError> {
     core::issue_enrollment(
+        &signer.to_bytes(),
+        parent,
+        &subject.to_bytes(),
+        audience,
+        claims,
+        validity,
+    )
+}
+
+/// Declare `subject`'s region and zone as a standalone locality statement.
+/// [`issue_enrollment`] already embeds one whenever the claims carry the
+/// reserved `aster.locality.*` attributes; this is for tooling and tests.
+pub fn issue_locality(
+    signer: &SecretKey,
+    parent: Option<&Chain>,
+    subject: &PublicKey,
+    audience: &Audience,
+    claims: &LocalityClaims,
+    validity: Validity,
+) -> Result<Chain, ChainError> {
+    core::issue_locality(
         &signer.to_bytes(),
         parent,
         &subject.to_bytes(),

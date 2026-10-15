@@ -1,11 +1,11 @@
 //! Declared locality: operator-known zone and region, signed by the swarm's
-//! root (directly or through a delegated issuer) as reserved enrollment
-//! attributes, published in the shared topology doc, and folded into the
-//! ladder as a bound on the measured level.
+//! root (directly or through a delegated issuer) as a locality statement
+//! bound to one endpoint, published in the shared topology doc, and folded
+//! into the ladder as a bound on the measured level.
 //!
 //! Design: `docs/_internal/aster-network-topology.md` §"Declared locality".
 //! This module is the pure part: value rules, the ladder bound, and the
-//! callback types the shared engine uses to read this node's credential and
+//! callback types the shared engine uses to read this node's statement and
 //! verify a peer's. Verification itself lives with enrollment, which supplies
 //! the callbacks, so topology does not depend on the enrollment feature.
 
@@ -91,19 +91,37 @@ impl CoreLevelSource {
     }
 }
 
-/// Returns this node's current enrollment chain (`aster-chain-v1`), or
-/// `None` when it holds none (e.g. admitted by a registration record).
-pub type OwnChainFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+/// A declaration that verified for one endpoint, and until when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoreVerifiedLocality {
+    pub declared: CoreDeclaredLocality,
+    /// Unix seconds at which the evidence stops being valid (the
+    /// statement's earliest `exp`); `None` for evidence without expiry,
+    /// such as an open-ended registration record.
+    pub expires_at: Option<u64>,
+}
 
-/// Verifies `chain` for the node `node_hex` and returns its declaration.
-/// An empty `chain` asks for the node's root-authored registration record
-/// instead. Anything that does not verify is `None`.
-pub type LocalityVerifyFn = Arc<dyn Fn(&str, &str) -> Option<CoreDeclaredLocality> + Send + Sync>;
+impl CoreVerifiedLocality {
+    /// Whether the evidence is still valid at `now` (Unix seconds).
+    pub fn is_current(&self, now: u64) -> bool {
+        self.expires_at.is_none_or(|exp| now < exp)
+    }
+}
 
-/// How the shared engine reads this node's credential and verifies peers'.
+/// Returns this node's current locality statement (an `aster-chain-v1`
+/// chain whose leaf is a locality link), or `None` when it holds none (no
+/// declaration in its credential, or admitted by a registration record).
+pub type OwnStatementFn = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+/// Verifies `statement` for the endpoint `node_hex` and returns its
+/// declaration. An empty `statement` asks for the node's root-authored
+/// registration record instead. Anything that does not verify is `None`.
+pub type LocalityVerifyFn = Arc<dyn Fn(&str, &str) -> Option<CoreVerifiedLocality> + Send + Sync>;
+
+/// How the shared engine reads this node's statement and verifies peers'.
 #[derive(Clone)]
 pub struct CoreLocalitySource {
-    pub own_chain: OwnChainFn,
+    pub own_statement: OwnStatementFn,
     pub verify: LocalityVerifyFn,
 }
 

@@ -9,7 +9,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use super::jws;
 use super::links::{
     decode_link, valid_key, ActionGrant, Audience, Confirmation, DelegationGrant,
-    EnrollmentExtensionV1, LinkKind, LinkPayload,
+    EnrollmentExtensionV1, LinkKind, LinkPayload, LocalityClaims,
 };
 use super::verify::{gates, Mode};
 use super::{split, Chain, ChainError, NoRevocations, TrustContext, MAX_LINKS, MAX_LINK_BYTES};
@@ -43,9 +43,16 @@ pub fn issue_delegation(
     )
 }
 
-/// Enroll `subject` with the given claims. Malformed reserved locality
-/// attributes (`aster.locality.*`) are refused as [`ChainError::Malformed`]:
-/// readers would ignore them, so signing them would only hide the mistake.
+/// Enroll `subject` with the given claims.
+///
+/// When the claims declare a locality (the reserved `aster.locality.region`
+/// / `aster.locality.zone` attributes), the same signer also signs a
+/// locality link for `subject` with the same parent, audience and validity,
+/// and embeds it in the enrollment link (`aster_locality_statement`). The
+/// holder publishes that statement instead of its credential; see
+/// [`locality_statement`]. Malformed reserved attributes are refused as
+/// [`ChainError::Malformed`]: readers would ignore them, so signing them
+/// would only hide the mistake.
 pub fn issue_enrollment(
     signer: &[u8; 32],
     parent: Option<&Chain>,
@@ -54,7 +61,52 @@ pub fn issue_enrollment(
     claims: &EnrollmentExtensionV1,
     validity: Validity,
 ) -> Result<Chain, ChainError> {
-    if claims.claims.declared_locality().is_err() {
+    let declared = claims
+        .claims
+        .declared_locality()
+        .map_err(|_| ChainError::Malformed)?;
+    let statement = declared
+        .map(|declared| {
+            let chain = issue_locality(
+                signer,
+                parent,
+                subject,
+                audience,
+                &declared.into(),
+                validity,
+            )?;
+            let leaf = chain.links().next().map(str::to_owned);
+            leaf.ok_or(ChainError::Issuance)
+        })
+        .transpose()?;
+    issue(
+        signer,
+        parent,
+        subject,
+        audience,
+        validity,
+        LinkKind::Enrollment,
+        |payload| {
+            payload.aster_enrollment_v1 = Some(claims.clone());
+            payload.aster_locality_statement = statement;
+        },
+    )
+}
+
+/// Declare `subject`'s region and zone: a locality statement, verified with
+/// [`LeafKind::Locality`](super::LeafKind::Locality) like any other leaf. A
+/// delegated signer needs `enrollment` in its grant's `may_issue` and the
+/// claimed reserved keys in its `attribute_keys`. Normally issued only by
+/// [`issue_enrollment`], which embeds it in the credential.
+pub fn issue_locality(
+    signer: &[u8; 32],
+    parent: Option<&Chain>,
+    subject: &[u8; 32],
+    audience: &Audience,
+    claims: &LocalityClaims,
+    validity: Validity,
+) -> Result<Chain, ChainError> {
+    if claims.declared().is_none() {
         return Err(ChainError::Malformed);
     }
     issue(
@@ -63,9 +115,26 @@ pub fn issue_enrollment(
         subject,
         audience,
         validity,
-        LinkKind::Enrollment,
-        |payload| payload.aster_enrollment_v1 = Some(claims.clone()),
+        LinkKind::Locality,
+        |payload| payload.aster_locality_v1 = Some(claims.clone()),
     )
+}
+
+/// The locality statement a credential carries: its embedded locality link
+/// followed by the credential's ancestor (delegation) links, so it verifies
+/// through the same anchor and delegations as the credential. `None` when
+/// the credential declares no locality or is not a well-formed enrollment
+/// chain. Decoded without trust: readers verify the statement itself.
+pub fn locality_statement(credential: &Chain) -> Option<Chain> {
+    let mut links = credential.links();
+    let leaf = jws::decode(links.next()?).ok()?;
+    let leaf = decode_link(&leaf.typ, &leaf.payload).ok()?;
+    if leaf.kind != LinkKind::Enrollment {
+        return None;
+    }
+    let mut statement = vec![leaf.locality_statement?];
+    statement.extend(links.map(str::to_owned));
+    Chain::from_links(&statement).ok()
 }
 
 /// Let `subject` act for the anchor principal within `grant`.
@@ -115,6 +184,8 @@ fn issue(
         aster_delegation_v1: None,
         aster_enrollment_v1: None,
         aster_action_v1: None,
+        aster_locality_v1: None,
+        aster_locality_statement: None,
     };
     extension(&mut payload);
     let payload = serde_json::to_vec(&payload).map_err(|_| ChainError::Malformed)?;

@@ -24,8 +24,8 @@ use anyhow::{anyhow, Result};
 use iroh::Endpoint;
 
 use super::cluster::{self, SharedView, TopoConfig, TopoRecords};
-use super::locality::{CoreDeclaredLocality, CoreLocalitySource};
-use super::records::{self, DeclaredLocality, NetworkPosition, RttEdge, TOPO_KEY_PREFIX};
+use super::locality::{CoreDeclaredLocality, CoreLocalitySource, CoreVerifiedLocality};
+use super::records::{self, LocalityRecord, NetworkPosition, RttEdge, TOPO_KEY_PREFIX};
 use super::{classify_ip, AddrClass};
 use crate::{CoreDoc, CoreDocEntry, CoreMonitor};
 
@@ -36,9 +36,15 @@ const VIEW_CACHE_TTL: Duration = Duration::from_secs(1);
 /// future prefix hashes; edges are a handful of integers.
 const MAX_POSITION_LEN: u64 = 4096;
 const MAX_EDGE_LEN: u64 = 256;
-/// A locality record carries one enrollment chain (capped at 24 KiB by the
-/// chain verifier) plus framing.
-const MAX_LOCALITY_LEN: u64 = 32 * 1024;
+/// A locality record carries one locality statement: a small locality link
+/// plus the issuer's delegation links, if any. The chain verifier caps it at
+/// 24 KiB (`MAX_CHAIN_BYTES`); 1 KiB more covers the framing. A root-signed
+/// statement is about 0.6 KiB.
+const MAX_LOCALITY_LEN: u64 = 25 * 1024;
+/// A cached verification result is reused while the statement is unchanged
+/// and still valid, but no longer than this, so root records that change
+/// the answer (a denial, an issuer revocation, a registration) are applied.
+const LOCALITY_RECHECK: Duration = Duration::from_secs(60);
 
 /// Pluggable admission check: is this author (hex node id) currently an
 /// admitted producer?
@@ -117,8 +123,24 @@ pub struct CoreTopoSwarm {
 
 #[derive(Debug, Default)]
 struct DeclaredState {
-    mine: Option<CoreDeclaredLocality>,
-    peers: HashMap<String, CoreDeclaredLocality>,
+    mine: Option<CoreVerifiedLocality>,
+    peers: HashMap<String, CachedDeclaration>,
+}
+
+/// One peer's last verification: of which statement, when, and the result
+/// (`None` = it did not verify, cached too so junk is not re-verified).
+#[derive(Debug, Clone)]
+struct CachedDeclaration {
+    statement: [u8; 32],
+    checked: Instant,
+    verified: Option<CoreVerifiedLocality>,
+}
+
+fn current(verified: Option<&CoreVerifiedLocality>) -> Option<CoreDeclaredLocality> {
+    let now = unix_now_ms() / 1000;
+    verified
+        .filter(|v| v.is_current(now))
+        .map(|v| v.declared.clone())
 }
 
 impl fmt::Debug for CoreTopoSwarm {
@@ -203,23 +225,28 @@ impl CoreTopoSwarm {
     }
 
     /// This node's verified declared locality, as of the last publisher
-    /// beat.
+    /// beat, while its statement is unexpired.
     pub fn own_locality(&self) -> Option<CoreDeclaredLocality> {
-        self.declared
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .mine
-            .clone()
+        current(
+            self.declared
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .mine
+                .as_ref(),
+        )
     }
 
-    /// A peer's verified declared locality, as of the last view refresh.
+    /// A peer's verified declared locality, as of the last view refresh,
+    /// while its statement is unexpired.
     pub fn declared_locality(&self, node_hex: &str) -> Option<CoreDeclaredLocality> {
-        self.declared
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .peers
-            .get(node_hex)
-            .cloned()
+        current(
+            self.declared
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .peers
+                .get(node_hex)
+                .and_then(|cached| cached.verified.as_ref()),
+        )
     }
 
     /// The most recently derived shared view, however old, without
@@ -304,18 +331,19 @@ impl CoreTopoSwarm {
             tracing::debug!("topology: position publish failed: {e}");
         }
 
-        // Declared locality: the current chain (renewals propagate within a
-        // beat), verified for ourselves too so both ends of a comparison go
-        // through the same rule.
+        // Declared locality: the current statement (renewed with the
+        // credential, so renewals propagate within a beat), verified for
+        // ourselves too so both ends of a comparison go through the same
+        // rule. Never the credential itself.
         if let Some(source) = &self.config.locality {
-            let chain = (source.own_chain)().unwrap_or_default();
-            let mine = (source.verify)(&self.self_hex, &chain);
+            let statement = (source.own_statement)().unwrap_or_default();
+            let mine = (source.verify)(&self.self_hex, &statement);
             self.declared
                 .write()
                 .unwrap_or_else(|e| e.into_inner())
                 .mine = mine;
-            let record = DeclaredLocality {
-                chain,
+            let record = LocalityRecord {
+                statement,
                 updated_unix_ms: now_ms as i64,
             };
             if let Err(e) = self
@@ -496,9 +524,11 @@ impl CoreTopoSwarm {
                 self.config.topo.max_skew,
             );
         }
-        // Declared locality: only for live vertices, verified against the
-        // record's own node. Anything that does not verify is "no
-        // declaration", never an error.
+        // Declared locality: only for live vertices, verified for the
+        // record's own node, so a statement copied from another endpoint
+        // declares nothing. Anything that does not verify is "no
+        // declaration", never an error. Results are cached per node and
+        // statement (see `LOCALITY_RECHECK`); expiry is applied at lookup.
         if let Some(source) = &self.config.locality {
             let wanted: Vec<_> = locality_entries
                 .into_iter()
@@ -506,6 +536,14 @@ impl CoreTopoSwarm {
                 .collect();
             let entries: Vec<_> = wanted.iter().map(|(e, _)| *e).collect();
             let contents = self.read_values(&entries).await?;
+            // A copy, not a take: lookups keep the old answers until the new
+            // map replaces them in one write.
+            let previous = self
+                .declared
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .peers
+                .clone();
             let horizon =
                 (now_ms + self.config.topo.max_skew.as_millis() as u64).min(i64::MAX as u64) as i64;
             let mut peers = HashMap::new();
@@ -519,9 +557,24 @@ impl CoreTopoSwarm {
                     dropped += 1;
                     continue;
                 }
-                if let Some(declared) = (source.verify)(node, &record.chain) {
-                    peers.insert(node.clone(), declared);
-                }
+                let statement = *blake3::hash(record.statement.as_bytes()).as_bytes();
+                let reusable = previous.get(node).filter(|cached| {
+                    cached.statement == statement
+                        && cached.checked.elapsed() < LOCALITY_RECHECK
+                        && cached
+                            .verified
+                            .as_ref()
+                            .is_none_or(|v| v.is_current(now_ms / 1000))
+                });
+                let cached = match reusable {
+                    Some(cached) => cached.clone(),
+                    None => CachedDeclaration {
+                        statement,
+                        checked: Instant::now(),
+                        verified: (source.verify)(node, &record.statement),
+                    },
+                };
+                peers.insert(node.clone(), cached);
             }
             self.declared
                 .write()

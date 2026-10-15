@@ -21,7 +21,8 @@ pub use aster_transport_core::{
     AdmittedFn, CoreClusterView as ClusterView, CoreDeclaredLocality as DeclaredLocality,
     CoreLadderLevel as LadderLevel, CoreLevelEstimate as LevelEstimate,
     CoreLevelSource as LevelSource, CoreLocalitySource as LocalitySource, CorePeerView as PeerView,
-    CoreSeparationVerdict as SeparationVerdict, LocalityVerifyFn, OwnChainFn, TopoConfig,
+    CoreSeparationVerdict as SeparationVerdict, CoreVerifiedLocality as VerifiedLocality,
+    LocalityVerifyFn, OwnStatementFn, TopoConfig,
 };
 
 /// Reserved enrollment attributes that declare a node's region and zone.
@@ -223,7 +224,7 @@ pub struct TopologySwarmOptions {
     /// Reader timing/coverage rules. `TopologySwarmOptions::default()`
     /// fills the design-doc defaults.
     pub timing: TopoConfig,
-    /// Publish this node's root-signed declared locality and verify peers'
+    /// Publish this node's root-signed locality statement and verify peers'
     /// (`None` = off). With enrollment, use
     /// [`Enrollment::topology_locality`](crate::enrollment::Enrollment::topology_locality).
     pub locality: Option<LocalitySource>,

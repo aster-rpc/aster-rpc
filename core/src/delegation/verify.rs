@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use super::jws::{self, Compact, JwsError};
 use super::links::{
     decode_link, ActionGrant, Audience, DecodedLink, EnrollmentExtensionV1, LinkBody,
+    LocalityClaims,
 };
 use super::{
     digest, split, ChainError, LeafKind, LinkKind, TrustContext, MAX_LEEWAY_SECONDS, MAX_LINKS,
@@ -17,6 +18,7 @@ use super::{
 pub enum LeafClaims {
     Enrollment(EnrollmentExtensionV1),
     Action(ActionGrant),
+    Locality(LocalityClaims),
 }
 
 /// A chain that passed every gate. Only [`verify_chain`] constructs one; the
@@ -111,6 +113,7 @@ pub fn verify_chain(
     let leaf_claims = match &leaf.body {
         LinkBody::Enrollment(extension) => LeafClaims::Enrollment(extension.clone()),
         LinkBody::Action(grant) => LeafClaims::Action(grant.clone()),
+        LinkBody::Locality(claims) => LeafClaims::Locality(claims.clone()),
         LinkBody::Delegation(_) => return Err(ChainError::Grammar),
     };
     Ok(VerifiedChain {
@@ -308,7 +311,7 @@ fn attenuate(parent: &DecodedLink, child: &DecodedLink) -> Result<(), ChainError
         values.into_iter().all(|value| bound.contains(value))
     };
     let claimed = child.claimed();
-    let mut ok = bounds.may_issue.contains(&child.kind)
+    let mut ok = bounds.may_issue.contains(&child.kind.authorized_by())
         && child
             .aud
             .values()

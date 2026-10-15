@@ -985,24 +985,44 @@ impl EnrollmentService {
         }
     }
 
-    /// `subject`'s verified declared locality (`aster.locality.*` claims):
-    /// from `chain` when it is non-empty and verifies as admission would,
-    /// otherwise from the root's registration record for `subject`. `None`
-    /// when nothing verifies or no well-formed declaration is present.
+    /// This node's locality statement: the locality link embedded in its
+    /// current credential, with the credential's delegation links. `None`
+    /// when it holds no credential or the credential declares no locality.
+    /// This, not the credential, is what the node publishes.
+    pub fn locality_statement(&self) -> Option<String> {
+        let chain = crate::delegation::Chain::from_text(&self.own_chain()?).ok()?;
+        crate::delegation::locality_statement(&chain).map(|statement| statement.into_text())
+    }
+
+    /// `endpoint`'s verified declared locality, with admission's precedence:
+    /// an active registration record for `endpoint` answers (its
+    /// `aster.locality.*` claims, the statement ignored); a definite denial
+    /// answers nothing; otherwise `statement` must verify for `endpoint` as a
+    /// credential would (root or delegated issuer within its grant, delegate
+    /// revocations, expiry). `None` for anything else, including a statement
+    /// issued to another endpoint.
     pub fn declared_locality(
         &self,
-        subject: &[u8; 32],
-        chain: &str,
-    ) -> Option<crate::topology::locality::CoreDeclaredLocality> {
-        let evidence = if chain.is_empty() {
-            self.trust()
-                .stores
-                .select_evidence(subject, None, unix_now())
-                .ok()?
-        } else {
-            self.verify_credential(subject, chain).ok()?
-        };
-        evidence.claims().declared_locality().ok().flatten()
+        endpoint: &[u8; 32],
+        statement: &str,
+    ) -> Option<crate::topology::locality::CoreVerifiedLocality> {
+        let trust = self.trust();
+        let now = unix_now();
+        match trust.stores.select_evidence(endpoint, None, now) {
+            Ok(record) => {
+                return Some(crate::topology::locality::CoreVerifiedLocality {
+                    declared: record.claims().declared_locality().ok().flatten()?,
+                    expires_at: record.expires_at(),
+                });
+            }
+            Err(RecordError::Denied(reason)) if reason.is_definite() => return None,
+            Err(_) if statement.is_empty() => return None,
+            Err(_) => {}
+        }
+        trust
+            .verifier
+            .verify_locality(statement, endpoint, now, trust.stores.as_ref())
+            .ok()
     }
 
     /// Replace this node's credential with a renewed chain, then present it

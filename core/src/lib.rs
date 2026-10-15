@@ -35,7 +35,8 @@ pub use topology::cluster::{
     CoreClusterView, CoreSeparationVerdict, SharedView as CoreTopoSharedView, TopoConfig,
 };
 pub use topology::locality::{
-    CoreDeclaredLocality, CoreLevelSource, CoreLocalitySource, LocalityVerifyFn, OwnChainFn,
+    CoreDeclaredLocality, CoreLevelSource, CoreLocalitySource, CoreVerifiedLocality,
+    LocalityVerifyFn, OwnStatementFn,
 };
 pub use topology::shared::{AdmittedFn, CoreTopoSwarm, CoreTopoSwarmConfig};
 pub use topology::{CoreLadderLevel, CoreLevelEstimate, CorePeerView};

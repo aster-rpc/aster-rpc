@@ -33,7 +33,8 @@ fn root_credential(seed: u8) -> String {
         .unwrap()
         .into_chain()
 }
-/// The root (seed 1) delegates to the issuer (seed 2): scope `build` only.
+/// The root (seed 1) delegates to the issuer (seed 2): scope `build` only,
+/// and the locality keys.
 fn delegation() -> Chain {
     issue_delegation(
         &key(1),
@@ -45,7 +46,11 @@ fn delegation() -> Chain {
             audiences: [FLEET.to_string()].into(),
             scopes: ["build".to_string()].into(),
             tags: BTreeSet::new(),
-            attribute_keys: BTreeSet::new(),
+            attribute_keys: [
+                "aster.locality.region".to_string(),
+                "aster.locality.zone".to_string(),
+            ]
+            .into(),
             max_child_lifetime: 3600,
             max_depth: 0,
             subjects: None,
@@ -62,10 +67,17 @@ fn delegation() -> Chain {
     .unwrap()
 }
 fn build() -> AdmissionClaims {
+    let zone = |value: &str| TypedAttribute::String(value.into());
     AdmissionClaims {
         scopes: Some(["build".to_string()].into()),
         tags: Some(BTreeSet::new()),
-        attributes: Some(Default::default()),
+        attributes: Some(
+            [
+                ("aster.locality.region".to_string(), zone("eu-west-1")),
+                ("aster.locality.zone".to_string(), zone("eu-west-1a")),
+            ]
+            .into(),
+        ),
     }
 }
 async fn node(seed: u8, alpns: Vec<Vec<u8>>) -> Node {
@@ -257,9 +269,13 @@ async fn renewal_keeps_a_node_admitted_across_lifetimes_with_the_root_offline() 
         let (node, enrollment) = enrolled(&fleet, 7, Registration::Ephemeral).await;
         let renewal = enrollment.start_renewal(RenewalConfig::new(fleet.issuer_node.addr()));
 
-        // Three 6-second lifetimes: the node stays admitted on renewed chains.
+        // Three 6-second lifetimes: the node stays admitted on renewed chains,
+        // and its locality statement is renewed with each credential.
         let deadline = now() + 3 * 6 + 2;
         let mut digests = BTreeSet::new();
+        let mut statements = BTreeSet::new();
+        let own = enrollment.topology_locality();
+        let reader = fleet.issuer_enrollment.topology_locality();
         while now() < deadline {
             let ready = fleet
                 .issuer_enrollment
@@ -267,9 +283,16 @@ async fn renewal_keeps_a_node_admitted_across_lifetimes_with_the_root_offline() 
                 .await
                 .expect("the renewed node stays admitted");
             digests.extend(chain_digest(&ready));
+            let statement = (own.own_statement)().expect("statement renewed with the credential");
+            let verified = (reader.verify)(&hex::encode(public(7)), &statement)
+                .expect("the current statement verifies");
+            assert_eq!(verified.declared.zone.as_deref(), Some("eu-west-1a"));
+            assert!(verified.expires_at.unwrap() <= now() + 6);
+            statements.insert(statement);
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         assert!(digests.len() >= 4, "renewed {} times", digests.len() - 1);
+        assert!(statements.len() >= 4, "{} statements", statements.len());
         drop(renewal);
         for node in [node, fleet.issuer_node] {
             node.shutdown().await;

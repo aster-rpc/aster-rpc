@@ -6,9 +6,11 @@
 //! structure and attenuation before any signature, signatures last. There is
 //! no other path to a [`VerifiedChain`].
 //!
-//! Three link kinds cover three jobs: a root delegates bounded issuing
+//! Four link kinds cover four jobs: a root delegates bounded issuing
 //! authority to an online issuer (`delegation`), an issuer enrolls a node
-//! (`enrollment`), and a principal lets an actor act on its behalf (`action`).
+//! (`enrollment`), a principal lets an actor act on its behalf (`action`),
+//! and an issuer declares an enrolled node's region and zone (`locality`,
+//! signed with and embedded in the enrollment link, published on its own).
 //! Long-lived authority is not a chain: it is a root-authored record that a
 //! consumer reads from Docs. Design: `docs/_internal/ownership-attestations.md`.
 
@@ -20,11 +22,13 @@ mod verify;
 
 use std::fmt;
 
-pub use issue::{issue_action, issue_delegation, issue_enrollment, Validity};
+pub use issue::{
+    issue_action, issue_delegation, issue_enrollment, issue_locality, locality_statement, Validity,
+};
 pub use links::{
     ActionGrant, AdmissionClaims, Audience, Confirmation, DelegationGrant, EnrollmentExtensionV1,
-    LinkKind, PublicConfirmationKey, Registration, TypedAttribute, ACTION_JWT_TYPE,
-    DELEGATION_JWT_TYPE, ENROLLMENT_LINK_TYPE,
+    LinkKind, LocalityClaims, PublicConfirmationKey, Registration, TypedAttribute, ACTION_JWT_TYPE,
+    DELEGATION_JWT_TYPE, ENROLLMENT_LINK_TYPE, LOCALITY_JWT_TYPE,
 };
 pub use rotation::{
     claimed_rotation_seq, issue_root_rotation, next_root_commitment, verify_applied_rotation,
@@ -56,6 +60,8 @@ const DIGEST_CONTEXT: &[u8] = b"aster.chain.v1\0";
 pub enum LeafKind {
     Enrollment,
     Action,
+    /// A locality statement: see [`locality_statement`].
+    Locality,
 }
 
 impl LeafKind {
@@ -63,6 +69,7 @@ impl LeafKind {
         match self {
             Self::Enrollment => LinkKind::Enrollment,
             Self::Action => LinkKind::Action,
+            Self::Locality => LinkKind::Locality,
         }
     }
 }

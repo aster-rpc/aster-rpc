@@ -163,6 +163,7 @@ fn payload(issuer: u8, subject: u8, kind: LinkKind, iat: u64, exp: u64) -> Value
             "aster_action_v1",
             json!({"operations": ["exec.submit"], "resources": [], "mandatory": []}),
         ),
+        LinkKind::Locality => ("aster_locality_v1", json!({"region": "eu-west-1"})),
     };
     value[extension.0] = extension.1;
     value
@@ -177,6 +178,8 @@ fn link(signer: u8, payload: &Value) -> String {
         LinkKind::Delegation
     } else if payload.get("aster_action_v1").is_some() {
         LinkKind::Action
+    } else if payload.get("aster_locality_v1").is_some() {
+        LinkKind::Locality
     } else {
         LinkKind::Enrollment
     };
@@ -1000,4 +1003,233 @@ fn malformed_locality_is_refused_at_issuance() {
         .unwrap()
         .remove("aster.locality.region");
     assert!(zone_only.claims.declared_locality().is_err());
+}
+
+// ── Locality statements: the separate, endpoint-bound leaf a node publishes ──
+
+fn verify_locality_at(statement: &str, leaf: u8, now: u64) -> Result<VerifiedChain, ChainError> {
+    let anchors = anchors();
+    verify_chain(
+        statement.as_bytes(),
+        LeafKind::Locality,
+        &key(leaf),
+        &TrustContext::new(&anchors, AUD, now, &NoRevocations),
+    )
+}
+
+/// A delegated credential with locality, and the statement embedded in it.
+fn delegated_statement() -> (Chain, Chain) {
+    let parent = delegation_to_issuer(&locality_grant());
+    let mut claims = locality_claims(s("eu-west-1"), Some(s("eu-west-1a")));
+    claims
+        .claims
+        .attributes
+        .as_mut()
+        .unwrap()
+        .insert("role".into(), s("secret-role-value"));
+    let credential = issue_enrollment(
+        &seed(ISSUER),
+        Some(&parent),
+        &key(NODE),
+        &aud(),
+        &claims,
+        validity(NOW - 10, DAY),
+    )
+    .unwrap();
+    let statement = locality_statement(&credential).expect("statement embedded");
+    (credential, statement)
+}
+
+fn payload_json(link: &str) -> Value {
+    let payload = link.split('.').nth(1).unwrap();
+    serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+}
+
+/// The statement verifies through the same delegation as the credential, as
+/// its own leaf kind, and carries region and zone and nothing else from the
+/// credential: no other attribute, scope or the enrollment leaf itself.
+#[test]
+fn locality_statement_is_a_separate_leaf_with_only_locality() {
+    let (credential, statement) = delegated_statement();
+    let verified = verify_locality_at(statement.to_text(), NODE, NOW).unwrap();
+    let LeafClaims::Locality(claims) = verified.leaf() else {
+        panic!("locality leaf expected");
+    };
+    assert_eq!(claims.region, "eu-west-1");
+    assert_eq!(claims.zone.as_deref(), Some("eu-west-1a"));
+    assert_eq!(verified.issuers(), &[key(ISSUER), key(ROOT)]);
+    assert_eq!(verified.not_after(), NOW - 10 + DAY, "same lifetime");
+
+    // Only the ancestors are shared with the credential.
+    let credential_links: Vec<_> = credential.links().collect();
+    let statement_links: Vec<_> = statement.links().collect();
+    assert_eq!(statement_links[1..], credential_links[1..]);
+    assert!(!statement.to_text().contains(credential_links[0]));
+    let leaf = payload_json(statement_links[0]);
+    let mut members: Vec<_> = leaf.as_object().unwrap().keys().cloned().collect();
+    members.sort();
+    assert_eq!(
+        members,
+        [
+            "aster_locality_v1",
+            "aud",
+            "cnf",
+            "exp",
+            "iat",
+            "iss",
+            "jti",
+            "sub"
+        ]
+    );
+    assert_eq!(
+        leaf["aster_locality_v1"],
+        json!({"region": "eu-west-1", "zone": "eu-west-1a"})
+    );
+    // No other credential claim is anywhere in the published statement.
+    let decoded: String = statement_links
+        .iter()
+        .map(|link| payload_json(link).to_string())
+        .collect();
+    assert!(!decoded.contains("secret-role-value"));
+    assert!(!decoded.contains("aster_enrollment_v1"));
+
+    // The statement is not a credential, and the credential not a statement.
+    assert_eq!(
+        verify(statement.to_text(), NODE).unwrap_err(),
+        ChainError::Grammar
+    );
+    assert_eq!(
+        verify_locality_at(credential.to_text(), NODE, NOW).unwrap_err(),
+        ChainError::Grammar
+    );
+}
+
+/// Bound to the endpoint it names: a statement republished for any other
+/// key is rejected.
+#[test]
+fn locality_statement_is_bound_to_its_endpoint() {
+    let (_, statement) = delegated_statement();
+    assert_eq!(
+        verify_locality_at(statement.to_text(), OTHER, NOW).unwrap_err(),
+        ChainError::LeafMismatch
+    );
+}
+
+/// The statement expires with the credential it was issued alongside.
+#[test]
+fn locality_statement_expires_with_the_credential() {
+    let (_, statement) = delegated_statement();
+    assert!(verify_locality_at(statement.to_text(), NODE, NOW - 10 + DAY - 1).is_ok());
+    assert_eq!(
+        verify_locality_at(statement.to_text(), NODE, NOW - 10 + DAY).unwrap_err(),
+        ChainError::Expired
+    );
+}
+
+/// A root-issued credential carries a one-link statement signed by the root;
+/// one without locality claims carries none.
+#[test]
+fn root_issued_statement_and_none_without_locality() {
+    let credential = issue_enrollment(
+        &seed(ROOT),
+        None,
+        &key(NODE),
+        &aud(),
+        &locality_claims(s("eu-west-1"), None),
+        validity(NOW - 10, DAY),
+    )
+    .unwrap();
+    let statement = locality_statement(&credential).unwrap();
+    assert_eq!(statement.links().count(), 1);
+    let verified = verify_locality_at(statement.to_text(), NODE, NOW).unwrap();
+    assert_eq!(verified.anchor(), &key(ROOT));
+    assert_eq!(
+        verified.leaf(),
+        &LeafClaims::Locality(LocalityClaims {
+            region: "eu-west-1".into(),
+            zone: None
+        })
+    );
+    assert_eq!(locality_statement(&node_chain()), None);
+}
+
+/// Verifiers apply delegation bounds to a statement as to a credential: the
+/// parent must allow enrollment and list the claimed keys. A hand-signed
+/// statement from an issuer without them is rejected.
+#[test]
+fn locality_statement_is_attenuated_by_the_issuers_grant() {
+    let locality_link = |grant: &DelegationGrant| {
+        let parent = delegation_to_issuer(grant);
+        let mut leaf = payload(ISSUER, NODE, LinkKind::Locality, NOW - 10, NOW + DAY);
+        leaf["aster_locality_v1"] = json!({"region": "eu-west-1", "zone": "eu-west-1a"});
+        let top = parent.links().next().unwrap().to_owned();
+        chain(&[link(ISSUER, &leaf), top])
+    };
+    assert!(verify_locality_at(&locality_link(&locality_grant()), NODE, NOW).is_ok());
+    // The zone key is missing from the grant.
+    let region_only = DelegationGrant {
+        attribute_keys: set(&["aster.locality.region"]),
+        ..grant()
+    };
+    assert_eq!(
+        verify_locality_at(&locality_link(&region_only), NODE, NOW).unwrap_err(),
+        ChainError::Attenuation
+    );
+    // The grant does not allow enrollment.
+    let no_enrollment = DelegationGrant {
+        may_issue: [LinkKind::Delegation, LinkKind::Action].into(),
+        ..locality_grant()
+    };
+    assert_eq!(
+        verify_locality_at(&locality_link(&no_enrollment), NODE, NOW).unwrap_err(),
+        ChainError::Attenuation
+    );
+    // `locality` is not a grantable kind of its own.
+    let mut bad = payload(ROOT, ISSUER, LinkKind::Delegation, NOW - 100, NOW + DAY);
+    bad["aster_delegation_v1"]["may_issue"] = json!(["enrollment", "locality"]);
+    let mut leaf = payload(ISSUER, NODE, LinkKind::Locality, NOW - 10, NOW + DAY / 2);
+    leaf["aster_locality_v1"] = json!({"region": "eu-west-1"});
+    assert_eq!(
+        verify_locality_at(&chain(&[link(ISSUER, &leaf), link(ROOT, &bad)]), NODE, NOW)
+            .unwrap_err(),
+        ChainError::Malformed
+    );
+}
+
+/// Malformed values are refused when a statement is signed directly, and a
+/// hand-signed one is rejected by verifiers.
+#[test]
+fn malformed_locality_statements_are_refused() {
+    let refused = issue_locality(
+        &seed(ROOT),
+        None,
+        &key(NODE),
+        &aud(),
+        &LocalityClaims {
+            region: "EU West".into(),
+            zone: None,
+        },
+        validity(NOW - 10, DAY),
+    );
+    assert_eq!(refused.unwrap_err(), ChainError::Malformed);
+    let mut leaf = payload(ROOT, NODE, LinkKind::Locality, NOW - 10, NOW + DAY);
+    leaf["aster_locality_v1"] = json!({"region": "eu-west-1", "zone": "Zone A"});
+    assert_eq!(
+        verify_locality_at(&chain(&[link(ROOT, &leaf)]), NODE, NOW).unwrap_err(),
+        ChainError::Malformed
+    );
+    // Only an enrollment link may embed a statement.
+    let mut action = payload(ROOT, NODE, LinkKind::Action, NOW - 10, NOW + DAY);
+    action["aster_locality_statement"] = json!("x.y.z");
+    let anchors = anchors();
+    assert_eq!(
+        verify_chain(
+            chain(&[link(ROOT, &action)]).as_bytes(),
+            LeafKind::Action,
+            &key(NODE),
+            &TrustContext::new(&anchors, AUD, NOW, &NoRevocations),
+        )
+        .unwrap_err(),
+        ChainError::Malformed
+    );
 }

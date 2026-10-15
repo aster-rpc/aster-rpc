@@ -2,8 +2,9 @@
 //! Declared locality through the shared topology doc: published, verified
 //! per node, folded into peer views as a bound, and answered by `locate` for
 //! a peer that was never dialed. Verification is stubbed here (the real
-//! source, `Enrollment::topology_locality`, is covered by the delegation and
-//! enrollment tests); this exercises the swarm plumbing and the ladder.
+//! source, `Enrollment::topology_locality`, and the published record are
+//! covered by the delegation and enrollment tests); this exercises the swarm
+//! plumbing, the reader's endpoint binding and expiry, and the ladder.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use std::time::Duration;
 use aster::rpc::AsterServer;
 use aster::topology::{
     DeclaredLocality, LadderLevel, LevelSource, LocalitySource, TopoConfig, TopologySwarmOptions,
+    VerifiedLocality,
 };
 use aster::{AsterConfig, NamespaceSecret, RelayMode, SecretKey};
 use tokio::time::timeout;
@@ -24,20 +26,31 @@ fn cfg() -> AsterConfig {
         .build()
 }
 
-/// What the "root" vouches for, by node. A published chain counts only when
-/// it is the one issued to that node, standing in for `verify_credential`'s
-/// subject binding.
-type Roster = Arc<HashMap<String, DeclaredLocality>>;
+/// What the "root" vouches for, by node, and until when (Unix seconds). A
+/// published statement counts only when it is the one issued to that node,
+/// standing in for the statement's endpoint binding.
+type Roster = Arc<HashMap<String, (DeclaredLocality, Option<u64>)>>;
 
 fn source(self_hex: String, roster: Roster) -> LocalitySource {
     LocalitySource {
-        own_chain: Arc::new(move || Some(format!("chain-for-{self_hex}"))),
-        verify: Arc::new(move |node_hex: &str, chain: &str| {
-            (chain == format!("chain-for-{node_hex}"))
+        own_statement: Arc::new(move || Some(format!("statement-for-{self_hex}"))),
+        verify: Arc::new(move |node_hex: &str, statement: &str| {
+            (statement == format!("statement-for-{node_hex}"))
                 .then(|| roster.get(node_hex).cloned())
                 .flatten()
+                .map(|(declared, expires_at)| VerifiedLocality {
+                    declared,
+                    expires_at,
+                })
         }),
     }
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 fn opts(locality: LocalitySource) -> TopologySwarmOptions {
@@ -54,11 +67,12 @@ fn opts(locality: LocalitySource) -> TopologySwarmOptions {
     }
 }
 
-fn zone(region: &str, zone: &str) -> DeclaredLocality {
-    DeclaredLocality {
+fn zone(region: &str, zone: &str) -> (DeclaredLocality, Option<u64>) {
+    let declared = DeclaredLocality {
         region: region.into(),
         zone: Some(zone.into()),
-    }
+    };
+    (declared, None)
 }
 
 async fn within<F: std::future::Future>(f: F) -> F::Output {
@@ -167,8 +181,9 @@ async fn declared_zones_bound_levels_and_locate_unmet_peers() {
     assert_eq!(b_from_a.declared_region.as_deref(), Some("eu-west-1"));
 }
 
-/// A record whose chain was not issued to its publisher is "no declaration":
-/// the measured level stands and nothing is reported as declared.
+/// A record whose statement was issued to another endpoint is "no
+/// declaration": the measured level stands and nothing is reported as
+/// declared.
 #[tokio::test]
 async fn unverified_declarations_are_ignored() {
     let servers = [
@@ -187,9 +202,9 @@ async fn unverified_declarations_are_ignored() {
         .enable_shared(&secret, opts(source(a.id().to_string(), roster.clone())))
         .await
         .unwrap();
-    // B publishes someone else's chain.
+    // B publishes a statement issued to someone else.
     let forged = LocalitySource {
-        own_chain: Arc::new(|| Some("chain-for-someone-else".to_string())),
+        own_statement: Arc::new(|| Some("statement-for-someone-else".to_string())),
         verify: source(b.id().to_string(), roster.clone()).verify,
     };
     b.topology()
@@ -220,4 +235,60 @@ async fn unverified_declarations_are_ignored() {
         "different region ignored"
     );
     assert!(view.declared_region.is_none());
+}
+
+/// A statement stops counting the moment it expires, even though the reader
+/// verified it earlier and still holds that result in its cache.
+#[tokio::test]
+async fn an_expired_statement_is_ignored() {
+    let servers = [
+        AsterServer::builder().config(cfg()).start().await.unwrap(),
+        AsterServer::builder().config(cfg()).start().await.unwrap(),
+    ];
+    let [a, b] = &servers;
+    let expires_at = unix_now() + 10;
+    let (b_declared, _) = zone("us-east-1", "us-east-1a");
+    let roster: Roster = Arc::new(HashMap::from([
+        (a.id().to_string(), zone("eu-west-1", "eu-west-1a")),
+        (b.id().to_string(), (b_declared, Some(expires_at))),
+    ]));
+    let secret = NamespaceSecret::from_bytes(SecretKey::generate().to_bytes());
+    wait_for_addr(a.node()).await;
+    wait_for_addr(b.node()).await;
+    for s in [a, b] {
+        s.topology()
+            .enable_shared(&secret, opts(source(s.id().to_string(), roster.clone())))
+            .await
+            .unwrap();
+    }
+    a.node().add_peer(b.node()).unwrap();
+    b.node().add_peer(a.node()).unwrap();
+    let _ab = within(a.node().rpc_connect(&b.id())).await.unwrap();
+
+    // Before expiry: B's declared different region makes it Far.
+    let declared = converge("A's declared view of B", || {
+        a.topology()
+            .peer(&b.id())
+            .filter(|v| v.level_source == LevelSource::Declared)
+    })
+    .await;
+    assert_eq!(declared.level, LadderLevel::Far);
+    assert!(unix_now() < expires_at, "declared view seen before expiry");
+
+    // After expiry: no declaration, the measurement stands.
+    let measured = converge("A ignoring B's expired statement", || {
+        a.topology()
+            .peer(&b.id())
+            .filter(|v| v.level_source == LevelSource::Measured)
+    })
+    .await;
+    assert!(unix_now() >= expires_at);
+    assert_eq!(measured.level, LadderLevel::SameHost);
+    assert!(measured.declared_region.is_none());
+    assert!(a
+        .topology()
+        .locate(&b.id())
+        .unwrap()
+        .declared_region
+        .is_none());
 }

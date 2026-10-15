@@ -518,6 +518,31 @@ impl JwtEnrollmentVerifier {
             Err(error) => Err(error.into()),
         }
     }
+
+    /// Verify a locality statement (see [`delegation::locality_statement`])
+    /// for `endpoint` exactly as a credential is verified: pinned root and
+    /// audience, delegation bounds and revocations, signed validity, and a
+    /// leaf naming `endpoint`. Returns the declaration and when the
+    /// statement stops being valid.
+    pub fn verify_locality(
+        &self,
+        statement: &str,
+        endpoint: &[u8; 32],
+        now: u64,
+        revoked: &dyn RevokedDelegates,
+    ) -> Result<crate::topology::locality::CoreVerifiedLocality, EnrollmentError> {
+        let anchors = [self.root];
+        let mut trust = TrustContext::new(&anchors, &self.audience, now, revoked);
+        trust.leeway = self.activation_leeway;
+        let verified = verify_chain(statement.as_bytes(), LeafKind::Locality, endpoint, &trust)?;
+        let LeafClaims::Locality(claims) = verified.leaf() else {
+            return Err(EnrollmentError::InvalidJwt);
+        };
+        Ok(crate::topology::locality::CoreVerifiedLocality {
+            declared: claims.declared().ok_or(EnrollmentError::InvalidClaims)?,
+            expires_at: Some(verified.not_after()),
+        })
+    }
 }
 
 /// Parse an enrollment identity consistently across JWTs, Docs and transport

@@ -7,13 +7,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde::{Deserialize, Serialize};
 
-use super::{ChainError, MAX_LIST_ENTRIES, MAX_STRING_BYTES};
+use super::{ChainError, MAX_LINK_BYTES, MAX_LIST_ENTRIES, MAX_STRING_BYTES};
 use crate::topology::locality::{
     CoreDeclaredLocality, MalformedLocality, REGION_ATTRIBUTE, ZONE_ATTRIBUTE,
 };
 
 pub const DELEGATION_JWT_TYPE: &str = "aster-delegation-v1+jwt";
 pub const ACTION_JWT_TYPE: &str = "aster-action-v1+jwt";
+/// A node's declared region and zone, issued alongside its enrollment.
+pub const LOCALITY_JWT_TYPE: &str = "aster-locality-v1+jwt";
 /// Unchanged from the enrollment profile, so a one-link enrollment chain is an
 /// enrollment credential.
 pub const ENROLLMENT_LINK_TYPE: &str = "aster-enrollment-v1+jwt";
@@ -154,6 +156,10 @@ pub enum LinkKind {
     Delegation,
     Enrollment,
     Action,
+    /// A locality statement. It is part of an enrollment, so a delegate needs
+    /// `enrollment` in `may_issue` to sign one; `locality` itself is never a
+    /// valid `may_issue` entry.
+    Locality,
 }
 
 impl LinkKind {
@@ -162,15 +168,64 @@ impl LinkKind {
             Self::Delegation => DELEGATION_JWT_TYPE,
             Self::Enrollment => ENROLLMENT_LINK_TYPE,
             Self::Action => ACTION_JWT_TYPE,
+            Self::Locality => LOCALITY_JWT_TYPE,
         }
     }
 
     fn from_jwt_type(typ: &str) -> Option<Self> {
-        [Self::Delegation, Self::Enrollment, Self::Action]
-            .into_iter()
-            .find(|kind| kind.jwt_type() == typ)
+        [
+            Self::Delegation,
+            Self::Enrollment,
+            Self::Action,
+            Self::Locality,
+        ]
+        .into_iter()
+        .find(|kind| kind.jwt_type() == typ)
+    }
+
+    /// The `may_issue` entry a parent delegation needs to sign this kind.
+    pub(crate) fn authorized_by(self) -> Self {
+        match self {
+            Self::Locality => Self::Enrollment,
+            kind => kind,
+        }
     }
 }
+
+/// `aster_locality_v1`: a node's declared region and, within it, zone. The
+/// only claims a locality statement carries. Values follow
+/// [`is_valid_locality_value`](crate::topology::locality::is_valid_locality_value).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalityClaims {
+    pub region: String,
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub zone: Option<String>,
+}
+
+impl LocalityClaims {
+    /// The declaration, or `None` when a value is malformed.
+    pub fn declared(&self) -> Option<CoreDeclaredLocality> {
+        CoreDeclaredLocality::from_values(Some(&self.region), self.zone.as_deref())
+    }
+}
+
+impl From<CoreDeclaredLocality> for LocalityClaims {
+    fn from(declared: CoreDeclaredLocality) -> Self {
+        Self {
+            region: declared.region,
+            zone: declared.zone,
+        }
+    }
+}
+
+/// The reserved attribute keys a locality statement claims, for attenuation.
+static LOCALITY_KEYS: std::sync::LazyLock<[String; 2]> =
+    std::sync::LazyLock::new(|| [REGION_ATTRIBUTE.to_string(), ZONE_ATTRIBUTE.to_string()]);
 
 /// `aster_delegation_v1`: the bounds a delegate's subtree must stay within.
 /// Every field is required; an empty list means "none".
@@ -250,6 +305,22 @@ pub(crate) struct LinkPayload {
         skip_serializing_if = "Option::is_none"
     )]
     pub aster_action_v1: Option<ActionGrant>,
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aster_locality_v1: Option<LocalityClaims>,
+    /// On an enrollment link only: the compact locality link the same issuer
+    /// signed for the same subject, audience and validity. The holder
+    /// publishes it, with the credential's ancestor links, as its locality
+    /// statement; the credential itself is never published.
+    #[serde(
+        default,
+        deserialize_with = "some",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aster_locality_statement: Option<String>,
 }
 
 /// An explicit `null` is not the same as omission: it cannot erase a value.
@@ -272,6 +343,7 @@ pub(crate) enum LinkBody {
     Delegation(DelegationGrant),
     Enrollment(EnrollmentExtensionV1),
     Action(ActionGrant),
+    Locality(LocalityClaims),
 }
 
 /// A link that passed G1: well-formed, keys parsed, limits checked. Not yet
@@ -288,6 +360,8 @@ pub(crate) struct DecodedLink {
     pub nbf: Option<u64>,
     pub exp: u64,
     pub body: LinkBody,
+    /// An enrollment link's embedded locality link (`aster_locality_statement`).
+    pub locality_statement: Option<String>,
 }
 
 impl DecodedLink {
@@ -303,6 +377,7 @@ impl DecodedLink {
             LinkBody::Delegation(grant) => (Some(&grant.mandatory), &[]),
             LinkBody::Action(grant) => (Some(&grant.mandatory), &[]),
             LinkBody::Enrollment(extension) => (None, &extension.mandatory),
+            LinkBody::Locality(_) => (None, &[]),
         };
         set.into_iter().flatten().chain(list)
     }
@@ -312,7 +387,7 @@ impl DecodedLink {
         match &self.body {
             LinkBody::Delegation(grant) => grant.may_register,
             LinkBody::Enrollment(extension) => extension.registration == Registration::Persistent,
-            LinkBody::Action(_) => false,
+            LinkBody::Action(_) | LinkBody::Locality(_) => false,
         }
     }
 
@@ -339,6 +414,16 @@ impl DecodedLink {
                 attribute_keys: empty(),
                 operations: Box::new(grant.operations.iter()),
             },
+            LinkBody::Locality(claims) => Claimed {
+                scopes: empty(),
+                tags: empty(),
+                attribute_keys: Box::new(LOCALITY_KEYS.iter().take(if claims.zone.is_some() {
+                    2
+                } else {
+                    1
+                })),
+                operations: empty(),
+            },
         }
     }
 }
@@ -355,15 +440,23 @@ pub(crate) fn decode_link(typ: &str, payload: &[u8]) -> Result<DecodedLink, Chai
     let kind = LinkKind::from_jwt_type(typ).ok_or(ChainError::Header)?;
     let payload: LinkPayload =
         serde_json::from_slice(payload).map_err(|_| ChainError::Malformed)?;
+    // Only an enrollment link may embed a locality statement.
+    if kind != LinkKind::Enrollment && payload.aster_locality_statement.is_some() {
+        return Err(ChainError::Malformed);
+    }
     let body = match (
         kind,
         payload.aster_delegation_v1,
         payload.aster_enrollment_v1,
         payload.aster_action_v1,
+        payload.aster_locality_v1,
     ) {
-        (LinkKind::Delegation, Some(grant), None, None) => LinkBody::Delegation(grant),
-        (LinkKind::Enrollment, None, Some(extension), None) => LinkBody::Enrollment(extension),
-        (LinkKind::Action, None, None, Some(grant)) => LinkBody::Action(grant),
+        (LinkKind::Delegation, Some(grant), None, None, None) => LinkBody::Delegation(grant),
+        (LinkKind::Enrollment, None, Some(extension), None, None) => {
+            LinkBody::Enrollment(extension)
+        }
+        (LinkKind::Action, None, None, Some(grant), None) => LinkBody::Action(grant),
+        (LinkKind::Locality, None, None, None, Some(claims)) => LinkBody::Locality(claims),
         _ => return Err(ChainError::Malformed),
     };
     let iss = parse_key(&payload.iss).ok_or(ChainError::Malformed)?;
@@ -387,8 +480,16 @@ pub(crate) fn decode_link(typ: &str, payload: &[u8]) -> Result<DecodedLink, Chai
         nbf: payload.nbf,
         exp: payload.exp,
         body,
+        locality_statement: payload.aster_locality_statement,
     };
     check_body_limits(&link.body)?;
+    if link
+        .locality_statement
+        .as_deref()
+        .is_some_and(|text| text.is_empty() || text.len() > MAX_LINK_BYTES || text.contains('~'))
+    {
+        return Err(ChainError::Malformed);
+    }
     Ok(link)
 }
 
@@ -409,15 +510,17 @@ fn check_body_limits(body: &LinkBody) -> Result<(), ChainError> {
                 &grant.attribute_keys,
                 &grant.operations,
                 &grant.mandatory,
-            ]) && grant.subjects.as_ref().is_none_or(|subjects| {
-                subjects.len() <= MAX_LIST_ENTRIES
-                    && subjects.iter().all(|key| parse_key(key).is_some())
-            })
+            ]) && !grant.may_issue.contains(&LinkKind::Locality)
+                && grant.subjects.as_ref().is_none_or(|subjects| {
+                    subjects.len() <= MAX_LIST_ENTRIES
+                        && subjects.iter().all(|key| parse_key(key).is_some())
+                })
         }
         LinkBody::Action(grant) => {
             lists_ok(&[&grant.operations, &grant.resources, &grant.mandatory])
                 && grant.request.as_deref().is_none_or(valid_digest)
         }
+        LinkBody::Locality(claims) => claims.declared().is_some(),
         LinkBody::Enrollment(extension) => {
             let claims = &extension.claims;
             lists_ok(&[

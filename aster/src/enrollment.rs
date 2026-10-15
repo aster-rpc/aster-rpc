@@ -367,19 +367,24 @@ impl Enrollment {
 
     /// The declared-locality source for
     /// [`TopologySwarmOptions::locality`](crate::topology::TopologySwarmOptions::locality):
-    /// publishes this node's current credential chain (renewals included) and
-    /// verifies each peer's as admission would, falling back to the root's
-    /// registration record for a node that holds no chain. Region and zone
-    /// come from the reserved `aster.locality.region` / `aster.locality.zone`
-    /// attributes the root or a delegated issuer signed.
+    /// publishes this node's locality statement (never its credential) and
+    /// verifies each peer's for that peer's endpoint, as a credential would
+    /// be verified, falling back to the root's registration record for a
+    /// node that publishes none.
+    ///
+    /// The statement is a locality link carrying only the region and zone,
+    /// which the root or a delegated issuer signs into the credential
+    /// whenever its claims carry the reserved `aster.locality.region` /
+    /// `aster.locality.zone` attributes, so it is renewed with the
+    /// credential and expires with it.
     pub fn topology_locality(&self) -> crate::topology::LocalitySource {
         let own = self.inner.clone();
         let verify = self.inner.clone();
         crate::topology::LocalitySource {
-            own_chain: Arc::new(move || own.credential().map(|(chain, _)| chain)),
-            verify: Arc::new(move |node_hex: &str, chain: &str| {
-                let subject: [u8; 32] = hex::decode(node_hex).ok()?.try_into().ok()?;
-                verify.declared_locality(&subject, chain)
+            own_statement: Arc::new(move || own.locality_statement()),
+            verify: Arc::new(move |node_hex: &str, statement: &str| {
+                let endpoint: [u8; 32] = hex::decode(node_hex).ok()?.try_into().ok()?;
+                verify.declared_locality(&endpoint, statement)
             }),
         }
     }

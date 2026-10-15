@@ -68,13 +68,16 @@ pub struct LanEdge {
 }
 
 /// A node's declared-locality record (`topo/v1/<node>/locality`): its
-/// current enrollment chain, whose root-signed `aster.locality.*` attributes
-/// readers verify. `chain` is `""` for a node admitted by a root-authored
-/// registration record; readers then use the record they already hold.
+/// current locality statement, an `aster-chain-v1` chain whose leaf is a
+/// locality link naming this node and carrying only region and zone, signed
+/// by the root or a delegated issuer. Never the enrollment credential.
+/// `statement` is `""` for a node that holds none (admitted by a
+/// root-authored registration record); readers then use the record they
+/// already hold.
 #[derive(ForyStruct, Clone, Debug, Default, PartialEq)]
-pub struct DeclaredLocality {
+pub struct LocalityRecord {
     #[fory(id = 1)]
-    pub chain: String,
+    pub statement: String,
     #[fory(id = 2)]
     pub updated_unix_ms: i64,
 }
@@ -90,8 +93,8 @@ fn fory() -> &'static Fory {
             .expect("register RttEdge");
         f.register_by_name::<LanEdge>("aster.topo.LanEdge")
             .expect("register LanEdge");
-        f.register_by_name::<DeclaredLocality>("aster.topo.DeclaredLocality")
-            .expect("register DeclaredLocality");
+        f.register_by_name::<LocalityRecord>("aster.topo.LocalityRecord")
+            .expect("register LocalityRecord");
         f
     })
 }
@@ -130,16 +133,14 @@ pub fn decode_lan_edge(bytes: &[u8]) -> Result<LanEdge> {
         .map_err(|e| anyhow!("LanEdge Fory decode failed: {e}"))
 }
 
-pub fn encode_locality(l: &DeclaredLocality) -> Vec<u8> {
-    fory()
-        .serialize(l)
-        .expect("DeclaredLocality Fory serialize")
+pub fn encode_locality(l: &LocalityRecord) -> Vec<u8> {
+    fory().serialize(l).expect("LocalityRecord Fory serialize")
 }
 
-pub fn decode_locality(bytes: &[u8]) -> Result<DeclaredLocality> {
+pub fn decode_locality(bytes: &[u8]) -> Result<LocalityRecord> {
     fory()
         .deserialize(bytes)
-        .map_err(|e| anyhow!("DeclaredLocality Fory decode failed: {e}"))
+        .map_err(|e| anyhow!("LocalityRecord Fory decode failed: {e}"))
 }
 
 // ── Key layout ────────────────────────────────────────────────────────────────
@@ -264,8 +265,8 @@ mod tests {
         };
         assert_eq!(decode_lan_edge(&encode_lan_edge(&l)).unwrap(), l);
 
-        let d = DeclaredLocality {
-            chain: "aster-chain-v1.abc".into(),
+        let d = LocalityRecord {
+            statement: "aster-chain-v1~abc".into(),
             updated_unix_ms: 1_700_000_000_000,
         };
         assert_eq!(decode_locality(&encode_locality(&d)).unwrap(), d);
