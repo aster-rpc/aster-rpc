@@ -409,3 +409,27 @@ class TestDemoConnection:
         assert contract is not None
         assert contract["name"] == "HelloWorld"
         assert len(contract["methods"]) == 2
+
+
+class TestSyncFinishedDisplay:
+    @staticmethod
+    def _event(**fields):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(kind="sync_finished", peer="a" * 64, **fields)
+
+    def test_completed_round_shows_origin(self):
+        from aster_cli.shell.commands import format_sync_finished
+
+        text = format_sync_finished(self._event(sync_origin="accept", sync_ok=True, sync_error=None))
+        assert "sync_finished" in text and "(accept)" in text and "red" not in text
+
+    def test_failed_round_shows_origin_and_error(self):
+        from aster_cli.shell.commands import format_sync_finished
+
+        text = format_sync_finished(
+            self._event(sync_origin="connect", sync_ok=False, sync_error="aborted [bold]")
+        )
+        assert "[red]sync_failed[/red]" in text and "(connect)" in text
+        # The error is escaped so Rich prints it rather than parsing it as markup.
+        assert "aborted \\[bold]" in text

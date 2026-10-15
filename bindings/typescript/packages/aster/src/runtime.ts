@@ -67,6 +67,63 @@ export interface ServiceSummary {
 /** Well-known filename emitted by `npx aster-gen`. */
 const GENERATED_FILENAME = 'aster-rpc.generated.ts';
 
+/** The parts of a doc event a sync wait reads. */
+interface SyncWaitEvent {
+  kind: string;
+  syncOk?: boolean;
+}
+
+/**
+ * Wait up to `timeoutMs` for a completed sync round or for an entry under
+ * `prefix`; resolves whether either happened.
+ *
+ * A failed round (refused, aborted, or an unreachable peer) also ends with
+ * `sync_finished`, with `syncOk` false. It counts as no news: waiting
+ * continues until the deadline, checking for entries while events are quiet.
+ *
+ * @internal
+ */
+export async function waitForInitialSync(
+  doc: { queryKeyPrefix(prefix: string): Promise<unknown[]> },
+  events: { recv(): Promise<SyncWaitEvent | null> },
+  timeoutMs: number,
+  prefix = 'contracts/',
+): Promise<boolean> {
+  const hasEntries = async (): Promise<boolean> => {
+    try {
+      return (await doc.queryKeyPrefix(prefix)).length > 0;
+    } catch {
+      return false;
+    }
+  };
+  const deadline = Date.now() + timeoutMs;
+  // One receive stays outstanding across quiet intervals, so an event that
+  // lands after a timeout is not lost to an abandoned receive.
+  let pending: Promise<SyncWaitEvent | null> | null = null;
+  const QUIET = Symbol('quiet');
+  while (Date.now() < deadline) {
+    pending ??= events.recv();
+    const waitMs = Math.min(deadline - Date.now(), 1000);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ev = await Promise.race([
+      pending,
+      new Promise<typeof QUIET>((r) => { timer = setTimeout(() => r(QUIET), waitMs); }),
+    ]).finally(() => clearTimeout(timer));
+    if (ev === QUIET) {
+      if (await hasEntries()) return true;
+      continue;
+    }
+    pending = null;
+    // The subscription ended; nothing more will arrive.
+    if (ev === null) return hasEntries();
+    if (ev.kind === 'sync_finished' && ev.syncOk) {
+      await new Promise((r) => setTimeout(r, 100));
+      return true;
+    }
+  }
+  return hasEntries();
+}
+
 /**
  * Options for AsterServer.
  * @group Server and Client
@@ -1228,32 +1285,10 @@ export class AsterClientWrapper {
         const doc = result.takeDoc();
         const events = result.takeEvents();
 
-        // Best-effort sync wait: bail out when sync_finished arrives or a
-        // contracts/ entry shows up, whichever comes first. Short total
-        // deadline because the producer writes these synchronously on
-        // startup so the initial pull is usually quick.
-        const deadline = Date.now() + 6000;
-        while (Date.now() < deadline) {
-          const remaining = deadline - Date.now();
-          if (remaining <= 0) break;
-          const waitMs = Math.min(remaining, 1000);
-          const ev = await Promise.race<any>([
-            events.recv(),
-            new Promise<null>(r => setTimeout(() => r(null), waitMs)),
-          ]);
-          if (ev && ev.kind === 'sync_finished') {
-            await new Promise(r => setTimeout(r, 100));
-            break;
-          }
-          if (!ev) {
-            try {
-              const entries = await doc.queryKeyPrefix('contracts/');
-              if (entries.length) break;
-            } catch {
-              /* ignore */
-            }
-          }
-        }
+        // Best-effort sync wait. Short total deadline because the producer
+        // writes these synchronously on startup so the initial pull is
+        // usually quick.
+        await waitForInitialSync(doc, events, 6000);
         this._registryDoc = doc;
         return doc;
       } catch (e) {

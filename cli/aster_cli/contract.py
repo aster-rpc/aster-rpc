@@ -604,10 +604,9 @@ def _namespace_from_directory_ref(source: str) -> str:
 
 async def _fetch_manifests_from_node(ticket: str, rcan_path: str | None = None) -> dict[str, dict]:
     """Connect to a live node, fetch all manifests, and return them."""
-    from aster.runtime import AsterClient, _coerce_node_addr
+    from aster.runtime import AsterClient, _coerce_node_addr, _wait_for_initial_sync
     from aster.config import AsterConfig
     from aster import docs_client, blobs_client
-    import asyncio
     import os as _os
 
     config = AsterConfig.from_env()
@@ -636,17 +635,9 @@ async def _fetch_manifests_from_node(ticket: str, rcan_path: str | None = None) 
 
     doc, rx = await dc.join_and_subscribe_namespace(ns, peer_id)
 
-    # Wait for sync
-    for _ in range(25):
-        try:
-            event = await asyncio.wait_for(rx.recv(), timeout=2.0)
-            if hasattr(event, "kind") and event.kind == "sync_finished":
-                await asyncio.sleep(0.3)
-                break
-        except asyncio.TimeoutError:
-            entries = await doc.query_key_prefix(b"contracts/")
-            if entries:
-                break
+    # Wait for a completed sync round or the first contract entry. A failed
+    # round is not a sync: the wait goes on until the deadline.
+    await _wait_for_initial_sync(doc, rx, timeout=50.0)
 
     manifests: dict[str, dict] = {}
     # Every contract the server published, read from its registry. Only a

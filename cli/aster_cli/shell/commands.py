@@ -1279,8 +1279,7 @@ class WatchCommand(ShellCommand):
                     ctx.display.print(f"[dim]{ts}[/dim] [{color}]{kind}[/{color}] {peer}…")
 
                 elif kind == "sync_finished":
-                    peer = event.peer[:16] if event.peer else "?"
-                    ctx.display.print(f"[dim]{ts}[/dim] [green]sync_finished[/green] {peer}…")
+                    ctx.display.print(f"[dim]{ts}[/dim] {format_sync_finished(event)}")
 
                 else:
                     ctx.display.print(f"[dim]{ts}[/dim] [dim]{kind}[/dim]")
@@ -1542,6 +1541,19 @@ def _kind_detail(node: VfsNode) -> str:
         NodeKind.ASTER: "service directory",
     }
     return details.get(node.kind, "")
+
+
+def format_sync_finished(event: Any) -> str:
+    """Rich markup for a ``sync_finished`` doc event: the peer, who started
+    the round, and, for a failed round, the error."""
+    from rich.markup import escape
+
+    peer = f"{event.peer[:16]}…" if event.peer else "?"
+    origin = getattr(event, "sync_origin", None) or "?"
+    if getattr(event, "sync_ok", None):
+        return f"[green]sync_finished[/green] {peer} [dim]({origin})[/dim]"
+    error = escape(getattr(event, "sync_error", None) or "unknown error")
+    return f"[red]sync_failed[/red] {peer} [dim]({origin})[/dim] {error}"
 
 
 def _after_mutation(ctx: CommandContext) -> None:

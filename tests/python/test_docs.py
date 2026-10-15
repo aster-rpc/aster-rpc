@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 pytestmark = pytest.mark.iroh_primitives
@@ -714,6 +716,72 @@ async def test_sync_finished_carries_origin_and_result():
         assert ev.sync_error is None
         assert ev.sync_origin in ("accept", "connect")
     assert {ev1.sync_origin, ev2.sync_origin} == {"accept", "connect"}
+
+    await node1.shutdown()
+    await node2.shutdown()
+
+
+class _FakeEvent:
+    def __init__(self, kind, **fields):
+        self.kind = kind
+        self.peer = fields.get("peer", "p" * 64)
+        self.sync_origin = fields.get("sync_origin")
+        self.sync_ok = fields.get("sync_ok")
+        self.sync_error = fields.get("sync_error")
+
+
+class _FakeReceiver:
+    """Yields the given events, then stays quiet."""
+
+    def __init__(self, events):
+        self._events = list(events)
+
+    async def recv(self):
+        if self._events:
+            return self._events.pop(0)
+        await asyncio.Event().wait()
+
+
+class _EmptyDoc:
+    async def query_key_prefix(self, prefix):
+        return []
+
+
+@pytest.mark.asyncio
+async def test_initial_sync_wait_ignores_a_failed_round():
+    """A failed sync_finished is "not synced yet": wait to the deadline."""
+    from aster.runtime import _wait_for_initial_sync
+
+    failed = _FakeEvent(
+        "sync_finished", sync_origin="connect", sync_ok=False, sync_error="aborted"
+    )
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    assert not await _wait_for_initial_sync(_EmptyDoc(), _FakeReceiver([failed]), timeout=0.5)
+    assert loop.time() - start >= 0.5
+
+    completed = _FakeEvent("sync_finished", sync_origin="accept", sync_ok=True)
+    assert await _wait_for_initial_sync(
+        _EmptyDoc(), _FakeReceiver([failed, completed]), timeout=5.0
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_sync_wait_with_a_refused_round():
+    """Live: the sharer left the doc, so it refuses the join's sync round."""
+    from aster import Node, docs_client
+    from aster.runtime import _wait_for_initial_sync
+
+    node1 = await Node.start()
+    node2 = await Node.start()
+    node1.add_node_addr(node2)
+    node2.add_node_addr(node1)
+    doc1 = await docs_client(node1).create()
+    ticket = await doc1.share("read")
+    await doc1.leave()
+
+    doc2, events2 = await docs_client(node2).join_and_subscribe(ticket)
+    assert not await _wait_for_initial_sync(doc2, events2, timeout=3.0)
 
     await node1.shutdown()
     await node2.shutdown()

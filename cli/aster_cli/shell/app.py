@@ -475,38 +475,17 @@ class PeerConnection:
 
             # Wait for sync with retry -- the doc needs to pull entries from
             # the producer. We try up to 3 times with increasing timeouts.
-            import asyncio as _asyncio
+            # A failed sync round is not a sync: each attempt waits for a
+            # completed round or a contracts/ entry until its deadline.
+            from aster.runtime import _wait_for_initial_sync
 
-            sync_done = False
             for attempt in range(3):
                 timeout = 3.0 * (attempt + 1)  # 3s, 6s, 9s
                 try:
-                    deadline = _asyncio.get_event_loop().time() + timeout
-                    while _asyncio.get_event_loop().time() < deadline:
-                        remaining = deadline - _asyncio.get_event_loop().time()
-                        if remaining <= 0:
-                            break
-                        try:
-                            event = await _asyncio.wait_for(
-                                event_receiver.recv(), timeout=min(remaining, 1.0)
-                            )
-                            kind = event.kind if hasattr(event, "kind") else str(event)
-                            logger.debug("Registry doc event: %s", kind)
-                            if kind == "sync_finished":
-                                await _asyncio.sleep(0.3)
-                                sync_done = True
-                                break
-                        except _asyncio.TimeoutError:
-                            test_entries = await doc.query_key_prefix(b"contracts/")
-                            if test_entries:
-                                logger.debug("Entries found before sync_finished")
-                                sync_done = True
-                                break
+                    if await _wait_for_initial_sync(doc, event_receiver, timeout=timeout):
+                        break
                 except Exception as exc:
                     logger.debug("Sync wait attempt %d interrupted: %s", attempt + 1, exc)
-
-                if sync_done:
-                    break
                 logger.debug("Sync attempt %d timed out, retrying...", attempt + 1)
 
             for svc in self._services:

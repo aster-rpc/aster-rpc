@@ -13,6 +13,7 @@ import {
   type DocEvent,
   type GossipTopicEvent,
 } from '@aster-rpc/aster';
+import { waitForInitialSync } from '../../../bindings/typescript/packages/aster/src/runtime.js';
 
 const OFFLINE = { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } as const;
 const NO_HASH = '00'.repeat(32);
@@ -252,6 +253,14 @@ describe('docs', () => {
     }
     // One end accepted what the other dialled.
     expect(new Set([evA.syncOrigin, evB.syncOrigin])).toEqual(new Set(['accept', 'connect']));
+  });
+
+  it('the registry sync wait does not take a refused round for a sync', async () => {
+    const doc = await a.docs().create();
+    const ticket = await doc.shareWithAddr('read');
+    await doc.leave(); // A now refuses B's sync request.
+    const joined = await b.docs().joinAndSubscribe(ticket);
+    expect(await waitForInitialSync(joined.takeDoc(), joined.takeEvents(), 3000)).toBe(false);
   });
 });
 

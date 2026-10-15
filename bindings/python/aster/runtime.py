@@ -1661,33 +1661,10 @@ class AsterClient:
             doc, receiver = await dc.join_and_subscribe_namespace(
                 self._registry_namespace, remote_node_id
             )
-            # Best-effort sync wait: read events until either sync_finished
-            # or any contracts/ entry lands. Short timeout because the
-            # producer writes the entries synchronously on startup so the
-            # peer sync is usually immediate.
-            sync_done = False
-            deadline = asyncio.get_event_loop().time() + 6.0
-            while asyncio.get_event_loop().time() < deadline and not sync_done:
-                remaining = deadline - asyncio.get_event_loop().time()
-                if remaining <= 0:
-                    break
-                try:
-                    event = await asyncio.wait_for(
-                        receiver.recv(), timeout=min(remaining, 1.0)
-                    )
-                    kind = getattr(event, "kind", str(event))
-                    if kind == "sync_finished":
-                        await asyncio.sleep(0.1)
-                        sync_done = True
-                        break
-                except asyncio.TimeoutError:
-                    try:
-                        entries = await doc.query_key_prefix(b"contracts/")
-                        if entries:
-                            sync_done = True
-                            break
-                    except Exception:
-                        pass
+            # Best-effort sync wait. Short timeout because the producer
+            # writes the entries synchronously on startup so the peer sync
+            # is usually immediate.
+            await _wait_for_initial_sync(doc, receiver, timeout=6.0)
             self._registry_doc = doc
             self._registry_event_rx = receiver
             return doc
@@ -2567,6 +2544,59 @@ def _with_node_identity(config: AsterConfig, identity_key: bytes | None) -> Aste
             secret_key_file=os.path.join(config.storage_path, "node.key")
         )
     return config
+
+
+def _is_completed_sync(event: Any) -> bool:
+    """Whether ``event`` is a ``sync_finished`` for a round that completed.
+
+    A failed round (refused, aborted, or an unreachable peer) also ends with
+    ``sync_finished``, with ``sync_ok`` false; it means "not synced yet".
+    """
+    return (
+        getattr(event, "kind", None) == "sync_finished"
+        and getattr(event, "sync_ok", None) is True
+    )
+
+
+async def _wait_for_initial_sync(
+    doc: Any, receiver: Any, timeout: float, prefix: bytes = b"contracts/"
+) -> bool:
+    """Wait up to ``timeout`` seconds for a completed sync round or for an
+    entry under ``prefix``. Returns whether either happened.
+
+    A failed sync round counts as no news: waiting continues until the
+    deadline, checking for entries while the stream is quiet.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+
+    async def has_entries() -> bool:
+        try:
+            return bool(await doc.query_key_prefix(prefix))
+        except Exception:
+            return False
+
+    while (remaining := deadline - loop.time()) > 0:
+        try:
+            event = await asyncio.wait_for(receiver.recv(), timeout=min(remaining, 1.0))
+        except asyncio.TimeoutError:
+            if await has_entries():
+                return True
+            continue
+        if event is None:
+            # The subscription ended; nothing more will arrive.
+            return await has_entries()
+        if _is_completed_sync(event):
+            await asyncio.sleep(0.1)
+            return True
+        if getattr(event, "kind", None) == "sync_finished":
+            logger.debug(
+                "sync round with %s failed (%s): %s",
+                getattr(event, "peer", "?"),
+                getattr(event, "sync_origin", "?"),
+                getattr(event, "sync_error", "?"),
+            )
+    return await has_entries()
 
 
 def _coerce_node_addr(addr: NodeAddr | str | bytes) -> NodeAddr:
