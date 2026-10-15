@@ -243,6 +243,13 @@ required-features = ["blobs", "docs"]
 name = "shell"
 required-features = ["rpc"]
 
+# Restart/reconnect investigation probe (docs/_internal/investigations/
+# 2026-10-15-restart-reconnect.md): an enrolled AsterServer that measures
+# Docs, blob and gossip recovery against one peer across restarts.
+[[example]]
+name = "restart_probe"
+required-features = ["enrollment", "rpc", "docs", "gossip"]
+
 # Cross-binding RPC interop smoke (Rust side). Source lives with the rest of
 # the matrix in tests/interop/; driven by tests/interop/run.py.
 [[example]]
@@ -301,3 +308,6 @@ fory-derive = "=1.7.6"
 http-body-util = "0.1"
 # The `otel` tests export to aster-otel's in-memory exporters.
 aster-otel = { path = "../aster-otel", version = "=0.3.0", registry = "aster", features = ["testing"] }
+# Log subscriber for the `restart_probe` example. Same exact pin aster-otel
+# resolves, so nothing new enters the graph.
+tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "registry", "fmt", "env-filter", "ansi"] }
