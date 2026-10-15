@@ -173,6 +173,7 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `secret_key_file(p)` | `ASTER_SECRET_KEY_FILE` | `[network] secret_key_file` | load-or-create at start (§2.1) |
 | `persistent(dir)` | `ASTER_STORAGE_PATH` | `[storage] path` | in-memory when unset |
 | `gc_interval(d)` | `ASTER_GC_INTERVAL_MS` | `[storage] gc_interval_ms` | `0` / unset = no GC |
+| `blob_zstd_level(n)` | `ASTER_BLOB_ZSTD_LEVEL` | `[storage] blob_zstd_level` | serve zstd blob transport beside plain and prefer it when fetching; `0` / unset = plain only; 3 is a good default, 5 for slow or relayed links (`Blobs::with_transport_compression` overrides per client) |
 | `bind_addr(a)` | `ASTER_BIND_ADDR` | `[network] bind_addr` | e.g. `0.0.0.0:9000` |
 | `alpn(bytes)` | — | — | extra inbound ALPNs, merged with `Node::start_with_alpns` |
 | `discovery(b)` | `ASTER_LOCAL_DISCOVERY` | `[network] local_discovery` | mDNS |

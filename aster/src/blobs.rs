@@ -3,9 +3,81 @@
 use crate::error::{Error, Result};
 use crate::id::{Hash, NodeId};
 use aster_transport_core::{
-    CoreBlobCustody, CoreBlobStatus, CoreBlobsClient, CoreFetchReport, CoreFetchStrategy,
-    CoreFetchTracker, CoreProviderOutcome,
+    CoreBlobCompression, CoreBlobCompressionStats, CoreBlobCustody, CoreBlobStatus,
+    CoreBlobsClient, CoreFetchReport, CoreFetchStrategy, CoreFetchTracker, CoreProviderOutcome,
 };
+
+/// Whether blob fetches compress the transfer with zstd.
+///
+/// Compression is a transport concern only: the stored bytes, hashes, Bao
+/// verification and [`FetchReport::bytes_transferred`] are those of a plain
+/// fetch. A node serves compressed transfers only when started with
+/// [`AsterConfigBuilder::blob_zstd_level`](crate::AsterConfigBuilder::blob_zstd_level).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlobTransportCompression {
+    /// Plain transfers only. The default on a node without
+    /// [`AsterConfig::blob_zstd_level`](crate::AsterConfig::blob_zstd_level).
+    #[default]
+    Off,
+    /// Offer zstd to each provider; one that does not serve it is fetched from
+    /// plain, and [`ProviderOutcome::plain_fallbacks`] counts that. A refusal
+    /// is remembered for five minutes, so the provider is not offered zstd
+    /// again until then. The default on a node with
+    /// [`AsterConfig::blob_zstd_level`](crate::AsterConfig::blob_zstd_level).
+    PreferZstd,
+    /// zstd only: a provider that does not serve it is a failed provider. For
+    /// tests and policy experiments.
+    RequireZstd,
+}
+
+impl BlobTransportCompression {
+    fn as_core(self) -> CoreBlobCompression {
+        match self {
+            Self::Off => CoreBlobCompression::Off,
+            Self::PreferZstd => CoreBlobCompression::PreferZstd,
+            Self::RequireZstd => CoreBlobCompression::RequireZstd,
+        }
+    }
+
+    fn from_core(core: CoreBlobCompression) -> Self {
+        match core {
+            CoreBlobCompression::Off => Self::Off,
+            CoreBlobCompression::PreferZstd => Self::PreferZstd,
+            CoreBlobCompression::RequireZstd => Self::RequireZstd,
+        }
+    }
+}
+
+/// zstd blob transport counters for a whole node, since it started.
+///
+/// Node-wide, not per fetch: concurrent fetches share them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BlobCompressionStats {
+    /// Compressed bytes received while fetching.
+    pub fetched_wire_bytes: u64,
+    /// Protocol bytes those decompressed to (payload plus a small protocol
+    /// overhead).
+    pub fetched_plain_bytes: u64,
+    /// Compressed bytes sent while serving.
+    pub served_wire_bytes: u64,
+    /// Protocol bytes those were compressed from.
+    pub served_plain_bytes: u64,
+    /// Transfers that failed on malformed or truncated zstd data, as opposed
+    /// to transport errors or content verification failures.
+    pub decode_errors: u64,
+}
+
+impl From<CoreBlobCompressionStats> for BlobCompressionStats {
+    fn from(s: CoreBlobCompressionStats) -> Self {
+        Self {
+            fetched_wire_bytes: s.fetched_wire_bytes,
+            fetched_plain_bytes: s.fetched_plain_bytes,
+            served_wire_bytes: s.served_wire_bytes,
+            served_plain_bytes: s.served_plain_bytes,
+            decode_errors: s.decode_errors,
+        }
+    }
+}
 
 /// The on-wire format of a blob.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -84,6 +156,7 @@ pub struct ProviderOutcome {
     failures: u32,
     completed_requests: u32,
     in_flight: u32,
+    plain_fallbacks: u32,
 }
 
 impl ProviderOutcome {
@@ -112,6 +185,13 @@ impl ProviderOutcome {
     pub fn in_flight(&self) -> u32 {
         self.in_flight
     }
+    /// How many attempts went over plain transport because this provider does
+    /// not serve compressed blobs ([`BlobTransportCompression::PreferZstd`]).
+    /// A capability, not a content outcome: those attempts are still counted
+    /// in [`Self::failures`] or [`Self::completed_requests`] as usual.
+    pub fn plain_fallbacks(&self) -> u32 {
+        self.plain_fallbacks
+    }
 }
 
 impl From<CoreProviderOutcome> for ProviderOutcome {
@@ -122,6 +202,7 @@ impl From<CoreProviderOutcome> for ProviderOutcome {
             failures: o.failures,
             completed_requests: o.completed_requests,
             in_flight: o.in_flight,
+            plain_fallbacks: o.plain_fallbacks,
         }
     }
 }
@@ -163,6 +244,16 @@ impl FetchReport {
         self.providers
             .iter()
             .filter(|p| p.in_flight > 0)
+            .map(|p| &p.node_id)
+    }
+
+    /// Providers that do not serve compressed blobs and were fetched from (or
+    /// tried) over plain transport instead. Cache these as plain-only rather
+    /// than ranking them down: it says nothing about their content.
+    pub fn plain_only(&self) -> impl Iterator<Item = &NodeId> {
+        self.providers
+            .iter()
+            .filter(|p| p.plain_fallbacks > 0)
             .map(|p| &p.node_id)
     }
 
@@ -328,6 +419,28 @@ impl Blobs {
         Self {
             inner: self.inner.clone().with_provider_idle_timeout(idle),
         }
+    }
+
+    /// This client with a different transport compression for every fetch
+    /// (the ordered `*_from` fetches and the single-provider ones). See
+    /// [`BlobTransportCompression`] for the modes and their defaults.
+    pub fn with_transport_compression(&self, compression: BlobTransportCompression) -> Self {
+        Self {
+            inner: self
+                .inner
+                .clone()
+                .with_transport_compression(compression.as_core()),
+        }
+    }
+
+    /// The transport compression this client's fetches use.
+    pub fn transport_compression(&self) -> BlobTransportCompression {
+        BlobTransportCompression::from_core(self.inner.transport_compression())
+    }
+
+    /// zstd transport counters for this node. See [`BlobCompressionStats`].
+    pub fn transport_compression_stats(&self) -> BlobCompressionStats {
+        self.inner.transport_compression_stats().into()
     }
 
     /// Clone the live Iroh Blobs store behind this facade.

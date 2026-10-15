@@ -339,6 +339,8 @@ impl EndpointConfig {
             transport_send_fairness: self.transport_send_fairness,
             transport_enable_segmentation_offload: self.transport_enable_segmentation_offload,
             data_dir: self.data_dir.clone(),
+            // Not yet exposed to Python; see AsterConfig::blob_zstd_level.
+            blob_zstd_level: None,
         })
     }
 }

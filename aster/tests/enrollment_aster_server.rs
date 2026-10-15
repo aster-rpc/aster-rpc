@@ -860,3 +860,91 @@ async fn misconfiguration_fails_closed_with_a_clear_error() {
     .await
     .unwrap();
 }
+
+/// With Enrollment installed, the compressed blobs ALPN needs an admitted
+/// session exactly like the plain one: a node without a credential is refused
+/// on both, and an enrolled client fetches over zstd.
+#[tokio::test]
+async fn compressed_blob_transport_requires_a_session_like_plain_blobs() {
+    use aster::{BlobFormat, BlobTransportCompression, FetchStrategy};
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let server = start_server(
+            server_base()
+                .blob_zstd_level(3)
+                .enrollment(server_enrollment(&root, files.path()))
+                .build(),
+        )
+        .await
+        .unwrap();
+        let payload = b"enrolled compressed payload ".repeat(512);
+        let hash = server.blobs().add_bytes(payload.clone()).await.unwrap();
+        let fetch = |blobs: aster::Blobs, mode: BlobTransportCompression| {
+            let hash = hash.clone();
+            let from = [server.node().id()];
+            async move {
+                tokio::time::timeout(
+                    Duration::from_secs(20),
+                    blobs
+                        .with_transport_compression(mode)
+                        .download_hash_to_store_from(
+                            &hash,
+                            &from,
+                            BlobFormat::Raw,
+                            FetchStrategy::Whole,
+                        ),
+                )
+                .await
+                .expect("fetch timed out")
+            }
+        };
+
+        // No credential, so no session: refused on both blobs ALPNs.
+        let stranger = Node::start(base(9).blob_zstd_level(3).build())
+            .await
+            .unwrap();
+        wait_for_addr(&stranger).await;
+        stranger.add_peer(server.node()).unwrap();
+        for mode in [
+            BlobTransportCompression::RequireZstd,
+            BlobTransportCompression::Off,
+        ] {
+            let res = fetch(stranger.blobs(), mode).await;
+            assert!(res.is_err(), "{mode:?}: sessionless node fetched: {res:?}");
+        }
+        assert!(!stranger.blobs().has(&hash).await.unwrap());
+
+        // An enrolled client has a session: both ALPNs serve it.
+        let client = connect(&server, client_config(&root, 5, credential(5, None)))
+            .await
+            .unwrap();
+        client.node().add_peer(server.node()).unwrap();
+        let report = fetch(client.node().blobs(), BlobTransportCompression::RequireZstd)
+            .await
+            .unwrap();
+        assert_eq!(report.served().count(), 1);
+        assert_eq!(
+            client.node().blobs().read_to_bytes(&hash).await.unwrap(),
+            payload
+        );
+        assert!(
+            client
+                .node()
+                .blobs()
+                .transport_compression_stats()
+                .fetched_wire_bytes
+                > 0
+        );
+        assert!(fetch(client.node().blobs(), BlobTransportCompression::Off)
+            .await
+            .is_ok());
+
+        stranger.shutdown().await;
+        client.close().await;
+        server.shutdown().await;
+        root.node.shutdown().await;
+    })
+    .await
+    .unwrap();
+}

@@ -65,6 +65,8 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::store::{gc_run_once as blobs_gc_run_once, GcConfig, ProtectCb, ProtectOutcome};
 use iroh_blobs::ticket::BlobTicket;
+use iroh_blobs::transport::zstd::{ZstdStats, ZstdTransform, ZSTD_ALPN};
+use iroh_blobs::transport::TransformedBlobsProtocol;
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat, ALPN as BLOBS_ALPN};
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::api::Doc;
@@ -163,6 +165,11 @@ pub struct CoreEndpointConfig {
     pub transport_enable_segmentation_offload: Option<bool>,
     /// Node data directory for persistent state; empty = no persistent state
     pub data_dir: Option<String>,
+    /// Serve blobs over zstd-compressed streams at this level, on
+    /// [`BLOBS_ZSTD_ALPN`] beside the plain blobs ALPN, and make blob fetches
+    /// prefer it. `None` (the default) serves the plain ALPN only and fetches
+    /// plain. Ignored by endpoints that are not full nodes.
+    pub blob_zstd_level: Option<i32>,
 }
 
 impl Default for CoreEndpointConfig {
@@ -196,6 +203,7 @@ impl Default for CoreEndpointConfig {
             transport_send_fairness: None,
             transport_enable_segmentation_offload: None,
             data_dir: None,
+            blob_zstd_level: None,
         }
     }
 }
@@ -324,6 +332,110 @@ pub struct CoreBlobLocalInfo {
 /// every provider listed after it.
 pub const DEFAULT_PROVIDER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// The blobs protocol over zstd-compressed streams. A data-plane ALPN like
+/// the plain blobs ALPN: never an admission ALPN, so Gate 0 refuses it to
+/// unadmitted peers.
+pub const BLOBS_ZSTD_ALPN: &[u8] = ZSTD_ALPN;
+
+/// How long a provider that refused [`BLOBS_ZSTD_ALPN`] is dialed on the plain
+/// ALPN directly, before compression is offered to it again.
+pub const BLOB_PLAIN_ONLY_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Whether blob fetches use zstd-compressed transport.
+///
+/// Compression changes only the bytes on the wire: content, hashes and
+/// verification are those of a plain fetch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CoreBlobCompression {
+    /// Plain transport only.
+    #[default]
+    Off,
+    /// Offer zstd; a provider that does not serve it is fetched from plain,
+    /// and that is reported per provider ([`CoreProviderOutcome::plain_fallbacks`]).
+    PreferZstd,
+    /// zstd only; a provider that does not serve it is a failed provider.
+    RequireZstd,
+}
+
+/// Byte counters for zstd blob transport on one node.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoreBlobCompressionStats {
+    /// Compressed bytes this node received while fetching.
+    pub fetched_wire_bytes: u64,
+    /// Protocol bytes those decompressed to.
+    pub fetched_plain_bytes: u64,
+    /// Compressed bytes this node sent while serving.
+    pub served_wire_bytes: u64,
+    /// Protocol bytes those were compressed from.
+    pub served_plain_bytes: u64,
+    /// Streams that failed on malformed or truncated zstd data (not on
+    /// transport errors or content verification).
+    pub decode_errors: u64,
+}
+
+/// The node's blob downloaders, one per [`CoreBlobCompression`] mode, and the
+/// zstd counters.
+struct BlobTransport {
+    plain: Downloader,
+    prefer_zstd: Downloader,
+    require_zstd: Downloader,
+    /// Default mode for new blob clients.
+    default: CoreBlobCompression,
+    fetch_stats: Arc<ZstdStats>,
+    serve_stats: Option<Arc<ZstdStats>>,
+}
+
+impl BlobTransport {
+    fn new(store: &BlobStore, endpoint: &Endpoint, serve: Option<&ZstdTransform>) -> Self {
+        // The fetching side only compresses its small requests; its level is
+        // the serving level when there is one.
+        let fetch = ZstdTransform::new(
+            serve.map_or(iroh_blobs::transport::zstd::DEFAULT_LEVEL, |t| t.level()),
+        );
+        let zstd = || {
+            Downloader::builder(store, endpoint)
+                .alpn(BLOBS_ZSTD_ALPN)
+                .stream_transform(Arc::new(fetch.clone()))
+        };
+        Self {
+            plain: Downloader::new(store, endpoint),
+            prefer_zstd: zstd().plain_fallback(BLOB_PLAIN_ONLY_TTL).build(),
+            require_zstd: zstd().build(),
+            default: if serve.is_some() {
+                CoreBlobCompression::PreferZstd
+            } else {
+                CoreBlobCompression::Off
+            },
+            fetch_stats: fetch.stats().clone(),
+            serve_stats: serve.map(|t| t.stats().clone()),
+        }
+    }
+
+    fn downloader(&self, mode: CoreBlobCompression) -> &Downloader {
+        match mode {
+            CoreBlobCompression::Off => &self.plain,
+            CoreBlobCompression::PreferZstd => &self.prefer_zstd,
+            CoreBlobCompression::RequireZstd => &self.require_zstd,
+        }
+    }
+
+    fn stats(&self) -> CoreBlobCompressionStats {
+        let fetched = self.fetch_stats.snapshot();
+        let served = self
+            .serve_stats
+            .as_ref()
+            .map(|s| s.snapshot())
+            .unwrap_or_default();
+        CoreBlobCompressionStats {
+            fetched_wire_bytes: fetched.wire_bytes_read,
+            fetched_plain_bytes: fetched.plain_bytes_read,
+            served_wire_bytes: served.wire_bytes_written,
+            served_plain_bytes: served.plain_bytes_written,
+            decode_errors: fetched.decode_errors + served.decode_errors,
+        }
+    }
+}
+
 /// How a multi-provider fetch should decompose a HashSeq.
 ///
 /// This is *not* about how many providers are used — ordered failover across
@@ -353,6 +465,11 @@ pub struct CoreProviderOutcome {
     /// non-zero in a [`CoreFetchTracker`] snapshot taken after the fetch was
     /// cancelled, where it names the provider the fetch was waiting on.
     pub in_flight: u32,
+    /// How many attempts went over plain transport because this provider does
+    /// not serve [`BLOBS_ZSTD_ALPN`] ([`CoreBlobCompression::PreferZstd`]).
+    /// Says nothing about whether the provider has the content: those
+    /// attempts still count in `failures` / `completed_requests` as usual.
+    pub plain_fallbacks: u32,
 }
 
 /// Records a multi-provider fetch as it runs, so its report can still be read
@@ -416,6 +533,7 @@ struct FetchAccumulator {
     order: Vec<EndpointId>,
     outcomes: HashMap<EndpointId, (u32, u32, u32)>,
     active: HashMap<Arc<iroh_blobs::protocol::GetRequest>, EndpointId>,
+    plain_fallbacks: HashMap<EndpointId, u32>,
     bytes: u64,
     errors: Vec<String>,
     part_failed: bool,
@@ -448,6 +566,10 @@ impl FetchAccumulator {
             DownloadProgressItem::Error(err) => self.errors.push(err.to_string()),
             DownloadProgressItem::DownloadError => self.part_failed = true,
             DownloadProgressItem::Progress(_) => {}
+            DownloadProgressItem::PlainFallback { id, .. } => {
+                self.entry(id);
+                *self.plain_fallbacks.entry(id).or_default() += 1;
+            }
         }
     }
 
@@ -463,6 +585,7 @@ impl FetchAccumulator {
                     failures,
                     completed_requests,
                     in_flight: self.active.values().filter(|a| *a == id).count() as u32,
+                    plain_fallbacks: self.plain_fallbacks.get(id).copied().unwrap_or(0),
                 }
             })
             .collect();
@@ -1581,7 +1704,7 @@ struct CoreNodeInner {
     docs: Docs,
     gossip: Gossip,
     store: BlobStore,
-    downloader: Downloader,
+    blob_transport: Arc<BlobTransport>,
     /// GC protection callback bridging the docs engine to the blob store: when
     /// invoked it inserts every hash referenced by an open replica into the GC
     /// `live` set (aborting the sweep on any enumeration error). Wired into the
@@ -1800,6 +1923,9 @@ impl CoreNode {
                 )
             })
             .unwrap_or_else(|| (Default::default(), Duration::from_millis(5000)));
+        let blob_zstd_level = endpoint_config
+            .as_ref()
+            .and_then(|config| config.blob_zstd_level);
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         // The docs engine stores entry content as untagged blobs in this shared
         // store, so GC must protect the docs live-content set or the first sweep
@@ -1822,7 +1948,7 @@ impl CoreNode {
             endpoint,
             store,
             None,
-            aster_alpns,
+            (aster_alpns, blob_zstd_level),
             monitor,
             (hook_receiver, hook_failure_mode),
             (protect_handler, protect_cb),
@@ -1863,6 +1989,9 @@ impl CoreNode {
                 )
             })
             .unwrap_or_else(|| (Default::default(), Duration::from_millis(5000)));
+        let blob_zstd_level = endpoint_config
+            .as_ref()
+            .and_then(|config| config.blob_zstd_level);
         let (endpoint, monitor, hook_receiver) = build_node_endpoint(endpoint_config).await?;
         let root = std::path::PathBuf::from(&path);
         // Create the data directory privately *before* the stores write secret
@@ -1889,7 +2018,7 @@ impl CoreNode {
             endpoint,
             store,
             Some(root),
-            aster_alpns,
+            (aster_alpns, blob_zstd_level),
             monitor,
             (hook_receiver, hook_failure_mode),
             (protect_handler, protect_cb),
@@ -1910,7 +2039,9 @@ impl CoreNode {
         endpoint: Endpoint,
         store: BlobStore,
         docs_root: Option<std::path::PathBuf>,
-        aster_alpns: Vec<Vec<u8>>,
+        // The protocols served beside blobs/docs/gossip: one queue handler per
+        // Aster ALPN, and zstd blob transport at this level when set.
+        (aster_alpns, blob_zstd_level): (Vec<Vec<u8>>, Option<i32>),
         monitor: Option<CoreMonitor>,
         hooks: (SharedHookReceiver, HookSettings),
         // The docs GC protection bridge, created together by
@@ -1920,8 +2051,12 @@ impl CoreNode {
     ) -> Result<Self> {
         let (hook_receiver, (_hook_failure_mode, _hook_timeout)) = hooks;
         let (protect_handler, protect_cb) = gc_protect;
-        let downloader = Downloader::new(&store, &endpoint);
         let blobs = BlobsProtocol::new(&store, None);
+        // zstd blob transport is served on the node's own router, so the same
+        // Gate-0 hooks see it, with the same provider events as the plain
+        // handler (none). It is never an admission ALPN.
+        let blobs_zstd = blob_zstd_level.map(ZstdTransform::new);
+        let blob_transport = Arc::new(BlobTransport::new(&store, &endpoint, blobs_zstd.as_ref()));
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let docs_builder = match &docs_root {
             Some(path) => Docs::persistent(path.clone()),
@@ -1960,6 +2095,12 @@ impl CoreNode {
             .accept(BLOBS_ALPN, blobs.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
             .accept(DOCS_ALPN, docs.clone());
+        if let Some(transform) = blobs_zstd {
+            router_builder = router_builder.accept(
+                BLOBS_ZSTD_ALPN,
+                TransformedBlobsProtocol::new(&store, None, Arc::new(transform)),
+            );
+        }
         for alpn in &aster_alpns {
             router_builder = router_builder.accept(
                 alpn.clone(),
@@ -1988,7 +2129,7 @@ impl CoreNode {
                 docs,
                 gossip,
                 store,
-                downloader,
+                blob_transport,
                 protect_cb,
                 secret_key_bytes,
                 aster_rx: Mutex::new(aster_rx),
@@ -2087,7 +2228,8 @@ impl CoreNode {
         CoreBlobsClient {
             store: self.inner.store.clone(),
             endpoint: self.inner.endpoint.clone(),
-            downloader: self.inner.downloader.clone(),
+            compression: self.inner.blob_transport.default,
+            blob_transport: self.inner.blob_transport.clone(),
             provider_idle_timeout: Some(DEFAULT_PROVIDER_IDLE_TIMEOUT),
             protect_cb: self.inner.protect_cb.clone(),
         }
@@ -3504,7 +3646,9 @@ pub enum CoreBlobStatus {
 pub struct CoreBlobsClient {
     pub store: BlobStore,
     pub endpoint: Endpoint,
-    downloader: Downloader,
+    blob_transport: Arc<BlobTransport>,
+    /// Transport compression for this client's fetches.
+    compression: CoreBlobCompression,
     /// Ordered fetches abandon a provider after this long without payload
     /// progress; `None` waits indefinitely.
     provider_idle_timeout: Option<std::time::Duration>,
@@ -3522,6 +3666,31 @@ impl CoreBlobsClient {
     pub fn with_provider_idle_timeout(mut self, idle: Option<std::time::Duration>) -> Self {
         self.provider_idle_timeout = idle;
         self
+    }
+
+    /// Set transport compression for this client's fetches. Defaults to
+    /// [`CoreBlobCompression::PreferZstd`] on a node configured with
+    /// [`CoreEndpointConfig::blob_zstd_level`], [`CoreBlobCompression::Off`]
+    /// otherwise. Fetching compressed does not require the node to serve
+    /// compressed.
+    pub fn with_transport_compression(mut self, compression: CoreBlobCompression) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// The transport compression this client's fetches use.
+    pub fn transport_compression(&self) -> CoreBlobCompression {
+        self.compression
+    }
+
+    /// zstd transport counters for the whole node (every client and the
+    /// serving side), since the node started.
+    pub fn transport_compression_stats(&self) -> CoreBlobCompressionStats {
+        self.blob_transport.stats()
+    }
+
+    pub(crate) fn downloader(&self) -> &Downloader {
+        self.blob_transport.downloader(self.compression)
     }
 
     pub async fn add_bytes(&self, data: Vec<u8>) -> Result<String> {
@@ -3859,7 +4028,7 @@ impl CoreBlobsClient {
             mem.add_endpoint_info(addr.clone());
             lookup.add(mem);
         }
-        self.downloader.download(hash, vec![addr.id]).await?;
+        self.downloader().download(hash, vec![addr.id]).await?;
 
         // If it's a HashSeq (Collection), extract the file contents
         if format == BlobFormat::HashSeq {
@@ -3940,7 +4109,11 @@ impl CoreBlobsClient {
         };
         let mut options = DownloadOptions::new(haf, providers, split);
         options.provider_idle_timeout = self.provider_idle_timeout;
-        let mut stream = self.downloader.download_with_opts(options).stream().await?;
+        let mut stream = self
+            .downloader()
+            .download_with_opts(options)
+            .stream()
+            .await?;
         let tracker = tracker.cloned().unwrap_or_default();
         *tracker.lock() = FetchAccumulator::default();
         while let Some(item) = futures_lite::StreamExt::next(&mut stream).await {
@@ -4103,7 +4276,7 @@ impl CoreBlobsClient {
             mem.add_endpoint_info(addr.clone());
             lookup.add(mem);
         }
-        self.downloader.download(hash, vec![addr.id]).await?;
+        self.downloader().download(hash, vec![addr.id]).await?;
 
         let collection = Collection::load(hash, &self.store).await?;
         let mut files = Vec::new();

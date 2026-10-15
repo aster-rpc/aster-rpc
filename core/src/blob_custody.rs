@@ -409,7 +409,7 @@ impl CoreBlobCustodyLease {
                 // The fork's whole-fetch actor is not immediately cancellation
                 // aware during dial/header awaits. Never release its custody
                 // merely because its progress receiver has been dropped.
-                client.downloader.wait_idle().await?;
+                client.downloader().wait_idle().await?;
                 return Err(CoreBlobCustodyError::Cancelled.into());
             };
             let report = result?;

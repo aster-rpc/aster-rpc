@@ -29,6 +29,7 @@
 mod admission;
 mod authority_report;
 mod binding_support;
+mod blob_compression;
 mod blob_fetch_multi;
 mod blob_gc;
 mod connection;

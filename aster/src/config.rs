@@ -128,6 +128,23 @@ pub struct AsterConfig {
     /// of `0` disables GC.
     pub gc_interval: Option<Duration>,
 
+    /// Serve blobs over zstd-compressed transport at this level, and make
+    /// blob fetches prefer it. `None` (the default) serves and fetches plain
+    /// only.
+    ///
+    /// The node registers the compressed blobs ALPN
+    /// ([`alpns::BLOBS_ZSTD`](crate::admission::alpns::BLOBS_ZSTD)) beside the
+    /// plain one, on the same router and behind the same Gate-0 admission; it
+    /// is never an admission ALPN. Fetches default to
+    /// [`BlobTransportCompression::PreferZstd`](crate::BlobTransportCompression::PreferZstd),
+    /// falling back to plain for providers that do not serve it. Stored bytes
+    /// and hashes are unaffected. The level is the sender's; 3 is a good
+    /// default, 5 suits slow or relayed links. Levels are clamped to 1..=19.
+    ///
+    /// Env: `ASTER_BLOB_ZSTD_LEVEL`; TOML: `[storage] blob_zstd_level`. A
+    /// value of `0` disables compression.
+    pub blob_zstd_level: Option<u8>,
+
     /// Stable node identity key.
     pub secret_key: Option<SecretKey>,
     /// Path to the node's **secret key file** — the one on-disk identity
@@ -324,6 +341,9 @@ impl AsterConfig {
             if let Some(value) = toml_u64(storage, "gc_interval_ms", label)? {
                 self.gc_interval = gc_interval_from_ms(value);
             }
+            if let Some(value) = toml_u64(storage, "blob_zstd_level", label)? {
+                self.blob_zstd_level = blob_zstd_level_from(value);
+            }
         }
 
         if let Some(network) = toml_section(raw, "network", label)? {
@@ -489,6 +509,9 @@ impl AsterConfig {
         }
         if let Some(value) = env_u64("ASTER_GC_INTERVAL_MS")? {
             self.gc_interval = gc_interval_from_ms(value);
+        }
+        if let Some(value) = env_u64("ASTER_BLOB_ZSTD_LEVEL")? {
+            self.blob_zstd_level = blob_zstd_level_from(value);
         }
         if let Some(value) = env_string_allow_empty("ASTER_SECRET_KEY") {
             if value.trim().is_empty() {
@@ -843,6 +866,7 @@ impl AsterConfig {
                 .storage_path
                 .as_ref()
                 .map(|dir| dir.to_string_lossy().into_owned()),
+            blob_zstd_level: self.blob_zstd_level.map(i32::from),
         }
     }
 
@@ -907,6 +931,7 @@ impl Default for AsterConfig {
             endpoint_addr: None,
             storage_path: None,
             gc_interval: None,
+            blob_zstd_level: None,
             secret_key: None,
             secret_key_file: None,
             relay_mode: RelayMode::Default,
@@ -1006,6 +1031,13 @@ impl AsterConfigBuilder {
     /// manual sweep. A zero `interval` disables GC.
     pub fn gc_interval(mut self, interval: Duration) -> Self {
         self.config.gc_interval = (!interval.is_zero()).then_some(interval);
+        self
+    }
+
+    /// Serve and prefer zstd-compressed blob transport at `level`. See
+    /// [`AsterConfig::blob_zstd_level`]. `0` disables it.
+    pub fn blob_zstd_level(mut self, level: u8) -> Self {
+        self.config.blob_zstd_level = blob_zstd_level_from(level.into());
         self
     }
 
@@ -1371,6 +1403,11 @@ fn parse_portmapper(source: &str, value: &str) -> Result<String> {
 
 fn gc_interval_from_ms(ms: u64) -> Option<Duration> {
     (ms > 0).then(|| Duration::from_millis(ms))
+}
+
+/// `0` disables; anything else is clamped to zstd's non-"ultra" range.
+fn blob_zstd_level_from(level: u64) -> Option<u8> {
+    (level > 0).then(|| level.min(19) as u8)
 }
 
 fn parse_relay_mode(value: &str) -> RelayMode {
@@ -1780,6 +1817,7 @@ mod tests {
         "ASTER_RELAY_URLS",
         "ASTER_SECRET_KEY_FILE",
         "ASTER_GC_INTERVAL_MS",
+        "ASTER_BLOB_ZSTD_LEVEL",
         "ASTER_HEALTH_PORT",
         "ASTER_HEALTH_HOST",
         "ASTER_HEALTH_ENABLED",
@@ -2368,6 +2406,32 @@ mod binding_knob_tests {
         env::set_var("ASTER_GC_INTERVAL_MS", "0");
         assert_eq!(AsterConfig::from_env().unwrap().gc_interval, None);
 
+        assert_eq!(AsterConfig::from_env().unwrap().blob_zstd_level, None);
+        env::set_var("ASTER_BLOB_ZSTD_LEVEL", "5");
+        let cfg = AsterConfig::from_env().unwrap();
+        assert_eq!(cfg.blob_zstd_level, Some(5));
+        assert_eq!(cfg.to_core_endpoint_config().blob_zstd_level, Some(5));
+        env::set_var("ASTER_BLOB_ZSTD_LEVEL", "40");
+        assert_eq!(AsterConfig::from_env().unwrap().blob_zstd_level, Some(19));
+        env::set_var("ASTER_BLOB_ZSTD_LEVEL", "0");
+        let cfg = AsterConfig::from_env().unwrap();
+        assert_eq!(cfg.blob_zstd_level, None);
+        assert_eq!(cfg.to_core_endpoint_config().blob_zstd_level, None);
+        assert_eq!(
+            AsterConfig::builder()
+                .blob_zstd_level(3)
+                .build()
+                .blob_zstd_level,
+            Some(3)
+        );
+        assert_eq!(
+            AsterConfig::builder()
+                .blob_zstd_level(0)
+                .build()
+                .blob_zstd_level,
+            None
+        );
+
         env::set_var("ASTER_PORTMAPPER_CONFIG", "sometimes");
         let err = AsterConfig::from_env().unwrap_err().to_string();
         assert!(err.contains("ASTER_PORTMAPPER_CONFIG"), "{err}");
@@ -2455,6 +2519,7 @@ mod binding_knob_tests {
                 r#"
 [storage]
 gc_interval_ms = 1500
+blob_zstd_level = 4
 
 [network]
 secret_key = "{}"
@@ -2470,6 +2535,7 @@ transport_send_fairness = false
         .unwrap();
         let cfg = AsterConfig::from_file(&path).unwrap();
         assert_eq!(cfg.gc_interval, Some(Duration::from_millis(1500)));
+        assert_eq!(cfg.blob_zstd_level, Some(4));
         assert_eq!(cfg.secret_key.as_ref().unwrap().to_bytes(), secret);
         assert_eq!(
             cfg.secret_key_file,

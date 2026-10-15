@@ -1434,6 +1434,7 @@ mod tests {
                 attempts: 3,
                 failures: 2,
                 completed_requests: 1,
+                plain_fallbacks: 0,
                 in_flight: 0,
             }],
             bytes_transferred: 0x0102_0304_0506_0708,
