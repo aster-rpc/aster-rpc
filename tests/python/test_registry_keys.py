@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 
 from aster.registry.keys import (
+    REGISTRY_PREFIXES,
     acl_key,
     channel_key,
     config_key,
@@ -62,8 +63,9 @@ def test_version_keys_parse_strictly():
         assert parse_version_key(bad) is None, bad
 
 
-@pytest.mark.parametrize("name", ["svc", "svc2", "a/b", "a", "50%"])
-def test_registry_keys_are_prefix_free(name):
+def _family_keys(name: str) -> set[bytes]:
+    """Keys from every builder, over segments chosen to provoke prefix
+    collisions. A new key family belongs here."""
     leaves = ["1", "10", "stable", "stable2", "x/y", "x", "", "%2F"]
     keys = set()
     for leaf in leaves:
@@ -71,6 +73,23 @@ def test_registry_keys_are_prefix_free(name):
         keys |= {channel_key(name, leaf), tag_key(name, leaf)}
         keys |= {lease_key(name, leaf, eid) for eid in leaves}
     keys |= {version_key(name, v) for v in (1, 10, 100, -1)}
+    return keys
+
+
+NAMES = ["svc", "svc2", "a/b", "a", "50%"]
+
+
+@pytest.mark.parametrize("name", NAMES)
+def test_registry_keys_are_prefix_free(name):
+    keys = _family_keys(name)
     for a in keys:
         for b in keys:
             assert a == b or not b.startswith(a), (a, b)
+
+
+def test_registry_prefixes_cover_every_family():
+    """A client that syncs only REGISTRY_PREFIXES receives every family the
+    builders write (the same key set as the prefix-free check)."""
+    for name in NAMES:
+        for key in _family_keys(name):
+            assert any(key.startswith(p) for p in REGISTRY_PREFIXES), key

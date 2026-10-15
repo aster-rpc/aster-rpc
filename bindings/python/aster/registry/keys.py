@@ -129,9 +129,13 @@ def config_key(subkey: str) -> bytes:
 
 
 # Registry download-policy prefixes -- all key namespaces that a registry
-# client should sync (applied via set_download_policy "nothing_except").
+# client should sync (applied via set_download_policy "nothing_except" by
+# RegistryClient). Every family a builder above writes must be covered, or the
+# entry syncs without its value; ``endpoints/`` and ``compatibility/`` are
+# spec-reserved families with no builder yet.
 REGISTRY_PREFIXES: list[bytes] = [
     b"contracts/",
+    b"manifests/",
     b"services/",
     b"endpoints/",
     b"compatibility/",
