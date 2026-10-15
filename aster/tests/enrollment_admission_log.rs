@@ -244,3 +244,98 @@ async fn every_gate_zero_decision_is_logged_under_aster_admission() {
     .await
     .unwrap();
 }
+
+/// Replica trust decisions are Gate-0 decisions too, with the same fields: a
+/// configured replica that presents no credential, and that this node holds
+/// no record for, is allowed for the enrollment handshake and then for this
+/// node's own outbound Docs connection (`reason=replica sync`) at debug; once
+/// the synchronized fleet copy still holds no registration for it, it is
+/// refused at info (`reason=replica not registered`).
+#[tokio::test]
+async fn replica_trust_decisions_are_logged_under_aster_admission() {
+    captured();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let files = tempfile::tempdir().unwrap();
+        // The replica: no credential, holding a fleet namespace that has no
+        // root-authored record at all.
+        let replica = node(5, true).await;
+        let fleet = replica.docs().create().await.unwrap();
+        let namespace: [u8; 32] = hex::decode(fleet.id().unwrap().to_string())
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let store = |name: &str| {
+            Arc::new(
+                EnrollmentPolicyStore::open(files.path().join(name), public(1), namespace, FLEET)
+                    .unwrap(),
+            )
+        };
+        let policy = || -> Arc<dyn AdmissionPolicy> {
+            Arc::new(PolicyExpressionV1::Predicate(
+                PolicyPredicate::TolerateStalePolicy,
+            ))
+        };
+        let replica_enroll = Enrollment::install(
+            &replica,
+            store("replica.json"),
+            JwtEnrollmentVerifier::new(public(1), FLEET).unwrap(),
+            None,
+            policy(),
+            EnrollmentOptions::default(),
+        )
+        .unwrap();
+        replica_enroll.set_policy_document(&fleet).unwrap();
+        serve(replica.clone(), replica_enroll.clone());
+
+        // The joiner has a credential, so the replica admits it.
+        let joiner = node(6, true).await;
+        let joiner_enroll = Enrollment::install(
+            &joiner,
+            store("joiner.json"),
+            JwtEnrollmentVerifier::new(public(1), FLEET).unwrap(),
+            Some(credential(6)),
+            policy(),
+            EnrollmentOptions::default(),
+        )
+        .unwrap();
+        serve(joiner.clone(), joiner_enroll.clone());
+        let attached = joiner_enroll
+            .attach_replicas(vec![replica.addr()], Duration::from_secs(10))
+            .await;
+        assert!(attached.is_err(), "an unregistered replica is refused");
+
+        let replica_hex = hex::encode(public(5));
+        for alpn in ["aster.enrollment/1", "/iroh-sync/1"] {
+            let allowed = wait_for_line(|line| {
+                line.fields.contains(&format!("peer={replica_hex};"))
+                    && line.fields.contains(&format!("alpn={alpn};"))
+                    && line.fields.contains("reason=replica sync;")
+            })
+            .await;
+            assert_eq!(allowed.level, tracing::Level::DEBUG, "{allowed:?}");
+            for field in ["decision=allow;", "source=none;"] {
+                assert!(allowed.fields.contains(field), "{field} in {allowed:?}");
+            }
+        }
+        let refused = wait_for_line(|line| {
+            line.fields.contains(&format!("peer={replica_hex};"))
+                && line.fields.contains("reason=replica not registered;")
+        })
+        .await;
+        assert_eq!(refused.level, tracing::Level::INFO, "{refused:?}");
+        for field in [
+            "alpn=aster.enrollment/1;",
+            "decision=deny;",
+            "detail=enrollment policy unavailable",
+        ] {
+            assert!(refused.fields.contains(field), "{field} in {refused:?}");
+        }
+        assert!(joiner_enroll.peer_session(&public(5)).is_none());
+
+        for node in [joiner, replica] {
+            node.shutdown().await;
+        }
+    })
+    .await
+    .unwrap();
+}

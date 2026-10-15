@@ -52,7 +52,9 @@ pub use aster_transport_core::enrollment::{
     ReviewedObservation, MAX_OBSERVATION_LIFETIME, OBSERVATION_JWT_TYPE,
 };
 pub use aster_transport_core::enrollment::{AcceptedRecords, RotationPin, MAX_FORWARDED_ROTATIONS};
-pub use aster_transport_core::enrollment::{DelegatedIssuer, IssuanceError, SubjectStanding};
+pub use aster_transport_core::enrollment::{
+    DelegatedIssuer, IssuanceError, ReplicaAttachment, SubjectStanding,
+};
 
 #[cfg(all(feature = "rpc", feature = "docs"))]
 pub mod issuer;
@@ -278,6 +280,31 @@ impl Enrollment {
         self.inner
             .connect_replicas(replicas.into_iter().map(|addr| addr.to_core()).collect())
             .await
+    }
+
+    /// Hold the fleet namespace from the configured policy `replicas` and keep
+    /// it synchronized with them. A configured replica this node has no record
+    /// for yet is trusted for synchronizing the fleet namespace only; see
+    /// `EnrollmentService::attach_replicas` in the transport core. This is
+    /// what `AsterServer` runs for `[enrollment] replicas`.
+    #[cfg(feature = "docs")]
+    pub async fn attach_replicas(
+        &self,
+        replicas: Vec<crate::NodeAddr>,
+        timeout: Duration,
+    ) -> anyhow::Result<ReplicaAttachment> {
+        self.inner
+            .attach_replicas(
+                replicas.into_iter().map(|addr| addr.to_core()).collect(),
+                timeout,
+            )
+            .await
+    }
+
+    /// What the root's records, as this node last reconciled them, say about
+    /// `subject`.
+    pub fn subject_standing(&self, subject: &[u8; 32]) -> SubjectStanding {
+        self.inner.subject_standing(subject)
     }
 
     #[cfg(feature = "docs")]

@@ -2,7 +2,9 @@
 //!
 //! Install before dialing, route only this ALPN to `accept`, and keep the
 //! returned service alive. Ordinary protocols stay gated until verified
-//! admission. Configured replica addresses are discovery hints, never trust.
+//! admission. Configured replica addresses are discovery hints, never trust:
+//! a configured replica this node has no evidence for yet is trusted for
+//! synchronizing the fleet namespace only (see [`EnrollmentService::attach_replicas`]).
 
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
@@ -66,6 +68,12 @@ const DENY_LOG_PER_SECOND: u32 = 32;
 /// one handshake per interval.
 const ON_DEMAND_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 
+/// The ALPNs synchronizing the fleet namespace from a replica needs: Docs set
+/// reconciliation and the blob fetches for its entries' content.
+fn replica_sync_alpn(alpn: &[u8]) -> bool {
+    alpn == iroh_docs::ALPN || alpn == iroh_blobs::ALPN || alpn == crate::BLOBS_ZSTD_ALPN
+}
+
 #[derive(Clone, Debug)]
 pub struct EnrollmentOptions {
     /// Bounds opening the first stream and receiving the credential-free probe.
@@ -112,6 +120,11 @@ pub struct EnrollmentOptions {
     /// without [`Self::rotation`]; a statement that is not part of the pinned
     /// history fails installation.
     pub applied_rotations: Vec<String>,
+    /// After [`EnrollmentService::attach_replicas`]: how often each configured
+    /// replica is synchronized again (one with a session) or retried (one
+    /// without), so later registrations and revocations arrive without a
+    /// root publication session even when a live Docs subscription dropped.
+    pub replica_sync_interval: Duration,
 }
 
 impl Default for EnrollmentOptions {
@@ -135,6 +148,7 @@ impl Default for EnrollmentOptions {
             require_synchronized_clock: false,
             rotation: None,
             applied_rotations: Vec::new(),
+            replica_sync_interval: Duration::from_secs(30),
         }
     }
 }
@@ -427,6 +441,23 @@ impl GateDenial {
     }
 }
 
+/// Why Gate 0 allowed a connection, for its decision log: the reason and the
+/// evidence source it rests on.
+type GateAllow = (&'static str, &'static str);
+
+/// An enrollment connection that passed its rate limit.
+const HANDSHAKE_ALLOW: GateAllow = ("enrollment handshake", "none");
+
+/// A configured replica this node holds no evidence for, trusted for
+/// synchronizing the fleet namespace only: the enrollment handshake's replica
+/// leg, and this node's own outbound Docs and blob connections while that
+/// synchronization runs. It grants no session, roles or other ALPN.
+const REPLICA_SYNC_ALLOW: GateAllow = ("replica sync", "none");
+
+fn admitted(source: &'static str) -> GateAllow {
+    ("admitted", source)
+}
+
 /// The admission source a Gate-0 allow rests on, for its decision log.
 fn source_label(source: &AdmissionEvidenceSource) -> &'static str {
     match source {
@@ -490,6 +521,68 @@ struct RotationState {
 struct OwnCredential {
     chain: Option<String>,
     evidence: Option<VerifiedAdmissionEvidence>,
+}
+
+/// The outcome of the joining side of the enrollment handshake.
+enum Joined {
+    /// Both sides admitted each other: a session, and the replica's fleet
+    /// namespace ticket.
+    Admitted(EnrollmentReadiness, Option<String>),
+    /// A configured replica that presented no credential, and that this
+    /// node's policy has no record for yet. It admitted this node; this node
+    /// trusts it only to synchronize the fleet namespace from.
+    SyncOnly {
+        peer: [u8; 32],
+        ticket: Option<String>,
+    },
+}
+
+/// What [`EnrollmentService::attach_replicas`] attached policy from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReplicaAttachment {
+    /// The fleet namespace was synchronized from this replica, which holds an
+    /// ordinary admitted session.
+    Synchronized([u8; 32]),
+    /// No replica completed; this node serves admission from the root-authored
+    /// records it already held (or received this start from a replica it could
+    /// not admit). Policy freshness stays unsynchronized
+    /// ([`EnrollmentReadiness::policy_sync`] is `None`) until a replica
+    /// synchronizes. `error` is the last replica's failure.
+    LocalCopy { error: String },
+}
+
+/// Fleet synchronizations in flight with one replica that holds no session,
+/// and the outbound connections Gate 0 let through for them.
+#[derive(Default)]
+struct ReplicaSync {
+    open: usize,
+    connections: Vec<CoreWeakConnection>,
+}
+
+/// One outbound fleet synchronization in flight with a replica that holds no
+/// session. When the last one for that replica ends, the connections it let
+/// through are closed, so a pooled Docs or blob connection cannot carry later
+/// traffic past Gate 0.
+struct ReplicaWindow<'a> {
+    windows: &'a Mutex<BTreeMap<[u8; 32], ReplicaSync>>,
+    peer: [u8; 32],
+}
+
+impl Drop for ReplicaWindow<'_> {
+    fn drop(&mut self) {
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(sync) = windows.get_mut(&self.peer) else {
+            return;
+        };
+        sync.open -= 1;
+        if sync.open == 0 {
+            if let Some(sync) = windows.remove(&self.peer) {
+                for connection in sync.connections {
+                    connection.close(0, b"replica sync complete");
+                }
+            }
+        }
+    }
 }
 
 struct HandshakeSlot<'a> {
@@ -556,19 +649,24 @@ pub struct EnrollmentService {
     rate: Mutex<RateState>,
     deny_log: Mutex<DenyLog>,
     on_demand: Mutex<OnDemandHandshakes>,
+    /// Configured replicas without a session that this node is synchronizing
+    /// the fleet namespace from right now (see [`REPLICA_SYNC_ALLOW`]).
+    replica_windows: Mutex<BTreeMap<[u8; 32], ReplicaSync>>,
+    replica_maintenance: Mutex<Option<AbortHandle>>,
     next_generation: AtomicU64,
     revoked: broadcast::Sender<EnrollmentRevoked>,
 }
 
 impl Drop for EnrollmentService {
     fn drop(&mut self) {
-        if let Some(watch) = self
-            .policy_watch
-            .get_mut()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            watch.abort();
+        for task in [&mut self.policy_watch, &mut self.replica_maintenance] {
+            if let Some(task) = task
+                .get_mut()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+            {
+                task.abort();
+            }
         }
     }
 }
@@ -648,6 +746,7 @@ impl EnrollmentService {
                 && !options.policy_timeout.is_zero()
                 && options.step_timeout > options.policy_timeout
                 && !options.reconciliation_interval.is_zero()
+                && !options.replica_sync_interval.is_zero()
                 && !options.session_idle_eviction.is_zero(),
             "invalid enrollment bounds"
         );
@@ -790,6 +889,8 @@ impl EnrollmentService {
             }),
             deny_log: Mutex::new(DenyLog::new()),
             on_demand: Mutex::new(OnDemandHandshakes::default()),
+            replica_windows: Mutex::new(BTreeMap::new()),
+            replica_maintenance: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             revoked,
         })
@@ -844,11 +945,36 @@ impl EnrollmentService {
         if alpn == ENROLLMENT_ALPN {
             let allowed = self.take_rate_slot(peer, address.map(|address| address.ip()));
             let decision = if allowed {
-                Ok(None)
+                Ok(HANDSHAKE_ALLOW)
             } else {
                 Err(GateDenial::new("rate limited"))
             };
             self.log_decision(&peer, &alpn, decision);
+            let _ = reply.send(hook_decision(allowed));
+            return;
+        }
+        // This node's own synchronization of the fleet namespace from a
+        // configured replica it holds no evidence for: only its outbound Docs
+        // and blob connections, and only while that synchronization runs.
+        if info.outbound && !self.has_session(&peer) && self.replica_window_open(&peer) {
+            let allowed = replica_sync_alpn(&alpn);
+            let decision = if allowed {
+                Ok(REPLICA_SYNC_ALLOW)
+            } else {
+                Err(GateDenial::new("replica sync only"))
+            };
+            self.log_replica_decision(&peer, &alpn, decision, false);
+            if allowed && !self.track_replica_connection(&peer, info.connection.clone()) {
+                // The window closed while the dial was in flight.
+                self.log_replica_decision(
+                    &peer,
+                    &alpn,
+                    Err(GateDenial::new("replica sync only")),
+                    false,
+                );
+                let _ = reply.send(hook_decision(false));
+                return;
+            }
             let _ = reply.send(hook_decision(allowed));
             return;
         }
@@ -867,7 +993,7 @@ impl EnrollmentService {
                 let _permit = permit;
                 let decision = self.gate_connection(&peer, source, connection).await;
                 let allowed = decision.is_ok();
-                self.log_decision(&peer, &alpn, decision.map(Some));
+                self.log_decision(&peer, &alpn, decision.map(admitted));
                 let _ = reply.send(hook_decision(allowed));
             });
             return;
@@ -908,7 +1034,7 @@ impl EnrollmentService {
                 },
             };
             let allowed = decision.is_ok();
-            self.log_decision(&peer, &alpn, decision.map(Some));
+            self.log_decision(&peer, &alpn, decision.map(admitted));
             let _ = reply.send(hook_decision(allowed));
         });
     }
@@ -929,6 +1055,17 @@ impl EnrollmentService {
         };
         if self.has_session(&peer) {
             let _ = reply.send(true);
+            return;
+        }
+        if self.replica_window_open(&peer) {
+            let allowed = replica_sync_alpn(&info.alpn);
+            let decision = if allowed {
+                Ok(REPLICA_SYNC_ALLOW)
+            } else {
+                Err(GateDenial::new("replica sync only"))
+            };
+            self.log_replica_decision(&peer, &info.alpn, decision, false);
+            let _ = reply.send(allowed);
             return;
         }
         tokio::spawn(async move {
@@ -1034,22 +1171,17 @@ impl EnrollmentService {
     /// [`DENY_LOG_PER_SECOND`] a second; the rest log at debug and are
     /// counted in the next info line's `suppressed`, since a remote decides
     /// how often it dials.
-    fn log_decision(
-        &self,
-        peer: &[u8; 32],
-        alpn: &[u8],
-        decision: Result<Option<&'static str>, GateDenial>,
-    ) {
+    fn log_decision(&self, peer: &[u8; 32], alpn: &[u8], decision: Result<GateAllow, GateDenial>) {
         let peer_hex = hex::encode(peer);
         let alpn = String::from_utf8_lossy(alpn);
         match decision {
-            Ok(source) => tracing::debug!(
+            Ok((reason, source)) => tracing::debug!(
                 target: ADMISSION_TARGET,
                 peer = %peer_hex,
                 alpn = %alpn,
                 decision = "allow",
-                reason = if source.is_some() { "admitted" } else { "enrollment handshake" },
-                source = source.unwrap_or("none"),
+                reason,
+                source,
                 "gate 0: enrollment admitted connection"
             ),
             Err(denial) => {
@@ -1081,6 +1213,49 @@ impl EnrollmentService {
                     ),
                 }
             }
+        }
+    }
+
+    /// Replica-trust decisions, which this node makes about its own dials and
+    /// its own configured replicas rather than at a remote's pace: allows at
+    /// debug like any other; a judgement refusing a replica after its fleet
+    /// synchronization (`judgement`) at info and unthrottled, since it runs
+    /// at most once per replica per sync interval; a dial beyond what the
+    /// synchronization needs at debug, like any blocked outbound dial.
+    fn log_replica_decision(
+        &self,
+        peer: &[u8; 32],
+        alpn: &[u8],
+        decision: Result<GateAllow, GateDenial>,
+        judgement: bool,
+    ) {
+        let denial = match decision {
+            Ok(allow) => return self.log_decision(peer, alpn, Ok(allow)),
+            Err(denial) => denial,
+        };
+        let peer = hex::encode(peer);
+        let alpn = String::from_utf8_lossy(alpn);
+        let detail = denial.detail.as_deref().unwrap_or("");
+        if judgement {
+            tracing::info!(
+                target: ADMISSION_TARGET,
+                peer = %peer,
+                alpn = %alpn,
+                decision = "deny",
+                reason = denial.reason,
+                detail,
+                "gate 0: enrollment refused replica"
+            );
+        } else {
+            tracing::debug!(
+                target: ADMISSION_TARGET,
+                peer = %peer,
+                alpn = %alpn,
+                decision = "deny",
+                reason = denial.reason,
+                detail,
+                "gate 0: enrollment refused connection"
+            );
         }
     }
 
@@ -2365,6 +2540,18 @@ impl EnrollmentService {
         &self,
         replica: CoreNodeAddr,
     ) -> Result<(EnrollmentReadiness, Option<String>)> {
+        match self.handshake(replica, false).await? {
+            Joined::Admitted(readiness, ticket) => Ok((readiness, ticket)),
+            Joined::SyncOnly { .. } => bail!("replica not admitted"),
+        }
+    }
+
+    /// The joining side of the handshake. With `sync_only`, a configured
+    /// replica that presents no credential and that this node's policy has
+    /// no record for at all yields [`Joined::SyncOnly`] instead of a refusal;
+    /// a credential that fails verification, or any record that denies it,
+    /// is still refused.
+    async fn handshake(&self, replica: CoreNodeAddr, sync_only: bool) -> Result<Joined> {
         tokio::time::timeout(self.options.handshake_timeout, async {
             let _permit = self
                 .outbound_permits
@@ -2396,7 +2583,27 @@ impl EnrollmentService {
                 self.offered_rotations(&proof.rotations);
                 let peer = identity(&connection.remote_id())?;
                 let source = observed_source(&connection);
-                let evidence = self.evidence(&peer, proof.chain.as_deref(), source).await?;
+                let evidence = match self.evidence(&peer, proof.chain.as_deref(), source).await {
+                    Ok(evidence) => Some(evidence),
+                    Err(error)
+                        if sync_only && proof.chain.is_none() && self.unknown(&peer, &error) =>
+                    {
+                        self.log_replica_decision(
+                            &peer,
+                            ENROLLMENT_ALPN,
+                            Ok(REPLICA_SYNC_ALLOW),
+                            false,
+                        );
+                        None
+                    }
+                    Err(error) => {
+                        if sync_only {
+                            let denial = GateDenial::from_admission(error.clone());
+                            self.log_replica_decision(&peer, ENROLLMENT_ALPN, Err(denial), true);
+                        }
+                        return Err(error.into());
+                    }
+                };
                 transmit(
                     &send,
                     &Presentation {
@@ -2410,7 +2617,9 @@ impl EnrollmentService {
                 transmit(&send, &true).await?;
                 let confirmed: bool = self.receive_step(&recv).await?;
                 ensure!(confirmed, "reciprocal enrollment rejected");
-                self.evaluate(&evidence, source).await?;
+                if let Some(evidence) = &evidence {
+                    self.evaluate(evidence, source).await?;
+                }
                 transmit(&send, &true).await?;
                 let closed = tokio::time::timeout(self.options.step_timeout, connection.closed())
                     .await
@@ -2419,6 +2628,15 @@ impl EnrollmentService {
                     closed.code == Some(0),
                     "replica did not complete enrollment"
                 );
+                // The replica admitted this node; this node admits nothing
+                // in return and ignores the bound-namespace tickets, which
+                // only an admitted replica's session may use.
+                let Some(evidence) = evidence else {
+                    return Ok(Joined::SyncOnly {
+                        peer,
+                        ticket: welcome.policy_ticket,
+                    });
+                };
                 self.evaluate(&evidence, source).await?;
                 let mut offered = welcome.bound_tickets;
                 offered.truncate(MAX_OFFERED_TICKETS);
@@ -2432,7 +2650,10 @@ impl EnrollmentService {
                     }
                     tickets.insert(peer, offered);
                 }
-                Ok((self.remember(evidence, source)?, welcome.policy_ticket))
+                Ok(Joined::Admitted(
+                    self.remember(evidence, source)?,
+                    welcome.policy_ticket,
+                ))
             }
             .await;
             match result {
@@ -2459,28 +2680,9 @@ impl EnrollmentService {
         ticket: String,
         timeout: Duration,
     ) -> Result<CoreDoc> {
-        use iroh_docs::{Capability, DocTicket};
-        use iroh_tickets::Ticket;
-        let mut decoded = DocTicket::decode_string(&ticket)?;
-        ensure!(
-            matches!(decoded.capability, Capability::Read(_)),
-            "bootstrap requires read-only policy capability"
-        );
-        ensure!(
-            namespace(&decoded.capability.id().to_string())? == *self.trust().store.namespace(),
-            "wrong policy namespace"
-        );
-        decoded.nodes.retain(|node| node.id.as_bytes() == &peer);
-        ensure!(
-            !decoded.nodes.is_empty(),
-            "policy ticket has no authenticated replica address"
-        );
+        let ticket = self.fleet_ticket(peer, &ticket)?;
         self.check_peer(&peer).await?;
-        let doc = self
-            .node
-            .docs_client()
-            .join(decoded.encode_string())
-            .await?;
+        let doc = self.node.docs_client().join(ticket).await?;
         self.set_policy_document(doc.clone())?;
         self.note_pending_policy_content();
         let result = tokio::time::timeout(timeout, async {
@@ -2500,6 +2702,308 @@ impl EnrollmentService {
             .policy_sync = Some(self.synchronization(peer));
         self.check_peer(&peer).await?;
         Ok(doc)
+    }
+
+    /// A replica's fleet ticket narrowed to what it may name: a read
+    /// capability for the pinned namespace, at `peer`'s address only.
+    fn fleet_ticket(&self, peer: [u8; 32], ticket: &str) -> Result<String> {
+        use iroh_docs::{Capability, DocTicket};
+        use iroh_tickets::Ticket;
+        let mut decoded = DocTicket::decode_string(ticket)?;
+        ensure!(
+            matches!(decoded.capability, Capability::Read(_)),
+            "bootstrap requires read-only policy capability"
+        );
+        ensure!(
+            namespace(&decoded.capability.id().to_string())? == *self.trust().store.namespace(),
+            "wrong policy namespace"
+        );
+        decoded.nodes.retain(|node| node.id.as_bytes() == &peer);
+        ensure!(
+            !decoded.nodes.is_empty(),
+            "policy ticket has no authenticated replica address"
+        );
+        Ok(decoded.encode_string())
+    }
+
+    /// Whether `error` means only that this node's policy holds nothing at
+    /// all about `peer` yet (an empty or not yet synchronized fleet copy), as
+    /// opposed to a denial, a skewed clock or a failed credential.
+    fn unknown(&self, peer: &[u8; 32], error: &AdmissionError) -> bool {
+        matches!(error, AdmissionError::Unavailable(_))
+            && matches!(
+                self.trust().stores.select_evidence(peer, None, unix_now()),
+                Err(RecordError::MissingEvidence)
+            )
+    }
+
+    fn replica_window_open(&self, peer: &[u8; 32]) -> bool {
+        self.replica_windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(peer)
+    }
+
+    fn open_replica_window(&self, peer: [u8; 32]) -> ReplicaWindow<'_> {
+        self.replica_windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(peer)
+            .or_default()
+            .open += 1;
+        ReplicaWindow {
+            windows: &self.replica_windows,
+            peer,
+        }
+    }
+
+    /// Remember a connection a replica window let through, to close with the
+    /// window. False when no window for `peer` is open any more.
+    fn track_replica_connection(&self, peer: &[u8; 32], connection: CoreWeakConnection) -> bool {
+        let mut windows = self
+            .replica_windows
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(sync) = windows.get_mut(peer) else {
+            return false;
+        };
+        sync.connections.retain(CoreWeakConnection::is_alive);
+        sync.connections.push(connection);
+        true
+    }
+
+    /// Hold the fleet namespace from the configured `replicas`, the policy
+    /// sources a node such as a daemon's child process is pointed at.
+    ///
+    /// Each replica is tried in order until one completes: enroll with it,
+    /// then synchronize the fleet namespace from it. A replica that presents
+    /// no credential and that this node's policy has no record for yet (an
+    /// empty or stale fleet copy) is trusted for that synchronization only:
+    /// it must still admit this node, this node's own outbound Docs and blob
+    /// connections to it pass Gate 0 while the synchronization runs, and
+    /// nothing else does. Every record is read by exact root author, so such
+    /// a replica can withhold records but not forge them. Afterwards local
+    /// policy judges it: registered, it is enrolled with as an ordinary
+    /// admitted peer; denied or still unknown, it is refused.
+    ///
+    /// When no replica completes, this node starts from the root-authored
+    /// records it holds locally, if any ([`ReplicaAttachment::LocalCopy`]);
+    /// with none it fails. Either way it then keeps every configured replica
+    /// in sync every [`EnrollmentOptions::replica_sync_interval`]: a replica
+    /// with a session is synchronized again, one without is retried as
+    /// above. Each step is bounded by `timeout`.
+    pub async fn attach_replicas(
+        &self,
+        replicas: Vec<CoreNodeAddr>,
+        timeout: Duration,
+    ) -> Result<ReplicaAttachment> {
+        ensure!(!replicas.is_empty(), "no policy replicas configured");
+        let fleet = hex::encode(self.trust().store.namespace());
+        if let Some(local) = self.node.docs_client().open(fleet).await? {
+            self.set_policy_document(local)?;
+            self.reconcile().await;
+        }
+        let mut last_error = None;
+        let mut attached = None;
+        for replica in &replicas {
+            match self.attach_replica(replica.clone(), timeout).await {
+                Ok(peer) => {
+                    attached = Some(peer);
+                    break;
+                }
+                Err(error) => {
+                    tracing::debug!(
+                        replica = %replica.endpoint_id,
+                        error = %format!("{error:#}"),
+                        "enrollment: policy replica did not complete"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+        let outcome = match attached {
+            Some(peer) => ReplicaAttachment::Synchronized(peer),
+            None => {
+                let error = last_error.unwrap_or_else(|| anyhow!("no policy replica answered"));
+                if !self.holds_local_policy().await {
+                    return Err(error.context(
+                        "no configured replica completed reciprocal enrollment and synchronization",
+                    ));
+                }
+                let error = format!("{error:#}");
+                tracing::warn!(
+                    %error,
+                    "enrollment: no policy replica completed; serving admission from the local \
+                     fleet copy, unsynchronized, and retrying the replicas"
+                );
+                ReplicaAttachment::LocalCopy { error }
+            }
+        };
+        self.spawn_replica_maintenance(replicas, timeout);
+        Ok(outcome)
+    }
+
+    /// Whether the fleet copy this node holds has any root-authored record.
+    async fn holds_local_policy(&self) -> bool {
+        let doc = self
+            .document
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match doc {
+            Some(doc) => self
+                .trust()
+                .store
+                .refresh(&doc)
+                .await
+                .is_ok_and(|report| report.available > 0),
+            None => false,
+        }
+    }
+
+    /// Enroll with one replica and synchronize the fleet namespace from it;
+    /// see [`Self::attach_replicas`]. Returns the replica's identity.
+    async fn attach_replica(&self, replica: CoreNodeAddr, timeout: Duration) -> Result<[u8; 32]> {
+        let joined = tokio::time::timeout(timeout, self.handshake(replica.clone(), true))
+            .await
+            .map_err(|_| anyhow!("policy replica did not answer within the sync timeout"))??;
+        let (readiness, ticket) = match joined {
+            Joined::Admitted(readiness, ticket) => (readiness, ticket),
+            Joined::SyncOnly { peer, ticket } => {
+                let ticket = ticket.ok_or_else(|| anyhow!("replica offered no fleet ticket"))?;
+                self.replica_sync(peer, &ticket, timeout).await?;
+                // Local policy can now judge the replica.
+                let judged = match self.subject_standing(&peer) {
+                    SubjectStanding::Registered => Ok(()),
+                    SubjectStanding::Denied(reason) => Err(AdmissionError::Denied(reason)),
+                    SubjectStanding::Unregistered | SubjectStanding::Unknown(_) => {
+                        Err(AdmissionError::Unavailable(
+                            "the replica's fleet copy holds no registration for it".into(),
+                        ))
+                    }
+                };
+                if let Err(error) = judged {
+                    let mut denial = GateDenial::from_admission(error.clone());
+                    if matches!(error, AdmissionError::Unavailable(_)) {
+                        denial.reason = "replica not registered";
+                    }
+                    self.log_replica_decision(&peer, ENROLLMENT_ALPN, Err(denial), true);
+                    return Err(error.into());
+                }
+                match tokio::time::timeout(timeout, self.handshake(replica, false))
+                    .await
+                    .map_err(|_| {
+                        anyhow!("policy replica did not answer within the sync timeout")
+                    })?? {
+                    Joined::Admitted(readiness, ticket) => (readiness, ticket),
+                    Joined::SyncOnly { .. } => bail!("replica not admitted"),
+                }
+            }
+        };
+        let ticket = ticket.ok_or_else(|| anyhow!("replica offered no fleet ticket"))?;
+        self.synchronize(readiness.peer, ticket, timeout).await?;
+        Ok(readiness.peer)
+    }
+
+    /// Synchronize the fleet namespace, and nothing else, from a replica that
+    /// admitted this node but holds no session here. Gate 0 lets this node's
+    /// own outbound Docs and blob connections to it through while this runs.
+    /// No policy freshness is recorded: only a session's sync proves that.
+    async fn replica_sync(&self, peer: [u8; 32], ticket: &str, timeout: Duration) -> Result<()> {
+        let ticket = self.fleet_ticket(peer, ticket)?;
+        {
+            // Importing the ticket already dials the replica.
+            let _window = self.open_replica_window(peer);
+            let doc = self.node.docs_client().join(ticket).await?;
+            self.set_policy_document(doc.clone())?;
+            self.note_pending_policy_content();
+            tokio::time::timeout(
+                timeout,
+                self.sync_document(&doc, peer, Some(self.trust().store.as_ref()), true),
+            )
+            .await
+            .map_err(|_| anyhow!("fleet synchronization from the replica timed out"))??;
+        }
+        self.trust().stores.sync_bindings()?;
+        self.reconcile().await;
+        Ok(())
+    }
+
+    /// Keep the fleet namespace synchronized with every configured replica
+    /// (see [`Self::attach_replicas`]). Replaces any earlier maintenance.
+    fn spawn_replica_maintenance(&self, replicas: Vec<CoreNodeAddr>, timeout: Duration) {
+        let weak = self.this.clone();
+        let interval = self.options.replica_sync_interval;
+        let task = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let Some(service) = weak.upgrade() else {
+                    break;
+                };
+                // A closed node has nothing to keep in sync, and must not be
+                // kept alive (with its policy store's lock) by trying.
+                let endpoint = service.node.inner.endpoint.clone();
+                if endpoint.is_closed() {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::timeout(
+                        timeout.saturating_mul(3),
+                        service.maintain_replicas(&replicas, timeout),
+                    ) => {}
+                    _ = endpoint.closed() => break,
+                }
+            }
+        });
+        if let Some(previous) = self
+            .replica_maintenance
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(task.abort_handle())
+        {
+            previous.abort();
+        }
+    }
+
+    async fn maintain_replicas(&self, replicas: &[CoreNodeAddr], timeout: Duration) {
+        for replica in replicas {
+            let Ok(peer) = identity(&replica.endpoint_id) else {
+                continue;
+            };
+            if self.has_session(&peer) {
+                let doc = self
+                    .document
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(doc) = doc {
+                    let started =
+                        tokio::time::timeout(timeout, doc.start_sync(vec![hex::encode(peer)]))
+                            .await;
+                    if !matches!(started, Ok(Ok(()))) {
+                        tracing::debug!(
+                            replica = %replica.endpoint_id,
+                            "enrollment: replica resync did not start"
+                        );
+                    }
+                    continue;
+                }
+            }
+            // A replica this node's policy definitely denies stays refused.
+            if let AdmissionError::Denied(_) = self.sessionless_standing(&peer) {
+                continue;
+            }
+            if let Err(error) = self.attach_replica(replica.clone(), timeout).await {
+                tracing::debug!(
+                    replica = %replica.endpoint_id,
+                    error = %format!("{error:#}"),
+                    "enrollment: policy replica retry did not complete"
+                );
+            }
+        }
     }
 
     /// Recheck before each consumer operation. Gate-0 also calls this before
@@ -3659,6 +4163,82 @@ mod tests {
             client.close().await;
         }
         assert_eq!(pending(&service), 0);
+        cleanup(service, path).await;
+    }
+
+    /// Replica trust tolerates only absent evidence. A configured replica
+    /// that presents no credential, while this node's store holds nothing
+    /// about it, is trusted to the point of receiving this node's
+    /// presentation (fleet synchronization would follow). One that presents a
+    /// credential that fails verification is refused before that, even with
+    /// an empty store: a chain signed by another key, a forged chain naming
+    /// the root as issuer, and a valid root credential issued to another key.
+    #[tokio::test]
+    async fn replica_trust_refuses_a_credential_that_fails_verification() {
+        let (service, path) = service(PausedPolicy::new(false), EnrollmentOptions::default()).await;
+        let request =
+            |subject: u8| EnrollmentIssueRequest::new(public(subject), AUDIENCE, unix_now() + 3600);
+        let other_key = JwtEnrollmentIssuer::from_seed(&[8; 32])
+            .issue(&request(9), unix_now())
+            .unwrap()
+            .into_chain();
+        let forged = {
+            // Another key's link, re-labelled as issued by the root: the
+            // payload names the root, the signature is still the other key's.
+            use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+            let (prefix, link) = other_key.rsplit_once('~').unwrap();
+            let mut parts: Vec<String> = link.split('.').map(str::to_owned).collect();
+            let payload = String::from_utf8(URL_SAFE_NO_PAD.decode(&parts[1]).unwrap()).unwrap();
+            let relabelled = payload.replace(&hex::encode(public(8)), &hex::encode(public(1)));
+            assert_ne!(payload, relabelled);
+            parts[1] = URL_SAFE_NO_PAD.encode(relabelled);
+            format!("{prefix}~{}", parts.join("."))
+        };
+        let wrong_subject = JwtEnrollmentIssuer::from_seed(&[1; 32])
+            .issue(&request(10), unix_now())
+            .unwrap()
+            .into_chain();
+        for (chain, trusted) in [
+            (None, true),
+            (Some(other_key), false),
+            (Some(forged), false),
+            (Some(wrong_subject), false),
+        ] {
+            let replica = raw_node(9).await;
+            let handler = tokio::spawn({
+                let replica = replica.clone();
+                async move {
+                    let (_, connection) = replica.accept_aster().await.unwrap();
+                    let (send, recv) = connection.accept_bi().await.unwrap();
+                    let _: Hello = receive(&recv).await.unwrap();
+                    transmit(
+                        &send,
+                        &ReplicaProof {
+                            version: 1,
+                            rotations: Vec::new(),
+                            chain,
+                            sent_at: unix_now(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let presented = receive::<Presentation>(&recv).await.is_ok();
+                    let _ = connection.close(REJECT, b"test replica done".to_vec());
+                    presented
+                }
+            });
+            let attached = service
+                .attach_replicas(vec![replica.node_addr_info()], Duration::from_secs(5))
+                .await;
+            assert!(
+                attached.is_err(),
+                "nothing completed and nothing is held locally"
+            );
+            assert_eq!(handler.await.unwrap(), trusted);
+            assert!(!service.has_session(&public(9)));
+            assert!(!service.replica_window_open(&public(9)));
+            replica.close().await;
+        }
         cleanup(service, path).await;
     }
 }

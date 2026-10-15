@@ -776,6 +776,11 @@ pub struct CoreHookHandshakeInfo {
     /// The connection being admitted, so admission can close it later.
     #[cfg(feature = "enrollment")]
     pub connection: CoreWeakConnection,
+    /// This node dialed the connection (QUIC client side). The hook runs for
+    /// both directions; admission may treat a dial it made itself differently
+    /// from one it accepted.
+    #[cfg(feature = "enrollment")]
+    pub outbound: bool,
 }
 
 /// A non-owning reference to a connection: it does not keep the connection
@@ -1412,6 +1417,8 @@ impl EndpointHooks for CoreHooksAdapter {
             observed_peer_addr: selected_transport_snapshot(conn).peer_addr,
             #[cfg(feature = "enrollment")]
             connection: CoreWeakConnection(conn.weak_handle()),
+            #[cfg(feature = "enrollment")]
+            outbound: conn.side() == iroh::endpoint::Side::Client,
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if self

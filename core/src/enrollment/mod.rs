@@ -52,7 +52,7 @@ mod policy;
 
 pub use bootstrap::{
     AdmissionError, EnrollmentOptions, EnrollmentReadiness, EnrollmentRevoked, EnrollmentService,
-    SubjectStanding, ENROLLMENT_ALPN,
+    ReplicaAttachment, SubjectStanding, ENROLLMENT_ALPN,
 };
 pub mod issuer;
 pub use issuer::{DelegatedIssuer, IssuanceError};

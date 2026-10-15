@@ -403,6 +403,12 @@ pub fn plan(config: &mut AsterConfig, side: Side, overrides: Overrides) -> Resul
             .map_err(|_| invalid("limits.max_admitted_peers is too large"))?;
     }
     let sync_timeout = limits.sync_timeout_ms.map_or(DEFAULT_SYNC_TIMEOUT, ms);
+    if sync_timeout.is_zero() {
+        return Err(invalid("limits.sync_timeout_ms must be positive"));
+    }
+    // One replica attempt is bounded by the sync timeout, so retrying at the
+    // same period keeps at most one attempt per replica outstanding.
+    options.replica_sync_interval = sync_timeout;
 
     let state = match (&section.state_path, &config.storage_path, side) {
         (Some(path), _, _) => StateLocation::Path(path.clone()),
@@ -535,8 +541,11 @@ impl Plan {
     }
 
     /// Hold the fleet namespace this node serves policy from: synchronize it
-    /// from the configured replicas, or, with none, import it read-only so
-    /// the root's publication sessions can deliver into it.
+    /// from the configured replicas and keep it synchronized with them
+    /// ([`Enrollment::attach_replicas`]), or, with none, import it read-only
+    /// so the root's publication sessions can deliver into it. With replicas,
+    /// the start fails only when none completes and no root-authored record
+    /// is held locally.
     pub async fn attach_policy(&self, node: &Node, enrollment: &Enrollment) -> Result<()> {
         if self.replicas.is_empty() {
             let doc = node
@@ -548,19 +557,10 @@ impl Plan {
                 .map_err(|e| invalid(format!("{e:#}")))?;
             return Ok(());
         }
-        let (readiness, ticket) = tokio::time::timeout(
-            self.sync_timeout,
-            enrollment.connect_replicas(self.replicas.clone()),
-        )
-        .await
-        .map_err(|_| invalid("no policy replica answered within sync_timeout_ms"))?
-        .map_err(|e| invalid(format!("enrolling with the policy replicas: {e:#}")))?;
-        let ticket = ticket
-            .ok_or_else(|| invalid("the policy replica offered no fleet namespace ticket"))?;
         enrollment
-            .synchronize(readiness.peer, ticket, self.sync_timeout)
+            .attach_replicas(self.replicas.clone(), self.sync_timeout)
             .await
-            .map_err(|e| invalid(format!("synchronizing the fleet namespace: {e:#}")))?;
+            .map_err(|e| invalid(format!("enrolling with the policy replicas: {e:#}")))?;
         Ok(())
     }
 
