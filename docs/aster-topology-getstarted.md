@@ -261,10 +261,16 @@ let opts = TopologySwarmOptions {
 node.topology().enable_shared(&secret, opts).await?;
 ```
 
-Each node publishes its current credential chain to the topology document
-(renewals included), and every reader verifies it as admission would before
-believing the zone. A node admitted by a registration record publishes no
-chain, and readers use the root's record instead. When both ends declare:
+The issuer signs a separate *locality statement* alongside each credential
+that carries these attributes: a small signed record naming the node and
+holding only its region and zone, with the credential's lifetime, renewed
+with it. Each node publishes that statement to the topology document, never
+its credential, so swarm members do not see its other claims. Every reader
+verifies the statement as it would a credential (root or delegated issuer,
+expiry) and only for the node that published it: a copied or expired
+statement declares nothing. A node admitted by a registration record
+publishes no statement, and readers use the root's record instead. When both
+ends declare:
 
 | Declared relation | Level |
 |---|---|
