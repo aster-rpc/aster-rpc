@@ -2282,6 +2282,8 @@ mod binding_knob_tests {
 
     #[test]
     fn every_builder_knob_round_trips_into_core_endpoint_config() {
+        // from_file / from_env apply ASTER_* env vars; hold the shared lock.
+        let _env = lock_env();
         let secret = SecretKey::from_bytes([0x11; 32]);
         let cfg = AsterConfig::builder()
             .relay_urls(["https://relay-a.example", "https://relay-b.example"])
@@ -2489,6 +2491,8 @@ mod binding_knob_tests {
 
     #[test]
     fn blob_zstd_level_toml_accepts_a_level_or_off() {
+        // from_file / from_env apply ASTER_* env vars; hold the shared lock.
+        let _env = lock_env();
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aster.toml");
         for (value, want) in [
