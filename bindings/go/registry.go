@@ -13,6 +13,7 @@ package aster
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -73,7 +74,7 @@ type ServiceSummary struct {
 // ─── ArtifactRef (§11.2.1) ──────────────────────────────────────────────────
 
 // ArtifactRef is the docs pointer to an immutable Iroh collection. Stored at
-// "contracts/{contract_id}" in the registry doc.
+// "contracts/{contract_id}/" in the registry doc.
 type ArtifactRef struct {
 	ContractID         string `json:"contract_id"`
 	CollectionHash     string `json:"collection_hash"`
@@ -110,7 +111,7 @@ func ArtifactRefFromJSON(s string) (*ArtifactRef, error) {
 // ─── EndpointLease (§11.6) ──────────────────────────────────────────────────
 
 // EndpointLease is a renewable advertisement for a live endpoint. Stored at
-// "services/{name}/contracts/{cid}/endpoints/{eid}".
+// "services/{name}/contracts/{cid}/endpoints/{eid}/".
 type EndpointLease struct {
 	EndpointID          string   `json:"endpoint_id"`
 	ContractID          string   `json:"contract_id"`
@@ -205,42 +206,66 @@ var RegistryPrefixes = [][]byte{
 	[]byte("_aster/"),
 }
 
-// ContractKey returns the doc key for an ArtifactRef: "contracts/{contract_id}".
+// Registry keys are prefix-free: no key is a byte prefix of another. iroh-docs
+// lets a write at a key (a value or a deletion marker) supersede the same
+// author's older entries whose keys extend it, so with ".../versions/v1" a
+// prefix of ".../versions/v10", publishing or retracting v1 would remove v10.
+// Every segment ends in "/" and variable segments escape "%" and "/" ("%25",
+// "%2F"), so a segment never holds a raw "/" and no family's key is an
+// interior path of another. The keys match core/src/registry.rs byte for byte.
+
+// KeySegment escapes a variable key segment: "%" -> "%25", "/" -> "%2F".
+func KeySegment(segment string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(segment, "%", "%25"), "/", "%2F")
+}
+
+// ContractKey returns the doc key for an ArtifactRef: "contracts/{contract_id}/".
 func ContractKey(contractID string) []byte {
-	return []byte("contracts/" + contractID)
+	return []byte("contracts/" + KeySegment(contractID) + "/")
 }
 
-// VersionKey returns "services/{name}/versions/v{version}".
+// ManifestKey returns the inline manifest shortcut key: "manifests/{contract_id}/".
+func ManifestKey(contractID string) []byte {
+	return []byte("manifests/" + KeySegment(contractID) + "/")
+}
+
+// VersionKey returns "services/{name}/versions/v{version}/".
 func VersionKey(name string, version int32) []byte {
-	return []byte(fmt.Sprintf("services/%s/versions/v%d", name, version))
+	return []byte(fmt.Sprintf("services/%s/versions/v%d/", KeySegment(name), version))
 }
 
-// ChannelKey returns "services/{name}/channels/{channel}".
+// VersionPrefix returns "services/{name}/versions/": every version pointer of
+// one service, and nothing else.
+func VersionPrefix(name string) []byte {
+	return []byte("services/" + KeySegment(name) + "/versions/")
+}
+
+// ChannelKey returns "services/{name}/channels/{channel}/".
 func ChannelKey(name, channel string) []byte {
-	return []byte("services/" + name + "/channels/" + channel)
+	return []byte("services/" + KeySegment(name) + "/channels/" + KeySegment(channel) + "/")
 }
 
-// TagKey returns "services/{name}/tags/{tag}".
+// TagKey returns "services/{name}/tags/{tag}/".
 func TagKey(name, tag string) []byte {
-	return []byte("services/" + name + "/tags/" + tag)
+	return []byte("services/" + KeySegment(name) + "/tags/" + KeySegment(tag) + "/")
 }
 
-// LeaseKey returns "services/{name}/contracts/{contract_id}/endpoints/{endpoint_id}".
+// LeaseKey returns "services/{name}/contracts/{contract_id}/endpoints/{endpoint_id}/".
 func LeaseKey(name, contractID, endpointID string) []byte {
-	return []byte("services/" + name + "/contracts/" + contractID + "/endpoints/" + endpointID)
+	return append(LeasePrefix(name, contractID), []byte(KeySegment(endpointID)+"/")...)
 }
 
 // LeasePrefix returns "services/{name}/contracts/{contract_id}/endpoints/" for range queries.
 func LeasePrefix(name, contractID string) []byte {
-	return []byte("services/" + name + "/contracts/" + contractID + "/endpoints/")
+	return []byte("services/" + KeySegment(name) + "/contracts/" + KeySegment(contractID) + "/endpoints/")
 }
 
-// AclKey returns "_aster/acl/{subkey}".
+// AclKey returns "_aster/acl/{subkey}/".
 func AclKey(subkey string) []byte {
-	return []byte("_aster/acl/" + subkey)
+	return []byte("_aster/acl/" + KeySegment(subkey) + "/")
 }
 
-// ConfigKey returns "_aster/config/{subkey}".
+// ConfigKey returns "_aster/config/{subkey}/".
 func ConfigKey(subkey string) []byte {
-	return []byte("_aster/config/" + subkey)
+	return []byte("_aster/config/" + KeySegment(subkey) + "/")
 }
