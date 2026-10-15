@@ -1352,8 +1352,12 @@ fn env_string_allow_empty(key: &str) -> Option<String> {
     env::var(key).ok()
 }
 
+// Paths from the environment and TOML expand a leading `~` at load time, so
+// every consumer sees the real path. systemd and other service managers pass
+// `~/...` through literally (no shell), so a check like `path.exists()` on the
+// raw value fails (portal-sync, 2026-10-15: `root_pubkey_file` refused to start).
 fn env_path(key: &str) -> Option<PathBuf> {
-    env_string(key).map(PathBuf::from)
+    env_string(key).map(|value| expand_tilde(Path::new(&value)))
 }
 
 fn env_bool(key: &str) -> Result<Option<bool>> {
@@ -1482,7 +1486,7 @@ fn parse_relay_mode(value: &str) -> RelayMode {
     }
 }
 
-fn expand_tilde(path: &Path) -> PathBuf {
+pub(crate) fn expand_tilde(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     if raw == "~" {
         return env::var_os("HOME")
@@ -1572,7 +1576,7 @@ fn toml_string_allow_empty(table: &toml::Table, key: &str, label: &str) -> Resul
 }
 
 fn toml_path(table: &toml::Table, key: &str, label: &str) -> Result<Option<PathBuf>> {
-    Ok(toml_string(table, key, label)?.map(PathBuf::from))
+    Ok(toml_string(table, key, label)?.map(|value| expand_tilde(Path::new(&value))))
 }
 
 fn toml_string_list(table: &toml::Table, key: &str, label: &str) -> Result<Option<Vec<String>>> {
@@ -2053,6 +2057,70 @@ mod tests {
         assert!(core.enable_hooks);
         assert_eq!(core.transport_receive_window, Some(8_000_000));
         assert_eq!(core.transport_send_fairness, Some(true));
+    }
+
+    #[test]
+    fn env_and_toml_paths_expand_a_leading_tilde() {
+        // systemd passes `~/...` through literally; every path setting must
+        // still resolve under $HOME (portal-sync root_pubkey_file, 2026-10-15).
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new();
+        let home = tempfile::tempdir().unwrap();
+        let saved_home = env::var_os("HOME");
+        env::set_var("HOME", home.path());
+
+        env::set_var("ASTER_ROOT_PUBKEY_FILE", "~/root.pub");
+        env::set_var("ASTER_STORAGE_PATH", "~/data");
+        env::set_var("ASTER_SECRET_KEY_FILE", "~/node.key");
+        let cfg = AsterConfig::from_env().unwrap();
+        assert_eq!(
+            cfg.root_pubkey_file.as_deref(),
+            Some(home.path().join("root.pub").as_path())
+        );
+        assert_eq!(
+            cfg.storage_path.as_deref(),
+            Some(home.path().join("data").as_path())
+        );
+        assert_eq!(
+            cfg.secret_key_file.as_deref(),
+            Some(home.path().join("node.key").as_path())
+        );
+        for key in [
+            "ASTER_ROOT_PUBKEY_FILE",
+            "ASTER_STORAGE_PATH",
+            "ASTER_SECRET_KEY_FILE",
+        ] {
+            env::remove_var(key);
+        }
+
+        let toml = home.path().join("aster.toml");
+        fs::write(
+            &toml,
+            "[trust]\nroot_pubkey_file = \"~/root.pub\"\n[storage]\npath = \"~/data\"\n",
+        )
+        .unwrap();
+        let cfg = AsterConfig::from_file(&toml).unwrap();
+        assert_eq!(
+            cfg.root_pubkey_file.as_deref(),
+            Some(home.path().join("root.pub").as_path())
+        );
+        assert_eq!(
+            cfg.storage_path.as_deref(),
+            Some(home.path().join("data").as_path())
+        );
+
+        // Not a leading tilde: left alone.
+        env::set_var("ASTER_STORAGE_PATH", "/srv/~data");
+        assert_eq!(
+            AsterConfig::from_env().unwrap().storage_path.as_deref(),
+            Some(Path::new("/srv/~data"))
+        );
+        env::remove_var("ASTER_STORAGE_PATH");
+
+        match saved_home {
+            Some(value) => env::set_var("HOME", value),
+            None => env::remove_var("HOME"),
+        }
     }
 
     #[test]

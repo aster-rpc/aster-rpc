@@ -303,6 +303,8 @@ pub fn plan(config: &mut AsterConfig, side: Side, overrides: Overrides) -> Resul
         return Ok(None);
     }
     if let Some(path) = &config.root_pubkey_file {
+        // A builder-supplied path is not expanded at load time.
+        let path = crate::config::expand_tilde(path);
         if !path.exists() {
             return Err(invalid(format!(
                 "root_pubkey_file {} does not exist",
