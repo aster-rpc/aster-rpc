@@ -18,7 +18,10 @@
 # noq 1.3.2 adds the stand-in fix for upstream n0-computer/noq#437 (a stateless
 # reset on any path closes the connection) and iroh 1.3.2 derives the stateless
 # reset key from the secret key, so a restarted endpoint resets the stale
-# connections of its previous process.
+# connections of its previous process. iroh-util 0.6.3 and iroh-blobs 0.103.9
+# retire a pooled blob connection whose provider stopped acknowledging (a restart
+# on a new port) and retry on a fresh one, instead of waiting out QUIC's idle
+# timeout.
 #
 # Regenerate every upgrade cycle. See docs/iroh-patches.md for the patch ledger
 # and the full upgrade procedure.
@@ -62,12 +65,12 @@ registry_bridge_crates = ["iroh-mdns-address-lookup", "iroh-tickets"]
 [forks.iroh-blobs]
 repo = "https://forge.emrul.dev/Aster/iroh-blobs.git"
 upstream_base = "v0.103.0"
-tag = "aster-iroh-blobs-v0.103.8"
-commit = "4971183ce58e5f55385825a879b94c991d383f57"
+tag = "aster-iroh-blobs-v0.103.9"
+commit = "094bdd2f17b6b73d47393af840675e93a0f5e0f2"
 branch = "upgrade/iroh-blobs-v0.103"
 crates = ["iroh-blobs"]
 registry_crates = ["iroh-blobs"]
-crate_version = "0.103.8"
+crate_version = "0.103.9"
 
 [forks.iroh-docs]
 repo = "https://forge.emrul.dev/Aster/iroh-docs.git"
@@ -98,15 +101,17 @@ crate_version = "0.101.5"
 # github.com/aster-rpc/iroh-util remains as the upstream-facing copy.
 # 0.6.2 packages upstream's cpfix rewrite (n0-computer/iroh-util PR #5,
 # aef1db3) plus the portal-sync witness tests; it supersedes the published but
-# never-consumed 0.6.1 independent patch (tag preserved).
+# never-consumed 0.6.1 independent patch (tag preserved). 0.6.3 adds
+# ConnectionPool::retire (Aster's own), which iroh-blobs 0.103.9 uses to drop a
+# pooled connection to a provider that restarted on a new address.
 repo = "https://forge.emrul.dev/Aster/iroh-util.git"
 upstream_base = "cpfix @ aef1db3 (upstream PR #5, over iroh-util-v0.6.0)"
-tag = "aster-iroh-util-v0.6.2"
-commit = "afed9e6d07e41450fe1970e794782bab7df9c2f4"
+tag = "aster-iroh-util-v0.6.3"
+commit = "6c42d23881459fdd07feb31287616c87c4676833"
 branch = "upgrade/iroh-util-v0.6"
 crates = ["iroh-util"]
 registry_crates = ["iroh-util"]
-crate_version = "0.6.2"
+crate_version = "0.6.3"
 
 [forks.iroh-gossip]
 repo = "https://forge.emrul.dev/Aster/iroh-gossip.git"
@@ -206,7 +211,7 @@ portmapper = "0.19.3"                # iroh 1.3.0 (net-tools 0030e57fc70981895bb
 version_specs = """
 salvo       = "=1.0.4"
 iroh        = "=1.3.2"
-iroh-blobs  = "0.103.8"
+iroh-blobs  = "0.103.9"
 iroh-docs   = "0.101.5"
 iroh-gossip = "0.101.1"
 iroh-tickets = "=1.0.0"
@@ -219,7 +224,7 @@ patch_crates_io = """
 iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
-iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "4971183ce58e5f55385825a879b94c991d383f57" }
+iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "094bdd2f17b6b73d47393af840675e93a0f5e0f2" }
 iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
 noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
@@ -230,7 +235,7 @@ netwatch    = { git = "https://github.com/n0-computer/net-tools",      rev = "00
 portmapper  = { git = "https://github.com/n0-computer/net-tools",      rev = "0030e57fc70981895bb86212ff0f059cc41c8a4e" }
 iroh-mdns-address-lookup = { git = "https://github.com/n0-computer/iroh-address-lookups", rev = "87fdd7ea1a902845695f8f685c1905f096b3d02d" }
 iroh-tickets = { git = "https://github.com/n0-computer/iroh-tickets",  rev = "4899684e1209dea29ed28aa2314450927557b037" }
-iroh-util    = { git = "https://forge.emrul.dev/Aster/iroh-util.git",  rev = "afed9e6d07e41450fe1970e794782bab7df9c2f4" }
+iroh-util    = { git = "https://forge.emrul.dev/Aster/iroh-util.git",  rev = "6c42d23881459fdd07feb31287616c87c4676833" }
 """
 
 # Salvo fork pin block ([patch.crates-io]) — the fork patches h3 / h3-quinn / h3-datagram /

@@ -19,7 +19,7 @@ rust-version = "1.96"
 # source used in this workspace, and a version used when packaging for Aster's
 # Cargo registry. [patch.crates-io] below still unifies transitive references.
 iroh        = { version = "=1.3.2", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh.git", rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
-iroh-blobs  = { version = "0.103.8", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "4971183ce58e5f55385825a879b94c991d383f57" }
+iroh-blobs  = { version = "0.103.9", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "094bdd2f17b6b73d47393af840675e93a0f5e0f2" }
 iroh-docs   = { version = "0.101.5", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
 iroh-gossip = { version = "0.101.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
 iroh-tickets = { version = "=1.0.0", registry = "aster", git = "https://github.com/n0-computer/iroh-tickets", rev = "4899684e1209dea29ed28aa2314450927557b037" }
@@ -58,7 +58,7 @@ crossbeam-utils = "0.8"
 iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
-iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "4971183ce58e5f55385825a879b94c991d383f57" }
+iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "094bdd2f17b6b73d47393af840675e93a0f5e0f2" }
 iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
 noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
@@ -72,7 +72,7 @@ netwatch                 = { git = "https://github.com/n0-computer/net-tools",  
 portmapper               = { git = "https://github.com/n0-computer/net-tools",            rev = "0030e57fc70981895bb86212ff0f059cc41c8a4e" }
 iroh-mdns-address-lookup = { git = "https://github.com/n0-computer/iroh-address-lookups", rev = "87fdd7ea1a902845695f8f685c1905f096b3d02d" }
 iroh-tickets             = { git = "https://github.com/n0-computer/iroh-tickets",         rev = "4899684e1209dea29ed28aa2314450927557b037" }
-iroh-util                = { git = "https://forge.emrul.dev/Aster/iroh-util.git",         rev = "afed9e6d07e41450fe1970e794782bab7df9c2f4" }
+iroh-util                = { git = "https://forge.emrul.dev/Aster/iroh-util.git",         rev = "6c42d23881459fdd07feb31287616c87c4676833" }
 
 # ──────────────────────────────────────────────────────────────────────────
 # Aster Salvo fork (HTTP transport — see docs/_internal/working_ideas/aster-http3-transport.md)
