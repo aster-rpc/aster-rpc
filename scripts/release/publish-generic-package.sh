@@ -38,9 +38,19 @@ done
 files_api="$forge/api/v1/packages/$owner/generic/$package/$version/files"
 upload_base="$forge/api/packages/$owner/generic/$package/$version"
 
+# API calls get 180 s. An upload gets 180 s plus 1 s per MiB: a candidate
+# bundle is several hundred MiB, and a runner on a home uplink (linbox) cannot
+# push that in 180 s (release candidate run 281 timed out at exactly 180 s).
 authed_curl() {
   printf 'user = "%s:%s"\n' "$user" "$ASTER_PACKAGE_TOKEN" \
-    | curl --config - --silent --show-error --connect-timeout 10 --max-time 180 "$@"
+    | curl --config - --silent --show-error --connect-timeout 10 \
+      --max-time "${max_time:-180}" "$@"
+}
+
+upload_max_time() {
+  local bytes
+  bytes="$(wc -c <"$1" | tr -d ' ')"
+  echo $((180 + bytes / 1048576))
 }
 
 remote_files() {
@@ -79,7 +89,8 @@ for file in "$@"; do
     log "$package/$version/$name already published; skipping"
     continue
   fi
-  authed_curl --fail-with-body --upload-file "$file" "$upload_base/$name" >/dev/null
+  max_time="$(upload_max_time "$file")" \
+    authed_curl --fail-with-body --upload-file "$file" "$upload_base/$name" >/dev/null
   log "uploaded $package/$version/$name"
 done
 
