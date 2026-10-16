@@ -26,7 +26,16 @@
 //! `aster.health.healthy` (0/1, over every live [`HealthState`]),
 //! `process.uptime`, and the iroh transport counters of each state's node
 //! (`aster.transport.bytes` by `aster.path` and `aster.direction`,
-//! `aster.transport.connections`).
+//! `aster.transport.connections`), its blob transfers (`aster.blobs.bytes` by
+//! `aster.direction` fetch/serve, `aster.encoding` plain/zstd and
+//! `aster.measure` payload/wire; `aster.blobs.transfers` by direction,
+//! encoding and `aster.result`; `aster.blobs.zstd.decode_errors` by
+//! direction), and the QUIC bytes it exchanged with each peer
+//! (`aster.peer.bytes` by `aster.direction` sent/received and
+//! `aster.protocol`, grouped by `aster.locality.level`, or per peer as
+//! `aster.peer` with [`HealthConfig::peer_label_cap`]; needs monitoring).
+//! A level series is a sum over the peers currently at that level, so a peer
+//! changing level moves its bytes between series.
 //!
 //! ```no_run
 //! # async fn run(node: aster::Node) -> aster::Result<()> {
@@ -54,7 +63,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -92,7 +101,7 @@ const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 /// immediately until one finishes. Probes are one request per connection.
 const MAX_CONNECTIONS: usize = 256;
 
-/// Where the health server listens.
+/// Where the health server listens, and how its metrics label peers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HealthConfig {
     /// Bind host (IP literal or resolvable name). Default `127.0.0.1`.
@@ -101,6 +110,12 @@ pub struct HealthConfig {
     /// [`HealthServer::addr`]). Note that in [`AsterConfig`](crate::AsterConfig)
     /// a `health_port` of `0` means *disabled* unless `health_enabled` is set.
     pub port: u16,
+    /// `None` (the default) groups `aster.peer.bytes` by
+    /// `aster.locality.level`. `Some(cap)` labels it per peer (`aster.peer`):
+    /// the first `cap` peers seen keep their own series for the life of the
+    /// process, every later peer is counted under `_OTHER`. From
+    /// [`AsterConfig::metrics_peer_labels`](crate::AsterConfig::metrics_peer_labels).
+    pub peer_label_cap: Option<usize>,
 }
 
 impl HealthConfig {
@@ -109,7 +124,15 @@ impl HealthConfig {
         Self {
             host: host.into(),
             port,
+            peer_label_cap: None,
         }
+    }
+
+    /// Label `aster.peer.bytes` per peer, up to `cap` peers (see
+    /// [`peer_label_cap`](Self::peer_label_cap)).
+    pub fn with_peer_labels(mut self, cap: usize) -> Self {
+        self.peer_label_cap = Some(cap);
+        self
     }
 }
 
@@ -167,8 +190,11 @@ pub struct HealthSnapshot {
 }
 
 struct StateInner {
-    /// Its transport counters feed `aster.transport.*`.
+    /// Its transport counters feed `aster.transport.*`, its blob counters
+    /// `aster.blobs.*`, and its peer views `aster.peer.bytes`.
     node: Option<Node>,
+    /// [`HealthConfig::peer_label_cap`], [`NO_PEER_LABELS`] when `None`.
+    peer_label_cap: AtomicUsize,
     started: Instant,
     healthy: AtomicBool,
     ready: AtomicBool,
@@ -205,6 +231,7 @@ impl HealthState {
     pub fn new(node: Option<&Node>) -> Self {
         let inner = Arc::new(StateInner {
             node: node.cloned(),
+            peer_label_cap: AtomicUsize::new(NO_PEER_LABELS),
             started: Instant::now(),
             healthy: AtomicBool::new(true),
             ready: AtomicBool::new(false),
@@ -412,6 +439,100 @@ fn transport(states: &[Arc<StateInner>]) -> aster_transport_core::TransportCount
     sum
 }
 
+/// [`StateInner::peer_label_cap`] when peers are grouped by level.
+const NO_PEER_LABELS: usize = usize::MAX;
+
+/// The `aster.peer` value of every peer folded past the cap.
+const OTHER_PEER: &str = "_OTHER";
+
+/// The distinct nodes of `states`, each with the peer-label cap of the first
+/// state naming it (`None`: group by level).
+fn distinct_nodes(states: &[Arc<StateInner>]) -> Vec<(Node, Option<usize>)> {
+    let mut out: Vec<(Node, Option<usize>)> = Vec::new();
+    for s in states {
+        let Some(node) = &s.node else { continue };
+        if out.iter().any(|(n, _)| n.id() == node.id()) {
+            continue;
+        }
+        let cap = s.peer_label_cap.load(Ordering::Relaxed);
+        out.push((node.clone(), (cap != NO_PEER_LABELS).then_some(cap)));
+    }
+    out
+}
+
+/// The blob transfer counters summed over `nodes`.
+fn blob_stats(nodes: &[(Node, Option<usize>)]) -> aster_transport_core::CoreBlobTransferStats {
+    let mut sum = aster_transport_core::CoreBlobTransferStats::default();
+    for (node, _) in nodes {
+        let c = node.core().blob_transfer_stats();
+        sum.fetched_payload_bytes += c.fetched_payload_bytes;
+        sum.fetched_zstd_payload_bytes += c.fetched_zstd_payload_bytes;
+        sum.fetched_wire_bytes += c.fetched_wire_bytes;
+        sum.served_payload_bytes += c.served_payload_bytes;
+        sum.served_zstd_payload_bytes += c.served_zstd_payload_bytes;
+        sum.served_wire_bytes += c.served_wire_bytes;
+        for (to, from) in [
+            (&mut sum.fetch_transfers, c.fetch_transfers),
+            (&mut sum.serve_transfers, c.serve_transfers),
+        ] {
+            to.plain_ok += from.plain_ok;
+            to.plain_failed += from.plain_failed;
+            to.zstd_ok += from.zstd_ok;
+            to.zstd_failed += from.zstd_failed;
+        }
+        sum.fetch_decode_errors += c.fetch_decode_errors;
+        sum.serve_decode_errors += c.serve_decode_errors;
+    }
+    sum
+}
+
+/// Peers given their own `aster.peer` series, first come first served. Kept
+/// for the life of the process, so a peer's series never changes name.
+fn peer_series() -> &'static Mutex<std::collections::HashSet<String>> {
+    static SERIES: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    SERIES.get_or_init(Default::default)
+}
+
+/// One `aster.peer.bytes` series: (group label key, group, protocol,
+/// direction).
+type PeerSeries = (&'static str, String, &'static str, &'static str);
+
+/// `aster.peer.bytes` grouped into series. The group is the peer's locality
+/// level, or with peer labels its id (or [`OTHER_PEER`] past the cap).
+fn peer_bytes(nodes: &[(Node, Option<usize>)]) -> BTreeMap<PeerSeries, u64> {
+    let mut out = BTreeMap::new();
+    for (node, cap) in nodes {
+        for view in node.core().peer_views() {
+            let (key, group) = match cap {
+                None => ("aster.locality.level", view.level.as_str().to_string()),
+                Some(cap) => {
+                    let mut series = peer_series().lock().unwrap_or_else(|e| e.into_inner());
+                    let own = series.contains(&view.node_id)
+                        || (series.len() < *cap && series.insert(view.node_id.clone()));
+                    let group = if own {
+                        view.node_id.clone()
+                    } else {
+                        OTHER_PEER.to_string()
+                    };
+                    ("aster.peer", group)
+                }
+            };
+            for (family, bytes) in view.quic_traffic.iter() {
+                for (direction, n) in [
+                    ("sent", bytes.quic_bytes_sent),
+                    ("received", bytes.quic_bytes_received),
+                ] {
+                    if n > 0 {
+                        *out.entry((key, group.clone(), family.as_str(), direction))
+                            .or_default() += n;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The generation whose meter provider has the callbacks below.
 static OBSERVED_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -489,6 +610,119 @@ pub(crate) fn register_observables(generation: u64, meter: &Meter) {
             }
             let c = transport(&states);
             o.observe(c.conns_opened.saturating_sub(c.conns_closed), &[]);
+        })
+        .build();
+    register_transfer_observables(meter);
+}
+
+/// `aster.blobs.*` and `aster.peer.bytes`, read off each state's node.
+fn register_transfer_observables(meter: &Meter) {
+    use aster_transport_core::CoreBlobEncoding;
+    const DIRECTION: &str = "aster.direction";
+    const ENCODING: &str = "aster.encoding";
+    meter
+        .u64_observable_counter("aster.blobs.bytes")
+        .with_description(
+            "Blob bytes fetched and served: payload (as decoded) by encoding, and \
+             compressed bytes on the wire for zstd",
+        )
+        .with_callback(|o| {
+            let nodes = distinct_nodes(&live_states());
+            if nodes.is_empty() {
+                return;
+            }
+            let c = blob_stats(&nodes);
+            for (direction, payload, zstd_payload, wire) in [
+                (
+                    "fetch",
+                    c.fetched_payload_bytes,
+                    c.fetched_zstd_payload_bytes,
+                    c.fetched_wire_bytes,
+                ),
+                (
+                    "serve",
+                    c.served_payload_bytes,
+                    c.served_zstd_payload_bytes,
+                    c.served_wire_bytes,
+                ),
+            ] {
+                let d = KeyValue::new(DIRECTION, direction);
+                for (encoding, measure, n) in [
+                    ("plain", "payload", payload.saturating_sub(zstd_payload)),
+                    ("zstd", "payload", zstd_payload),
+                    ("zstd", "wire", wire),
+                ] {
+                    o.observe(
+                        n,
+                        &[
+                            d.clone(),
+                            KeyValue::new(ENCODING, encoding),
+                            KeyValue::new("aster.measure", measure),
+                        ],
+                    );
+                }
+            }
+        })
+        .build();
+    meter
+        .u64_observable_counter("aster.blobs.transfers")
+        .with_description(
+            "Finished blob transfers: provider attempts when fetching, requests when serving",
+        )
+        .with_callback(|o| {
+            let nodes = distinct_nodes(&live_states());
+            if nodes.is_empty() {
+                return;
+            }
+            let c = blob_stats(&nodes);
+            for (direction, counts) in [("fetch", c.fetch_transfers), ("serve", c.serve_transfers)]
+            {
+                for encoding in CoreBlobEncoding::ALL {
+                    for (result, ok) in [("ok", true), ("error", false)] {
+                        o.observe(
+                            counts.get(encoding, ok),
+                            &[
+                                KeyValue::new(DIRECTION, direction),
+                                KeyValue::new(ENCODING, encoding.as_str()),
+                                KeyValue::new("aster.result", result),
+                            ],
+                        );
+                    }
+                }
+            }
+        })
+        .build();
+    meter
+        .u64_observable_counter("aster.blobs.zstd.decode_errors")
+        .with_description("zstd blob streams that failed on malformed or truncated data")
+        .with_callback(|o| {
+            let nodes = distinct_nodes(&live_states());
+            if nodes.is_empty() {
+                return;
+            }
+            let c = blob_stats(&nodes);
+            o.observe(c.fetch_decode_errors, &[KeyValue::new(DIRECTION, "fetch")]);
+            o.observe(c.serve_decode_errors, &[KeyValue::new(DIRECTION, "serve")]);
+        })
+        .build();
+    meter
+        .u64_observable_counter("aster.peer.bytes")
+        .with_description(
+            "QUIC bytes exchanged with peers by protocol, grouped by locality level (or \
+             per peer when configured); needs monitoring",
+        )
+        .with_callback(|o| {
+            let nodes = distinct_nodes(&live_states());
+            for ((key, group, protocol, direction), n) in peer_bytes(&nodes) {
+                o.observe(
+                    n,
+                    &[
+                        KeyValue::new(key, group),
+                        KeyValue::new("aster.protocol", protocol),
+                        KeyValue::new(DIRECTION, direction),
+                    ],
+                );
+            }
         })
         .build();
 }
@@ -694,6 +928,10 @@ impl HealthServer {
         let addr = listener
             .local_addr()
             .map_err(|e| Error::Connection(format!("health server local_addr: {e}")))?;
+        state.inner.peer_label_cap.store(
+            config.peer_label_cap.unwrap_or(NO_PEER_LABELS),
+            Ordering::Relaxed,
+        );
         let observability = acquire_observability().await?;
         let (stop_tx, stop_rx) = oneshot::channel();
         let task = tokio::spawn(accept_loop(listener, state.clone(), stop_rx));

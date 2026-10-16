@@ -253,6 +253,20 @@ pub struct AsterConfig {
     ///
     /// Env: `ASTER_HEALTH_ENABLED`; TOML: `[health] enabled`.
     pub health_enabled: Option<bool>,
+    /// Label `aster.peer.bytes` per peer (`aster.peer`) instead of grouping it
+    /// by locality level. For small fleets and debugging: the first
+    /// [`metrics_peer_label_cap`](Self::metrics_peer_label_cap) peers seen
+    /// keep their own series for the life of the process, every later peer is
+    /// counted under `_OTHER`. Default off.
+    ///
+    /// Env: `ASTER_METRICS_PEER_LABELS`; TOML: `[metrics] peer_labels`.
+    pub metrics_peer_labels: bool,
+    /// How many peers get their own `aster.peer` series when
+    /// [`metrics_peer_labels`](Self::metrics_peer_labels) is on. Default
+    /// [`DEFAULT_METRICS_PEER_LABEL_CAP`].
+    ///
+    /// Env: `ASTER_METRICS_PEER_LABEL_CAP`; TOML: `[metrics] peer_label_cap`.
+    pub metrics_peer_label_cap: usize,
 
     /// Extra ALPNs the node accepts inbound connections on, in addition to the
     /// built-in blobs/docs/gossip protocols. Merged (deduplicated) with the
@@ -490,6 +504,15 @@ impl AsterConfig {
             }
         }
 
+        if let Some(metrics) = toml_section(raw, "metrics", label)? {
+            if let Some(value) = toml_bool(metrics, "peer_labels", label)? {
+                self.metrics_peer_labels = value;
+            }
+            if let Some(value) = toml_usize(metrics, "peer_label_cap", label)? {
+                self.metrics_peer_label_cap = value;
+            }
+        }
+
         Ok(())
     }
 
@@ -691,6 +714,12 @@ impl AsterConfig {
         if let Some(value) = env_bool("ASTER_HEALTH_ENABLED")? {
             self.health_enabled = Some(value);
         }
+        if let Some(value) = env_bool("ASTER_METRICS_PEER_LABELS")? {
+            self.metrics_peer_labels = value;
+        }
+        if let Some(value) = env_usize("ASTER_METRICS_PEER_LABEL_CAP")? {
+            self.metrics_peer_label_cap = value;
+        }
         self.enrollment.apply_env()?;
 
         Ok(())
@@ -706,8 +735,14 @@ impl AsterConfig {
     /// [`is_health_enabled`](Self::is_health_enabled)).
     #[cfg(feature = "health")]
     pub fn health_config(&self) -> Option<crate::ops::HealthConfig> {
-        self.is_health_enabled()
-            .then(|| crate::ops::HealthConfig::new(self.health_host.clone(), self.health_port))
+        self.is_health_enabled().then(|| {
+            let config = crate::ops::HealthConfig::new(self.health_host.clone(), self.health_port);
+            if self.metrics_peer_labels {
+                config.with_peer_labels(self.metrics_peer_label_cap)
+            } else {
+                config
+            }
+        })
     }
 
     /// Resolve the root public key from `root_pubkey` or `root_pubkey_file`.
@@ -1000,6 +1035,8 @@ impl Default for AsterConfig {
             health_port: 0,
             health_host: "127.0.0.1".into(),
             health_enabled: None,
+            metrics_peer_labels: false,
+            metrics_peer_label_cap: DEFAULT_METRICS_PEER_LABEL_CAP,
             alpns: Vec::new(),
             enrollment: EnrollmentConfig::default(),
         }
@@ -1301,6 +1338,15 @@ impl AsterConfigBuilder {
         self
     }
 
+    /// Label `aster.peer.bytes` per peer, the first `cap` peers each under
+    /// its own `aster.peer` series and the rest under `_OTHER` (see
+    /// [`AsterConfig::metrics_peer_labels`]).
+    pub fn metrics_peer_labels(mut self, cap: usize) -> Self {
+        self.config.metrics_peer_labels = true;
+        self.config.metrics_peer_label_cap = cap;
+        self
+    }
+
     /// This node's enrollment credential chain, inline (see
     /// [`AsterConfig::enrollment_credential_chain`]).
     pub fn enrollment_credential_chain(mut self, chain: impl Into<String>) -> Self {
@@ -1451,6 +1497,9 @@ fn parse_portmapper(source: &str, value: &str) -> Result<String> {
 fn gc_interval_from_ms(ms: u64) -> Option<Duration> {
     (ms > 0).then(|| Duration::from_millis(ms))
 }
+
+/// Default for [`AsterConfig::metrics_peer_label_cap`].
+pub const DEFAULT_METRICS_PEER_LABEL_CAP: usize = 64;
 
 /// Default for [`AsterConfig::blob_zstd_level`].
 pub const DEFAULT_BLOB_ZSTD_LEVEL: u8 = 3;
@@ -1889,6 +1938,8 @@ mod tests {
         "ASTER_HEALTH_PORT",
         "ASTER_HEALTH_HOST",
         "ASTER_HEALTH_ENABLED",
+        "ASTER_METRICS_PEER_LABELS",
+        "ASTER_METRICS_PEER_LABEL_CAP",
     ];
 
     pub(super) fn env_lock() -> &'static Mutex<()> {
@@ -2622,6 +2673,40 @@ mod binding_knob_tests {
             AsterConfig::from_file(&path).unwrap().blob_zstd_level,
             Some(3)
         );
+    }
+
+    #[test]
+    fn metrics_peer_label_keys_from_toml_env_and_builder() {
+        let _lock = lock_env();
+        let _env = super::tests_env_guard();
+
+        let cfg = AsterConfig::default();
+        assert!(!cfg.metrics_peer_labels);
+        assert_eq!(cfg.metrics_peer_label_cap, DEFAULT_METRICS_PEER_LABEL_CAP);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        fs::write(&path, "[metrics]\npeer_labels = true\npeer_label_cap = 3\n").unwrap();
+        let cfg = AsterConfig::from_file(&path).unwrap();
+        assert!(cfg.metrics_peer_labels);
+        assert_eq!(cfg.metrics_peer_label_cap, 3);
+
+        env::set_var("ASTER_METRICS_PEER_LABEL_CAP", "1");
+        let cfg = AsterConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.metrics_peer_label_cap, 1);
+        env::set_var("ASTER_METRICS_PEER_LABELS", "false");
+        let cfg = AsterConfig::from_file(&path).unwrap();
+        assert!(!cfg.metrics_peer_labels);
+        env::remove_var("ASTER_METRICS_PEER_LABELS");
+        env::remove_var("ASTER_METRICS_PEER_LABEL_CAP");
+
+        let cfg = AsterConfig::builder()
+            .health(true)
+            .metrics_peer_labels(2)
+            .build();
+        #[cfg(feature = "health")]
+        assert_eq!(cfg.health_config().unwrap().peer_label_cap, Some(2));
+        assert!(cfg.metrics_peer_labels);
     }
 
     #[test]

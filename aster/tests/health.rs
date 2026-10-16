@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use aster::ops::{HealthConfig, HealthServer, PROMETHEUS_CONTENT_TYPE};
 use aster::rpc::{AsterServer, Call, RpcStatus, ServiceDispatch, StatusCode, StreamHeader};
-use aster::{AsterConfig, Node, RelayMode};
+use aster::{AsterConfig, BlobFormat, FetchStrategy, Node, RelayMode};
 use aster_otel::testing::TestExporters;
 use aster_otel::ObservabilityConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -61,6 +61,8 @@ fn child() {
             "after_init_with_reader" => case_after_init_with_reader().await,
             "gate0" => case_gate0().await,
             "audit_readiness" => case_audit_readiness(),
+            "blob_peer_metrics" => case_blob_peer_metrics().await,
+            "peer_label_cap" => case_peer_label_cap().await,
             other => panic!("unknown case {other}"),
         }
     });
@@ -657,6 +659,160 @@ async fn case_gate0() {
     srv.shutdown().await;
 }
 
+// ── blob and peer transfer instruments ──────────────────────────────────────
+
+fn monitored() -> AsterConfig {
+    cfg().into_builder().monitoring(true).build()
+}
+
+/// Two started, connected nodes with monitoring (the peer view feeds
+/// `aster.peer.bytes`).
+async fn monitored_node() -> Node {
+    let n = Node::start(monitored()).await.unwrap();
+    wait_for_addr(&n).await;
+    n
+}
+
+const BLOB: usize = 256 * 1024;
+
+/// `consumer` fetches a fresh compressible blob from `holder` over zstd.
+async fn fetch_blob(consumer: &Node, holder: &Node, fill: u8) {
+    consumer.add_peer(holder).unwrap();
+    holder.add_peer(consumer).unwrap();
+    let hash = holder.blobs().add_bytes(vec![fill; BLOB]).await.unwrap();
+    timeout(
+        Duration::from_secs(30),
+        consumer.blobs().download_hash_to_store_from(
+            &hash,
+            &[holder.id()],
+            BlobFormat::Raw,
+            FetchStrategy::Whole,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+fn peer_bytes(s: &[Sample], group: (&str, &str), protocol: &str, direction: &str) -> f64 {
+    value(
+        s,
+        "aster_peer_bytes_total",
+        &[
+            group,
+            ("aster_protocol", protocol),
+            ("aster_direction", direction),
+        ],
+    )
+    .unwrap_or(0.0)
+}
+
+/// `aster.blobs.*` from a zstd fetch, and `aster.peer.bytes` grouped by
+/// locality level.
+async fn case_blob_peer_metrics() {
+    let a = monitored_node().await;
+    let b = monitored_node().await;
+    let health = HealthServer::start(&a, HealthConfig::new("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = health.addr();
+    fetch_blob(&a, &b, b'x').await;
+
+    let blob = |s: &[Sample], encoding: &str, measure: &str| {
+        value(
+            s,
+            "aster_blobs_bytes_total",
+            &[
+                ("aster_direction", "fetch"),
+                ("aster_encoding", encoding),
+                ("aster_measure", measure),
+            ],
+        )
+    };
+    let s = scrape_until(addr, "blob and peer bytes", |s| {
+        blob(s, "zstd", "payload") == Some(BLOB as f64)
+            && peer_bytes(
+                s,
+                ("aster_locality_level", "same_host"),
+                "blobs-zstd",
+                "received",
+            ) > 0.0
+    })
+    .await;
+    let wire = blob(&s, "zstd", "wire").unwrap();
+    assert!(wire > 0.0 && wire < BLOB as f64 / 4.0, "wire {wire}");
+    assert_eq!(blob(&s, "plain", "payload"), Some(0.0));
+    assert_eq!(
+        value(
+            &s,
+            "aster_blobs_transfers_total",
+            &[
+                ("aster_direction", "fetch"),
+                ("aster_encoding", "zstd"),
+                ("aster_result", "ok"),
+            ],
+        ),
+        Some(1.0)
+    );
+    assert_eq!(
+        value(
+            &s,
+            "aster_blobs_zstd_decode_errors_total",
+            &[("aster_direction", "fetch")]
+        ),
+        Some(0.0)
+    );
+    assert!(
+        s.iter().all(|x| !x.labels.contains_key("aster_peer")),
+        "no per-peer labels by default"
+    );
+    health.shutdown().await;
+    a.shutdown().await;
+    b.shutdown().await;
+}
+
+/// Per-peer labels with a cap of 1: the first peer keeps its own series, the
+/// second is counted under `_OTHER`.
+async fn case_peer_label_cap() {
+    let a = monitored_node().await;
+    let b = monitored_node().await;
+    let c = monitored_node().await;
+    let health = HealthServer::start(&a, HealthConfig::new("127.0.0.1", 0).with_peer_labels(1))
+        .await
+        .unwrap();
+    let addr = health.addr();
+    let b_id = b.id().to_string();
+    let c_id = c.id().to_string();
+
+    fetch_blob(&a, &b, b'b').await;
+    scrape_until(addr, "B's own series", |s| {
+        peer_bytes(s, ("aster_peer", &b_id), "blobs-zstd", "received") > 0.0
+    })
+    .await;
+
+    fetch_blob(&a, &c, b'c').await;
+    let s = scrape_until(addr, "C under _OTHER", |s| {
+        peer_bytes(s, ("aster_peer", "_OTHER"), "blobs-zstd", "received") > 0.0
+    })
+    .await;
+    assert!(peer_bytes(&s, ("aster_peer", &b_id), "blobs-zstd", "received") > 0.0);
+    assert!(
+        s.iter()
+            .all(|x| x.labels.get("aster_peer").map(String::as_str) != Some(c_id.as_str())),
+        "C has no series of its own"
+    );
+    assert!(
+        s.iter()
+            .filter(|x| x.name == "aster_peer_bytes_total")
+            .all(|x| !x.labels.contains_key("aster_locality_level")),
+        "per-peer series are not also grouped by level"
+    );
+    health.shutdown().await;
+    a.shutdown().await;
+    b.shutdown().await;
+    c.shutdown().await;
+}
+
 /// Design §3.5: once a log bridge is open, `/readyz` carries an `audit`
 /// check, and a dropped `aster::audit` record fails readiness.
 fn case_audit_readiness() {
@@ -741,6 +897,16 @@ fn health_after_an_init_with_push_exporters_joins_and_serves() {
 #[test]
 fn health_after_an_init_with_prometheus_joins_it() {
     run("after_init_with_reader");
+}
+
+#[test]
+fn blob_transfers_and_peer_bytes_reach_metrics() {
+    run("blob_peer_metrics");
+}
+
+#[test]
+fn peer_labels_fold_past_the_cap() {
+    run("peer_label_cap");
 }
 
 #[test]

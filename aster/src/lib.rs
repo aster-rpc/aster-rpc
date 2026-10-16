@@ -120,7 +120,7 @@ pub use aster_transport_core::trust::{
 pub use config::{
     AsterConfig, AsterConfigBuilder, AsterIdentityPeer, EnrollmentConfig, EnrollmentLimits,
     LoadedIdentity, PublishedServices, RelayMode, RoleMappingConfig, DEFAULT_BLOB_ZSTD_LEVEL,
-    DEFAULT_ROLE_ATTRIBUTE,
+    DEFAULT_METRICS_PEER_LABEL_CAP, DEFAULT_ROLE_ATTRIBUTE,
 };
 
 /// The Aster RPC ALPN (`aster/1`). Also [`alpns::RPC`] and, with the `rpc`
