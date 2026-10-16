@@ -1,12 +1,14 @@
 //! Root-authored fleet records: namespace bindings (B9), sealed observer
-//! write grants (D2) and issuer status (B8). Semantics live in Aster core;
-//! this adapter builds the records and publishes them as the root.
+//! write grants (D2), issuer status (B8) and the issuer-key publishers'
+//! sealed fleet write grants (gateway identity). Semantics live in Aster
+//! core; this adapter builds the records and publishes them as the root.
 
 use std::path::PathBuf;
 
 use aster::enrollment::{
     Audience, BindingStatus, IssuerStatus, IssuerStatusV1, NamespaceBindingV1, NamespacePurpose,
     OBSERVER_GRANT_APP, OBSERVER_GRANT_PREFIX, issuer_status_key, namespace_binding_key,
+    publisher_grant_key, publisher_grant_record, publisher_grant_withdrawal,
 };
 use aster::grants::{GrantContext, GrantRecord, grant_key, seal_namespace_grant};
 use aster_cli_kit::out::{Report, Styler};
@@ -96,6 +98,45 @@ pub struct IssuerArgs {
     reauthorizes: Option<u64>,
     #[command(flatten)]
     fleet: FleetArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct PublisherArgs {
+    /// Seal the fleet namespace's write capability to this publisher's node key; repeatable.
+    /// Its credential must also grant `aster.identity-publisher`
+    #[arg(long, value_name = "KEY", required_unless_present = "unseal")]
+    seal_to: Vec<String>,
+    /// Withdraw a publisher's grant; repeatable
+    #[arg(long, value_name = "KEY")]
+    unseal: Vec<String>,
+    #[command(flatten)]
+    fleet: FleetArgs,
+}
+
+#[derive(Serialize)]
+struct PublisherGrantReport {
+    sealed_to: Vec<String>,
+    unsealed: Vec<String>,
+    delivered: bool,
+}
+
+impl Report for PublisherGrantReport {
+    fn human(&self, _: Styler) -> String {
+        let mut text = String::from("Delivered to every policy replica.");
+        if !self.sealed_to.is_empty() {
+            text.push_str(&format!(
+                "\nSealed identity-publisher grants: {}",
+                self.sealed_to.join(", ")
+            ));
+        }
+        if !self.unsealed.is_empty() {
+            text.push_str(&format!(
+                "\nWithdrew identity-publisher grants: {}",
+                self.unsealed.join(", ")
+            ));
+        }
+        text
+    }
 }
 
 #[derive(Serialize)]
@@ -403,6 +444,51 @@ pub async fn issuer(ctx: &Ctx, args: IssuerArgs, now: u64) -> Result<()> {
         written,
         sealed_to: vec![],
         unsealed: vec![],
+        delivered: true,
+    })
+}
+
+/// Seal the fleet namespace's write grant to issuer-key publishers, or
+/// withdraw it, as the root.
+pub async fn identity_publisher(ctx: &Ctx, args: PublisherArgs) -> Result<()> {
+    let seal_to = args
+        .seal_to
+        .iter()
+        .map(|key| hex32(key, "publisher key"))
+        .collect::<Result<Vec<_>>>()?;
+    let unseal = args
+        .unseal
+        .iter()
+        .map(|key| hex32(key, "publisher key"))
+        .collect::<Result<Vec<_>>>()?;
+    if seal_to.iter().any(|key| unseal.contains(key)) {
+        return Err(Error::usage("a key cannot be both sealed to and unsealed"));
+    }
+    let session = Session::start(ctx, &args.fleet).await?;
+    let secret = namespace_secret(&args.fleet.fleet_secret_file, session.fleet_namespace())?;
+    let fleet = session
+        .writable(session.fleet_namespace(), &args.fleet.fleet_secret_file)
+        .await?;
+    for publisher in &seal_to {
+        let (key, record) =
+            publisher_grant_record(session.root(), publisher, &secret.to_bytes())
+                .map_err(|e| Error::usage(format!("sealing the publisher grant: {e:#}")))?;
+        session.put_root(&fleet, key.as_bytes(), record).await?;
+    }
+    for publisher in &unseal {
+        let key = publisher_grant_key(publisher);
+        session
+            .put_root(
+                &fleet,
+                key.as_bytes(),
+                publisher_grant_withdrawal("identity publisher withdrawn"),
+            )
+            .await?;
+    }
+    session.finish(vec![fleet]).await?;
+    ctx.emit(&PublisherGrantReport {
+        sealed_to: seal_to.iter().map(hex::encode).collect(),
+        unsealed: unseal.iter().map(hex::encode).collect(),
         delivered: true,
     })
 }

@@ -48,6 +48,8 @@ pub enum EnrollCommand {
     Namespace(policy::NamespaceCommand),
     /// Revoke or reactivate an online issuer as the root
     Issuer(policy::IssuerArgs),
+    /// Seal (or withdraw) the fleet namespace write grant an issuer-key publisher needs
+    IdentityPublisher(policy::PublisherArgs),
     /// List the observations the root can promote, and those it ignores
     Review(observe::ReviewArgs),
     /// Promote observed persistent nodes to root-authored registrations
@@ -210,6 +212,7 @@ pub async fn run(ctx: &Ctx, command: EnrollCommand) -> Result<()> {
         EnrollCommand::Delegate(args) => ctx.emit(&issue_delegate(ctx, args, now)?),
         EnrollCommand::Namespace(command) => policy::namespace(ctx, command).await,
         EnrollCommand::Issuer(args) => policy::issuer(ctx, args, now).await,
+        EnrollCommand::IdentityPublisher(args) => policy::identity_publisher(ctx, args).await,
         EnrollCommand::Review(args) => observe::run_review(ctx, args).await,
         EnrollCommand::Promote(args) => observe::run_promote(ctx, *args).await,
         EnrollCommand::Revoke(args) => registration::revoke(ctx, *args).await,
