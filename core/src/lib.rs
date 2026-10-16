@@ -284,6 +284,24 @@ pub struct CoreGossipEvent {
     pub data: Option<Vec<u8>>,
 }
 
+/// The entries of [`CoreDoc::query_key_prefix_stream`], in author-then-key order.
+pub struct CoreDocEntryStream {
+    inner: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<CoreDocEntry>> + Send>>,
+}
+
+impl std::fmt::Debug for CoreDocEntryStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoreDocEntryStream").finish_non_exhaustive()
+    }
+}
+
+impl CoreDocEntryStream {
+    /// The next entry; `None` once every matching entry was returned.
+    pub async fn next(&mut self) -> Option<Result<CoreDocEntry>> {
+        self.inner.next().await
+    }
+}
+
 /// A document entry returned from queries, containing metadata about who wrote it and what they wrote.
 #[derive(Clone, Debug)]
 pub struct CoreDocEntry {
@@ -5351,6 +5369,28 @@ impl CoreDoc {
                 timestamp: entry.timestamp(),
             })
             .collect())
+    }
+
+    /// Stream every entry under a key prefix, across all authors, ordered by
+    /// author then key (iroh-docs' default sort), without collecting them.
+    ///
+    /// For a reader that must see every entry but cannot bound how many there
+    /// are (anyone holding a namespace's write secret can add authors and keys
+    /// at will): memory stays bounded however many entries match.
+    pub async fn query_key_prefix_stream(&self, prefix: Vec<u8>) -> Result<CoreDocEntryStream> {
+        let query = Query::key_prefix(prefix).build();
+        let stream = self.doc.get_many(query).await?.map(|entry| {
+            entry.map(|entry| CoreDocEntry {
+                author_id: entry.author().to_string(),
+                key: entry.key().to_vec(),
+                content_hash: entry.content_hash().to_hex().to_string(),
+                content_len: entry.content_len(),
+                timestamp: entry.timestamp(),
+            })
+        });
+        Ok(CoreDocEntryStream {
+            inner: Box::pin(stream),
+        })
     }
 
     /// List the latest entry for each distinct key under a prefix, across all authors.

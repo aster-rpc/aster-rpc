@@ -105,6 +105,20 @@ impl From<CoreDocEntry> for DocEntry {
     }
 }
 
+/// The entries of [`Doc::query_key_prefix_stream`], in author-then-key order.
+#[derive(Debug)]
+pub struct DocEntryStream(aster_transport_core::CoreDocEntryStream);
+
+impl DocEntryStream {
+    /// The next entry; `Ok(None)` once every matching entry was returned.
+    pub async fn next(&mut self) -> Result<Option<DocEntry>> {
+        match self.0.next().await {
+            None => Ok(None),
+            Some(entry) => Ok(Some(DocEntry::from(entry?))),
+        }
+    }
+}
+
 /// A live document event.
 #[derive(Clone, Debug)]
 pub enum DocEvent {
@@ -652,6 +666,19 @@ impl Doc {
             .into_iter()
             .map(DocEntry::from)
             .collect())
+    }
+
+    /// Every entry under a key prefix, across authors, in author-then-key
+    /// order, read one at a time: memory stays bounded however many entries
+    /// match. For readers that must see every entry of a prefix anyone with
+    /// write access can fill.
+    pub async fn query_key_prefix_stream(
+        &self,
+        prefix: impl Into<Vec<u8>>,
+    ) -> Result<DocEntryStream> {
+        Ok(DocEntryStream(
+            self.inner.query_key_prefix_stream(prefix.into()).await?,
+        ))
     }
 
     /// The latest entry for each distinct key under a prefix (`limit` optional).

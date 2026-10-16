@@ -31,6 +31,14 @@
 //!
 //! ## What a core keeps
 //!
+//! Every entry under the prefix is read, one at a time, and nothing is
+//! counted before its author is shown to hold `aster.identity-publisher`:
+//! the fleet write secret lets its holder write as any author, so an author
+//! without the role can write any number of entries and change nothing. A
+//! publisher has at most one set per issuer; of its sets for issuers this
+//! core does not trust, at most [`unlisted_issuer_quota`] are kept, so a
+//! misbehaving publisher cannot displace another publisher's sets.
+//!
 //! The newest accepted record (by `fetched_at`) per issuer. A set older than
 //! `[identity] max_key_set_age_secs` (default 48 hours) verifies nothing, so
 //! a publisher that stops refreshing cannot keep a removed key alive. Keys of an issuer
@@ -56,8 +64,18 @@ pub use aster_transport_core::delegation::issuer_keys::{
 /// The role a publisher's credential must grant for its issuer key sets to
 /// count. Granted through Enrollment, narrowly.
 pub const IDENTITY_PUBLISHER_ROLE: &str = "aster.identity-publisher";
-/// Most key-set entries a core reads; more and it holds none (fail closed).
-pub const MAX_KEY_SET_ENTRIES: usize = 1024;
+/// How many key sets for issuers a core does not trust it keeps from one
+/// publisher, per trusted issuer (at least one): see
+/// [`unlisted_issuer_quota`].
+pub const UNLISTED_ISSUER_SETS_PER_TRUSTED_ISSUER: usize = 4;
+
+/// The most key sets for unlisted issuers a core keeps from one publisher,
+/// when `trusted` issuers are configured: `max(trusted, 1)` ×
+/// [`UNLISTED_ISSUER_SETS_PER_TRUSTED_ISSUER`]. A publisher's sets for
+/// trusted issuers are at most one each (the entry key names the issuer).
+pub fn unlisted_issuer_quota(trusted: usize) -> usize {
+    trusted.max(1) * UNLISTED_ISSUER_SETS_PER_TRUSTED_ISSUER
+}
 
 /// One accepted key set.
 #[derive(Debug)]
@@ -195,13 +213,13 @@ pub(crate) use watch::{watch, IssuerKeysWatch};
 
 #[cfg(all(feature = "enrollment", feature = "docs"))]
 mod watch {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
     use std::time::Duration;
 
     use aster_transport_core::delegation::issuer_keys::{decode_key_set, ISSUER_KEYS_PREFIX};
 
-    use super::{Accepted, IssuerKeys, IDENTITY_PUBLISHER_ROLE, MAX_KEY_SET_ENTRIES};
+    use super::{unlisted_issuer_quota, Accepted, IssuerKeys, IDENTITY_PUBLISHER_ROLE};
     use crate::docs::{Doc, DocEvent};
     use crate::enrollment::runtime::RoleMapping;
     use crate::enrollment::Enrollment;
@@ -337,16 +355,64 @@ mod watch {
             .map_or(0, |elapsed| elapsed.as_secs())
     }
 
+    /// The last author's last credential and what it established: entries of
+    /// one author arrive together and normally carry the same chain.
+    struct Verdict {
+        author: [u8; 32],
+        credential: Option<String>,
+        /// `Some(valid_until)` when the author is a publisher.
+        publisher: Option<Option<u64>>,
+    }
+
     impl Scanner {
+        /// Whether `author`, carrying `credential`, holds
+        /// `aster.identity-publisher` at `now`; `Some(valid_until)` if so.
+        fn publisher(
+            &self,
+            author: &[u8; 32],
+            credential: Option<&str>,
+            now: u64,
+        ) -> std::result::Result<Option<u64>, &'static str> {
+            let Some(evidence) = self.enrollment.evidence_for(author, credential) else {
+                return Err("author holds no valid credential or registration");
+            };
+            if evidence.expires_at().is_some_and(|exp| now >= exp) {
+                return Err("author's credential expired");
+            }
+            if !self
+                .mapping
+                .roles(evidence.claims())
+                .contains(IDENTITY_PUBLISHER_ROLE)
+            {
+                return Err("author lacks aster.identity-publisher");
+            }
+            Ok(evidence.expires_at())
+        }
+
+        /// Read every entry under the prefix, one at a time, and keep the
+        /// newest accepted set per issuer.
+        ///
+        /// Nothing is counted before an entry's author is shown to hold
+        /// `aster.identity-publisher`, so an author without it (anyone holding
+        /// the fleet write secret can write as any author) changes nothing,
+        /// however many entries it writes. A publisher has at most one entry
+        /// per issuer (the key names the issuer); its sets for issuers this
+        /// server does not trust are kept up to
+        /// [`unlisted_issuer_quota`] each, so a misbehaving publisher holds
+        /// a bounded amount and never displaces another publisher's sets.
         async fn rebuild(&self) {
             let now = unix_now();
-            let leeway = self.identity.load().clock_leeway_secs;
-            let entries = match self
+            let settings = self.identity.load();
+            let leeway = settings.clock_leeway_secs;
+            let trusted: BTreeSet<Vec<u8>> = settings
+                .trusted_issuers
+                .iter()
+                .map(|issuer| super::issuer_keys_key(&issuer.iss))
+                .collect();
+            let quota = unlisted_issuer_quota(trusted.len());
+            let mut entries = match self
                 .doc
-                .query_key_prefix(
-                    ISSUER_KEYS_PREFIX.as_bytes().to_vec(),
-                    Some(MAX_KEY_SET_ENTRIES as u64 + 1),
-                )
+                .query_key_prefix_stream(ISSUER_KEYS_PREFIX.as_bytes().to_vec())
                 .await
             {
                 Ok(entries) => entries,
@@ -356,17 +422,21 @@ mod watch {
                     return;
                 }
             };
-            if entries.len() > MAX_KEY_SET_ENTRIES {
-                tracing::warn!(
-                    target: IDENTITY,
-                    limit = MAX_KEY_SET_ENTRIES,
-                    "too many issuer key-set entries; holding none"
-                );
-                self.keys.replace(BTreeMap::new());
-                return;
-            }
             let mut best: BTreeMap<String, Arc<Accepted>> = BTreeMap::new();
-            for entry in entries {
+            // Accepted sets for unlisted issuers, per publisher. Only
+            // publishers appear here, so it is as small as their number.
+            let mut unlisted: BTreeMap<[u8; 32], usize> = BTreeMap::new();
+            let mut over_quota: BTreeSet<[u8; 32]> = BTreeSet::new();
+            let mut verdict: Option<Verdict> = None;
+            loop {
+                let entry = match entries.next().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(error) => {
+                        tracing::warn!(target: IDENTITY, error = %error, "reading issuer keys failed");
+                        return;
+                    }
+                };
                 if entry.content_len == 0
                     || entry.content_len > super::MAX_KEY_SET_RECORD_BYTES as u64
                 {
@@ -375,6 +445,20 @@ mod watch {
                 let Some(publisher) = parse_hex32(entry.author.as_str()) else {
                     continue;
                 };
+                let listed = trusted.contains(&entry.key);
+                if !listed && unlisted.get(&publisher).is_some_and(|held| *held >= quota) {
+                    // Over quota: skipped before its content is read.
+                    if over_quota.insert(publisher) {
+                        tracing::warn!(
+                            target: IDENTITY,
+                            publisher = hex::encode(publisher).as_str(),
+                            limit = quota,
+                            "issuer keys: a publisher wrote more key sets for unlisted issuers \
+                             than the limit; the rest are ignored"
+                        );
+                    }
+                    continue;
+                }
                 let publisher_id = hex::encode(publisher);
                 let bytes = match self
                     .doc
@@ -400,40 +484,44 @@ mod watch {
                         continue;
                     }
                 };
-                let ignored = |reason: &str| {
-                    tracing::debug!(
-                        target: IDENTITY,
-                        iss = record.iss.as_str(),
-                        publisher = publisher_id.as_str(),
-                        reason,
-                        "issuer key set ignored"
-                    );
+                let cached = verdict.as_ref().filter(|held| {
+                    held.author == publisher && held.credential == record.credential
+                });
+                let standing = match cached {
+                    Some(held) => held.publisher.ok_or("author is not a publisher"),
+                    None => {
+                        let standing =
+                            self.publisher(&publisher, record.credential.as_deref(), now);
+                        verdict = Some(Verdict {
+                            author: publisher,
+                            credential: record.credential.clone(),
+                            publisher: standing.ok(),
+                        });
+                        standing
+                    }
                 };
-                let Some(evidence) = self
-                    .enrollment
-                    .evidence_for(&publisher, record.credential.as_deref())
-                else {
-                    ignored("author holds no valid credential or registration");
-                    continue;
+                let valid_until = match standing {
+                    Ok(valid_until) => valid_until,
+                    Err(reason) => {
+                        tracing::debug!(
+                            target: IDENTITY,
+                            iss = record.iss.as_str(),
+                            publisher = publisher_id.as_str(),
+                            reason,
+                            "issuer key set ignored"
+                        );
+                        continue;
+                    }
                 };
-                if evidence.expires_at().is_some_and(|exp| now >= exp) {
-                    ignored("author's credential expired");
-                    continue;
-                }
-                if !self
-                    .mapping
-                    .roles(evidence.claims())
-                    .contains(IDENTITY_PUBLISHER_ROLE)
-                {
-                    ignored("author lacks aster.identity-publisher");
-                    continue;
+                if !listed {
+                    *unlisted.entry(publisher).or_default() += 1;
                 }
                 let candidate = Accepted {
                     keys: record.keys,
                     publisher,
                     source_url: record.source_url,
                     fetched_at: record.fetched_at,
-                    valid_until: evidence.expires_at(),
+                    valid_until,
                 };
                 let newer = best.get(&record.iss).is_none_or(|held| {
                     (candidate.fetched_at, candidate.publisher) > (held.fetched_at, held.publisher)

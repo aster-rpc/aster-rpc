@@ -648,3 +648,158 @@ async fn an_issuer_without_audiences_or_enrollment_fails_start_up() {
         .expect("trusted issuers need Enrollment");
     assert!(error.to_string().contains("enrollment"), "{error}");
 }
+
+/// Write `count` key sets as `author` into `fleet` without syncing: valid
+/// records for made-up issuers, carrying `chain`, every other one replaced by
+/// bytes that are not a record at all.
+async fn write_junk(
+    fleet: &Doc,
+    author: &aster::AuthorId,
+    label: &str,
+    chain: Option<&str>,
+    count: usize,
+) {
+    let filler = IdpKey::es256();
+    let jwks: serde_json::Value = serde_json::from_str(&jwks(&[(&filler, "junk")])).unwrap();
+    for n in 0..count {
+        let iss = format!("https://junk-{label}-{n}.example.com");
+        let bytes = if n % 2 == 0 {
+            aster_transport_core::delegation::issuer_keys::encode_key_set(
+                &iss,
+                &format!("{iss}/jwks"),
+                now(),
+                &jwks,
+                chain,
+            )
+            .unwrap()
+        } else {
+            b"not a key set".to_vec()
+        };
+        fleet
+            .set_bytes(author, issuer_keys_key(&iss), bytes)
+            .await
+            .unwrap();
+    }
+}
+
+/// Wait until the server's copy of the fleet holds at least `count` complete
+/// entries under the issuer-key prefix.
+async fn wait_entry_count(server: &AsterServer, fleet: &Doc, count: usize) {
+    let doc = server
+        .node()
+        .docs()
+        .open(fleet.id().unwrap())
+        .await
+        .unwrap()
+        .expect("the server holds the fleet namespace");
+    let events = doc.subscribe().await.unwrap();
+    loop {
+        let mut stream = doc
+            .query_key_prefix_stream(aster::rpc::issuer_keys::ISSUER_KEYS_PREFIX)
+            .await
+            .unwrap();
+        let mut complete = 0;
+        while let Some(entry) = stream.next().await.unwrap() {
+            let content = doc
+                .read_entry_contents_if_complete(std::slice::from_ref(&entry.content_hash))
+                .await
+                .unwrap();
+            complete += usize::from(content[0].is_some());
+        }
+        if complete >= count {
+            return;
+        }
+        events.recv().await.unwrap().expect("subscription ended");
+    }
+}
+
+/// Slice 3 left a denial of service: anyone holding the fleet write secret
+/// could write more than the core's entry cap and leave it with no keys. Now
+/// nothing counts before its author is shown to be a publisher, and a
+/// publisher's sets for unlisted issuers are bounded per publisher.
+#[tokio::test]
+async fn junk_writers_cannot_evict_a_trusted_issuers_keys() {
+    const MISBEHAVING: u8 = 9;
+    tokio::time::timeout(Duration::from_secs(300), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let server = start_server(&root, files.path()).await;
+        let keys = server.issuer_keys().unwrap();
+        let edge = connect(&root, &server, EDGE, Some(GATEWAY_ROLE)).await;
+        let publisher =
+            Publisher::start(&root, &server, PUBLISHER, Some(IDENTITY_PUBLISHER_ROLE)).await;
+        let rogue = Publisher::start(&root, &server, ROGUE, Some("data.read")).await;
+        let misbehaving =
+            Publisher::start(&root, &server, MISBEHAVING, Some(IDENTITY_PUBLISHER_ROLE)).await;
+
+        let a1 = IdpKey::es256();
+        publisher
+            .publish(&server, ISS_A, jwks(&[(&a1, "a1")]), now() - 10)
+            .await;
+        wait_keys(&keys, |k| kids(k, ISS_A) == ["a1"]).await;
+
+        // Far more than slice 3's 1024-entry cap, from three writers: a
+        // credentialed node without the publisher role, a docs author that is
+        // no node at all (the write secret lets anyone add authors), and a
+        // publisher writing sets for issuers the server does not trust.
+        let rogue_author = rogue.client.node().docs().default_author().await.unwrap();
+        write_junk(
+            &rogue.fleet,
+            &rogue_author,
+            "rogue",
+            Some(&rogue.chain),
+            700,
+        )
+        .await;
+        let stranger = rogue.client.node().docs().create_author().await.unwrap();
+        write_junk(&rogue.fleet, &stranger, "stranger", None, 500).await;
+        let misbehaving_author = misbehaving
+            .client
+            .node()
+            .docs()
+            .default_author()
+            .await
+            .unwrap();
+        write_junk(
+            &misbehaving.fleet,
+            &misbehaving_author,
+            "misbehaving",
+            Some(&misbehaving.chain),
+            60,
+        )
+        .await;
+        for fleet in [&rogue.fleet, &misbehaving.fleet] {
+            fleet
+                .sync_with_timeout(&[server.id()], Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+        wait_entry_count(&server, &root.fleet, 1 + 700 + 500 + 60).await;
+
+        // A rotation after all of that arrived: the rebuild that installs it
+        // has read every junk entry.
+        let a2 = IdpKey::es256();
+        publisher
+            .publish(&server, ISS_A, jwks(&[(&a2, "a2")]), now())
+            .await;
+        wait_keys(&keys, |k| kids(k, ISS_A) == ["a2"]).await;
+
+        let sets = keys.key_sets();
+        let by = |who: String| sets.iter().filter(|set| set.publisher == who).count();
+        assert_eq!(by(id(ROGUE)), 0, "a non-publisher holds nothing");
+        assert_eq!(by(stranger.as_str().to_string()), 0, "nor does a stranger");
+        // 30 of the misbehaving publisher's 60 are well-formed records.
+        assert_eq!(
+            by(id(MISBEHAVING)),
+            aster::rpc::issuer_keys::unlisted_issuer_quota(1),
+            "a publisher's unlisted sets are bounded"
+        );
+        assert_eq!(keys.key_set(ISS_A).unwrap().publisher, id(PUBLISHER));
+        data(&edge, &a2.token("a2", user_claims(ISS_A)))
+            .read()
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("test timed out");
+}
