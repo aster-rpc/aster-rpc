@@ -587,9 +587,11 @@ func Version() (major, minor, patch uint32) {
 // this binding runs against. ABI 7.0 swapped aster_hook_failure_mode_t so
 // 0 = FAIL_CLOSED (6.0 grew aster_config_t to 288 bytes); 7.1 added the audit
 // outbox acknowledgement log (aster_audit_outbox_acknowledgements); 7.2 added
-// aster_server_drain (AsterServer.Drain). This binding needs native ABI 7.2 or
-// a later 7.x.
-const ABIMinorRequired = uint32(2)
+// aster_server_drain (AsterServer.Drain); 7.3 added the cluster network
+// settings beside aster_config_t (aster_config_set_network: BindAddrV6,
+// AdvertiseAddrs, RelayCACerts, Discovery). This binding needs native ABI 7.3
+// or a later 7.x.
+const ABIMinorRequired = uint32(3)
 
 var (
 	abiOnce sync.Once

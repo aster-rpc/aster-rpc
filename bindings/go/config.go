@@ -70,8 +70,33 @@ type AsterConfig struct {
 	// StoragePath is the persistent store directory; "" = in memory.
 	StoragePath  string
 	GCIntervalMs uint64
-	// BindAddr, e.g. "127.0.0.1:0"; "" = all interfaces.
+	// BindAddr, e.g. "127.0.0.1:0"; "" = all interfaces. An IPv4 address
+	// pins only the IPv4 socket; set BindAddrV6 to pin the IPv6 one.
 	BindAddr string
+	// BindAddrV6 pins the IPv6 socket, e.g. "[::]:7842" (C ABI 7.3). Env
+	// ASTER_BIND_ADDR_V6; TOML [network] bind_addr_v6.
+	BindAddrV6 string
+	// AdvertiseAddrs are extra direct addresses ("IP:port") the node is
+	// reachable on but cannot discover, e.g. a NodePort or load balancer.
+	// Published with the discovered ones; hints only, since peers still
+	// verify the node key in the TLS handshake. Env ASTER_ADVERTISE_ADDRS
+	// (comma-separated); TOML [network] advertise_addrs.
+	AdvertiseAddrs []string
+	// RelayCACerts are PEM files whose CA certificates are trusted for relay
+	// TLS, in addition to the WebPKI roots (only them with RelayCAOnly): a
+	// self-hosted relay with a private-CA certificate. Relay transport
+	// security only; peer identity is unaffected. Env ASTER_RELAY_CA_CERTS
+	// (comma-separated); TOML [network] relay_ca_certs / relay_ca_only.
+	RelayCACerts []string
+	RelayCAOnly  bool
+	// Discovery is "" / DiscoveryDefault (n0 at iroh.link), DiscoveryNone,
+	// DiscoveryLocal (mDNS only) or DiscoveryCustom (only DiscoveryDNSOrigin
+	// and DiscoveryPkarrRelays; setting either selects it). Env
+	// ASTER_DISCOVERY, ASTER_DISCOVERY_DNS_ORIGIN, ASTER_DISCOVERY_PKARR_RELAYS;
+	// TOML [network] discovery, discovery_dns_origin, discovery_pkarr_relays.
+	Discovery            string
+	DiscoveryDNSOrigin   string
+	DiscoveryPkarrRelays []string
 	// ALPNs the node accepts, in addition to those added by a server/client.
 	ALPNs        []string
 	IdentityFile string
@@ -395,6 +420,11 @@ func (c *AsterConfig) toNative(a *cArena, extraALPNs []string) (C.aster_config_t
 		set |= C.ASTER_TRANSPORT_ENABLE_SEGMENTATION_OFFLOAD
 	}
 	n.transport_set = set
+	// C ABI 7.3: settings without an aster_config_t slot go into n.storage;
+	// the caller releases n.
+	if err := c.setNetworkNative(a, &n); err != nil {
+		return n, err
+	}
 	return n, nil
 }
 
@@ -488,6 +518,7 @@ func (c *AsterConfig) fromNative(n *C.aster_config_t) {
 		mtu := uint32(n.transport_initial_mtu)
 		c.Transport.InitialMtu = &mtu
 	}
+	c.networkFromNative(n)
 }
 
 // ─── binding-level sources ─────────────────────────────────────────────────

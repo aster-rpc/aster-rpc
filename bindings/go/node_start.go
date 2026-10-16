@@ -81,6 +81,9 @@ func startNodeOn(ctx context.Context, rt *Runtime, cfg AsterConfig, opts NodeOpt
 	var a cArena
 	defer a.free()
 	native, err := cfg.toNative(&a, opts.ExtraALPNs)
+	// Network settings (C ABI 7.3) live in library storage; the start call
+	// copies them, so release once it returns.
+	defer C.aster_config_release(&native)
 	if err != nil {
 		return nil, err
 	}

@@ -44,6 +44,8 @@ func cStructSizes() map[string]uintptr {
 		"aster_http_server_config_t":   unsafe.Sizeof(C.aster_http_server_config_t{}),
 		"aster_generated_cert_t":       unsafe.Sizeof(C.aster_generated_cert_t{}),
 		"aster_config_t":               unsafe.Sizeof(C.aster_config_t{}),
+		// ABI 7.3
+		"aster_network_config_t": unsafe.Sizeof(C.aster_network_config_t{}),
 	}
 }
 
