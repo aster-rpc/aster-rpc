@@ -207,6 +207,40 @@ class RuntimeGates(unittest.TestCase):
         self.assertNotIn('runner_work=', workflow)
         self.assertNotIn("-path '*/tmp/aster-target'", workflow)
 
+    def test_every_enrollment_gated_aster_target_runs_with_a_count(self):
+        # rust-tests discovers aster's enrollment / identity-publisher targets
+        # by their #![cfg] line and requires each to report passing tests
+        # under `--features identity-publisher`. A target whose gate needs a
+        # feature that run does not enable would compile to zero tests there.
+        import tomllib
+        workflow = (ROOT / '.forgejo/workflows/linux.yml').read_text()
+        step = workflow.split('- name: Enrollment JWT, durable policy and offline-root bootstrap', 1)[1]
+        step = step.split('\n      - name: ', 1)[0]
+        pattern = re.search(r"grep -l -E '([^']+)' aster/tests/\*\.rs", step)
+        self.assertIsNotNone(pattern, 'discovery of enrollment-gated aster targets')
+        self.assertIn('-p aster --features identity-publisher', step)
+        self.assertIn('reported no passing tests under identity-publisher', step)
+        features = tomllib.loads((ROOT / 'aster/Cargo.toml').read_text())['features']
+        enabled, pending = set(), ['default', 'identity-publisher']
+        while pending:
+            name = pending.pop()
+            if name in enabled:
+                continue
+            enabled.add(name)
+            pending += [f for f in features.get(name, []) if f in features]
+        discovered = []
+        for path in sorted((ROOT / 'aster/tests').glob('*.rs')):
+            text = path.read_text()
+            if not re.search(pattern[1], text, re.M):
+                continue
+            discovered.append(path.stem)
+            gate = re.search(r'^#!\[cfg\((.*?)\)\]\s*$', text, re.M | re.S)
+            self.assertNotIn('not(', gate[1], path.name)
+            needed = set(re.findall(r'feature\s*=\s*"([^"]+)"', gate[1]))
+            self.assertLessEqual(needed, enabled, f'{path.name} needs features the run does not enable')
+        for target in ('enrollment_gateway_identity', 'enrollment_provider_tokens', 'node_config', 'identity_publisher', 'enrollment_replica_trust'):
+            self.assertIn(target, discovered)
+
     def test_kache_root_and_scope_with_fake_reporter(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

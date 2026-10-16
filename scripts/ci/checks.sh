@@ -64,15 +64,16 @@ check() {
     # exports as dead code, so lint the library target alone.
     clippy-napi)
       cargo clippy --locked -p aster-transport-napi -- -D warnings ;;
-    # The enrollment-only graphs (no rpc) and their opt-in test suites.
+    # The enrollment-only graphs (no rpc) and their opt-in test suites, then
+    # every test target under the widest enrollment graph (identity-publisher
+    # implies enrollment, docs and rpc).
     clippy-enrollment)
       cargo clippy --locked -p aster_transport_core --features enrollment --lib \
         --test enrollment --test enrollment_issuance --test enrollment_records \
         --test enrollment_review_regressions -- -D warnings
       cargo clippy --locked -p aster --no-default-features --features enrollment,docs \
         --test enrollment --test enrollment_bootstrap --test enrollment_review_regressions --test enrollment_admission_log -- -D warnings
-      cargo clippy --locked -p aster --no-default-features --features enrollment,docs,rpc \
-        --test enrollment_replica_trust -- -D warnings ;;
+      cargo clippy --locked -p aster --features identity-publisher --tests -- -D warnings ;;
     clippy-exec)
       cargo clippy --locked -p aster-exec --features service --all-targets \
         -p aster-exec-client -p aster-cli -- -D warnings ;;
