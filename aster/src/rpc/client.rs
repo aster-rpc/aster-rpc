@@ -55,7 +55,7 @@ use tracing::Instrument;
 use super::codec::{
     deadline_header_secs, decode_rpc_status, encode_stream_header, SerializationMode, StreamHeader,
 };
-use super::interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
+use super::interceptor::{CircuitBreaker, ClientCallContext, Interceptor, Pipeline, RetryPolicy};
 use super::observe::{client_status, error_status, ClientObs};
 use super::status::{status_to_error, StatusCode};
 use crate::error::{Error, Result};
@@ -298,7 +298,7 @@ impl RpcConnection {
                 },
             };
         }
-        let ctx = CallContext {
+        let ctx = ClientCallContext {
             service: h.service.clone(),
             method: h.method.clone(),
             attempt: 1,

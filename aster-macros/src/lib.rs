@@ -950,8 +950,15 @@ fn is_u8(ty: &Type) -> bool {
 ///   `ServiceContract`.
 ///
 /// Per-method `#[rpc(requires = <expr>)]` (a `CapabilityRequirement`) and
-/// `#[rpc(idempotent)]` are supported. Payload types must derive
-/// `#[derive(ForyStruct, AsterType)]`. Streaming methods are not yet supported.
+/// `#[rpc(idempotent)]` are supported, as are the streaming patterns
+/// (`#[rpc(server_stream | client_stream | bidi_stream)]`). Payload types must
+/// derive `#[derive(ForyStruct, AsterType)]`.
+///
+/// A method may take an extra `ctx: &aster::rpc::CallContext` (or owned
+/// `CallContext`) parameter, detected by type: the dispatcher passes the
+/// call's context (peer, principal, attributes, metadata, deadline,
+/// cancellation). It is not part of the wire contract — adding or removing it
+/// never changes the contract id — and the generated client omits it.
 #[proc_macro_attribute]
 pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
     let args = parse_macro_input!(attr as ServiceArgs);
@@ -1058,6 +1065,36 @@ struct MethodSpec {
     idempotent: bool,
     /// Unary method with no request arg — the request is the implicit `Empty`.
     no_request: bool,
+    /// The optional `CallContext` parameter: its position among the typed
+    /// (non-`self`) arguments, and whether it is taken by reference.
+    ctx: Option<CtxParam>,
+}
+
+#[derive(Clone, Copy)]
+struct CtxParam {
+    pos: usize,
+    by_ref: bool,
+}
+
+/// Classify a handler argument type as the framework-injected call context:
+/// `&CallContext` (by reference) or `CallContext` (owned), matched on the last
+/// path segment so `aster::rpc::CallContext` and an imported `CallContext`
+/// both work. `None` for any other type.
+fn ctx_param_kind(ty: &Type) -> syn::Result<Option<bool>> {
+    let is_ctx = |t: &Type| matches!(path_segment(t), Some((ident, args)) if ident == "CallContext" && args.is_empty());
+    match ty {
+        Type::Reference(r) if is_ctx(&r.elem) => {
+            if r.mutability.is_some() {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "take the call context as `&CallContext` or `CallContext`, not `&mut`",
+                ));
+            }
+            Ok(Some(true))
+        }
+        Type::Path(_) if is_ctx(ty) => Ok(Some(false)),
+        _ => Ok(None),
+    }
 }
 
 fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<TokenStream2> {
@@ -1365,6 +1402,10 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
 /// - `#[rpc(server_stream)]`: `async fn(&self, Req, ResponseSink<Resp>) -> Result<()>`
 /// - `#[rpc(client_stream)]`: `async fn(&self, RequestStream<Req>) -> Result<Resp>`
 /// - `#[rpc(bidi_stream)]`: `async fn(&self, RequestStream<Req>, ResponseSink<Resp>) -> Result<()>`
+///
+/// Any of these may add one `ctx: &CallContext` (or owned `ctx: CallContext`)
+/// parameter, conventionally last; it is detected by type, receives the
+/// call's `aster::rpc::CallContext`, and is excluded from the contract.
 fn parse_method(m: &mut syn::TraitItemFn) -> syn::Result<MethodSpec> {
     let ident = m.sig.ident.clone();
 
@@ -1417,12 +1458,31 @@ fn parse_method(m: &mut syn::TraitItemFn) -> syn::Result<MethodSpec> {
             "#[aster::service] methods must take &self",
         ));
     }
-    let args: Vec<&Type> = inputs
+    let typed: Vec<&Type> = inputs
         .filter_map(|a| match a {
             FnArg::Typed(pt) => Some(&*pt.ty),
             FnArg::Receiver(_) => None,
         })
         .collect();
+    // The optional call-context parameter is framework injection, not a wire
+    // field: set it aside before reading the payload types, so it never
+    // reaches the contract (and never changes the contract id).
+    let mut ctx: Option<CtxParam> = None;
+    let mut args: Vec<&Type> = Vec::with_capacity(typed.len());
+    for (pos, ty) in typed.into_iter().enumerate() {
+        match ctx_param_kind(ty)? {
+            Some(by_ref) => {
+                if ctx.is_some() {
+                    return Err(syn::Error::new_spanned(
+                        ty,
+                        "at most one `CallContext` parameter per method",
+                    ));
+                }
+                ctx = Some(CtxParam { pos, by_ref });
+            }
+            None => args.push(ty),
+        }
+    }
 
     let result_ok = |sig: &syn::Signature| -> syn::Result<Type> {
         match &sig.output {
@@ -1496,6 +1556,7 @@ fn parse_method(m: &mut syn::TraitItemFn) -> syn::Result<MethodSpec> {
         requires,
         idempotent,
         no_request,
+        ctx,
     })
 }
 
@@ -1570,6 +1631,25 @@ fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2
     let ident = &s.ident;
     let req = &s.req_ty;
     let resp = &s.resp_ty;
+    // The handler call with its payload arguments, plus the call context at
+    // the position the method declared it.
+    let invoke = |payload: Vec<TokenStream2>| -> TokenStream2 {
+        let mut args = payload;
+        if let Some(c) = s.ctx {
+            let ctx = if c.by_ref {
+                quote!(&__ctx)
+            } else {
+                quote!(::core::clone::Clone::clone(&__ctx))
+            };
+            args.insert(c.pos.min(args.len()), ctx);
+        }
+        quote!(self.inner.#ident(#(#args),*))
+    };
+    let bind_ctx = if s.ctx.is_some() {
+        quote!(let __ctx = ::core::clone::Clone::clone(call.context());)
+    } else {
+        quote!()
+    };
     match s.pattern {
         Pattern::Unary => {
             let respond = respond_one(resp_idx);
@@ -1578,17 +1658,18 @@ fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2
             let (decode, invoke) = if s.no_request {
                 (
                     quote! { let _ = call.recv_request().await; },
-                    quote! { self.inner.#ident() },
+                    invoke(vec![]),
                 )
             } else {
                 (
                     decode_one_request(req, req_idx),
-                    quote! { self.inner.#ident(__req) },
+                    invoke(vec![quote!(__req)]),
                 )
             };
             quote! {
                 #name => {
                     #decode
+                    #bind_ctx
                     match #invoke.await {
                         ::core::result::Result::Ok(__resp) => { #respond }
                         ::core::result::Result::Err(__e) => {
@@ -1600,11 +1681,13 @@ fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2
         }
         Pattern::ServerStream => {
             let decode = decode_one_request(req, req_idx);
+            let invoke = invoke(vec![quote!(__req), quote!(__sink)]);
             quote! {
                 #name => {
                     #decode
+                    #bind_ctx
                     let __sink = call.response_sink::<#resp>(self.fory[#resp_idx].clone());
-                    match self.inner.#ident(__req, __sink).await {
+                    match #invoke.await {
                         ::core::result::Result::Ok(()) => {
                             let _ = call.finish(&::aster::rpc::RpcStatus::ok()).await;
                         }
@@ -1617,10 +1700,12 @@ fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2
         }
         Pattern::ClientStream => {
             let respond = respond_one(resp_idx);
+            let invoke = invoke(vec![quote!(__reqs)]);
             quote! {
                 #name => {
+                    #bind_ctx
                     let __reqs = call.take_requests::<#req>(self.fory[#req_idx].clone());
-                    match self.inner.#ident(__reqs).await {
+                    match #invoke.await {
                         ::core::result::Result::Ok(__resp) => { #respond }
                         ::core::result::Result::Err(__e) => {
                             let _ = call.finish(&::aster::rpc::status_from_error(&__e)).await;
@@ -1629,20 +1714,24 @@ fn dispatch_arm(s: &MethodSpec, req_idx: usize, resp_idx: usize) -> TokenStream2
                 }
             }
         }
-        Pattern::BidiStream => quote! {
-            #name => {
-                let __reqs = call.take_requests::<#req>(self.fory[#req_idx].clone());
-                let __sink = call.response_sink::<#resp>(self.fory[#resp_idx].clone());
-                match self.inner.#ident(__reqs, __sink).await {
-                    ::core::result::Result::Ok(()) => {
-                        let _ = call.finish(&::aster::rpc::RpcStatus::ok()).await;
-                    }
-                    ::core::result::Result::Err(__e) => {
-                        let _ = call.finish(&::aster::rpc::status_from_error(&__e)).await;
+        Pattern::BidiStream => {
+            let invoke = invoke(vec![quote!(__reqs), quote!(__sink)]);
+            quote! {
+                #name => {
+                    #bind_ctx
+                    let __reqs = call.take_requests::<#req>(self.fory[#req_idx].clone());
+                    let __sink = call.response_sink::<#resp>(self.fory[#resp_idx].clone());
+                    match #invoke.await {
+                        ::core::result::Result::Ok(()) => {
+                            let _ = call.finish(&::aster::rpc::RpcStatus::ok()).await;
+                        }
+                        ::core::result::Result::Err(__e) => {
+                            let _ = call.finish(&::aster::rpc::status_from_error(&__e)).await;
+                        }
                     }
                 }
             }
-        },
+        }
     }
 }
 
@@ -1749,7 +1838,7 @@ fn client_method(
 
 #[cfg(test)]
 mod tests {
-    use super::{analyze_field, child_types, is_reserved_namespace, FieldInfo};
+    use super::{analyze_field, child_types, is_reserved_namespace, parse_method, FieldInfo};
     use syn::parse::Parser;
 
     /// Analyze one named field written as source, e.g.
@@ -1942,5 +2031,65 @@ mod tests {
         assert!(!is_reserved_namespace("portalsync"));
         assert!(!is_reserved_namespace("myapp.aster"));
         assert!(!is_reserved_namespace("Aster")); // reservation is case-exact
+    }
+
+    fn method(src: &str) -> syn::Result<super::MethodSpec> {
+        let mut m: syn::TraitItemFn = syn::parse_str(src).unwrap();
+        parse_method(&mut m)
+    }
+
+    fn ty(t: &syn::Type) -> String {
+        quote::quote!(#t).to_string().replace(' ', "")
+    }
+
+    #[test]
+    fn call_context_param_is_detected_and_kept_out_of_the_payload() {
+        let m =
+            method("async fn get(&self, req: Req, ctx: &CallContext) -> Result<Resp>;").unwrap();
+        let c = m.ctx.expect("ctx detected");
+        assert_eq!((c.pos, c.by_ref), (1, true));
+        assert_eq!(
+            (ty(&m.req_ty), ty(&m.resp_ty)),
+            ("Req".into(), "Resp".into())
+        );
+
+        let m =
+            method("async fn who(&self, ctx: aster::rpc::CallContext) -> Result<Resp>;").unwrap();
+        let c = m.ctx.expect("ctx detected");
+        assert_eq!((c.pos, c.by_ref), (0, false));
+        assert!(m.no_request);
+
+        let m = method(
+            "#[rpc(client_stream)] async fn sum(&self, ctx: &CallContext, r: RequestStream<Req>) -> Result<Resp>;",
+        )
+        .unwrap();
+        assert_eq!(m.ctx.map(|c| c.pos), Some(0));
+        assert_eq!(ty(&m.req_ty), "Req");
+
+        let m = method(
+            "#[rpc(bidi_stream)] async fn chat(&self, r: RequestStream<Req>, o: ResponseSink<Resp>, ctx: CallContext) -> Result<()>;",
+        )
+        .unwrap();
+        assert_eq!(m.ctx.map(|c| c.pos), Some(2));
+        assert_eq!(
+            (ty(&m.req_ty), ty(&m.resp_ty)),
+            ("Req".into(), "Resp".into())
+        );
+
+        let m = method("async fn get(&self, req: Req) -> Result<Resp>;").unwrap();
+        assert!(m.ctx.is_none());
+    }
+
+    #[test]
+    fn call_context_param_misuse_is_a_compile_error() {
+        let err = |src: &str| method(src).err().expect("expected an error").to_string();
+        assert!(
+            err("async fn get(&self, req: Req, ctx: &mut CallContext) -> Result<Resp>;")
+                .contains("not `&mut`")
+        );
+        assert!(err(
+            "async fn get(&self, a: &CallContext, req: Req, b: CallContext) -> Result<Resp>;"
+        )
+        .contains("at most one"));
     }
 }

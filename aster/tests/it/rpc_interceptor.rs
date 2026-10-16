@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aster::rpc::{
-    async_trait, Call, CallContext, CircuitBreaker, Interceptor, RetryPolicy, RpcConnection,
+    async_trait, Call, CircuitBreaker, ClientCallContext, Interceptor, RetryPolicy, RpcConnection,
     RpcStatus, SerializationMode, Server, ServiceDispatch, StatusCode, StreamHeader, RPC_ALPN,
 };
 use aster::{AsterConfig, Node, RelayMode};
@@ -82,11 +82,19 @@ struct LogInterceptor {
 
 #[async_trait]
 impl Interceptor for LogInterceptor {
-    async fn on_request(&self, ctx: &CallContext, request: Vec<u8>) -> aster::Result<Vec<u8>> {
+    async fn on_request(
+        &self,
+        ctx: &ClientCallContext,
+        request: Vec<u8>,
+    ) -> aster::Result<Vec<u8>> {
         self.log.lock().unwrap().push(format!("req:{}", ctx.method));
         Ok(request)
     }
-    async fn on_response(&self, ctx: &CallContext, response: Vec<u8>) -> aster::Result<Vec<u8>> {
+    async fn on_response(
+        &self,
+        ctx: &ClientCallContext,
+        response: Vec<u8>,
+    ) -> aster::Result<Vec<u8>> {
         self.log
             .lock()
             .unwrap()
@@ -104,11 +112,19 @@ struct CountInterceptor {
 
 #[async_trait]
 impl Interceptor for CountInterceptor {
-    async fn on_request(&self, ctx: &CallContext, request: Vec<u8>) -> aster::Result<Vec<u8>> {
+    async fn on_request(
+        &self,
+        ctx: &ClientCallContext,
+        request: Vec<u8>,
+    ) -> aster::Result<Vec<u8>> {
         self.attempts.lock().unwrap().push(ctx.attempt);
         Ok(request)
     }
-    async fn on_response(&self, _ctx: &CallContext, response: Vec<u8>) -> aster::Result<Vec<u8>> {
+    async fn on_response(
+        &self,
+        _ctx: &ClientCallContext,
+        response: Vec<u8>,
+    ) -> aster::Result<Vec<u8>> {
         self.responses.fetch_add(1, Ordering::SeqCst);
         Ok(response)
     }

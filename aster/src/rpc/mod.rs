@@ -26,6 +26,7 @@ pub mod auth;
 pub mod baseline;
 pub mod client;
 pub mod codec;
+pub mod context;
 pub mod contract;
 mod deadline;
 pub mod dynamic;
@@ -61,6 +62,7 @@ pub use codec::{
     decode_rpc_status, encode_stream_header, new_payload_fory, CallHeader, CodecError, RpcStatus,
     SerializationMode, StreamHeader,
 };
+pub use context::CallContext;
 pub use contract::{
     contract_id, encode_scalar_default, make_field, make_union_variant, message_shape,
     message_type_def, resolve_type_def, shape_field, shape_variant, union_shape, union_type_def,
@@ -71,7 +73,7 @@ pub use contract::{
 };
 pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationError};
 pub use empty::Empty;
-pub use interceptor::{CallContext, CircuitBreaker, Interceptor, Pipeline, RetryPolicy};
+pub use interceptor::{CircuitBreaker, ClientCallContext, Interceptor, Pipeline, RetryPolicy};
 #[cfg(feature = "otel")]
 pub use observe::otel::{current_trace_context, with_trace_context, ExtractContext};
 pub use projection::{Projection, ProjectionRegistry};

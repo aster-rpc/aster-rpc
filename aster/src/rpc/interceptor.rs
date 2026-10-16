@@ -13,9 +13,10 @@ use std::time::{Duration, Instant};
 use super::status::StatusCode;
 use crate::error::{Error, Result};
 
-/// Per-call context handed to [`Interceptor`] hooks.
+/// Per-call context handed to client [`Interceptor`] hooks. (The server-side
+/// handler context is [`CallContext`](super::CallContext).)
 #[derive(Clone, Debug)]
-pub struct CallContext {
+pub struct ClientCallContext {
     pub service: String,
     pub method: String,
     /// 1-based attempt number (incremented across retries).
@@ -30,15 +31,15 @@ pub struct CallContext {
 #[async_trait::async_trait]
 pub trait Interceptor: Send + Sync + 'static {
     /// Transform/observe the request payload before it is sent.
-    async fn on_request(&self, _ctx: &CallContext, request: Vec<u8>) -> Result<Vec<u8>> {
+    async fn on_request(&self, _ctx: &ClientCallContext, request: Vec<u8>) -> Result<Vec<u8>> {
         Ok(request)
     }
     /// Transform/observe the response payload after a successful call.
-    async fn on_response(&self, _ctx: &CallContext, response: Vec<u8>) -> Result<Vec<u8>> {
+    async fn on_response(&self, _ctx: &ClientCallContext, response: Vec<u8>) -> Result<Vec<u8>> {
         Ok(response)
     }
     /// Observe/map an error before it is returned (or retried).
-    async fn on_error(&self, _ctx: &CallContext, error: Error) -> Error {
+    async fn on_error(&self, _ctx: &ClientCallContext, error: Error) -> Error {
         error
     }
 }
@@ -175,7 +176,7 @@ impl Pipeline {
     /// `on_error` and considered for retry, and updates the circuit breaker.
     pub(crate) async fn run_unary<F, Fut>(
         &self,
-        mut ctx: CallContext,
+        mut ctx: ClientCallContext,
         request: Vec<u8>,
         invoke: F,
     ) -> Result<Vec<u8>>
@@ -228,7 +229,7 @@ impl Pipeline {
     /// `on_response`. Any step's error short-circuits the attempt.
     async fn attempt_once<F, Fut>(
         &self,
-        ctx: &CallContext,
+        ctx: &ClientCallContext,
         original: Vec<u8>,
         invoke: &F,
     ) -> Result<Vec<u8>>
@@ -263,7 +264,7 @@ impl Pipeline {
         Ok(resp)
     }
 
-    async fn apply_on_error(&self, ctx: &CallContext, mut error: Error) -> Error {
+    async fn apply_on_error(&self, ctx: &ClientCallContext, mut error: Error) -> Error {
         for i in self.interceptors.iter().rev() {
             error = i.on_error(ctx, error).await;
         }
@@ -289,7 +290,7 @@ mod deadline_contract_regression {
             }),
             ..Default::default()
         };
-        let ctx = CallContext {
+        let ctx = ClientCallContext {
             service: "deadline-contract".into(),
             method: "retry".into(),
             attempt: 1,

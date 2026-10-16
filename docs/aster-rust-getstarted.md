@@ -843,7 +843,89 @@ Gate 0 (connection admission) and Gate 3 (per-call capability) are independent
 layers; Enrollment drives both when configured. Gate 2 (session `authorize` →
 rcan) is not yet in the Rust crate.
 
-### 4.7 Client interceptors (deadline / retry / circuit breaker)
+### 4.7 The call context in handlers
+
+Add a `ctx: &CallContext` parameter to any `#[aster::service]` method — unary,
+streaming or session-scoped — to read who is calling and how long they will
+wait. The macro detects it by type and passes the call's context; it is not a
+wire field, so adding or removing it never changes the contract id, and the
+generated client does not take it.
+
+```rust
+use aster::rpc::{async_trait, AsterServer, AuthContext, AuthOutcome, Authenticator,
+                 CallContext, ResponseSink, RpcStatus, StatusCode};
+
+#[aster::service(name = "Reports", version = 1)]
+trait Reports {
+    #[rpc(server_stream)]
+    async fn export(&self, req: ExportRequest, out: ResponseSink<Row>, ctx: &CallContext)
+        -> aster::Result<()>;
+}
+
+struct ReportsImpl;
+
+#[async_trait]
+impl Reports for ReportsImpl {
+    async fn export(&self, req: ExportRequest, out: ResponseSink<Row>, ctx: &CallContext)
+        -> aster::Result<()> {
+        let user = ctx.principal();                 // the Authenticator's principal
+        let budget = ctx.remaining();               // Some(time left) when a deadline applies
+        for row in load_rows(user, &req, budget).await? {
+            tokio::select! {
+                _ = ctx.cancelled() => return Ok(()), // the caller went away
+                sent = out.send(&row) => sent?,
+            }
+        }
+        Ok(())
+    }
+}
+
+struct BearerAuth;
+#[async_trait]
+impl Authenticator for BearerAuth {
+    async fn authenticate(&self, ctx: &AuthContext) -> Result<AuthOutcome, RpcStatus> {
+        let token = ctx.metadata.get("authorization")
+            .ok_or_else(|| RpcStatus::error(StatusCode::Unauthenticated, "no token"))?;
+        Ok(AuthOutcome { principal: Some(verify(token)?), ..Default::default() })
+    }
+}
+
+# async fn serve() -> aster::Result<()> {
+let srv = AsterServer::builder()
+    .service(ReportsServer::new(ReportsImpl))
+    .authenticator(BearerAuth)
+    .start()
+    .await?;
+# Ok(())
+# }
+```
+
+`CallContext` (one `Arc`, cheap to clone) carries:
+
+| Accessor | Value |
+|---|---|
+| `peer()` | the transport's caller id (Iroh: endpoint id hex); `provenance()` says how far to trust it |
+| `principal()` | the `Authenticator`'s `AuthOutcome.principal`, else `peer()` |
+| `attributes()` / `attribute(k)` | the merged set Gate 3 checked (store + authenticator) |
+| `service()`, `method()`, `call_id()` | what was called |
+| `session_id()` | the session, for a session-scoped service |
+| `metadata()` / `metadata_value(k)` | request metadata (HTTP: the request headers) |
+| `deadline()` / `remaining()` | the effective deadline: min(caller's, method timeout, server handler timeout) |
+| `is_cancelled()` / `cancelled().await` | peer cancel, stream failure or deadline passed |
+
+Take `ctx: CallContext` (owned) instead when the handler moves it into a task.
+The dispatcher drops a handler's future when its call is cancelled, so inside
+the handler `cancelled()` serves `select!`-style early exits; a spawned task
+holding a clone sees it resolve too.
+
+Code deeper in the call reads the same context without a parameter:
+`CallContext::current()` (panics outside a handler) or
+`CallContext::try_current()`. It is a tokio task-local set around every
+handler: a task the handler `tokio::spawn`s does **not** inherit it — pass a
+clone instead. Hand-written `ServiceDispatch` impls get it from
+`call.context()`.
+
+### 4.8 Client interceptors (deadline / retry / circuit breaker)
 
 Attach policies to a connection with builder methods; they wrap **unary** calls.
 A connection with no policies is a no-op pass-through.
@@ -863,7 +945,7 @@ let client = EchoClient::new(conn);
 Custom interceptors implement `aster::rpc::Interceptor`
 (`on_request`/`on_response`/`on_error`) and attach via `.with_interceptor(…)`.
 
-### 4.8 Publish & discover a contract (manifests)
+### 4.9 Publish & discover a contract (manifests)
 
 A producer publishes its contract collection (`contract.bin` + per-type defs +
 `manifest.json`) into a registry doc; a consumer resolves it and verifies

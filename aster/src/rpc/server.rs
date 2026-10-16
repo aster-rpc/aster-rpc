@@ -39,6 +39,7 @@ use super::auth::{AttributeStore, AuthContext, Authenticator, CapabilityRequirem
 use super::codec::{
     decode_stream_header, encode_rpc_status, RpcStatus, SerializationMode, StreamHeader,
 };
+use super::context::{CallContext, CallContextParts};
 use super::deadline::DeadlineQueue;
 use super::dynamic::DynamicService;
 use super::foreign::{
@@ -943,6 +944,7 @@ impl Dispatcher {
             None
         };
 
+        let session_scoped = factory.is_some();
         let target = match factory {
             // SHARED service: one instance for everyone, and no session id.
             None => match check_shared(&header.service, header.session_id) {
@@ -1011,6 +1013,7 @@ impl Dispatcher {
             target,
             attributes: HashMap::new(),
             deadline,
+            session_scoped,
             call_admission,
         };
         if self.authenticator.is_some() {
@@ -1042,6 +1045,9 @@ impl Dispatcher {
     /// [`complete`](Dispatcher::complete) for a call whose telemetry the
     /// caller already started.
     async fn complete_observed(&self, route: Route, mut parts: CallParts, mut obs: CallObs) {
+        // The transport's caller id, kept when an authenticator replaces it
+        // with a principal (the handler context reports both).
+        let mut transport_peer = None;
         let routed = match route {
             Route::Reject(status) => {
                 finish_refused(obs, &parts, &status);
@@ -1054,6 +1060,7 @@ impl Dispatcher {
             }
             Route::Authenticate(mut routed) => {
                 open_routed(&mut obs, &mut routed, &parts.peer_id);
+                transport_peer = Some(parts.peer_id.clone());
                 match self.authenticate(routed, &mut parts).await {
                     Ok(Some(routed)) => routed,
                     Ok(None) => {
@@ -1083,6 +1090,7 @@ impl Dispatcher {
             target,
             attributes,
             deadline,
+            session_scoped,
             ..
         } = routed;
         obs.dispatching(&header, &parts.peer_id, &attributes);
@@ -1123,16 +1131,36 @@ impl Dispatcher {
         // handler, as a deadline does, whatever the pattern: a unary handler
         // has no send to fail, so it would otherwise run to completion.
         let peer_cancel = peer_cancelled(parts.cancel_notify.clone(), parts.cancelled.clone());
+        let session_id = if !session_scoped {
+            None
+        } else if parts.connection_id.is_some() {
+            (header.session_id != 0).then(|| header.session_id.to_string())
+        } else {
+            http_session_id(&header)
+        };
+        let ctx = CallContext::new(CallContextParts {
+            header,
+            principal: parts.peer_id.clone(),
+            transport_peer,
+            provenance: parts.provenance,
+            attributes,
+            session_id,
+            deadline,
+            cancelled: parts.cancelled.clone(),
+            signal: parts.cancel_notify.clone(),
+        });
         let Some(at) = deadline else {
             let handler = super::observe::scoped(
                 pass,
-                svc.dispatch(&method, Call::new(parts, header, attributes, None, obs))
+                ctx.clone()
+                    .scope(svc.dispatch(&method, Call::new(parts, ctx.clone(), obs)))
                     .instrument(span.clone()),
             );
             tokio::select! {
                 biased;
                 () = handler => {}
                 () = peer_cancel => {
+                    ctx.end();
                     span.in_scope(|| {
                         tracing::debug!(target: DISPATCH, "peer cancelled; handler dropped")
                     });
@@ -1140,19 +1168,21 @@ impl Dispatcher {
             }
             return;
         };
-        let cancelled = parts.cancelled.clone();
         let sender = parts.response_sender.clone();
         let (fire, fired) = tokio::sync::oneshot::channel::<()>();
         let _guard = self.deadlines.register(at, move || {
             let _ = fire.send(());
         });
-        let handler = svc.dispatch(&method, Call::new(parts, header, attributes, Some(at), obs));
+        let handler = ctx
+            .clone()
+            .scope(svc.dispatch(&method, Call::new(parts, ctx.clone(), obs)));
         let deadline_span = span.clone();
         let handler = super::observe::scoped(pass, handler.instrument(span));
         tokio::select! {
             biased;
             () = handler => {}
             () = peer_cancel => {
+                ctx.end();
                 // No trailer: the peer is not listening for one (§6.0).
                 deadline_span.in_scope(|| {
                     tracing::debug!(target: DISPATCH, "peer cancelled; handler dropped")
@@ -1161,7 +1191,7 @@ impl Dispatcher {
             _ = fired => {
                 // The handler future is dropped when this arm wins, which
                 // cancels it. Flag the call too, for anything it spawned.
-                cancelled.store(true, Ordering::Release);
+                ctx.end();
                 deadline_span.in_scope(|| {
                     tracing::debug!(target: DISPATCH, "deadline exceeded; handler cancelled")
                 });
@@ -1517,6 +1547,8 @@ pub struct Routed {
     target: Target,
     attributes: HashMap<String, String>,
     deadline: Option<Instant>,
+    /// The target is a session-scoped service (the call carries a session id).
+    session_scoped: bool,
     call_admission: Option<DispatchPermit>,
 }
 
@@ -1790,11 +1822,9 @@ fn http_session_id(h: &StreamHeader) -> Option<String> {
 /// emit streaming items with [`send`](Call::send), and terminate with
 /// [`respond`](Call::respond) (unary) or [`finish`](Call::finish) (streaming).
 pub struct Call {
-    header: StreamHeader,
-    attributes: HashMap<String, String>,
-    peer_id: String,
-    provenance: PeerProvenance,
-    cancelled: Arc<AtomicBool>,
+    /// Header, caller identity, attributes, deadline and cancel state; shared
+    /// with the handler's [`CallContext`].
+    ctx: CallContext,
     response_sender: ResponseSender,
     /// The first request payload, delivered inline by the reactor (taken once).
     first_request: Option<Vec<u8>>,
@@ -1806,7 +1836,6 @@ pub struct Call {
     /// there are *additional* frames to forward; if the first frame already ended
     /// the stream, the channel is never closed, so we must not block reading it.
     first_is_end: bool,
-    deadline: Option<Instant>,
     /// Request frames read after the first (for the corrupt-frame log).
     frames_read: u64,
     /// The terminal status this call sent, or that the server sent for it (a
@@ -1819,7 +1848,7 @@ impl Drop for Call {
     fn drop(&mut self) {
         let code = match self.sent {
             Some(code) => code,
-            None if self.deadline.is_some_and(|at| Instant::now() >= at) => {
+            None if self.ctx.deadline().is_some_and(|at| Instant::now() >= at) => {
                 StatusCode::DeadlineExceeded
             }
             None if self.is_cancelled() => StatusCode::Cancelled,
@@ -1829,27 +1858,18 @@ impl Drop for Call {
         self.obs.finish(
             code,
             CallInfo {
-                service: &self.header.service,
-                method: &self.header.method,
-                call_id: self.header.call_id,
-                peer: &self.peer_id,
+                service: self.ctx.service(),
+                method: self.ctx.method(),
+                call_id: self.ctx.call_id(),
+                peer: self.ctx.principal(),
             },
         );
     }
 }
 
 impl Call {
-    fn new(
-        inner: CallParts,
-        header: StreamHeader,
-        attributes: HashMap<String, String>,
-        deadline: Option<Instant>,
-        obs: CallObs,
-    ) -> Self {
+    fn new(inner: CallParts, ctx: CallContext, obs: CallObs) -> Self {
         let CallParts {
-            peer_id,
-            provenance,
-            cancelled,
             response_sender,
             request_payload,
             request_receiver,
@@ -1858,16 +1878,11 @@ impl Call {
         } = inner;
         let first_is_end = request_flags & FLAG_END_STREAM != 0;
         Self {
-            header,
-            attributes,
-            peer_id,
-            provenance,
-            cancelled,
+            ctx,
             response_sender,
             first_request: Some(request_payload),
             request_receiver: Some(request_receiver),
             first_is_end,
-            deadline,
             frames_read: 0,
             sent: None,
             obs,
@@ -1879,22 +1894,30 @@ impl Call {
     /// [`method_timeout`](ServiceDispatch::method_timeout) and the server's
     /// [`handler_timeout`](Server::handler_timeout). `None` = no deadline.
     pub fn deadline(&self) -> Option<Instant> {
-        self.deadline
+        self.ctx.deadline()
+    }
+
+    /// The handler-facing [`CallContext`] for this call (peer, principal,
+    /// attributes, metadata, deadline, cancellation). Clone it to keep it.
+    pub fn context(&self) -> &CallContext {
+        &self.ctx
     }
 
     /// The decoded request header.
     pub fn header(&self) -> &StreamHeader {
-        &self.header
+        self.ctx.header()
     }
 
     /// The method being invoked.
     pub fn method(&self) -> &str {
-        &self.header.method
+        self.ctx.method()
     }
 
-    /// The remote peer's id (hex).
+    /// The caller id dispatch uses: the [`Authenticator`] principal when one
+    /// resolved it, else the transport's peer id (hex). The context separates
+    /// the two ([`CallContext::peer`] / [`CallContext::principal`]).
     pub fn peer(&self) -> &str {
-        &self.peer_id
+        self.ctx.principal()
     }
 
     /// How the transport learned [`peer`](Call::peer).
@@ -1904,7 +1927,7 @@ impl Call {
     /// [`iroh_only`](ServiceDispatch::iroh_only) and let dispatch reject the
     /// call before the handler runs.
     pub fn provenance(&self) -> PeerProvenance {
-        self.provenance
+        self.ctx.provenance()
     }
 
     /// The peer's authorization attributes (from the server's
@@ -1912,13 +1935,13 @@ impl Call {
     /// Already consulted for the Gate-3 check; exposed for handler-level
     /// decisions. Empty if the peer has no recorded attributes.
     pub fn attributes(&self) -> &HashMap<String, String> {
-        &self.attributes
+        self.ctx.attributes()
     }
 
     /// Whether the peer has cancelled the call (or the stream errored). Poll
     /// this from long-running streaming handlers to stop early.
     pub fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Acquire)
+        self.ctx.cancel_flag().load(Ordering::Acquire)
     }
 
     /// Receive the next request payload. Returns the first request (delivered
@@ -1947,10 +1970,15 @@ impl Call {
             // finds the stream finished.
             NextFrame::Corrupt(err) => {
                 self.frames_read += 1;
-                warn_corrupt_frame(&self.header, &self.peer_id, self.frames_read, &err);
+                warn_corrupt_frame(
+                    self.ctx.header(),
+                    self.ctx.principal(),
+                    self.frames_read,
+                    &err,
+                );
                 let status = corrupt_frame_status(&err);
                 self.sent.get_or_insert(StatusCode::InvalidArgument);
-                self.cancelled.store(true, Ordering::Release);
+                self.ctx.cancel_flag().store(true, Ordering::Release);
                 emit_rpc_status(&self.response_sender, &status).await;
                 None
             }
@@ -2014,11 +2042,11 @@ impl Call {
     pub fn take_requests<T>(&mut self, fory: Arc<Fory>) -> RequestStream<T> {
         let failer = CallFailer {
             sender: self.response_sender.clone(),
-            cancelled: self.cancelled.clone(),
-            service: self.header.service.clone(),
-            method: self.header.method.clone(),
-            call_id: self.header.call_id,
-            peer: self.peer_id.clone(),
+            cancelled: self.ctx.cancel_flag().clone(),
+            service: self.ctx.service().to_string(),
+            method: self.ctx.method().to_string(),
+            call_id: self.ctx.call_id(),
+            peer: self.ctx.principal().to_string(),
         };
         RequestStream::new(
             self.first_request.take(),
