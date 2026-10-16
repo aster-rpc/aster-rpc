@@ -7,25 +7,26 @@ The module path is `sdk.getaster.now/go` (Go 1.25+). This guide uses
 discovery and public release tags; the module path alone is not yet a working
 public installation source. See [publication setup](../../deploy/go-vanity/README.md).
 **Target:** Go 1.25+ (Fory Go 1.7.6 requires it)
-**ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, **C ABI 7.x, 7.3 minimum** (`aster_*` symbols)
+**ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, **C ABI 7.x, 7.4 minimum** (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Preview status (C ABI 7.3 minimum)
+## Preview status (C ABI 7.4 minimum)
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
 TypeScript, Java and .NET. Aster 0.3 is a preview release.
 
 **Native library requirement (for consumers such as Kasm):** this module needs
-`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 7.3 or a later 7.x**.
+`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 7.4 or a later 7.x**.
 It refuses anything else three ways:
 
 - at compile time, `runtime.go` fails with `#error` when the `aster_ffi.h` on
   `CGO_CFLAGS` is not major 7;
 - at run time, `CheckABI` (called by `NewRuntime` and before any config is
   filled) returns an error wrapping `ErrABIMismatch` when the loaded library's major is not
-  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (3; 7.1 added the audit
+  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (4; 7.1 added the audit
   outbox acknowledgement log, 7.2 `aster_server_drain`, 7.3 the cluster
-  network settings `aster_config_set_network`);
+  network settings `aster_config_set_network`, 7.4 the transfer metrics and
+  `aster_config_set_metrics`);
 - the library itself refuses `aster_runtime_new` from another major and, since
   6.0, will not fill an `aster_config_t` until `aster_abi_accept` has
   succeeded for its major, so a 5.x-built caller cannot have its 280-byte
@@ -94,7 +95,11 @@ the 7.0 header and library together.
   `DiscoveryNone`, `DiscoveryLocal`, `DiscoveryCustom` with
   `DiscoveryDNSOrigin` / `DiscoveryPkarrRelays`) keeps lookups off n0's
   `iroh.link`. Env and TOML names are in `docs/aster-rust-getstarted.md` §2.2;
-  the Kubernetes recipe is in `docs/relay-self-hosted.md`. (ABI 4.6 removed
+  the Kubernetes recipe is in `docs/relay-self-hosted.md`.
+  `MetricsPeerLabels` / `MetricsPeerLabelCap` (ABI 7.4; env
+  `ASTER_METRICS_PEER_LABELS` / `_CAP`, TOML `[metrics]`) label
+  `aster.peer.bytes` per peer on the node's ops listener (cap 0 = 64).
+  (ABI 4.6 removed
   `aster_node_metrics_prometheus`; `MetricsPrometheus()` replaces it, see
   Observability below.)
   `Memory*` / `Persistent*` are convenience wrappers over `aster_node_start`
@@ -194,6 +199,12 @@ the 7.0 header and library together.
   `ErrVerificationFailed`, ... (status codes) and `ErrRpcNotFound`,
   `ErrRpcUnimplemented`, ... (RPC codes); `errors.As` to `*RpcError` /
   `*IrohError`. Native failures carry `aster_last_error_message`.
+- **Transfer metrics (ABI 7.4):** `Blobs.TransferStats()` (node-wide
+  `BlobTransferStats`: fetched / served payload, zstd payload, wire and plain
+  bytes, fallbacks, transfers by encoding and result, decode errors);
+  `FetchReport` providers carry `InFlight`, `PlainFallbacks`,
+  `BytesTransferred` and `WireBytes` (fetch report v2); `TopologyPeerView`
+  carries `QuicTraffic` (per protocol family) and `BlobTransfer`.
 - **ABI 3.3 data plane:** `Blobs.DownloadHashFrom` (+ `FetchReport`),
   `DownloadHash`, `ReadRange`, `GCRunOnce`; `Tags.DeletePrefix`;
   `Docs.AuthorityReport` / `Open` / `ImportWriteNamespace` /
@@ -476,6 +487,7 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `server.go` | ALPN, frame flags, `EncodeFrame` |
 | `config.go` | `AsterConfig` ↔ `aster_config_t`, `ConfigFromEnv` / `ConfigFromTOML` |
 | `config_network.go` | ABI 7.3 cluster settings (`BindAddrV6`, `AdvertiseAddrs`, `RelayCACerts`, `Discovery`) ↔ `aster_network_config_t` |
+| `transfer_metrics.go` | ABI 7.4 `Blobs.TransferStats`, fetch report v1/v2 parsing, topology `QuicTraffic` / `BlobTransfer`, `MetricsPeerLabels` ↔ `aster_metrics_config_t` |
 | `node_start.go` | `StartNode`, admission requests, connect/accept/ticket helpers |
 | `gate.go` | `Gate` — Gate-0 policy (`aster_gate_*`) |
 | `enrollment.go` | ABI 5.1 Enrollment from config: `EnrollmentConfig` / `RoleMapping` / `Policy*`, `Enrollment` (status, peer claims, check, revocations), `EnrollmentIssuer` |

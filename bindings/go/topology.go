@@ -55,6 +55,10 @@ type TopologyPeerView struct {
 	LastMeasuredUnixMillis     uint64              `json:"last_measured_unix_ms"`
 	ClusterHeldSinceUnixMillis uint64              `json:"cluster_held_since_unix_ms"`
 	IsConnected                bool                `json:"is_connected"`
+	// QuicTraffic is the QUIC bytes exchanged with the peer by protocol
+	// family; BlobTransfer the exact blob payload bytes (C ABI 7.4).
+	QuicTraffic  TopologyQuicTraffic   `json:"quic_traffic"`
+	BlobTransfer TopologyPeerBlobStats `json:"blob_transfer"`
 }
 
 // TopologySwarmOptions overrides native timing/coverage defaults. Nil fields

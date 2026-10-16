@@ -164,10 +164,7 @@ func (s *BlobCustodyScope) Read(ctx context.Context, hash string) ([]byte, error
 func (s *BlobCustodyScope) DownloadHashFrom(ctx context.Context, hash string, providers []string, format BlobFormat, strategy FetchStrategy, toStore bool) ([]byte, FetchReport, error) {
 	var a cArena
 	defer a.free()
-	var flags C.uint32_t
-	if toStore {
-		flags = C.ASTER_FETCH_TO_STORE
-	}
+	flags := fetchReportFlags(toStore)
 	p, err := s.run(ctx, "aster_blob_custody_download_hash_from", ASTER_EVENT_BLOB_FETCHED, func(op *C.aster_operation_t) C.int32_t {
 		return C.aster_blob_custody_download_hash_from(C.uint64_t(s.runtime.handle), C.uint64_t(s.handle), a.str(hash), a.list(providers), C.uint32_t(format), C.uint32_t(strategy), flags, 0, op)
 	})

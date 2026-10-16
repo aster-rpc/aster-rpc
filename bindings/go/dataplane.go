@@ -53,40 +53,32 @@ const (
 	FetchSplitChildren FetchStrategy = C.ASTER_FETCH_STRATEGY_SPLIT_CHILDREN
 )
 
-// ProviderReport is one provider's record in a FetchReport.
+// ProviderReport is one provider's record in a FetchReport (Rust
+// aster::ProviderOutcome).
 type ProviderReport struct {
 	NodeID            string
 	Attempts          uint32
 	Failures          uint32
 	CompletedRequests uint32
+	// InFlight counts requests mid-attempt when the report was taken (0 in a
+	// finished fetch's report). C ABI 7.4.
+	InFlight uint32
+	// PlainFallbacks counts attempts that went plain because the provider
+	// does not serve zstd. C ABI 7.4.
+	PlainFallbacks uint32
+	// BytesTransferred is the payload this provider's attempts decoded; the
+	// providers' sum is FetchReport.BytesTransferred. C ABI 7.4.
+	BytesTransferred uint64
+	// WireBytes are the compressed bytes received from this provider over
+	// zstd; nil when every attempt against it was plain. C ABI 7.4.
+	WireBytes *uint64
 }
 
-// FetchReport describes a multi-provider fetch (fetch report v1).
+// FetchReport describes a multi-provider fetch (fetch report v2; see
+// parseFetchReport in transfer_metrics.go).
 type FetchReport struct {
 	BytesTransferred uint64
 	Providers        []ProviderReport
-}
-
-func parseFetchReport(p []byte) (FetchReport, []byte, error) {
-	const header, record = int(C.ASTER_FETCH_REPORT_HEADER_SIZE), int(C.ASTER_FETCH_PROVIDER_RECORD_SIZE)
-	if len(p) < header || p[0] != C.ASTER_FETCH_REPORT_VERSION {
-		return FetchReport{}, nil, fmt.Errorf("fetch report: bad header: %w", ErrInternal)
-	}
-	n := int(binary.LittleEndian.Uint32(p[4:8]))
-	r := FetchReport{BytesTransferred: binary.LittleEndian.Uint64(p[8:16])}
-	if len(p) < header+n*record {
-		return FetchReport{}, nil, fmt.Errorf("fetch report: truncated: %w", ErrInternal)
-	}
-	for i := 0; i < n; i++ {
-		rec := p[header+i*record:]
-		r.Providers = append(r.Providers, ProviderReport{
-			NodeID:            hex.EncodeToString(rec[:32]),
-			Attempts:          binary.LittleEndian.Uint32(rec[32:36]),
-			Failures:          binary.LittleEndian.Uint32(rec[36:40]),
-			CompletedRequests: binary.LittleEndian.Uint32(rec[40:44]),
-		})
-	}
-	return r, p[header+n*record:], nil
 }
 
 // DownloadHashFrom fetches a blob from an ordered provider list (tried in
@@ -96,10 +88,7 @@ func (b *Blobs) DownloadHashFrom(ctx context.Context, hash string, providers []s
 	strategy FetchStrategy, toStore bool) ([]byte, FetchReport, error) {
 	var a cArena
 	defer a.free()
-	var flags C.uint32_t
-	if toStore {
-		flags = C.ASTER_FETCH_TO_STORE
-	}
+	flags := fetchReportFlags(toStore)
 	ev, err := startOp(ctx, b.runtime, "aster_blobs_download_hash_from", func(op *C.aster_operation_t) C.int32_t {
 		return C.aster_blobs_download_hash_from(C.uint64_t(b.runtime.handle), C.uint64_t(b.node.handle),
 			a.str(hash), a.list(providers), C.uint32_t(format), C.uint32_t(strategy), flags, 0, op)

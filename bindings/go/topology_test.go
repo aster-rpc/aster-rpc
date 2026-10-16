@@ -117,6 +117,10 @@ func TestTopology_MeasuredPeersSharedSnapshotAndOwnership(t *testing.T) {
 	if err != nil || peer.Level != TopologySameHost || !peer.Direct || peer.LastMeasuredUnixMillis == 0 || peer.RemoteAddr == nil {
 		t.Fatalf("measured peer %+v %v", peer, err)
 	}
+	// C ABI 7.4: a measured peer has exchanged QUIC bytes on some protocol.
+	if total := peer.QuicTraffic.Total(); total.Sent == 0 || total.Received == 0 {
+		t.Fatalf("measured peer without QUIC traffic: %+v", peer.QuicTraffic)
+	}
 	peers, err := nodes[0].Topology().Peers()
 	if err != nil || !slices.ContainsFunc(peers, func(p TopologyPeerView) bool { return p.NodeID == ids[1] }) {
 		t.Fatalf("peers %v %v", peers, err)

@@ -47,6 +47,8 @@ func TestABI_StructSizes(t *testing.T) {
 		"aster_generated_cert_t":       64,
 		"aster_config_t":               288, // ABI 6.0
 		"aster_network_config_t":       96,  // ABI 7.3
+		"aster_metrics_config_t":       16,  // ABI 7.4
+		"aster_blob_transfer_stats_t":  168, // ABI 7.4
 	}
 	got := cStructSizes()
 	for name, w := range want {
@@ -178,7 +180,7 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 		t.Error("topology snapshot event drifted from header")
 	}
 	// ABI 7.0 swapped the hook failure mode values; 7.1 added the audit acknowledgement log.
-	if major, minor, _ := Version(); major != 7 || ABIVersionMajor != 7 || minor < ABIMinorRequired || ABIMinorRequired != 3 {
+	if major, minor, _ := Version(); major != 7 || ABIVersionMajor != 7 || minor < ABIMinorRequired || ABIMinorRequired != 4 {
 		t.Errorf("library ABI %d.%d, binding needs 7.%d+ (major %d)", major, minor, ABIMinorRequired, ABIVersionMajor)
 	}
 	if ASTER_EVENT_ENROLLMENT_RESULT != 127 || AdmissionErrorNotAdmitted != 1 || AdmissionErrorDenied != 2 ||

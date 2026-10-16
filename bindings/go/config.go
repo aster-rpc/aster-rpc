@@ -97,6 +97,14 @@ type AsterConfig struct {
 	Discovery            string
 	DiscoveryDNSOrigin   string
 	DiscoveryPkarrRelays []string
+	// MetricsPeerLabels labels aster.peer.bytes per peer (aster.peer)
+	// instead of by locality level: the first MetricsPeerLabelCap peers seen
+	// keep their own series, later ones count under _OTHER (C ABI 7.4). Env
+	// ASTER_METRICS_PEER_LABELS / ASTER_METRICS_PEER_LABEL_CAP; TOML
+	// [metrics] peer_labels / peer_label_cap. MetricsPeerLabelCap 0 = the
+	// default (64).
+	MetricsPeerLabels   bool
+	MetricsPeerLabelCap uint32
 	// ALPNs the node accepts, in addition to those added by a server/client.
 	ALPNs        []string
 	IdentityFile string
@@ -425,6 +433,9 @@ func (c *AsterConfig) toNative(a *cArena, extraALPNs []string) (C.aster_config_t
 	if err := c.setNetworkNative(a, &n); err != nil {
 		return n, err
 	}
+	if err := c.setMetricsNative(&n); err != nil {
+		return n, err
+	}
 	return n, nil
 }
 
@@ -519,6 +530,7 @@ func (c *AsterConfig) fromNative(n *C.aster_config_t) {
 		c.Transport.InitialMtu = &mtu
 	}
 	c.networkFromNative(n)
+	c.metricsFromNative(n)
 }
 
 // ─── binding-level sources ─────────────────────────────────────────────────

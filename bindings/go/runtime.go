@@ -589,9 +589,11 @@ func Version() (major, minor, patch uint32) {
 // outbox acknowledgement log (aster_audit_outbox_acknowledgements); 7.2 added
 // aster_server_drain (AsterServer.Drain); 7.3 added the cluster network
 // settings beside aster_config_t (aster_config_set_network: BindAddrV6,
-// AdvertiseAddrs, RelayCACerts, Discovery). This binding needs native ABI 7.3
-// or a later 7.x.
-const ABIMinorRequired = uint32(3)
+// AdvertiseAddrs, RelayCACerts, Discovery); 7.4 the transfer metrics
+// (Blobs.TransferStats, fetch report v2, topology QuicTraffic / BlobTransfer)
+// and the [metrics] peer labels (aster_config_set_metrics). This binding needs
+// native ABI 7.4 or a later 7.x.
+const ABIMinorRequired = uint32(4)
 
 var (
 	abiOnce sync.Once
