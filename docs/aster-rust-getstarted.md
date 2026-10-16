@@ -196,6 +196,9 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `transport_<knob>(v)` | `ASTER_TRANSPORT_<KNOB>` | `[network] transport_<knob>` | `max_concurrent_bidi_streams`, `max_concurrent_uni_streams`, `stream_receive_window`, `receive_window`, `send_window`, `max_idle_timeout_ms`, `keep_alive_interval_ms`, `initial_mtu`, `datagram_receive_buffer_size`, `datagram_send_buffer_size`, `send_fairness`, `enable_segmentation_offload` |
 | `identity_file(p)` | `ASTER_IDENTITY_FILE` | `[identity] file` | `.aster-identity` credential file |
 | `accept_on_behalf_of(b)` | `ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF` | `[identity] accept_on_behalf_of` | default `false`: accept calls a gateway makes for a user (§4.7.1); off, such calls are refused |
+| `trusted_issuer(TrustedIssuer)` / `trusted_issuers([..])` | `ASTER_IDENTITY_TRUSTED_ISSUERS` (JSON array) | `[[identity.trusted_issuers]]` | identity providers whose forwarded tokens are accepted (§4.7.1.1); each needs `audiences`; needs `[enrollment]` |
+| `edge_token_max_lifetime_secs(n)` | `ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS` | `[identity] edge_token_max_lifetime_secs` | default and maximum `300` |
+| `clock_leeway_secs(n)` | `ASTER_IDENTITY_CLOCK_LEEWAY_SECS` | `[identity] clock_leeway_secs` | default `60`, at most `300`; applies to `iat`/`nbf`, never `exp` |
 | `remote_config(b)` | `ASTER_REMOTE_CONFIG_ENABLED` | `[remote_config] enabled` | default `true`: serve `aster.ops.NodeConfig` (§4.7.2) |
 | `remote_config_lock([..])` | `ASTER_REMOTE_CONFIG_LOCK` (comma-separated) | `[remote_config] lock = [..]` | sections remote overrides may not touch, e.g. `["identity"]`; an unknown name fails the start |
 | `health_port(p)` | `ASTER_HEALTH_PORT` | `[health] port` | health/metrics HTTP port; `0` (default) = disabled unless `health(true)` |
@@ -1049,12 +1052,67 @@ minutes, as the service would. In the handler:
 
 The service checks: `iss` is the transport peer (another node's token, or one
 replayed by another gateway, is `UNAUTHENTICATED`), the Ed25519 signature,
-`exp` (never extended) and `iat`/`nbf` with 60 s leeway, and `exp - iat` ≤ 5
-min. Both limits are fixed for now. A call without the entry is authorised as
-the peer, exactly as before. Accepted calls record `principal`, `actor`,
-`obo_iss` and `obo_jti` on their `rpc` span and log under
-`aster::rpc::identity` (debug). Tokens from external identity providers (OIDC)
-come in a later release.
+`exp` (never extended) and `iat`/`nbf` with `[identity] clock_leeway_secs`
+(default 60 s), and `exp - iat` ≤ `[identity] edge_token_max_lifetime_secs`
+(default and maximum 5 min). A call without the entry is authorised as the
+peer, exactly as before. Accepted calls record `principal`, `actor`, `obo_iss`
+and `obo_jti` on their `rpc` span and log under `aster::rpc::identity`
+(debug).
+
+#### 4.7.1.1 Forwarding an identity provider's token
+
+A user signed in with OIDC (or a machine client with OAuth client
+credentials) already holds a JWT from the identity provider. The edge
+forwards it **unchanged** with `CallOptions::on_behalf_of(token)`; it cannot
+forge these tokens, only replay them until they expire. The service chooses
+the verifier from the token's `iss`: a node id is an edge-minted token, any
+other issuer must be trusted:
+
+```toml
+[identity]
+accept_on_behalf_of = true
+
+[[identity.trusted_issuers]]
+iss = "https://accounts.example.com"
+audiences = ["odata-core"]       # required: start-up fails without it
+roles_claim = "groups"           # an array, or a space-separated string such as "scope"
+role_map = { "data-readers" = "data.read", "data-admins" = "data.admin" }
+max_token_lifetime_secs = 900    # default
+```
+
+The service checks the signature (RS256, PS256 or ES256; `none`, `HS*` and an
+`alg` that is not the key's are refused), `iss`, that `aud` holds a configured
+audience, `exp`/`nbf`/`iat` with the leeway, and `exp - iat` ≤
+`max_token_lifetime_secs`. Roles are the `roles_claim` values that
+`role_map` maps; **unmapped values are dropped**, and a map may not grant
+`aster.*` roles. `principal()` is `iss|sub`, `auth_methods()` the token's
+`amr` (empty when it has none). Every failure is `UNAUTHENTICATED`.
+
+**Keys never come from a fetch.** The service reads the issuer's keys from the
+fleet namespace Enrollment already uses, under
+`aster/identity/v1/issuers/<base64url(iss)>/jwks`, so air-gapped nodes verify
+too. A token whose `kid` is not there is refused. A record counts only when
+its docs author (the node that wrote it) holds a credential granting
+`aster.identity-publisher`; the record carries that credential, so the
+publisher needs no session with each service. The newest record per issuer
+wins, so publishing a new key set rotates keys without a restart, and a key
+dropped from it stops verifying once it syncs. A publisher writes with
+`aster::rpc::issuer_keys::publish_issuer_keys`:
+
+```rust
+use aster::rpc::issuer_keys::{publish_issuer_keys, IssuerKeyPublication};
+
+let chain = client.enrollment().unwrap().credential().map(|(chain, _)| chain);
+publish_issuer_keys(client.node(), &fleet_doc, chain.as_deref(), &IssuerKeyPublication {
+    iss: "https://accounts.example.com".into(),
+    source_url: "https://accounts.example.com/.well-known/jwks.json".into(),
+    jwks_json, // as fetched over validated TLS
+    fetched_at,
+}).await?;
+```
+
+`AsterServer::issuer_keys()` shows what a service holds (issuer, publisher,
+`kid`s, fetch time).
 
 ### 4.7.2 Remote overrides (`aster.ops.NodeConfig`)
 
@@ -1064,7 +1122,11 @@ record on the node:
 - **properties:** a name and tags;
 - **typed attributes:** bool, int, float or string;
 - **overrides** of the sections that declare themselves overridable.
-  `[identity]` (`accept_on_behalf_of`) is the only one today.
+  `[identity]` (`accept_on_behalf_of`, `trusted_issuers`,
+  `edge_token_max_lifetime_secs`, `clock_leeway_secs`) is the only one
+  today. `trusted_issuers` replaces the whole list, and the resulting
+  section is validated as a whole (an issuer without audiences is
+  `INVALID_ARGUMENT`).
 
 Gate 3 requires the role `aster.config-admin` on every method. `set` and
 `clear` also require that the role comes from the caller's own Enrollment
@@ -1083,7 +1145,10 @@ let ack = config
             .name("eu-gateway-1")
             .tag("gateway")
             .attribute("region", "eu-west")
-            .identity(IdentityOverride { accept_on_behalf_of: Some(true) }),
+            .identity(IdentityOverride {
+                accept_on_behalf_of: Some(true),
+                ..Default::default()
+            }),
     )
     .await?;
 assert!(ack.complete); // the override is in force on the node
