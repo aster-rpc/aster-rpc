@@ -486,12 +486,24 @@ impl RpcConnection {
         header: &StreamHeader,
         requests: Vec<Vec<u8>>,
     ) -> Result<ResponseStream> {
+        self.bidi_with(header, requests, &CallOptions::default())
+            .await
+    }
+
+    /// [`bidi`](RpcConnection::bidi) with [`CallOptions`]. The deadline bounds
+    /// the whole call, as for [`bidi_open_with`](RpcConnection::bidi_open_with).
+    pub async fn bidi_with(
+        &self,
+        header: &StreamHeader,
+        requests: Vec<Vec<u8>>,
+        options: &CallOptions,
+    ) -> Result<ResponseStream> {
         if requests.is_empty() {
             return Err(Error::InvalidArgument(
                 "bidi streaming requires at least one request".into(),
             ));
         }
-        let (sink, resp) = self.bidi_open(header).await?;
+        let (sink, resp) = self.bidi_open_with(header, options).await?;
         tokio::spawn(async move {
             let n = requests.len();
             for (i, req) in requests.into_iter().enumerate() {

@@ -60,6 +60,7 @@ mod rpc_baseline;
 mod rpc_bytes_wire;
 mod rpc_call_context;
 mod rpc_client;
+mod rpc_client_options;
 mod rpc_contract;
 mod rpc_deadline;
 mod rpc_dynamic_proxy;

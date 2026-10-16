@@ -945,7 +945,8 @@ fn is_u8(ty: &Type) -> bool {
 /// `async fn(&self, Req) -> aster::Result<Resp>` methods. Generates:
 /// - the trait (re-emitted with `#[async_trait]`, `#[rpc]` attrs stripped);
 /// - `XServer<T>` implementing `ServiceDispatch` (decode → call → encode);
-/// - `XClient` with one async method per RPC over an `RpcConnection`;
+/// - `XClient` with one async method per RPC over an `RpcConnection`, plus
+///   `with_options(CallOptions)` for a per-call deadline / metadata / session;
 /// - `XServer::<T>::contract()` / `XClient::contract()` → the cross-binding
 ///   `ServiceContract`.
 ///
@@ -1374,15 +1375,33 @@ fn expand_service(args: ServiceArgs, mut trait_def: ItemTrait) -> syn::Result<To
             }
         }
 
-        /// Client stub over an `RpcConnection`.
+        /// Client stub over an `RpcConnection`. Cheap to clone.
+        #[derive(Clone)]
         pub struct #client_ident {
             conn: ::aster::rpc::RpcConnection,
-            fory: ::std::vec::Vec<::std::sync::Arc<::aster::rpc::Fory>>,
+            fory: ::std::sync::Arc<::std::vec::Vec<::std::sync::Arc<::aster::rpc::Fory>>>,
+            options: ::aster::rpc::CallOptions,
         }
 
         impl #client_ident {
             pub fn new(conn: ::aster::rpc::RpcConnection) -> Self {
-                Self { conn, fory: #build_fory }
+                Self {
+                    conn,
+                    fory: ::std::sync::Arc::new(#build_fory),
+                    options: ::aster::rpc::CallOptions::default(),
+                }
+            }
+            /// A copy of this client whose calls (every method, every pattern)
+            /// carry `options`: deadline, metadata, session id, serialization
+            /// mode. Replaces any options set before; `new` starts with none.
+            /// Cheap (no codec rebuild), so build one per incoming request:
+            /// `client.with_options(CallOptions::new().deadline(d).metadata(k, v)).method(req)`.
+            pub fn with_options(&self, options: ::aster::rpc::CallOptions) -> Self {
+                Self {
+                    conn: ::core::clone::Clone::clone(&self.conn),
+                    fory: ::core::clone::Clone::clone(&self.fory),
+                    options,
+                }
             }
             /// The cross-binding `ServiceContract` for this service.
             pub fn contract() -> ::aster::rpc::ServiceContract {
@@ -1771,14 +1790,14 @@ fn client_method(
         Pattern::Unary if s.no_request => quote! {
             pub async fn #ident(&self) -> ::aster::Result<#resp> {
                 let __bytes = self.fory[#req_idx].serialize(&<#req>::default()).map_err(#encode_err)?;
-                let __resp_bytes = self.conn.unary(&#header, __bytes).await?;
+                let __resp_bytes = self.conn.unary_with(&#header, __bytes, &self.options).await?;
                 self.fory[#resp_idx].deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
             }
         },
         Pattern::Unary => quote! {
             pub async fn #ident(&self, req: #req) -> ::aster::Result<#resp> {
                 let __bytes = self.fory[#req_idx].serialize(&req).map_err(#encode_err)?;
-                let __resp_bytes = self.conn.unary(&#header, __bytes).await?;
+                let __resp_bytes = self.conn.unary_with(&#header, __bytes, &self.options).await?;
                 self.fory[#resp_idx].deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
             }
         },
@@ -1787,7 +1806,7 @@ fn client_method(
                 -> ::aster::Result<::aster::rpc::MessageStream<#resp>>
             {
                 let __bytes = self.fory[#req_idx].serialize(&req).map_err(#encode_err)?;
-                let __raw = self.conn.server_stream(&#header, __bytes).await?;
+                let __raw = self.conn.server_stream_with(&#header, __bytes, &self.options).await?;
                 ::core::result::Result::Ok(::aster::rpc::MessageStream::new(__raw, self.fory[#resp_idx].clone()))
             }
         },
@@ -1797,7 +1816,7 @@ fn client_method(
                 for __r in &reqs {
                     __encoded.push(self.fory[#req_idx].serialize(__r).map_err(#encode_err)?);
                 }
-                let __resp_bytes = self.conn.client_stream(&#header, __encoded).await?;
+                let __resp_bytes = self.conn.client_stream_with(&#header, __encoded, &self.options).await?;
                 self.fory[#resp_idx].deserialize::<#resp>(&__resp_bytes).map_err(#decode_err)
             }
         },
@@ -1811,7 +1830,7 @@ fn client_method(
                     for __r in &reqs {
                         __encoded.push(self.fory[#req_idx].serialize(__r).map_err(#encode_err)?);
                     }
-                    let __raw = self.conn.bidi(&#header, __encoded).await?;
+                    let __raw = self.conn.bidi_with(&#header, __encoded, &self.options).await?;
                     ::core::result::Result::Ok(::aster::rpc::MessageStream::new(__raw, self.fory[#resp_idx].clone()))
                 }
 
@@ -1825,7 +1844,7 @@ fn client_method(
                         ::aster::rpc::MessageStream<#resp>,
                     )>
                 {
-                    let (__sink, __raw) = self.conn.bidi_open(&#header).await?;
+                    let (__sink, __raw) = self.conn.bidi_open_with(&#header, &self.options).await?;
                     ::core::result::Result::Ok((
                         ::aster::rpc::BidiCall::new(__sink, self.fory[#req_idx].clone()),
                         ::aster::rpc::MessageStream::new(__raw, self.fory[#resp_idx].clone()),

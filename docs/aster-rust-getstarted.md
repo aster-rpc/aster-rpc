@@ -805,6 +805,37 @@ let replies = chat.collect().await?;
 # }
 ```
 
+#### Per-call deadline and metadata
+
+`with_options` returns a copy of the client (cheap: no codec rebuild) whose
+calls carry a `CallOptions`: a deadline, request metadata, a session id. It
+applies to every method in all four patterns; the plain client sends none.
+An edge that forwards each request's budget and identity builds one per
+request:
+
+```rust
+use std::time::Duration;
+use aster::rpc::CallOptions;
+
+# async fn forward(client: &EchoClient, budget: Duration, user: &str) -> aster::Result<()> {
+let call = client.with_options(
+    CallOptions::new()
+        .deadline(budget)                   // client-enforced; DEADLINE_EXCEEDED when it passes
+        .metadata("x-user", user),          // the handler reads ctx.metadata_value("x-user")
+);
+let resp = call.echo(EchoRequest { message: "hi".into(), count: 0 }).await?;
+let mut s = call.echo_n(EchoRequest { message: "x".into(), count: 3 }).await?;
+# Ok(())
+# }
+```
+
+The handler sees both through `CallContext` (§4.7): `metadata()` and
+`deadline()` / `remaining()`. A unary deadline bounds each attempt and
+overrides the connection's `with_deadline` (§4.8); a streaming deadline bounds
+the whole call from opening the stream. Unary interceptors see the deadline
+and metadata in `ClientCallContext`. For a session-scoped service, start from
+`session.options()` (`conn.open_session()?`) to stamp the session id.
+
 ### 4.6 Per-call authorization (Gate 3)
 
 `#[rpc(requires = …)]` is checked **before** the handler runs, against the
