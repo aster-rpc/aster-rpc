@@ -158,53 +158,66 @@ pub fn advertise_addrs(config: &CoreEndpointConfig) -> Result<Vec<SocketAddr>> {
         .collect()
 }
 
-/// Read every certificate from the PEM files in
-/// [`CoreEndpointConfig::relay_ca_cert_files`].
-fn read_ca_certs(files: &[String]) -> Result<Vec<CertificateDer<'static>>> {
+/// Read every certificate from the PEM files `files`; `label` names the
+/// setting in errors.
+fn read_ca_certs(files: &[String], label: &str) -> Result<Vec<CertificateDer<'static>>> {
     let mut certs = Vec::new();
     for file in files {
         let path = Path::new(file);
-        let bytes =
-            std::fs::read(path).with_context(|| format!("relay_ca_certs: cannot read {file}"))?;
+        let bytes = std::fs::read(path).with_context(|| format!("{label}: cannot read {file}"))?;
         let before = certs.len();
         for cert in CertificateDer::pem_slice_iter(&bytes) {
-            certs.push(cert.map_err(|e| anyhow!("relay_ca_certs: {file}: invalid PEM: {e}"))?);
+            certs.push(cert.map_err(|e| anyhow!("{label}: {file}: invalid PEM: {e}"))?);
         }
         if certs.len() == before {
-            return Err(anyhow!(
-                "relay_ca_certs: {file} holds no PEM CERTIFICATE block"
-            ));
+            return Err(anyhow!("{label}: {file} holds no PEM CERTIFICATE block"));
         }
     }
     Ok(certs)
 }
 
-/// The CA trust for relay (and other non-peer) TLS, or `None` for iroh's
-/// default (the built-in WebPKI roots).
-pub fn relay_ca_tls_config(config: &CoreEndpointConfig) -> Result<Option<CaTlsConfig>> {
-    if config.relay_ca_cert_files.is_empty() {
-        if config.relay_ca_only {
+/// CA trust from PEM bundles: `None` for the built-in WebPKI roots alone,
+/// else those roots plus `files`, or only `files` when `only`. `label` names
+/// the setting in errors (`relay_ca_certs`, `identity.publisher.ca_certs`).
+/// Every certificate must be a usable trust anchor, so a bad bundle fails at
+/// start rather than on the first handshake.
+pub fn ca_tls_config(files: &[String], only: bool, label: &str) -> Result<Option<CaTlsConfig>> {
+    if files.is_empty() {
+        if only {
             return Err(anyhow!(
-                "relay_ca_only requires at least one relay_ca_certs file"
+                "{label}: trusting only these roots needs at least one file"
             ));
         }
         return Ok(None);
     }
-    let certs = read_ca_certs(&config.relay_ca_cert_files)?;
-    // Fail at start, not on the first relay handshake, if a file holds
-    // something rustls will not accept as a trust anchor.
+    let certs = read_ca_certs(files, label)?;
     let mut store = rustls::RootCertStore::empty();
     let (_, rejected) = store.add_parsable_certificates(certs.iter().cloned());
     if rejected != 0 {
         return Err(anyhow!(
-            "relay_ca_certs: {rejected} certificate(s) are not usable trust anchors"
+            "{label}: {rejected} certificate(s) are not usable trust anchors"
         ));
     }
-    Ok(Some(if config.relay_ca_only {
+    Ok(Some(if only {
         CaTlsConfig::custom_roots(certs)
     } else {
         CaTlsConfig::embedded().with_extra_roots(certs)
     }))
+}
+
+/// The CA trust for relay (and other non-peer) TLS, or `None` for iroh's
+/// default (the built-in WebPKI roots).
+pub fn relay_ca_tls_config(config: &CoreEndpointConfig) -> Result<Option<CaTlsConfig>> {
+    if config.relay_ca_cert_files.is_empty() && config.relay_ca_only {
+        return Err(anyhow!(
+            "relay_ca_only requires at least one relay_ca_certs file"
+        ));
+    }
+    ca_tls_config(
+        &config.relay_ca_cert_files,
+        config.relay_ca_only,
+        "relay_ca_certs",
+    )
 }
 
 /// Apply advertised addresses, relay CA trust and discovery to `builder`,

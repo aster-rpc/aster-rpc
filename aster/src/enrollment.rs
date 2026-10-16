@@ -51,6 +51,10 @@ pub use aster_transport_core::enrollment::{
     ObservationRejection, ObservationReview, ObservationV1, ObserverGrant, PolicyStores,
     ReviewedObservation, MAX_OBSERVATION_LIFETIME, OBSERVATION_JWT_TYPE,
 };
+pub use aster_transport_core::enrollment::{
+    publisher_grant_key, publisher_grant_record, publisher_grant_withdrawal, PublisherGrant,
+    PUBLISHER_GRANT_APP, PUBLISHER_GRANT_PREFIX,
+};
 pub use aster_transport_core::enrollment::{AcceptedRecords, RotationPin, MAX_FORWARDED_ROTATIONS};
 pub use aster_transport_core::enrollment::{
     DelegatedIssuer, IssuanceError, ReplicaAttachment, SubjectStanding,
@@ -193,6 +197,24 @@ pub async fn open_observer_grant(
         root,
         &observer.to_bytes(),
         observations,
+    )
+    .await
+}
+
+/// Open the root's sealed grant of the fleet namespace's write capability to
+/// the issuer-key publisher `publisher`, from its copy of `fleet` (see
+/// [`publisher_grant_record`] for the root's side). An `[identity.publisher]`
+/// node does this itself before every write.
+#[cfg(feature = "docs")]
+pub async fn open_publisher_grant(
+    fleet: &crate::docs::Doc,
+    root: &[u8; 32],
+    publisher: &crate::SecretKey,
+) -> anyhow::Result<PublisherGrant> {
+    aster_transport_core::enrollment::open_publisher_grant(
+        &fleet.enrollment_core(),
+        root,
+        &publisher.to_bytes(),
     )
     .await
 }
@@ -492,6 +514,12 @@ impl Enrollment {
     /// The fleet namespace pinned to [`Self::trusted_root`].
     pub fn fleet_namespace(&self) -> [u8; 32] {
         self.inner.fleet_namespace()
+    }
+
+    /// The trusted root, changing on every accepted root rotation; after a
+    /// change, [`Self::fleet_namespace`] names the new root's namespace.
+    pub fn root_changes(&self) -> tokio::sync::watch::Receiver<[u8; 32]> {
+        self.inner.root_changes()
     }
 
     /// The root this node trusts now, with its next-root commitment and

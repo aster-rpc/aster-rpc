@@ -59,6 +59,7 @@ use std::time::Duration;
 
 use crate::config::{
     AsterConfig, TrustedIssuer, DEFAULT_CLOCK_LEEWAY_SECS, DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS,
+    DEFAULT_MAX_KEY_SET_AGE_SECS,
 };
 
 use super::auth::{AttributeStore, ROLE_ATTRIBUTE};
@@ -93,6 +94,10 @@ pub const MAX_EDGE_TOKEN_LIFETIME: Duration =
 pub const MAX_PROVIDER_TOKEN_LIFETIME: Duration = Duration::from_secs(86_400);
 /// Most `[[identity.trusted_issuers]]`.
 pub const MAX_TRUSTED_ISSUERS: usize = 32;
+/// Shortest `[identity] max_key_set_age_secs`.
+pub const MIN_KEY_SET_AGE: Duration = Duration::from_secs(60);
+/// Longest `[identity] max_key_set_age_secs` (30 days).
+pub const MAX_KEY_SET_AGE: Duration = Duration::from_secs(30 * 86_400);
 /// Most `audiences` of one trusted issuer.
 pub const MAX_ISSUER_AUDIENCES: usize = 16;
 /// Most `role_map` entries of one trusted issuer.
@@ -169,6 +174,9 @@ pub struct IdentitySettings {
     pub edge_token_max_lifetime_secs: u64,
     /// Leeway on `iat` / `nbf`, 0..=300 (`[identity] clock_leeway_secs`).
     pub clock_leeway_secs: u64,
+    /// Oldest issuer key set verified with, by its fetch time,
+    /// 60..=2592000 (`[identity] max_key_set_age_secs`).
+    pub max_key_set_age_secs: u64,
 }
 
 impl Default for IdentitySettings {
@@ -178,6 +186,7 @@ impl Default for IdentitySettings {
             trusted_issuers: Vec::new(),
             edge_token_max_lifetime_secs: DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS,
             clock_leeway_secs: DEFAULT_CLOCK_LEEWAY_SECS,
+            max_key_set_age_secs: DEFAULT_MAX_KEY_SET_AGE_SECS,
         }
     }
 }
@@ -209,6 +218,7 @@ impl IdentitySettings {
             trusted_issuers: config.identity_trusted_issuers.clone(),
             edge_token_max_lifetime_secs: config.identity_edge_token_max_lifetime_secs,
             clock_leeway_secs: config.identity_clock_leeway_secs,
+            max_key_set_age_secs: config.identity_max_key_set_age_secs,
         }
     }
 
@@ -230,6 +240,15 @@ impl IdentitySettings {
             return Err(format!(
                 "identity.clock_leeway_secs must be at most {}",
                 MAX_CLOCK_LEEWAY.as_secs()
+            ));
+        }
+        if !(MIN_KEY_SET_AGE.as_secs()..=MAX_KEY_SET_AGE.as_secs())
+            .contains(&self.max_key_set_age_secs)
+        {
+            return Err(format!(
+                "identity.max_key_set_age_secs must be in {}..={}",
+                MIN_KEY_SET_AGE.as_secs(),
+                MAX_KEY_SET_AGE.as_secs()
             ));
         }
         if self.trusted_issuers.len() > MAX_TRUSTED_ISSUERS {
@@ -316,6 +335,34 @@ impl IdentitySettings {
         }
         Ok(())
     }
+}
+
+/// The `[identity.publisher]` section `config` asks for, checked for start-up:
+/// the build must have the `identity-publisher` feature, the node Enrollment
+/// (the keys go into its fleet namespace), and the section must validate.
+pub(crate) fn publisher_plan(
+    config: &AsterConfig,
+    has_enrollment: bool,
+) -> crate::Result<Option<crate::config::IdentityPublisherConfig>> {
+    let Some(publisher) = &config.identity_publisher else {
+        return Ok(None);
+    };
+    if !cfg!(feature = "identity-publisher") {
+        return Err(crate::Error::InvalidArgument(
+            "[identity.publisher] is configured but aster was built without the \
+             `identity-publisher` feature"
+                .into(),
+        ));
+    }
+    if !has_enrollment {
+        return Err(crate::Error::InvalidArgument(
+            "[identity.publisher] needs [enrollment]: issuer keys are written into its fleet \
+             namespace"
+                .into(),
+        ));
+    }
+    publisher.validate(config.identity_max_key_set_age_secs)?;
+    Ok(Some(publisher.clone()))
 }
 
 /// The [`IdentitySettings`] every dispatcher of one server reads, per call.
@@ -495,7 +542,16 @@ fn verify_provider(
         ));
     };
     let now = unix_now();
-    let lookup = |kid: &str| keys.key(iss, kid, now);
+    let max_age = policy.settings.max_key_set_age_secs;
+    // The kid that had no key, for the publisher's unknown-kid refresh.
+    let missing = std::cell::RefCell::new(None::<String>);
+    let lookup = |kid: &str| {
+        let key = keys.key(iss, kid, now, max_age);
+        if key.is_none() {
+            *missing.borrow_mut() = Some(kid.to_string());
+        }
+        key
+    };
     let verified = verify_provider_token(
         token,
         &ProviderIssuerPolicy {
@@ -513,6 +569,11 @@ fn verify_provider(
     )
     .map_err(|error| {
         use ProviderTokenError as E;
+        if error == E::UnknownKey {
+            if let Some(kid) = missing.borrow().as_deref() {
+                keys.notice_unknown_kid(iss, kid);
+            }
+        }
         let reason = match error {
             E::Configuration => "configuration",
             E::Size => "size",

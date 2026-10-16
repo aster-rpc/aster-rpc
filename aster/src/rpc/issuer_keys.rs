@@ -31,14 +31,18 @@
 //!
 //! ## What a core keeps
 //!
-//! The newest accepted record (by `fetched_at`) per issuer. Keys of an issuer
+//! The newest accepted record (by `fetched_at`) per issuer. A set older than
+//! `[identity] max_key_set_age_secs` (default 48 hours) verifies nothing, so
+//! a publisher that stops refreshing cannot keep a removed key alive. Keys of an issuer
 //! that is not in `[[identity.trusted_issuers]]` are kept but never used, so
 //! a NodeConfig override that adds an issuer takes effect as soon as it is
 //! acknowledged. A token whose `kid` is not in its issuer's newest set is
 //! refused with `UNAUTHENTICATED`; nothing is fetched. A key removed from the
 //! newest set stops verifying when that set arrives. The cache is rebuilt on
 //! every change to the namespace (and once a minute, so expiries and
-//! late-applied revocations are picked up).
+//! late-applied revocations are picked up). When the root rotates, the
+//! watcher re-opens on the new root's fleet namespace: nothing written under
+//! the old root counts any more.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -80,11 +84,23 @@ pub struct IssuerKeySet {
     pub valid_until: Option<u64>,
 }
 
+/// Called with `(iss, kid)` when a token names a key this server does not
+/// hold: the publisher on the same node refreshes that issuer.
+pub(crate) type KidNotice = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
 /// The issuer keys a server holds, swapped whole on every rebuild.
-#[derive(Debug)]
 pub(crate) struct IssuerKeys {
     sets: arc_swap::ArcSwap<BTreeMap<String, Arc<Accepted>>>,
     generation: tokio::sync::watch::Sender<u64>,
+    notice: std::sync::RwLock<Option<KidNotice>>,
+}
+
+impl std::fmt::Debug for IssuerKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuerKeys")
+            .field("sets", &self.sets.load())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for IssuerKeys {
@@ -92,19 +108,42 @@ impl Default for IssuerKeys {
         Self {
             sets: arc_swap::ArcSwap::default(),
             generation: tokio::sync::watch::Sender::new(0),
+            notice: std::sync::RwLock::new(None),
         }
     }
 }
 
 impl IssuerKeys {
-    /// The key `kid` of `iss` at `now`, while its publisher's authority holds.
-    pub(crate) fn key(&self, iss: &str, kid: &str, now: u64) -> Option<ProviderKey> {
+    /// The key `kid` of `iss` at `now`, while its publisher's authority holds
+    /// and the set is at most `max_age` seconds old.
+    pub(crate) fn key(&self, iss: &str, kid: &str, now: u64, max_age: u64) -> Option<ProviderKey> {
         let sets = self.sets.load();
         let set = sets.get(iss)?;
         if set.valid_until.is_some_and(|until| now >= until) {
             return None;
         }
+        if now.saturating_sub(set.fetched_at) > max_age {
+            return None;
+        }
         set.keys.iter().find(|key| key.kid() == kid).cloned()
+    }
+
+    /// Route unknown-`kid` notices to `notice` (the node's publisher).
+    #[cfg_attr(not(feature = "identity-publisher"), allow(dead_code))]
+    pub(crate) fn set_kid_notice(&self, notice: KidNotice) {
+        *self.notice.write().unwrap_or_else(|e| e.into_inner()) = Some(notice);
+    }
+
+    /// A token named `kid` of `iss`, which no held (fresh) set has.
+    pub(crate) fn notice_unknown_kid(&self, iss: &str, kid: &str) {
+        let notice = self
+            .notice
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(notice) = notice {
+            notice(iss, kid);
+        }
     }
 
     #[cfg_attr(not(all(feature = "enrollment", feature = "docs")), allow(dead_code))]
@@ -182,6 +221,16 @@ mod watch {
         task: tokio::task::JoinHandle<()>,
     }
 
+    /// Open (read-only unless held writable) `namespace` and subscribe to it.
+    async fn open(node: &Node, namespace: [u8; 32]) -> Result<(Doc, crate::docs::DocEvents)> {
+        let doc = node
+            .docs()
+            .open_or_import_read_namespace(crate::NamespaceId::from_bytes(namespace))
+            .await?;
+        let events = doc.subscribe().await?;
+        Ok((doc, events))
+    }
+
     impl Drop for IssuerKeysWatch {
         fn drop(&mut self) {
             self.task.abort();
@@ -205,15 +254,12 @@ mod watch {
         identity: Arc<LiveIdentity>,
         keys: Arc<IssuerKeys>,
     ) -> Result<IssuerKeysWatch> {
-        let doc = node
-            .docs()
-            .open_or_import_read_namespace(crate::NamespaceId::from_bytes(
-                enrollment.fleet_namespace(),
-            ))
-            .await?;
+        // Subscribed before the first read, so no rotation falls between.
+        let mut roots = enrollment.root_changes();
+        let mut namespace = enrollment.fleet_namespace();
         // Subscribed before the first scan, so no change falls between them.
-        let events = doc.subscribe().await?;
-        let scanner = Scanner {
+        let (doc, mut events) = open(node, namespace).await?;
+        let mut scanner = Scanner {
             doc,
             enrollment,
             mapping,
@@ -221,23 +267,53 @@ mod watch {
             keys,
         };
         scanner.rebuild().await;
+        let node = node.clone();
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(REBUILD_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             interval.tick().await;
             loop {
-                tokio::select! {
+                let rebuild = tokio::select! {
                     event = events.recv() => match event {
-                        Ok(Some(event)) => {
-                            if relevant(&event) {
-                                scanner.rebuild().await;
-                            }
-                        }
+                        Ok(Some(event)) => relevant(&event),
                         // Lagged or failed: rebuild from what is stored.
-                        Err(_) => scanner.rebuild().await,
+                        Err(_) => true,
                         Ok(None) => break,
                     },
-                    _ = interval.tick() => scanner.rebuild().await,
+                    changed = roots.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        true
+                    }
+                    _ = interval.tick() => true,
+                };
+                // A root rotation moves the fleet namespace: re-open on the
+                // new one (retried every tick until it opens). Until then the
+                // rebuild below reads the old namespace under the new root's
+                // trust, where no publisher's credential verifies.
+                let current = scanner.enrollment.fleet_namespace();
+                if current != namespace {
+                    match open(&node, current).await {
+                        Ok((doc, reopened)) => {
+                            tracing::info!(
+                                target: IDENTITY,
+                                fleet = hex::encode(current).as_str(),
+                                "issuer keys: root rotated; watching the new fleet namespace"
+                            );
+                            scanner.doc = doc;
+                            events = reopened;
+                            namespace = current;
+                        }
+                        Err(error) => tracing::warn!(
+                            target: IDENTITY,
+                            error = %error,
+                            "issuer keys: opening the rotated fleet namespace failed"
+                        ),
+                    }
+                }
+                if rebuild {
+                    scanner.rebuild().await;
                 }
             }
         });

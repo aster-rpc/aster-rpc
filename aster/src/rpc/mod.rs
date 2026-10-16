@@ -37,6 +37,8 @@ pub mod identity;
 pub mod interceptor;
 #[cfg(feature = "delegation")]
 pub mod issuer_keys;
+#[cfg(feature = "identity-publisher")]
+pub mod jwks_publisher;
 pub mod lease;
 pub mod node_config;
 pub(crate) mod observe;

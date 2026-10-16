@@ -94,6 +94,7 @@ pub const IDENTITY_FIELDS: &[&str] = &[
     "trusted_issuers",
     "edge_token_max_lifetime_secs",
     "clock_leeway_secs",
+    "max_key_set_age_secs",
 ];
 /// Most attributes on one record.
 pub const MAX_ATTRIBUTES: usize = 64;
@@ -294,6 +295,8 @@ pub struct IdentityOverride {
     pub edge_token_max_lifetime_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clock_leeway_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_key_set_age_secs: Option<u64>,
 }
 
 impl IdentityOverride {
@@ -311,6 +314,9 @@ impl IdentityOverride {
         }
         if let Some(value) = self.clock_leeway_secs {
             out.clock_leeway_secs = value;
+        }
+        if let Some(value) = self.max_key_set_age_secs {
+            out.max_key_set_age_secs = value;
         }
         out
     }
@@ -522,7 +528,7 @@ mod service {
     use super::*;
     use crate::config::{
         ConfigSource, SETTING_ACCEPT_ON_BEHALF_OF, SETTING_CLOCK_LEEWAY,
-        SETTING_EDGE_TOKEN_MAX_LIFETIME, SETTING_TRUSTED_ISSUERS,
+        SETTING_EDGE_TOKEN_MAX_LIFETIME, SETTING_MAX_KEY_SET_AGE, SETTING_TRUSTED_ISSUERS,
     };
     use crate::docs::Doc;
     use crate::id::{AuthorId, NamespaceSecret};
@@ -859,6 +865,12 @@ mod service {
                     o.and_then(|o| o.clock_leeway_secs).map(int),
                     int(base.clock_leeway_secs),
                     int(default.clock_leeway_secs),
+                ),
+                self.setting(
+                    SETTING_MAX_KEY_SET_AGE,
+                    o.and_then(|o| o.max_key_set_age_secs).map(int),
+                    int(base.max_key_set_age_secs),
+                    int(default.max_key_set_age_secs),
                 ),
             ]
         }

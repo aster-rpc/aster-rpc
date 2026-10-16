@@ -117,6 +117,9 @@ pub const SETTING_TRUSTED_ISSUERS: &str = "identity.trusted_issuers";
 pub const SETTING_EDGE_TOKEN_MAX_LIFETIME: &str = "identity.edge_token_max_lifetime_secs";
 /// The [`AsterConfig::setting_sources`] key of `[identity] clock_leeway_secs`.
 pub const SETTING_CLOCK_LEEWAY: &str = "identity.clock_leeway_secs";
+/// The [`AsterConfig::setting_sources`] key of
+/// `[identity] max_key_set_age_secs`.
+pub const SETTING_MAX_KEY_SET_AGE: &str = "identity.max_key_set_age_secs";
 
 /// Default `[[identity.trusted_issuers]] max_token_lifetime_secs`.
 pub const DEFAULT_PROVIDER_TOKEN_LIFETIME_SECS: u64 = 900;
@@ -124,6 +127,216 @@ pub const DEFAULT_PROVIDER_TOKEN_LIFETIME_SECS: u64 = 900;
 pub const DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS: u64 = 300;
 /// Default `[identity] clock_leeway_secs`.
 pub const DEFAULT_CLOCK_LEEWAY_SECS: u64 = 60;
+/// Default `[identity] max_key_set_age_secs` (48 hours).
+pub const DEFAULT_MAX_KEY_SET_AGE_SECS: u64 = 172_800;
+/// Default `[identity.publisher] refresh_secs`.
+pub const DEFAULT_PUBLISHER_REFRESH_SECS: u64 = 3600;
+/// Shortest `[identity.publisher] refresh_secs`.
+pub const MIN_PUBLISHER_REFRESH_SECS: u64 = 60;
+/// Longest `[identity.publisher] refresh_secs`.
+pub const MAX_PUBLISHER_REFRESH_SECS: u64 = 86_400;
+/// Default `[identity.publisher] min_refresh_secs`.
+pub const DEFAULT_PUBLISHER_MIN_REFRESH_SECS: u64 = 60;
+/// Most issuers one publisher fetches for.
+pub const MAX_PUBLISHER_ISSUERS: usize = 32;
+/// Longest `[identity.publisher] jwks_url` value.
+pub const MAX_JWKS_URL_BYTES: usize = 2048;
+
+/// The issuer-key publisher (`[identity.publisher]`; design: "Issuer keys" in
+/// `docs/_internal/web_gateway/gateway-identity.md`). Only on the node that
+/// publishes keys, normally the gateway: it fetches each issuer's JWK set
+/// over validated HTTPS and writes it into the fleet namespace for every
+/// core to verify with. The node's credential must grant
+/// `aster.identity-publisher`, and the root must have sealed it the fleet
+/// namespace's write grant (`aster enroll identity-publisher grant`).
+///
+/// ```toml
+/// [identity.publisher]
+/// issuers = ["https://accounts.example.com"]
+/// jwks_url = { "https://accounts.example.com" = "https://accounts.example.com/.well-known/jwks.json" }
+/// refresh_secs = 3600        # default; 60..=86400
+/// min_refresh_secs = 60      # default; unknown-kid refreshes at most this often
+/// ca_certs = ["/etc/aster/idp-ca.pem"]   # extra roots for the IdP's TLS
+/// ca_only = false            # true: trust only ca_certs, not the WebPKI roots
+/// ```
+///
+/// Every issuer needs a `jwks_url` (`https`, no user info or fragment), and
+/// every `jwks_url` key must be an issuer. `refresh_secs` must be at most
+/// half of this node's `[identity] max_key_set_age_secs`, so a failed
+/// refresh is retried before cores stop trusting the last set.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityPublisherConfig {
+    /// The issuers (`iss`) to publish keys for.
+    pub issuers: Vec<String>,
+    /// Issuer → the HTTPS URL of its JWK set.
+    #[serde(default)]
+    pub jwks_url: BTreeMap<String, String>,
+    /// Scheduled refresh interval, with jitter.
+    #[serde(default = "default_publisher_refresh")]
+    pub refresh_secs: u64,
+    /// Shortest gap between two refreshes of one issuer that tokens with an
+    /// unknown `kid` trigger, 1..=`refresh_secs`. A notice inside the gap is
+    /// served when it ends, so a rotation is never missed and a stream of
+    /// made-up `kid`s costs at most one fetch per gap.
+    #[serde(default = "default_publisher_min_refresh")]
+    pub min_refresh_secs: u64,
+    /// Extra PEM trust anchors for the identity providers' TLS, as for
+    /// `relay_ca_certs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ca_certs: Vec<PathBuf>,
+    /// Trust only `ca_certs`, not the built-in WebPKI roots.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ca_only: bool,
+}
+
+fn default_publisher_refresh() -> u64 {
+    DEFAULT_PUBLISHER_REFRESH_SECS
+}
+
+fn default_publisher_min_refresh() -> u64 {
+    DEFAULT_PUBLISHER_MIN_REFRESH_SECS
+}
+
+impl IdentityPublisherConfig {
+    /// Publish `issuers`, each from its `jwks_url`, every
+    /// [`DEFAULT_PUBLISHER_REFRESH_SECS`].
+    pub fn new<I, S, U>(issuers: I) -> Self
+    where
+        I: IntoIterator<Item = (S, U)>,
+        S: Into<String>,
+        U: Into<String>,
+    {
+        let jwks_url: BTreeMap<String, String> = issuers
+            .into_iter()
+            .map(|(iss, url)| (iss.into(), url.into()))
+            .collect();
+        Self {
+            issuers: jwks_url.keys().cloned().collect(),
+            jwks_url,
+            refresh_secs: DEFAULT_PUBLISHER_REFRESH_SECS,
+            min_refresh_secs: DEFAULT_PUBLISHER_MIN_REFRESH_SECS,
+            ca_certs: Vec::new(),
+            ca_only: false,
+        }
+    }
+
+    /// Refresh every `secs`.
+    pub fn refresh_secs(mut self, secs: u64) -> Self {
+        self.refresh_secs = secs;
+        self
+    }
+
+    /// Let unknown-`kid` refreshes of one issuer run at most every `secs`.
+    pub fn min_refresh_secs(mut self, secs: u64) -> Self {
+        self.min_refresh_secs = secs;
+        self
+    }
+
+    /// Trust `path` (PEM) for the identity providers' TLS too.
+    pub fn ca_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.ca_certs.push(path.into());
+        self
+    }
+
+    /// Trust only [`Self::ca_certs`].
+    pub fn ca_only(mut self, only: bool) -> Self {
+        self.ca_only = only;
+        self
+    }
+
+    /// Validate the section against this node's `max_key_set_age_secs`.
+    /// `AsterServer` and `AsterClient` refuse to start on an error.
+    pub fn validate(&self, max_key_set_age_secs: u64) -> Result<()> {
+        let invalid =
+            |message: String| Error::InvalidArgument(format!("[identity.publisher] {message}"));
+        if self.issuers.is_empty() {
+            return Err(invalid("issuers is empty".into()));
+        }
+        if self.issuers.len() > MAX_PUBLISHER_ISSUERS {
+            return Err(invalid(format!("at most {MAX_PUBLISHER_ISSUERS} issuers")));
+        }
+        if !(MIN_PUBLISHER_REFRESH_SECS..=MAX_PUBLISHER_REFRESH_SECS).contains(&self.refresh_secs) {
+            return Err(invalid(format!(
+                "refresh_secs must be in {MIN_PUBLISHER_REFRESH_SECS}..={MAX_PUBLISHER_REFRESH_SECS}"
+            )));
+        }
+        if !(1..=self.refresh_secs).contains(&self.min_refresh_secs) {
+            return Err(invalid(
+                "min_refresh_secs must be in 1..=refresh_secs".into(),
+            ));
+        }
+        if self.refresh_secs.saturating_mul(2) > max_key_set_age_secs {
+            return Err(invalid(format!(
+                "refresh_secs ({}) must be at most half of [identity] max_key_set_age_secs ({}), \
+                 so a failed refresh is retried before cores stop trusting the last key set",
+                self.refresh_secs, max_key_set_age_secs
+            )));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for iss in &self.issuers {
+            if iss.is_empty() || iss.len() > 256 || iss.chars().any(char::is_control) {
+                return Err(invalid(format!("issuer {iss:?} is not a valid iss")));
+            }
+            if iss.contains('|') || (iss.len() == 64 && iss.bytes().all(|b| b.is_ascii_hexdigit()))
+            {
+                return Err(invalid(format!(
+                    "issuer {iss:?}: a node id or a value with '|' is not a provider issuer"
+                )));
+            }
+            if !seen.insert(iss.as_str()) {
+                return Err(invalid(format!("issuer {iss:?} is listed twice")));
+            }
+            let Some(url) = self.jwks_url.get(iss) else {
+                return Err(invalid(format!("issuer {iss:?} has no jwks_url")));
+            };
+            check_jwks_url(url)
+                .map_err(|reason| invalid(format!("jwks_url of {iss:?}: {reason}")))?;
+        }
+        if let Some(extra) = self
+            .jwks_url
+            .keys()
+            .find(|iss| !seen.contains(iss.as_str()))
+        {
+            return Err(invalid(format!(
+                "jwks_url names {extra:?}, which is not in issuers"
+            )));
+        }
+        if self.ca_only && self.ca_certs.is_empty() {
+            return Err(invalid("ca_only needs at least one ca_certs file".into()));
+        }
+        Ok(())
+    }
+}
+
+/// The checks on a `jwks_url` that need no URL parser: `https://`, a host,
+/// no user info, fragment, whitespace or control characters, bounded.
+fn check_jwks_url(url: &str) -> std::result::Result<(), String> {
+    if url.len() > MAX_JWKS_URL_BYTES {
+        return Err(format!("longer than {MAX_JWKS_URL_BYTES} bytes"));
+    }
+    if url.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("contains whitespace or a control character".into());
+    }
+    let Some(rest) = url
+        .get(..8)
+        .filter(|scheme| scheme.eq_ignore_ascii_case("https://"))
+        .map(|_| &url[8..])
+    else {
+        return Err("must be an https:// URL".into());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err("has no host".into());
+    }
+    if authority.contains('@') {
+        return Err("may not carry user info".into());
+    }
+    if url.contains('#') {
+        return Err("may not carry a fragment".into());
+    }
+    Ok(())
+}
 
 /// An external identity provider whose tokens a server accepts in
 /// `aster-on-behalf-of` (`[[identity.trusted_issuers]]`; design:
@@ -497,6 +710,20 @@ pub struct AsterConfig {
     /// Env: `ASTER_IDENTITY_CLOCK_LEEWAY_SECS`; TOML:
     /// `[identity] clock_leeway_secs`.
     pub identity_clock_leeway_secs: u64,
+    /// Oldest issuer key set (by its fetch time) a server verifies with,
+    /// 60..=2592000. Default 172800 (48 hours). A publisher that stops
+    /// refreshing cannot keep a removed key alive past it; keep it well above
+    /// the publisher's `refresh_secs` (at least twice).
+    ///
+    /// Env: `ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS`; TOML:
+    /// `[identity] max_key_set_age_secs`.
+    pub identity_max_key_set_age_secs: u64,
+    /// The issuer-key publisher, on the node that publishes keys (see
+    /// [`IdentityPublisherConfig`]). Needs the `identity-publisher` feature.
+    ///
+    /// Env: `ASTER_IDENTITY_PUBLISHER` (a JSON object of the same fields);
+    /// TOML: `[identity.publisher]`.
+    pub identity_publisher: Option<IdentityPublisherConfig>,
 
     /// Serve `aster.ops.NodeConfig`, the remote overrides of overridable
     /// sections (`[identity]` today). Default `true`; `false` turns the
@@ -815,6 +1042,16 @@ impl AsterConfig {
                 self.setting_sources
                     .insert(SETTING_CLOCK_LEEWAY.into(), ConfigSource::File);
             }
+            if let Some(value) = toml_u64(identity, "max_key_set_age_secs", label)? {
+                self.identity_max_key_set_age_secs = value;
+                self.setting_sources
+                    .insert(SETTING_MAX_KEY_SET_AGE.into(), ConfigSource::File);
+            }
+            if let Some(value) = identity.get("publisher") {
+                self.identity_publisher = Some(value.clone().try_into().map_err(|e| {
+                    Error::InvalidArgument(format!("{label} [identity.publisher]: {e}"))
+                })?);
+            }
         }
 
         if let Some(remote) = toml_section(raw, "remote_config", label)? {
@@ -1094,6 +1331,19 @@ impl AsterConfig {
             self.identity_clock_leeway_secs = value;
             self.setting_sources
                 .insert(SETTING_CLOCK_LEEWAY.into(), ConfigSource::Env);
+        }
+        if let Some(value) = env_u64("ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS")? {
+            self.identity_max_key_set_age_secs = value;
+            self.setting_sources
+                .insert(SETTING_MAX_KEY_SET_AGE.into(), ConfigSource::Env);
+        }
+        if let Some(value) = env_string("ASTER_IDENTITY_PUBLISHER") {
+            self.identity_publisher = Some(serde_json::from_str(&value).map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "ASTER_IDENTITY_PUBLISHER: expected a JSON object of [identity.publisher] \
+                     fields: {e}"
+                ))
+            })?);
         }
         if let Some(value) = env_bool("ASTER_REMOTE_CONFIG_ENABLED")? {
             self.remote_config_enabled = value;
@@ -1492,6 +1742,8 @@ impl Default for AsterConfig {
             identity_trusted_issuers: Vec::new(),
             identity_edge_token_max_lifetime_secs: DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS,
             identity_clock_leeway_secs: DEFAULT_CLOCK_LEEWAY_SECS,
+            identity_max_key_set_age_secs: DEFAULT_MAX_KEY_SET_AGE_SECS,
+            identity_publisher: None,
             remote_config_enabled: true,
             remote_config_lock: Vec::new(),
             setting_sources: BTreeMap::new(),
@@ -1898,6 +2150,23 @@ impl AsterConfigBuilder {
         self.config
             .setting_sources
             .insert(SETTING_CLOCK_LEEWAY.into(), ConfigSource::Code);
+        self
+    }
+
+    /// Oldest issuer key set a server verifies with (see
+    /// [`AsterConfig::identity_max_key_set_age_secs`]).
+    pub fn max_key_set_age_secs(mut self, secs: u64) -> Self {
+        self.config.identity_max_key_set_age_secs = secs;
+        self.config
+            .setting_sources
+            .insert(SETTING_MAX_KEY_SET_AGE.into(), ConfigSource::Code);
+        self
+    }
+
+    /// Run the issuer-key publisher (see
+    /// [`AsterConfig::identity_publisher`]).
+    pub fn identity_publisher(mut self, publisher: IdentityPublisherConfig) -> Self {
+        self.config.identity_publisher = Some(publisher);
         self
     }
 
@@ -2485,6 +2754,8 @@ mod tests {
         "ASTER_IDENTITY_TRUSTED_ISSUERS",
         "ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS",
         "ASTER_IDENTITY_CLOCK_LEEWAY_SECS",
+        "ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS",
+        "ASTER_IDENTITY_PUBLISHER",
         "ASTER_ROOT_PUBKEY",
         "ASTER_ROOT_PUBKEY_FILE",
         "ASTER_ENROLLMENT_CREDENTIAL",
@@ -3311,6 +3582,72 @@ mod binding_knob_tests {
                 .build()
                 .identity_accept_on_behalf_of
         );
+    }
+
+    #[test]
+    fn identity_publisher_and_key_set_age_from_toml_env_and_builder() {
+        let _lock = lock_env();
+        let _env = super::tests_env_guard();
+
+        let defaults = AsterConfig::default();
+        assert_eq!(defaults.identity_max_key_set_age_secs, 172_800);
+        assert!(defaults.identity_publisher.is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        fs::write(
+            &path,
+            "[identity]\nmax_key_set_age_secs = 86400\n\n[identity.publisher]\n\
+             issuers = [\"https://idp\"]\n\
+             jwks_url = { \"https://idp\" = \"https://idp/jwks\" }\n\
+             min_refresh_secs = 30\nca_certs = [\"/etc/idp.pem\"]\n",
+        )
+        .unwrap();
+        let cfg = AsterConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.identity_max_key_set_age_secs, 86_400);
+        assert_eq!(
+            cfg.setting_sources.get(SETTING_MAX_KEY_SET_AGE),
+            Some(&ConfigSource::File)
+        );
+        let publisher = cfg.identity_publisher.unwrap();
+        assert_eq!(publisher.issuers, ["https://idp"]);
+        assert_eq!(publisher.jwks_url["https://idp"], "https://idp/jwks");
+        assert_eq!(publisher.refresh_secs, DEFAULT_PUBLISHER_REFRESH_SECS);
+        assert_eq!(publisher.min_refresh_secs, 30);
+        assert_eq!(publisher.ca_certs, [PathBuf::from("/etc/idp.pem")]);
+        assert!(!publisher.ca_only);
+        publisher.validate(86_400).unwrap();
+        // Unknown publisher keys are refused.
+        fs::write(&path, "[identity.publisher]\nissuers = []\nurl = \"x\"\n").unwrap();
+        assert!(AsterConfig::from_file(&path).is_err());
+
+        fs::write(&path, "").unwrap();
+        env::set_var("ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS", "3600");
+        env::set_var(
+            "ASTER_IDENTITY_PUBLISHER",
+            r#"{"issuers": ["https://idp"], "jwks_url": {"https://idp": "https://idp/k"}, "refresh_secs": 600}"#,
+        );
+        let cfg = AsterConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.identity_max_key_set_age_secs, 3600);
+        assert_eq!(cfg.identity_publisher.as_ref().unwrap().refresh_secs, 600);
+        env::set_var("ASTER_IDENTITY_PUBLISHER", "not json");
+        assert!(AsterConfig::from_file(&path).is_err());
+        env::remove_var("ASTER_IDENTITY_PUBLISHER");
+        env::remove_var("ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS");
+
+        let built = AsterConfig::builder()
+            .max_key_set_age_secs(7200)
+            .identity_publisher(IdentityPublisherConfig::new([(
+                "https://idp",
+                "https://idp/k",
+            )]))
+            .build();
+        assert_eq!(built.identity_max_key_set_age_secs, 7200);
+        assert_eq!(
+            built.setting_sources.get(SETTING_MAX_KEY_SET_AGE),
+            Some(&ConfigSource::Code)
+        );
+        // 3600 s refresh against a 7200 s maximum age: exactly half is allowed.
+        built.identity_publisher.unwrap().validate(7200).unwrap();
     }
 
     #[test]

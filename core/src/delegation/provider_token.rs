@@ -442,6 +442,26 @@ pub fn peek_issuer(token: &str) -> Result<String, ProviderTokenError> {
         .ok_or(ProviderTokenError::Malformed)
 }
 
+/// The unverified `iss` and header `kid` of a compact JWT, for a publisher
+/// deciding whether the token names a key it has not fetched yet. The same
+/// framing gates as [`peek_issuer`], plus the `kid` bounds; never trusted on
+/// its own.
+pub fn peek_issuer_and_kid(token: &str) -> Result<(String, String), ProviderTokenError> {
+    let unverified = decode(token)?;
+    let iss = unverified
+        .claims
+        .get("iss")
+        .and_then(Value::as_str)
+        .ok_or(ProviderTokenError::Malformed)?;
+    let kid = unverified
+        .header
+        .get("kid")
+        .and_then(Value::as_str)
+        .filter(|kid| valid_text(kid, MAX_KID_BYTES))
+        .ok_or(ProviderTokenError::Header)?;
+    Ok((iss.to_string(), kid.to_string()))
+}
+
 fn check_header(header: &Map<String, Value>) -> Result<(ProviderAlg, String), ProviderTokenError> {
     use ProviderTokenError::Header;
     if header
@@ -834,6 +854,24 @@ mod tests {
         let mut c = claims();
         f(&mut c);
         c
+    }
+
+    #[test]
+    fn peek_reads_issuer_and_kid_without_trusting_them() {
+        let key = TestKey::ec();
+        let token = key.sign(&header("ES256", "k-new"), &claims());
+        assert_eq!(
+            peek_issuer_and_kid(&token).unwrap(),
+            (ISS.to_string(), "k-new".to_string())
+        );
+        let no_kid = key.sign(&serde_json::json!({"alg": "ES256"}), &claims());
+        assert_eq!(
+            peek_issuer_and_kid(&no_kid),
+            Err(ProviderTokenError::Header)
+        );
+        let long_kid = key.sign(&header("ES256", &"k".repeat(MAX_KID_BYTES + 1)), &claims());
+        assert!(peek_issuer_and_kid(&long_kid).is_err());
+        assert!(peek_issuer_and_kid("not.a.token").is_err());
     }
 
     #[test]

@@ -130,6 +130,14 @@ impl AsterClientBuilder {
         };
         #[cfg(not(all(feature = "enrollment", feature = "docs")))]
         let alpns = Vec::new();
+        #[cfg(all(feature = "enrollment", feature = "docs"))]
+        let has_enrollment = plan.is_some();
+        #[cfg(not(all(feature = "enrollment", feature = "docs")))]
+        let has_enrollment = false;
+        #[cfg_attr(not(feature = "identity-publisher"), allow(unused_variables))]
+        let publisher_config = super::identity::publisher_plan(&config, has_enrollment)?;
+        #[cfg(feature = "identity-publisher")]
+        let max_key_set_age = config.identity_max_key_set_age_secs;
         let node = Node::start_with_alpns(config, alpns).await?;
 
         #[cfg(all(feature = "enrollment", feature = "docs"))]
@@ -148,6 +156,27 @@ impl AsterClientBuilder {
             node.shutdown().await;
             return Err(err);
         }
+        // The issuer-key publisher, delivering to the server; every token
+        // this client forwards is checked against what it published.
+        #[cfg(feature = "identity-publisher")]
+        let publisher = match (&publisher_config, &enrollment) {
+            (Some(publisher_config), Some(enrolled)) => {
+                match super::jwks_publisher::IssuerKeyPublisher::start(
+                    &node,
+                    enrolled.enrollment.clone(),
+                    publisher_config,
+                    max_key_set_age,
+                    vec![server.node_id.clone()],
+                ) {
+                    Ok(publisher) => Some(publisher),
+                    Err(err) => {
+                        node.shutdown().await;
+                        return Err(err);
+                    }
+                }
+            }
+            _ => None,
+        };
         let rpc = match node.rpc_connect(&server.node_id).await {
             Ok(rpc) => rpc,
             Err(err) => {
@@ -155,12 +184,18 @@ impl AsterClientBuilder {
                 return Err(err);
             }
         };
-        Ok(AsterClient {
+        let client = AsterClient {
             node,
             server,
             rpc,
             #[cfg(all(feature = "enrollment", feature = "docs"))]
             enrollment,
+            #[cfg(feature = "identity-publisher")]
+            publisher,
+        };
+        Ok(AsterClient {
+            rpc: client.decorate(client.rpc.clone()),
+            ..client
         })
     }
 }
@@ -217,9 +252,28 @@ pub struct AsterClient {
     rpc: RpcConnection,
     #[cfg(all(feature = "enrollment", feature = "docs"))]
     enrollment: Option<ClientEnrollment>,
+    #[cfg(feature = "identity-publisher")]
+    publisher: Option<super::jwks_publisher::IssuerKeyPublisher>,
 }
 
 impl AsterClient {
+    /// `rpc` with this client's own interceptors: with a publisher, the one
+    /// that notices forwarded tokens' unknown `kid`s.
+    fn decorate(&self, rpc: RpcConnection) -> RpcConnection {
+        #[cfg(feature = "identity-publisher")]
+        if let Some(publisher) = &self.publisher {
+            return rpc
+                .with_interceptor(super::jwks_publisher::NoticeInterceptor(publisher.handle()));
+        }
+        rpc
+    }
+
+    /// The issuer-key publisher this client runs from `[identity.publisher]`.
+    #[cfg(feature = "identity-publisher")]
+    pub fn identity_publisher(&self) -> Option<super::jwks_publisher::PublisherHandle> {
+        self.publisher.as_ref().map(|publisher| publisher.handle())
+    }
+
     /// Start configuring a client.
     pub fn builder() -> AsterClientBuilder {
         AsterClientBuilder::default()
@@ -242,7 +296,8 @@ impl AsterClient {
     /// Open a fresh RPC connection to the server, for example after the
     /// previous one closed.
     pub async fn reconnect(&mut self) -> Result<RpcConnection> {
-        self.rpc = self.node.rpc_connect(&self.server.node_id).await?;
+        let rpc = self.node.rpc_connect(&self.server.node_id).await?;
+        self.rpc = self.decorate(rpc);
         Ok(self.rpc.clone())
     }
 
@@ -278,6 +333,8 @@ impl AsterClient {
 
     /// Stop renewing and close the node.
     pub async fn close(self) {
+        #[cfg(feature = "identity-publisher")]
+        drop(self.publisher);
         #[cfg(all(feature = "enrollment", feature = "docs"))]
         drop(self.enrollment);
         self.node.shutdown().await;

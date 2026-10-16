@@ -49,6 +49,7 @@ mod clock;
 mod jwt;
 mod observations;
 mod policy;
+mod publisher_grant;
 
 pub use bootstrap::{
     AdmissionError, EnrollmentOptions, EnrollmentReadiness, EnrollmentRevoked, EnrollmentService,
@@ -87,6 +88,10 @@ pub use observations::{
     OBSERVATION_JWT_TYPE,
 };
 pub use policy::{AdmissionGuard, ObservedSourceAddress, SourceAddressProvenance, SourceCidr};
+pub use publisher_grant::{
+    open_publisher_grant, publisher_grant_key, publisher_grant_record, publisher_grant_withdrawal,
+    PublisherGrant, PUBLISHER_GRANT_APP, PUBLISHER_GRANT_PREFIX,
+};
 pub use records::{
     credential_status_key, issuer_status_key, namespace_binding_key, node_registration_key,
     observation_key, BindingStatus, CredentialStatusV1, IssuerStatus, IssuerStatusV1,

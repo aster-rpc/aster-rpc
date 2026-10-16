@@ -576,6 +576,8 @@ impl AsterServerBuilder {
                     .into(),
             ));
         }
+        #[cfg_attr(not(feature = "identity-publisher"), allow(unused_variables))]
+        let publisher_config = super::identity::publisher_plan(&config, has_enrollment)?;
 
         // `aster/1` always; blobs/docs/gossip ALPNs are registered by core.
         // `route_alpn`/`with_expose` also push their ALPN into `extra_alpns`, so
@@ -828,6 +830,38 @@ impl AsterServerBuilder {
                     return Err(err);
                 }
                 let renewal = plan.start_renewal(&installed.enrollment, None);
+                // The issuer-key publisher, delivering to the policy
+                // replicas; tokens this server refuses for an unknown kid
+                // refresh their issuer.
+                #[cfg(feature = "identity-publisher")]
+                let publisher = match &publisher_config {
+                    None => None,
+                    Some(publisher_config) => {
+                        match super::jwks_publisher::IssuerKeyPublisher::start(
+                            &node,
+                            installed.enrollment.clone(),
+                            publisher_config,
+                            identity_settings.max_key_set_age_secs,
+                            plan.replica_ids(),
+                        ) {
+                            Ok(publisher) => {
+                                let handle = publisher.handle();
+                                issuer_keys.set_kid_notice(Arc::new(
+                                    move |iss: &str, kid: &str| handle.notice_kid(iss, kid),
+                                ));
+                                Some(publisher)
+                            }
+                            Err(err) => {
+                                handle.abort();
+                                if let Some(http) = &http {
+                                    http.abort();
+                                }
+                                node.shutdown().await;
+                                return Err(err);
+                            }
+                        }
+                    }
+                };
                 let watch = match super::issuer_keys::watch(
                     &node,
                     installed.enrollment.clone(),
@@ -853,6 +887,8 @@ impl AsterServerBuilder {
                     _renewal: renewal,
                     issuer_keys: super::issuer_keys::IssuerKeysHandle(issuer_keys),
                     _issuer_keys_watch: watch,
+                    #[cfg(feature = "identity-publisher")]
+                    publisher,
                 })
             }
             _ => None,
@@ -943,6 +979,9 @@ struct ServerEnrollment {
     /// Provider-token issuer keys from the fleet namespace.
     issuer_keys: super::issuer_keys::IssuerKeysHandle,
     _issuer_keys_watch: super::issuer_keys::IssuerKeysWatch,
+    /// The issuer-key publisher, from `[identity.publisher]`.
+    #[cfg(feature = "identity-publisher")]
+    publisher: Option<super::jwks_publisher::IssuerKeyPublisher>,
 }
 
 /// Binding support: the baseline services [`AsterServerBuilder`] registers,
@@ -1081,6 +1120,15 @@ impl AsterServer {
     #[cfg(all(feature = "enrollment", feature = "docs"))]
     pub fn issuer_keys(&self) -> Option<super::issuer_keys::IssuerKeysHandle> {
         self.enrollment.as_ref().map(|e| e.issuer_keys.clone())
+    }
+
+    /// The issuer-key publisher this server runs from `[identity.publisher]`.
+    #[cfg(feature = "identity-publisher")]
+    pub fn identity_publisher(&self) -> Option<super::jwks_publisher::PublisherHandle> {
+        self.enrollment
+            .as_ref()
+            .and_then(|e| e.publisher.as_ref())
+            .map(|publisher| publisher.handle())
     }
 
     /// The delegated [`Issuer`](crate::enrollment::Issuer) this server runs

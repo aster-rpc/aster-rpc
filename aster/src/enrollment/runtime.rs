@@ -579,6 +579,16 @@ impl Plan {
         Ok(())
     }
 
+    /// The configured policy replicas' node ids (an `AsterServer`'s
+    /// issuer-key publisher delivers to them).
+    #[cfg_attr(not(feature = "identity-publisher"), allow(dead_code))]
+    pub(crate) fn replica_ids(&self) -> Vec<crate::NodeId> {
+        self.replicas
+            .iter()
+            .map(|addr| addr.node_id.clone())
+            .collect()
+    }
+
     /// Start renewing this node's credential, when configured: from
     /// `renew_from`, else (client only) from `server` when it signed the
     /// credential. `renew = false` disables both.

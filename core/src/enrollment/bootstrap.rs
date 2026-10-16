@@ -655,6 +655,8 @@ pub struct EnrollmentService {
     replica_maintenance: Mutex<Option<AbortHandle>>,
     next_generation: AtomicU64,
     revoked: broadcast::Sender<EnrollmentRevoked>,
+    /// The trusted root, sent again on every accepted rotation.
+    roots: watch::Sender<[u8; 32]>,
 }
 
 impl Drop for EnrollmentService {
@@ -859,9 +861,11 @@ impl EnrollmentService {
         // One reconciliation can revoke every admitted peer; size the channel
         // so that does not lag a promptly polling consumer.
         let (revoked, _) = broadcast::channel(options.max_admitted_peers.max(128));
+        let roots = watch::Sender::new(*trust.store.root());
         Arc::new_cyclic(|this| Self {
             this: this.clone(),
             node,
+            roots,
             audience: trust.store.audience().to_owned(),
             trust: RwLock::new(Arc::new(trust)),
             rotation: Mutex::new(rotation),
@@ -1671,6 +1675,12 @@ impl EnrollmentService {
             .map(|rotation| rotation.root)
     }
 
+    /// The trusted root now, changing on every accepted rotation; with it,
+    /// [`Self::fleet_namespace`] has moved to the new root's namespace.
+    pub fn root_changes(&self) -> watch::Receiver<[u8; 32]> {
+        self.roots.subscribe()
+    }
+
     /// The rotation statements this node has applied, oldest first, as it
     /// offers them to peers in the enrollment handshake.
     pub fn root_rotations(&self) -> Vec<String> {
@@ -1748,6 +1758,7 @@ impl EnrollmentService {
         }
         if applied > 0 {
             self.after_rotation();
+            self.roots.send_replace(*self.trust().store.root());
         }
         Ok(applied)
     }

@@ -57,6 +57,12 @@ coordination = [
 # `coordination` graphs do not enable it.
 coordination-testing = ["coordination"]
 audit-outbox = ["dep:redb", "dep:libc", "dep:windows-sys", "dep:sha2", "dep:url", "dep:reqwest", "dep:crossbeam-channel", "dep:rustls", "dep:rustls-platform-verifier", "dep:httpdate"]
+# The issuer-key publisher (`[identity.publisher]`, gateway identity slice 3):
+# fetches identity providers' JWK sets over HTTPS and writes them into the
+# fleet namespace. reqwest and rustls are the versions iroh's own HTTP client
+# already resolves (reqwest with `rustls-no-provider`, rustls with ring), so
+# this adds no crate to the graph.
+identity-publisher = ["enrollment", "docs", "rpc", "dep:reqwest", "dep:rustls"]
 discovery = []
 hooks = []
 # `aster::ops`: the /healthz, /readyz, /metrics HTTP listener (the Rust home
@@ -328,6 +334,12 @@ fory-derive = "=1.7.6"
 http-body-util = "0.1"
 # The `otel` tests export to aster-otel's in-memory exporters.
 aster-otel = { path = "../aster-otel", version = "=0.3.0", registry = "aster", features = ["testing"] }
+# The identity-publisher tests serve a JWK set over HTTPS from a throwaway CA:
+# rcgen as core's relay test uses it, tokio-rustls as iroh's HTTP client
+# resolves it, so nothing new enters the graph.
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 # Log subscriber for the `restart_probe` example. Same exact pin aster-otel
 # resolves, so nothing new enters the graph.
 tracing-subscriber = { version = "=0.3.23", default-features = false, features = ["std", "registry", "fmt", "env-filter", "ansi"] }
