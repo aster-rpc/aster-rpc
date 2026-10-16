@@ -128,13 +128,19 @@ fn namespace(doc: &Doc) -> [u8; 32] {
         .unwrap()
 }
 
+/// Wait until `node` has a direct address to hand out: a condition wait
+/// on the endpoint's address watcher, failing loudly after 30 s rather
+/// than letting a later connect fail for an unrelated-looking reason.
 async fn wait_for_addr(node: &Node) {
-    for _ in 0..100 {
-        if !node.addr().direct_addresses.is_empty() {
-            return;
+    use aster::native::iroh::Watcher;
+    let mut addrs = node.native_endpoint().watch_addr();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while node.addr().direct_addresses.is_empty() {
+            addrs.updated().await.expect("endpoint closed");
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await
+    .expect("the node had no direct address after 30 s");
 }
 
 /// The root: holds the writable fleet namespace and serves enrollment, as a

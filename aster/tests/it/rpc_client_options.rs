@@ -143,13 +143,19 @@ fn cfg() -> AsterConfig {
         .build()
 }
 
+/// Wait until `n` has a direct address to hand out: a condition wait
+/// on the endpoint's address watcher, failing loudly after 30 s rather
+/// than letting a later connect fail for an unrelated-looking reason.
 async fn wait_for_addr(n: &Node) {
-    for _ in 0..50 {
-        if !n.addr().direct_addresses.is_empty() {
-            return;
+    use aster::native::iroh::Watcher;
+    let mut addrs = n.native_endpoint().watch_addr();
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while n.addr().direct_addresses.is_empty() {
+            addrs.updated().await.expect("endpoint closed");
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    })
+    .await
+    .expect("the node had no direct address after 30 s");
 }
 
 async fn within<F: Future>(f: F) -> F::Output {
