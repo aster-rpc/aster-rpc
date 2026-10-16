@@ -45,6 +45,11 @@ pub(crate) enum Control {
         event_id: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    Acknowledgements {
+        after: u64,
+        limit: usize,
+        reply: oneshot::Sender<Result<Vec<Acknowledgement>>>,
+    },
     Fetch {
         reply: Sender<Result<Option<Batch>>>,
     },
@@ -154,6 +159,8 @@ pub(crate) fn storage_entry(
     drop(submissions);
     drop(controls);
     shared.closed_notify.notify_waiters();
+    // Wake acknowledgement waiters so their re-query observes the closed outbox.
+    shared.ack_cursor.send_modify(|_| {});
 }
 
 fn refresh(store: &Store, shared: &Shared) -> Result<()> {
@@ -197,6 +204,12 @@ fn refresh(store: &Store, shared: &Shared) -> Result<()> {
     }
     status.durable_commits = store.commits;
     status.last_group_size = store.last_group_size;
+    drop(status);
+    shared.ack_cursor.send_if_modified(|cursor| {
+        let moved = *cursor != store.ack_cursor;
+        *cursor = store.ack_cursor;
+        moved
+    });
     Ok(())
 }
 fn fatal<T>(result: &Result<T>) -> bool {
@@ -482,6 +495,11 @@ fn process_selected(store: &mut Store, shared: &Shared, control: Control) -> Res
             event_id,
             reply: sender,
         } => reply!(sender, store.replay(event_id)),
+        Control::Acknowledgements {
+            after,
+            limit,
+            reply: sender,
+        } => reply!(sender, store.acknowledgements(after, limit)),
         Control::Flush { .. } => unreachable!(),
     }
     shared.signal();

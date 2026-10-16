@@ -8,6 +8,16 @@ const PENDING: TableDefinition<u64, &[u8]> = TableDefinition::new("audit_pending
 const DEAD: TableDefinition<u64, &[u8]> = TableDefinition::new("audit_dead_v1");
 const RECEIPTS: TableDefinition<u64, &[u8]> = TableDefinition::new("audit_receipts_v1");
 const MAX_RECEIPT_BYTES: usize = 32 * 1024;
+/// Acknowledgement log, keyed by a monotonic cursor. Each row is fixed width:
+/// sequence (u64 BE), acknowledged-at ms (u64 BE), batch digest, envelope digest.
+const ACKS: TableDefinition<u64, &[u8]> = TableDefinition::new("audit_acks_v1");
+/// META key holding the last assigned acknowledgement cursor (u64 BE). Kept
+/// apart from `state` so the logical accounting record is unchanged.
+const ACK_CURSOR_KEY: &str = "ack_cursor_v1";
+const ACK_RECORD_BYTES: usize = 80;
+/// Age pruning per transaction is bounded so one acknowledgement never turns
+/// into an unbounded delete; the count bound is always enforced in full.
+const ACK_AGE_PRUNE_PER_COMMIT: usize = 4096;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct State {
@@ -51,6 +61,8 @@ pub(crate) struct Store {
     pub last_group_size: usize,
     oldest_cache: Option<(u64, u64)>,
     pub storage_recovered: bool,
+    /// Last committed acknowledgement-log cursor (0 = none ever recorded).
+    pub ack_cursor: u64,
 }
 fn charge(bytes: &[u8]) -> u64 {
     bytes.len() as u64 + 8
@@ -117,6 +129,7 @@ impl Store {
         write.open_table(PENDING).map_err(AuditError::storage)?;
         write.open_table(DEAD).map_err(AuditError::storage)?;
         write.open_table(RECEIPTS).map_err(AuditError::storage)?;
+        write.open_table(ACKS).map_err(AuditError::storage)?;
         let existing = write
             .open_table(META)
             .map_err(AuditError::storage)?
@@ -146,7 +159,7 @@ impl Store {
             }
             state
         } else {
-            for definition in [PENDING, DEAD, RECEIPTS] {
+            for definition in [PENDING, DEAD, RECEIPTS, ACKS] {
                 if write
                     .open_table(definition)
                     .map_err(AuditError::storage)?
@@ -174,6 +187,18 @@ impl Store {
                 stall: None,
             }
         };
+        let ack_cursor = read_ack_cursor(&write)?;
+        if write
+            .open_table(ACKS)
+            .map_err(AuditError::storage)?
+            .last()
+            .map_err(AuditError::storage)?
+            .is_some_and(|(key, _)| key.value() > ack_cursor)
+        {
+            return Err(AuditError::storage(
+                "acknowledgement log ahead of its cursor",
+            ));
+        }
         if !recovered {
             write_state(&write, &state)?;
             commit(write)?;
@@ -191,9 +216,11 @@ impl Store {
             last_group_size: 0,
             oldest_cache: None,
             storage_recovered,
+            ack_cursor,
         };
         store.validate_recovered()?;
         store.reload_oldest()?;
+        store.prune_acknowledgements_on_open()?;
         if store.state.fingerprint != store.config.destination.fingerprint()? {
             store.reconfigure(store.config.destination.clone())?;
         }
@@ -466,6 +493,7 @@ impl Store {
         }
         let write = durable_storage::durable_write(&self.database).map_err(AuditError::storage)?;
         let mut state = self.state.clone();
+        let mut acknowledged = Vec::with_capacity(ids.len());
         {
             let mut table = write.open_table(PENDING).map_err(AuditError::storage)?;
             for id in &ids {
@@ -489,6 +517,7 @@ impl Store {
                 table.remove(sequence).map_err(AuditError::storage)?;
                 state.pending_records -= 1;
                 state.pending_bytes -= charge(&bytes);
+                acknowledged.push(sequence);
             }
             if state.isolation_until > 0 {
                 let first = table
@@ -504,11 +533,145 @@ impl Store {
         }
         state.stall = None;
         write_state(&write, &state)?;
+        // The acknowledgement log rides in the deleting transaction: after any
+        // crash either both the deletion and its log rows exist, or neither.
+        let ack_cursor = self.log_acknowledgements(&write, &ids, &acknowledged)?;
+        #[cfg(test)]
+        super::tests::ack_crash_point(1);
         commit(write)?;
+        #[cfg(test)]
+        super::tests::ack_crash_point(2);
         self.state = state;
+        self.ack_cursor = ack_cursor;
         self.last_error = None;
         self.reload_oldest()?;
         Ok(())
+    }
+
+    /// Append one row per acknowledged record and enforce the log bounds, inside
+    /// the caller's write transaction. Returns the new last cursor.
+    fn log_acknowledgements(
+        &self,
+        write: &redb::WriteTransaction,
+        ids: &[EventId],
+        sequences: &[u64],
+    ) -> Result<u64> {
+        let mut cursor = self.ack_cursor;
+        if self.config.acknowledgement_log_max_entries > 0 {
+            // The receiver's acknowledgement was checked to echo exactly this digest.
+            let batch = decode_digest(&batch_id(ids.iter().map(EventId::as_str)))?;
+            let now = now_ms();
+            let mut table = write.open_table(ACKS).map_err(AuditError::storage)?;
+            for (id, sequence) in ids.iter().zip(sequences) {
+                let (_, _, digest) = parse_id(id.as_str())?;
+                cursor = cursor
+                    .checked_add(1)
+                    .ok_or_else(|| AuditError::storage("acknowledgement cursor exhausted"))?;
+                let mut row = [0u8; ACK_RECORD_BYTES];
+                row[..8].copy_from_slice(&sequence.to_be_bytes());
+                row[8..16].copy_from_slice(&now.to_be_bytes());
+                row[16..48].copy_from_slice(&batch);
+                row[48..].copy_from_slice(&decode_digest(digest)?);
+                table
+                    .insert(cursor, row.as_slice())
+                    .map_err(AuditError::storage)?;
+            }
+            drop(table);
+            write
+                .open_table(META)
+                .map_err(AuditError::storage)?
+                .insert(ACK_CURSOR_KEY, cursor.to_be_bytes().as_slice())
+                .map_err(AuditError::storage)?;
+        }
+        self.prune_acknowledgements(write, ACK_AGE_PRUNE_PER_COMMIT)?;
+        Ok(cursor)
+    }
+
+    /// Remove the oldest rows beyond the count bound, then rows older than the
+    /// age bound (lowest cursor first, at most `age_limit` of them).
+    fn prune_acknowledgements(
+        &self,
+        write: &redb::WriteTransaction,
+        age_limit: usize,
+    ) -> Result<usize> {
+        let mut table = write.open_table(ACKS).map_err(AuditError::storage)?;
+        let mut excess = table
+            .len()
+            .map_err(AuditError::storage)?
+            .saturating_sub(self.config.acknowledgement_log_max_entries);
+        let cutoff = match self.config.acknowledgement_log_max_age_ms {
+            0 => 0,
+            age => now_ms().saturating_sub(age),
+        };
+        let mut aged = 0;
+        let mut removed = 0;
+        loop {
+            let Some(at) = table
+                .first()
+                .map_err(AuditError::storage)?
+                .map(|(_, value)| ack_time(value.value()))
+                .transpose()?
+            else {
+                break;
+            };
+            let expired = at < cutoff && aged < age_limit;
+            if excess == 0 && !expired {
+                break;
+            }
+            table.pop_first().map_err(AuditError::storage)?;
+            if excess > 0 {
+                excess -= 1;
+            } else {
+                aged += 1;
+            }
+            removed += 1;
+        }
+        Ok(removed)
+    }
+
+    fn prune_acknowledgements_on_open(&mut self) -> Result<()> {
+        let write = durable_storage::durable_write(&self.database).map_err(AuditError::storage)?;
+        if self.prune_acknowledgements(&write, usize::MAX)? > 0 {
+            commit(write)?;
+        }
+        Ok(())
+    }
+
+    /// Up to `limit` acknowledgements with a cursor greater than `after`, in cursor order.
+    pub fn acknowledgements(&self, after: u64, limit: usize) -> Result<Vec<Acknowledgement>> {
+        let read = self.database.begin_read().map_err(AuditError::storage)?;
+        let mut out = Vec::new();
+        // A database written before the log existed has no table until the
+        // first acknowledgement commits one.
+        let table = match read.open_table(ACKS) {
+            Ok(table) => table,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(out),
+            Err(error) => return Err(AuditError::storage(error)),
+        };
+        let Some(start) = after.checked_add(1) else {
+            return Ok(out);
+        };
+        for row in table.range(start..).map_err(AuditError::storage)? {
+            if out.len() == limit {
+                break;
+            }
+            let (key, value) = row.map_err(AuditError::storage)?;
+            let row = value.value();
+            let acknowledged_at_ms = ack_time(row)?;
+            let sequence = u64::from_be_bytes(row[..8].try_into().unwrap());
+            out.push(Acknowledgement {
+                cursor: key.value(),
+                event_id: EventId(format!(
+                    "aster-audit-v1:{}:{sequence}:{}",
+                    self.state.identity,
+                    hex::encode(&row[48..])
+                )),
+                sequence,
+                batch_id: hex::encode(&row[16..48]),
+                acknowledged_at_ms,
+            });
+        }
+        Ok(out)
     }
     pub fn delivery_error(
         &mut self,
@@ -849,6 +1012,33 @@ impl Store {
         drop(self.database);
         self._lock.unlock().map_err(AuditError::storage)
     }
+}
+fn read_ack_cursor(write: &redb::WriteTransaction) -> Result<u64> {
+    write
+        .open_table(META)
+        .map_err(AuditError::storage)?
+        .get(ACK_CURSOR_KEY)
+        .map_err(AuditError::storage)?
+        .map(|value| {
+            <[u8; 8]>::try_from(value.value())
+                .map(u64::from_be_bytes)
+                .map_err(|_| AuditError::storage("invalid acknowledgement cursor"))
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+/// Validates the fixed row width and returns its acknowledged-at time.
+fn ack_time(row: &[u8]) -> Result<u64> {
+    if row.len() != ACK_RECORD_BYTES {
+        return Err(AuditError::storage("invalid acknowledgement row"));
+    }
+    Ok(u64::from_be_bytes(row[8..16].try_into().unwrap()))
+}
+fn decode_digest(hex_digest: &str) -> Result<[u8; 32]> {
+    hex::decode(hex_digest)
+        .ok()
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .ok_or_else(|| AuditError::storage("invalid digest"))
 }
 fn receipt_row(write: &redb::WriteTransaction, sequence: u64) -> Result<Vec<DispositionReceipt>> {
     write

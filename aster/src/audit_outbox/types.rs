@@ -9,6 +9,14 @@ pub const MAX_BATCH_BYTES: usize = 1024 * 1024;
 pub(crate) const QUEUE_EVENTS: usize = 1024;
 pub(crate) const QUEUE_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const CONTROL_CAPACITY: usize = 64;
+/// Default bound on retained acknowledgement-log entries (about 8 MiB of rows).
+pub const DEFAULT_ACK_LOG_ENTRIES: u64 = 100_000;
+/// Upper bound on the configurable acknowledgement-log entry count.
+pub const MAX_ACK_LOG_ENTRIES: u64 = 1_000_000;
+/// Default acknowledgement-log age bound: seven days.
+pub const DEFAULT_ACK_LOG_AGE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Largest page one acknowledgement-log query returns.
+pub const MAX_ACK_PAGE: usize = 1000;
 
 /// Stable language-neutral error codes. Messages never contain event bodies or credentials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,6 +96,19 @@ pub struct OutboxConfig {
     pub max_retained_bytes: u64,
     #[serde(default = "default_event")]
     pub max_event_bytes: usize,
+    /// Most acknowledgement-log entries retained; the oldest are pruned first.
+    /// Zero disables the log. Not charged to `max_retained_bytes`.
+    #[serde(default = "default_ack_entries")]
+    pub acknowledgement_log_max_entries: u64,
+    /// Entries acknowledged longer ago than this are pruned (zero: no age bound).
+    #[serde(default = "default_ack_age")]
+    pub acknowledgement_log_max_age_ms: u64,
+}
+fn default_ack_entries() -> u64 {
+    DEFAULT_ACK_LOG_ENTRIES
+}
+fn default_ack_age() -> u64 {
+    DEFAULT_ACK_LOG_AGE_MS
 }
 fn default_retained() -> u64 {
     DEFAULT_RETAINED_BYTES
@@ -102,6 +123,8 @@ impl OutboxConfig {
             destination,
             max_retained_bytes: DEFAULT_RETAINED_BYTES,
             max_event_bytes: DEFAULT_EVENT_BYTES,
+            acknowledgement_log_max_entries: DEFAULT_ACK_LOG_ENTRIES,
+            acknowledgement_log_max_age_ms: DEFAULT_ACK_LOG_AGE_MS,
         }
     }
     pub(crate) fn validate(&self) -> Result<()> {
@@ -109,6 +132,7 @@ impl OutboxConfig {
             || self.max_event_bytes < 256
             || self.max_event_bytes > MAX_EVENT_BYTES
             || self.max_retained_bytes < 256
+            || self.acknowledgement_log_max_entries > MAX_ACK_LOG_ENTRIES
         {
             return Err(AuditError::new(
                 AuditErrorKind::InvalidConfig,
@@ -202,6 +226,20 @@ pub struct DispositionReceipt {
     pub destination_fingerprint: String,
     pub rejection: Option<DeliveryError>,
 }
+/// One receiver acknowledgement, recorded in the same durable transaction that
+/// deleted the acknowledged record. `cursor` increases with each recorded
+/// acknowledgement (never reused), so a consumer resumes after the last one it saw.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Acknowledgement {
+    pub cursor: u64,
+    pub event_id: EventId,
+    pub sequence: u64,
+    /// The batch digest the receiver echoed in its durable acknowledgement.
+    pub batch_id: String,
+    /// Local Unix milliseconds when the acknowledgement was committed.
+    pub acknowledged_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuarantineExport {
     pub event_id: EventId,

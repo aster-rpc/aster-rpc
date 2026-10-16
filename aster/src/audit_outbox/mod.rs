@@ -40,6 +40,9 @@ pub(crate) struct Shared {
     storage_failed: AtomicBool,
     delivery_generation: AtomicU64,
     closed_notify: tokio::sync::Notify,
+    /// Last committed acknowledgement-log cursor; waiters re-query when it moves.
+    /// The storage worker also bumps it on exit so waiters observe closing.
+    ack_cursor: tokio::sync::watch::Sender<u64>,
     handles: AtomicUsize,
     wake_lock: Mutex<u64>,
     wake: Condvar,
@@ -134,6 +137,7 @@ impl AuditOutbox {
             storage_failed: AtomicBool::new(false),
             delivery_generation: AtomicU64::new(1),
             closed_notify: tokio::sync::Notify::new(),
+            ack_cursor: tokio::sync::watch::Sender::new(0),
             handles: AtomicUsize::new(1),
             wake_lock: Mutex::new(0),
             wake: Condvar::new(),
@@ -371,6 +375,52 @@ impl AuditOutbox {
         self.enqueue(Control::Export { event_id, reply })?;
         completion.await.map_err(|_| AuditError::worker())?
     }
+    /// Up to `limit` (1..=[`MAX_ACK_PAGE`]) acknowledgement-log entries with a
+    /// cursor greater than `after`, oldest first. Pass 0 to start from the oldest
+    /// retained entry and the last returned `cursor` to continue. Entries are
+    /// pruned by the configured count and age bounds; a consumer that falls
+    /// behind sees a gap in cursors, never a reordering.
+    pub async fn acknowledgements(&self, after: u64, limit: usize) -> Result<Vec<Acknowledgement>> {
+        if limit == 0 || limit > MAX_ACK_PAGE {
+            return Err(AuditError::new(
+                AuditErrorKind::InvalidEvent,
+                "acknowledgement page limit must be between 1 and 1000",
+            ));
+        }
+        let (reply, completion) = oneshot::channel();
+        self.enqueue(Control::Acknowledgements {
+            after,
+            limit,
+            reply,
+        })?;
+        completion.await.map_err(|_| AuditError::worker())?
+    }
+
+    /// Like [`Self::acknowledgements`], but when no entry after `after` exists yet,
+    /// waits up to `timeout` for the next committed acknowledgement. Returns an
+    /// empty page on timeout. Loop on the last cursor for a live, lossless feed.
+    pub async fn wait_acknowledgements(
+        &self,
+        after: u64,
+        limit: usize,
+        timeout: Duration,
+    ) -> Result<Vec<Acknowledgement>> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut cursor = self.shared.ack_cursor.subscribe();
+        loop {
+            cursor.borrow_and_update();
+            let page = self.acknowledgements(after, limit).await?;
+            if !page.is_empty() {
+                return Ok(page);
+            }
+            match tokio::time::timeout_at(deadline, cursor.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(AuditError::worker()),
+                Err(_) => return Ok(page),
+            }
+        }
+    }
+
     pub async fn replay(&self, event_id: String) -> Result<()> {
         wire::parse_id(&event_id)?;
         let (reply, completion) = oneshot::channel();

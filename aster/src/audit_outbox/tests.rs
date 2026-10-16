@@ -5,6 +5,19 @@ thread_local! {
     pub(crate) static COMMIT_AFTER_FAILURE: Cell<bool> = const { Cell::new(false) };
     pub(crate) static WRITE_FAILURE: Cell<bool> = const { Cell::new(false) };
     static QUARANTINE_PAUSE: Cell<u8> = const { Cell::new(0) };
+    static ACK_PAUSE: Cell<u8> = const { Cell::new(0) };
+}
+/// Child-process seam: park forever just before (1) or after (2) the
+/// acknowledgement transaction commits, so the parent can kill it there.
+pub(crate) fn ack_crash_point(stage: u8) {
+    if ACK_PAUSE.with(|value| value.get()) != stage {
+        return;
+    }
+    let marker = std::env::var_os("ASTER_AUDIT_CHILD_MARKER").unwrap();
+    write_marker(std::path::Path::new(&marker), &[stage]);
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 pub(crate) fn quarantine_crash_point(stage: u8) {
     if QUARANTINE_PAUSE.with(|value| value.get()) != stage {
@@ -1017,6 +1030,20 @@ fn child_process_entry() {
         write_marker(&marker, b"locked");
         return;
     }
+    if mode.starts_with("ack_") {
+        let mut store = store::Store::open(config).unwrap();
+        let ids = store
+            .batch()
+            .unwrap()
+            .unwrap()
+            .events
+            .into_iter()
+            .map(|event| event.id)
+            .collect();
+        ACK_PAUSE.with(|value| value.set(if mode == "ack_before" { 1 } else { 2 }));
+        store.acknowledge(store.generation, ids).unwrap();
+        unreachable!("acknowledgement crash boundary did not pause");
+    }
     if mode.starts_with("quarantine_") {
         let mut store = store::Store::open(config).unwrap();
         let input: QuarantineExport = serde_json::from_slice(
@@ -1391,5 +1418,203 @@ async fn process_kill_after_acceptance_and_after_receiver_commit_recovers_same_i
             assert!(receiver.attempts.lock().unwrap().len() >= 2);
         }
         outbox.close().await.unwrap();
+    }
+}
+
+#[test]
+fn acknowledgement_log_records_each_event_and_honours_count_age_and_disable() {
+    let directory = private_directory();
+    let mut config = config(directory.path());
+    let mut store = store::Store::open(config.clone()).unwrap();
+    let ids = store
+        .submit_group((1..=5).map(event).collect())
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    let before = now_ms();
+    store
+        .acknowledge(store.generation, ids[..2].to_vec())
+        .unwrap();
+    store
+        .acknowledge(store.generation, ids[2..].to_vec())
+        .unwrap();
+    let log = store.acknowledgements(0, 100).unwrap();
+    assert_eq!(log.len(), 5);
+    for (index, entry) in log.iter().enumerate() {
+        assert_eq!(entry.cursor, index as u64 + 1);
+        assert_eq!(entry.event_id, ids[index]);
+        assert_eq!(entry.sequence, index as u64 + 1);
+        assert!(entry.acknowledged_at_ms >= before);
+        let batch = if index < 2 { &ids[..2] } else { &ids[2..] };
+        assert_eq!(
+            entry.batch_id,
+            wire::batch_id(batch.iter().map(EventId::as_str))
+        );
+    }
+    // Cursor paging: strictly after the cursor, bounded by the limit.
+    let page = store.acknowledgements(2, 2).unwrap();
+    assert_eq!(
+        page.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+        vec![3, 4]
+    );
+    assert!(store.acknowledgements(5, 10).unwrap().is_empty());
+    assert!(store.acknowledgements(u64::MAX, 10).unwrap().is_empty());
+    assert_eq!(store.state.pending_records, 0);
+    assert_eq!(
+        store.state.retained(),
+        0,
+        "the log is not charged to retention"
+    );
+    drop(store);
+
+    // A smaller count bound prunes the oldest entries on open; cursors persist.
+    config.acknowledgement_log_max_entries = 2;
+    let mut store = store::Store::open(config.clone()).unwrap();
+    assert_eq!(
+        store
+            .acknowledgements(0, 100)
+            .unwrap()
+            .iter()
+            .map(|e| e.cursor)
+            .collect::<Vec<_>>(),
+        vec![4, 5]
+    );
+    let next = store
+        .submit_group(vec![event(6)])
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    store.acknowledge(store.generation, next.clone()).unwrap();
+    let log = store.acknowledgements(0, 100).unwrap();
+    assert_eq!(log.iter().map(|e| e.cursor).collect::<Vec<_>>(), vec![5, 6]);
+    assert_eq!(log[1].event_id, next[0]);
+    drop(store);
+
+    // An age bound prunes entries acknowledged longer ago than it.
+    let newest = log[1].acknowledged_at_ms;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while now_ms() <= newest + 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "clock did not advance"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    config.acknowledgement_log_max_age_ms = 1;
+    let store = store::Store::open(config.clone()).unwrap();
+    assert!(store.acknowledgements(0, 100).unwrap().is_empty());
+    assert_eq!(store.ack_cursor, 6);
+    drop(store);
+
+    // Zero entries disables the log; the cursor does not advance.
+    config.acknowledgement_log_max_age_ms = DEFAULT_ACK_LOG_AGE_MS;
+    config.acknowledgement_log_max_entries = 0;
+    let mut store = store::Store::open(config.clone()).unwrap();
+    let more = store
+        .submit_group(vec![event(7)])
+        .into_iter()
+        .collect::<Result<Vec<_>>>()
+        .unwrap();
+    store.acknowledge(store.generation, more).unwrap();
+    assert!(store.acknowledgements(0, 100).unwrap().is_empty());
+    assert_eq!(store.ack_cursor, 6);
+    drop(store);
+
+    config.acknowledgement_log_max_entries = MAX_ACK_LOG_ENTRIES + 1;
+    assert_eq!(
+        store::Store::open(config).err().unwrap().kind(),
+        AuditErrorKind::InvalidConfig
+    );
+}
+
+#[tokio::test]
+async fn acknowledgement_wait_follows_live_delivery_and_resumes_after_reopen() {
+    let directory = private_directory();
+    let receiver = fixture::Receiver::start(&directory.path().join("receiver.redb"), 0);
+    let config = OutboxConfig::new(directory.path().join("outbox"), receiver.destination());
+    let outbox = AuditOutbox::open(config.clone()).await.unwrap();
+    assert_eq!(
+        outbox.acknowledgements(0, 0).await.unwrap_err().kind(),
+        AuditErrorKind::InvalidEvent
+    );
+    assert!(outbox
+        .wait_acknowledgements(0, 10, Duration::from_millis(20))
+        .await
+        .unwrap()
+        .is_empty());
+    let waiter = {
+        let outbox = outbox.clone();
+        tokio::spawn(async move {
+            outbox
+                .wait_acknowledgements(0, 10, Duration::from_secs(30))
+                .await
+        })
+    };
+    let id = outbox.submit(event(1)).await.unwrap();
+    let page = waiter.await.unwrap().unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].event_id, id);
+    assert_eq!(page[0].cursor, 1);
+    assert_eq!(page[0].batch_id, wire::batch_id([id.as_str()]));
+    assert!(receiver.contains(id.as_str()));
+    outbox.close().await.unwrap();
+    assert_eq!(
+        outbox
+            .wait_acknowledgements(1, 10, Duration::from_secs(30))
+            .await
+            .unwrap_err()
+            .kind(),
+        AuditErrorKind::Closed
+    );
+
+    let outbox = AuditOutbox::open(config).await.unwrap();
+    let second = outbox.submit(event(2)).await.unwrap();
+    outbox.flush(Duration::from_secs(10)).await.unwrap();
+    let page = outbox
+        .wait_acknowledgements(1, 10, Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!((page[0].cursor, &page[0].event_id), (2, &second));
+    assert_eq!(outbox.acknowledgements(0, 10).await.unwrap().len(), 2);
+    outbox.close().await.unwrap();
+}
+
+#[test]
+fn process_kill_before_and_after_ack_commit_keeps_deletion_and_log_together() {
+    for (mode, after) in [("ack_before", false), ("ack_after", true)] {
+        let directory = private_directory();
+        let config = config(directory.path());
+        let mut store = store::Store::open(config.clone()).unwrap();
+        let ids = store
+            .submit_group(vec![event(1), event(2), event(3)])
+            .into_iter()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        store.close().unwrap();
+        let marker = directory.path().join("marker");
+        let mut process = child(directory.path(), &marker, mode, None);
+        wait_file(&marker);
+        process.kill().unwrap();
+        process.wait().unwrap();
+        let store = store::Store::open(config).unwrap();
+        let log = store.acknowledgements(0, 100).unwrap();
+        if after {
+            assert_eq!(store.state.pending_records, 0);
+            assert!(store.batch().unwrap().is_none());
+            assert_eq!(
+                log.iter().map(|e| e.event_id.clone()).collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(store.ack_cursor, 3);
+        } else {
+            // Neither the deletion nor any log row survived the kill.
+            assert_eq!(store.state.pending_records, 3);
+            assert!(log.is_empty());
+            assert_eq!(store.ack_cursor, 0);
+            for id in &ids {
+                assert!(store.export(id.to_string()).unwrap().pending);
+            }
+        }
     }
 }
