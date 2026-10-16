@@ -247,6 +247,12 @@ required-features = ["blobs", "docs"]
 name = "shell"
 required-features = ["rpc"]
 
+# Idle-connection cost (docs/_internal/investigations/
+# 2026-10-16-idle-connection-cost.md): server RSS per connection and idle CPU.
+[[example]]
+name = "idle_connections"
+required-features = ["rpc"]
+
 # Restart/reconnect investigation probe (docs/_internal/investigations/
 # 2026-10-15-restart-reconnect.md): an enrolled AsterServer that measures
 # Docs, blob and gossip recovery against one peer across restarts.

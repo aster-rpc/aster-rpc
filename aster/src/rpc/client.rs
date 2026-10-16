@@ -289,6 +289,12 @@ impl RpcConnection {
         drained(&self.inner)
     }
 
+    /// Whether the connection is still open (not closed by either side or
+    /// lost).
+    pub fn is_open(&self) -> bool {
+        self.inner.close_info().is_none()
+    }
+
     /// The pipeline (or the bare transport) for one unary call.
     async fn unary_attempts(
         &self,
