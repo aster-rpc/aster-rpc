@@ -65,6 +65,35 @@ public final class CallOptions {
     return new CallOptions(timeout, idempotent, metadata == null ? Map.of() : Map.copyOf(metadata));
   }
 
+  /**
+   * A copy making the call on behalf of a user (Rust {@code CallOptions::on_behalf_of}): {@code
+   * jwt} (a provider's token forwarded unchanged, or one from {@code AsterClient.mintUserToken})
+   * goes in the {@link site.aster.identity.GatewayIdentity#ON_BEHALF_OF_METADATA} entry, replacing
+   * an earlier one. The server must accept it ({@code [identity] accept_on_behalf_of}) and this
+   * node must hold {@code aster.gateway}. A client running {@code [identity.publisher]} notices the
+   * token's key id, so a provider's key rotation is published at once.
+   */
+  public CallOptions withOnBehalfOf(String jwt) {
+    Map<String, String> m = new HashMap<>();
+    for (Map.Entry<String, String> e : metadata.entrySet()) {
+      if (!e.getKey().equalsIgnoreCase(site.aster.identity.GatewayIdentity.ON_BEHALF_OF_METADATA)) {
+        m.put(e.getKey(), e.getValue());
+      }
+    }
+    m.put(site.aster.identity.GatewayIdentity.ON_BEHALF_OF_METADATA, jwt);
+    return new CallOptions(timeout, idempotent, Map.copyOf(m));
+  }
+
+  /** The token set by {@link #withOnBehalfOf}, or {@code null}. */
+  public String onBehalfOf() {
+    for (Map.Entry<String, String> e : metadata.entrySet()) {
+      if (e.getKey().equalsIgnoreCase(site.aster.identity.GatewayIdentity.ON_BEHALF_OF_METADATA)) {
+        return e.getValue();
+      }
+    }
+    return null;
+  }
+
   /** A copy with one more metadata entry. */
   public CallOptions withMetadata(String key, String value) {
     Map<String, String> m = new HashMap<>(metadata);

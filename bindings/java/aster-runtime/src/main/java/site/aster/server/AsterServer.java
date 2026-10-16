@@ -114,6 +114,12 @@ public final class AsterServer implements AutoCloseable {
 
   private final boolean ownsHealth;
 
+  /** The NodeConfig audit outbox opened for {@link Builder#auditOutbox} (null = none). */
+  private final site.aster.audit.AuditOutbox auditOutbox;
+
+  /** {@link #nodeProperties()} cached per NodeConfig generation. */
+  private volatile site.aster.identity.NodeProperties cachedProperties;
+
   /** The {@code aster.ops.NodeInfo} attribute announcing the contract registry namespace. */
   public static final String REGISTRY_NAMESPACE_ATTRIBUTE = "aster.registry_namespace";
 
@@ -151,8 +157,10 @@ public final class AsterServer implements AutoCloseable {
       RegisteredService[] byIndex,
       site.aster.health.HealthServer health,
       boolean ownsHealth,
-      site.aster.lease.LeaseGrantor.Backend grantor) {
+      site.aster.lease.LeaseGrantor.Backend grantor,
+      site.aster.audit.AuditOutbox auditOutbox) {
     this.node = node;
+    this.auditOutbox = auditOutbox;
     this.grantor = grantor;
     this.health = health;
     this.ownsHealth = ownsHealth;
@@ -234,6 +242,35 @@ public final class AsterServer implements AutoCloseable {
    */
   public site.aster.enrollment.EnrollmentIssuer issuer() {
     return issuer;
+  }
+
+  /**
+   * The serving node's {@code aster.ops.NodeConfig} properties now (Rust {@code
+   * AsterServer::node_config().properties()}; {@code aster_server_node_properties}), cached per
+   * generation. {@link site.aster.identity.NodeProperties#EMPTY} once closed.
+   */
+  public site.aster.identity.NodeProperties nodeProperties() {
+    if (!running.get()) {
+      return site.aster.identity.NodeProperties.EMPTY;
+    }
+    long generation = dispatch.nodeConfigGeneration();
+    site.aster.identity.NodeProperties cached = cachedProperties;
+    if (cached != null && cached.generation() == generation) {
+      return cached;
+    }
+    byte[] json = dispatch.nodePropertiesJson();
+    site.aster.identity.NodeProperties fresh =
+        json.length == 0
+            ? site.aster.identity.NodeProperties.EMPTY
+            : site.aster.identity.IdentityJson.decode(
+                json, site.aster.identity.NodeProperties.class);
+    cachedProperties = fresh;
+    return fresh;
+  }
+
+  /** The NodeConfig audit outbox opened for {@link Builder#auditOutbox} (null = none). */
+  public site.aster.audit.AuditOutbox auditOutbox() {
+    return auditOutbox;
   }
 
   /**
@@ -447,6 +484,13 @@ public final class AsterServer implements AutoCloseable {
     if (ownsHealth && health != null) {
       health.close();
     }
+    if (auditOutbox != null) {
+      try {
+        auditOutbox.closeAsync().get(5, TimeUnit.SECONDS);
+      } catch (Exception ignored) {
+        // best effort: the runtime closes with the node
+      }
+    }
     node.close();
   }
 
@@ -464,6 +508,7 @@ public final class AsterServer implements AutoCloseable {
       byte[] request,
       String peer,
       String transportPeer,
+      String actor,
       int wireCallId,
       long connectionHandle,
       java.util.concurrent.atomic.AtomicBoolean over) {}
@@ -547,6 +592,8 @@ public final class AsterServer implements AutoCloseable {
         transportPeer = identity.peer();
       }
     }
+    // A forwarded call (ABI 7.7): the gateway is the transport peer, the actor.
+    String actor = (flags & Dispatch.FLAG_ON_BEHALF_OF) != 0 ? transportPeer : null;
 
     RegisteredService svc = serviceIdx < byIndex.length ? byIndex[serviceIdx] : null;
     if (svc == null || methodIdx < 0 || methodIdx >= svc.methods.length) {
@@ -574,6 +621,7 @@ public final class AsterServer implements AutoCloseable {
             request,
             peer,
             transportPeer,
+            actor,
             wireCallId,
             connectionHandle,
             new AtomicBoolean());
@@ -716,8 +764,9 @@ public final class AsterServer implements AutoCloseable {
             ? new HashMap<>(dispatch.metadata(callId))
             : new HashMap<>();
     Map<String, String> attributes = new HashMap<>();
+    // A forwarded call runs as the user: the gateway's own attributes are not the caller's.
     Map<String, String> peerAttrs =
-        (flags & Dispatch.FLAG_IROH_AUTHENTICATED) != 0
+        (flags & Dispatch.FLAG_IROH_AUTHENTICATED) != 0 && call.actor() == null
             ? peerAttributes.get(call.transportPeer())
             : null;
     if (peerAttrs != null) {
@@ -745,6 +794,8 @@ public final class AsterServer implements AutoCloseable {
         // The connection may have closed since.
       }
     }
+    site.aster.identity.ForwardedIdentity onBehalfOf =
+        call.actor() != null ? dispatch.onBehalfOf(callId) : null;
     var d = method.descriptor();
     return CallContext.builder(call.service().descriptor.name(), d.name())
         .callId(Integer.toString(call.wireCallId()))
@@ -752,6 +803,9 @@ public final class AsterServer implements AutoCloseable {
         .dispatchCallId(callId)
         .peer(call.transportPeer())
         .principal(call.peer())
+        .actor(call.actor())
+        .onBehalfOf(onBehalfOf)
+        .nodeProperties(this::nodeProperties)
         .irohAuthenticated((flags & Dispatch.FLAG_IROH_AUTHENTICATED) != 0)
         .metadata(metadata)
         .attributes(attributes)
@@ -850,8 +904,34 @@ public final class AsterServer implements AutoCloseable {
     private site.aster.health.HealthServer health;
     private String healthHost;
     private int healthPort = -1;
+    private Boolean acceptOnBehalfOf;
+    private site.aster.audit.AuditOutbox.Config auditOutboxConfig;
 
     private Builder() {}
+
+    /**
+     * Accept (or refuse) calls a gateway makes on behalf of a user, overriding the config's {@code
+     * [identity] accept_on_behalf_of} (Rust {@code AsterServerBuilder::accept_on_behalf_of}; {@code
+     * ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF}). Off, a call carrying {@link
+     * site.aster.identity.GatewayIdentity#ON_BEHALF_OF_METADATA} is refused with {@code
+     * PERMISSION_DENIED} rather than run as the gateway. {@code null} = the config decides.
+     */
+    public Builder acceptOnBehalfOf(Boolean accept) {
+      this.acceptOnBehalfOf = accept;
+      return this;
+    }
+
+    /**
+     * Record every {@code aster.ops.NodeConfig} set and clear durably (Rust {@code
+     * AsterServerBuilder::audit_outbox}; {@code aster_server_set_audit_outbox}): the server opens
+     * an audit outbox with {@code config} on its node ({@link AsterServer#auditOutbox()}) and
+     * closes it on close. A change the outbox does not accept is refused. Fails the start when the
+     * config turns NodeConfig off ({@code [remote_config] enabled = false}).
+     */
+    public Builder auditOutbox(site.aster.audit.AuditOutbox.Config config) {
+      this.auditOutboxConfig = config;
+      return this;
+    }
 
     /**
      * Serve the ops endpoints ({@code /healthz}, {@code /readyz}, {@code /metrics}) on {@code
@@ -1085,6 +1165,9 @@ public final class AsterServer implements AutoCloseable {
           byIndex[idx] = rs;
         }
         b.option(Dispatch.OPTION_MAX_SESSIONS_PER_CONNECTION, maxSessionsPerConnection);
+        if (acceptOnBehalfOf != null) {
+          b.option(Dispatch.OPTION_ACCEPT_ON_BEHALF_OF, acceptOnBehalfOf ? 1 : 0);
+        }
         b.topology(builtinTopology, topologyRequirement);
         site.aster.health.HealthServer attached = health;
         boolean owned = false;
@@ -1098,7 +1181,22 @@ public final class AsterServer implements AutoCloseable {
           owned = true;
         }
         site.aster.lease.LeaseGrantor.Backend grantor = null;
+        site.aster.audit.AuditOutbox outbox = null;
         try {
+          if (auditOutboxConfig != null) {
+            try {
+              outbox =
+                  site.aster.audit.AuditOutbox.open(node.runtime(), auditOutboxConfig)
+                      .get(30, TimeUnit.SECONDS);
+            } catch (java.util.concurrent.ExecutionException e) {
+              throw e.getCause() instanceof RuntimeException re
+                  ? re
+                  : new IrohException("audit outbox: " + e.getCause());
+            } catch (Exception e) {
+              throw new IrohException("audit outbox: " + e);
+            }
+            b.auditOutbox(outbox.nativeHandle());
+          }
           if (attached != null) {
             b.attachHealth(attached.nativeHandle());
           }
@@ -1111,10 +1209,13 @@ public final class AsterServer implements AutoCloseable {
           }
           // With enrollment and replicas this blocks up to sync_timeout_ms (policy sync).
           Dispatch dispatch = b.start(ringCapacity);
-          return new AsterServer(this, node, dispatch, byIndex, attached, owned, grantor);
+          return new AsterServer(this, node, dispatch, byIndex, attached, owned, grantor, outbox);
         } catch (RuntimeException e) {
           if (grantor != null) {
             grantor.close();
+          }
+          if (outbox != null) {
+            outbox.close();
           }
           if (owned) {
             attached.close();

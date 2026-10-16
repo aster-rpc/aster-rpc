@@ -45,7 +45,7 @@ final class ObservabilityLifecycleTest {
   @Test
   void abiFloorAndAlreadyExistsStatus() {
     assertEquals(7, IrohLibrary.EXPECTED_ABI_MAJOR);
-    assertEquals(5, IrohLibrary.REQUIRED_ABI_MINOR);
+    assertEquals(7, IrohLibrary.REQUIRED_ABI_MINOR);
     assertTrue(IrohLibrary.getInstance().abiVersionMinor() >= IrohLibrary.REQUIRED_ABI_MINOR);
     assertEquals(IrohStatus.ALREADY_EXISTS, IrohStatus.fromCode(17));
     assertEquals(17, IrohStatus.ALREADY_EXISTS.code);

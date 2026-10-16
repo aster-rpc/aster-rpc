@@ -203,6 +203,11 @@ public final class AuditOutbox implements AutoCloseable {
     this.cleanable = CLEANER.register(this, new Free(runtime, handle));
   }
 
+  /** The native {@code aster_audit_outbox_t}, valid on its runtime; binding plumbing. */
+  public long nativeHandle() {
+    return handle;
+  }
+
   private static final class Free implements Runnable {
     private final IrohRuntime runtime;
     private final long handle;

@@ -106,6 +106,45 @@ public final class AsterClient implements AutoCloseable {
     return enrollment;
   }
 
+  /**
+   * Mint a short-lived token for user {@code sub} with {@code roles}, signed in by {@code amr},
+   * valid for {@code ttl} (at most 5 minutes), signed with this client's key and bounded by the
+   * issuer delegation in its credential ({@link site.aster.enrollment.Enrollment#mintUserToken};
+   * Rust {@code AsterClient::user_token_issuer}). Attach it with {@link
+   * CallOptions#withOnBehalfOf}.
+   *
+   * @throws IllegalStateException without enrollment
+   */
+  public String mintUserToken(
+      String sub, List<String> roles, List<String> amr, java.time.Duration ttl) {
+    if (enrollment == null) {
+      throw new IllegalStateException("minting users' tokens needs [enrollment]");
+    }
+    return enrollment.mintUserToken(sub, roles, amr, ttl);
+  }
+
+  /**
+   * An {@code aster.ops.NodeConfig} admin client for the server at {@code target} (Rust {@code
+   * NodeConfigClient}), over this client's (enrolled) connection to it. Every method needs {@code
+   * aster.config-admin} in this client's credential.
+   */
+  public CompletableFuture<site.aster.identity.NodeConfigClient> nodeConfig(NodeAddr target) {
+    return connect(target).thenApply(site.aster.identity.NodeConfigClient::new);
+  }
+
+  /** Hand a forwarded token to this client's issuer-key publisher, if it runs one. */
+  private void noticeOnBehalfOf(CallOptions options) {
+    String token = options == null ? null : options.onBehalfOf();
+    if (token == null || enrollment == null) {
+      return;
+    }
+    try {
+      enrollment.noticeToken(token);
+    } catch (RuntimeException ignored) {
+      // no publisher (NOT_FOUND), or a token of an issuer it does not publish
+    }
+  }
+
   /** Whether this client renews its credential (Rust {@code AsterClient::is_renewing}). */
   public boolean isRenewing() {
     if (enrollment == null) {
@@ -305,6 +344,7 @@ public final class AsterClient implements AutoCloseable {
       Req request,
       Class<Resp> responseType,
       CallOptions options) {
+    noticeOnBehalfOf(options);
     CallContext ctx =
         Interception.context(
             interceptors, service, method, sessionId, peer, "server_stream", options);
@@ -434,6 +474,7 @@ public final class AsterClient implements AutoCloseable {
       String method,
       Class<Resp> responseType,
       CallOptions options) {
+    noticeOnBehalfOf(options);
     CallContext ctx =
         Interception.context(
             interceptors, service, method, sessionId, peer, "bidi_stream", options);
@@ -472,6 +513,7 @@ public final class AsterClient implements AutoCloseable {
       Class<Resp> responseType,
       CallOptions options) {
     InvocationFuture<Resp> out = new InvocationFuture<>();
+    noticeOnBehalfOf(options);
     CallContext ctx =
         Interception.context(interceptors, service, method, sessionId, peer, "unary", options);
     callExecutor.execute(
@@ -608,6 +650,7 @@ public final class AsterClient implements AutoCloseable {
       Class<Resp> responseType,
       CallOptions options) {
     InvocationFuture<List<Resp>> out = new InvocationFuture<>();
+    noticeOnBehalfOf(options);
     CallContext ctx =
         Interception.context(interceptors, service, method, sessionId, peer, pattern, options);
     callExecutor.execute(
@@ -666,6 +709,7 @@ public final class AsterClient implements AutoCloseable {
       Class<Resp> responseType,
       CallOptions options) {
     InvocationFuture<Resp> out = new InvocationFuture<>();
+    noticeOnBehalfOf(options);
     CallContext ctx =
         Interception.context(
             interceptors, service, method, sessionId, peer, "client_stream", options);

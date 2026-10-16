@@ -9,6 +9,7 @@ import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.lang.invoke.MethodHandle;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -64,6 +65,16 @@ public final class Enrollment implements AutoCloseable {
       UpcallNative.handle("aster_enrollment_issuer_info", FunctionDescriptor.of(I, J, J, A));
   private static final MethodHandle ISSUE =
       UpcallNative.handle("aster_enrollment_issue", FunctionDescriptor.of(I, J, J, B, A));
+  private static final MethodHandle MINT_USER_TOKEN =
+      UpcallNative.handle("aster_enrollment_mint_user_token", FunctionDescriptor.of(I, J, J, B, A));
+  private static final MethodHandle PUBLISHER_NOTICE =
+      UpcallNative.handle(
+          "aster_enrollment_publisher_notice", FunctionDescriptor.of(I, J, J, B, B));
+  private static final MethodHandle PUBLISHER_NOTICE_TOKEN =
+      UpcallNative.handle(
+          "aster_enrollment_publisher_notice_token", FunctionDescriptor.of(I, J, J, B));
+  private static final MethodHandle PUBLISHER_STATUS =
+      UpcallNative.handle("aster_enrollment_publisher_status", FunctionDescriptor.of(I, J, J, A));
   private static final MethodHandle STRING_RELEASE =
       UpcallNative.handle("aster_string_release", FunctionDescriptor.of(I, A, J));
 
@@ -215,6 +226,87 @@ public final class Enrollment implements AutoCloseable {
             "aster_enrollment_next_revocation",
             (a, op) -> (int) NEXT_REVOCATION.invoke(rt(), handle, 0L, op))
         .thenApply(b -> decode(b, Revocation.class));
+  }
+
+  // ── gateway identity (C ABI 7.7) ────────────────────────────────────────
+
+  /**
+   * Mint a short-lived token for user {@code sub} with {@code roles}, signed in by {@code amr} (at
+   * least one, e.g. {@link site.aster.identity.GatewayIdentity#AMR_WEBAUTHN}), valid for {@code
+   * ttl} (1 s to 5 minutes, rounded up to whole seconds), signed with this node's key (Rust {@code
+   * AsterClient::user_token_issuer} + {@code Issuer::mint_user_token}). The roles must be within
+   * the issuer delegation ({@link site.aster.identity.GatewayIdentity#ISSUABLE_ROLES_ATTRIBUTE}) in
+   * the credential held now; anything else is {@code INVALID_ARGUMENT}. Attach it with {@code
+   * CallOptions.withOnBehalfOf}; this node needs {@code aster.gateway}.
+   */
+  public String mintUserToken(String sub, List<String> roles, List<String> amr, Duration ttl) {
+    live();
+    java.util.Objects.requireNonNull(ttl, "ttl");
+    long secs = ttl.getSeconds() + (ttl.getNano() > 0 ? 1 : 0);
+    Map<String, Object> req = new LinkedHashMap<>();
+    req.put("sub", sub);
+    req.put("roles", roles == null ? List.of() : roles);
+    req.put("amr", amr == null ? List.of() : amr);
+    req.put("ttl_secs", Math.max(0, secs));
+    byte[] body = json(req);
+    return new String(
+        sync(
+            "aster_enrollment_mint_user_token",
+            (a, out) -> (int) MINT_USER_TOKEN.invoke(rt(), handle, DataPlane.bytes(a, body), out)),
+        StandardCharsets.UTF_8);
+  }
+
+  /**
+   * Tell this node's issuer-key publisher ({@code [identity.publisher]}) that a token of {@code
+   * iss} named {@code kid}: an unknown kid refreshes {@code iss} at once (at most every {@code
+   * min_refresh_secs}). Rust {@code PublisherHandle::notice_kid}.
+   *
+   * @throws IrohException {@code NOT_FOUND} when the node runs no publisher
+   */
+  public void noticeKid(String iss, String kid) {
+    live();
+    try (Arena a = Arena.ofConfined()) {
+      UpcallNative.check(
+          (int)
+              PUBLISHER_NOTICE.invoke(rt(), handle, DataPlane.utf8(a, iss), DataPlane.utf8(a, kid)),
+          "aster_enrollment_publisher_notice");
+    } catch (Throwable t) {
+      throw UpcallNative.rethrow(t);
+    }
+  }
+
+  /**
+   * {@link #noticeKid} with the {@code iss} and {@code kid} of a compact JWT (unverified; a token
+   * that does not parse is ignored). {@code AsterClient} calls it for every token it forwards.
+   *
+   * @throws IrohException {@code NOT_FOUND} when the node runs no publisher
+   */
+  public void noticeToken(String token) {
+    live();
+    try (Arena a = Arena.ofConfined()) {
+      UpcallNative.check(
+          (int) PUBLISHER_NOTICE_TOKEN.invoke(rt(), handle, DataPlane.utf8(a, token)),
+          "aster_enrollment_publisher_notice_token");
+    } catch (Throwable t) {
+      throw UpcallNative.rethrow(t);
+    }
+  }
+
+  /**
+   * The issuer-key publisher's state per issuer.
+   *
+   * @throws IrohException {@code NOT_FOUND} when the node runs no publisher
+   */
+  public Map<String, site.aster.identity.IssuerPublishStatus> publisherStatus() {
+    byte[] json =
+        sync(
+            "aster_enrollment_publisher_status",
+            (a, out) -> (int) PUBLISHER_STATUS.invoke(rt(), handle, out));
+    return site.aster.identity.IdentityJson.decode(
+        json,
+        new com.fasterxml.jackson.core.type.TypeReference<
+            Map<String, site.aster.identity.IssuerPublishStatus>>() {},
+        "publisher status");
   }
 
   // ── issuer (package-private; EnrollmentIssuer) ──────────────────────────

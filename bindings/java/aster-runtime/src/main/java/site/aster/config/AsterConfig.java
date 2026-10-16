@@ -105,6 +105,26 @@ public final class AsterConfig {
   private boolean metricsPeerLabels;
   private int metricsPeerLabelCap = METRICS_PEER_LABEL_CAP_DEFAULT;
 
+  // ── Gateway identity (C ABI 7.7: [identity], [identity.publisher], [remote_config]) ──
+  private boolean acceptOnBehalfOf;
+  private List<site.aster.identity.TrustedIssuer> trustedIssuers = List.of();
+  private Long edgeTokenMaxLifetimeSecs;
+  private Long clockLeewaySecs;
+  private Long maxKeySetAgeSecs;
+  private site.aster.identity.IdentityPublisherConfig identityPublisher;
+  private boolean remoteConfigEnabled = true;
+  private List<String> remoteConfigLock = List.of();
+
+  /**
+   * Where each overridable {@code [identity]} setting came from ({@code aster_config_source_t}, by
+   * {@code ASTER_IDENTITY_SETTING_*} index), so {@code aster.ops.NodeConfig} get reports file /
+   * env; a builder call on the setting drops it (the value then comes from code).
+   */
+  private final byte[] identitySources = new byte[IDENTITY_SETTINGS];
+
+  /** {@code ASTER_IDENTITY_SETTING_*} count. */
+  public static final int IDENTITY_SETTINGS = 5;
+
   // ── Blob transport ([storage] blob_zstd_level) ─────────────────────────
   private Integer blobZstdLevel;
 
@@ -401,6 +421,87 @@ public final class AsterConfig {
    */
   public int metricsPeerLabelCap() {
     return metricsPeerLabelCap;
+  }
+
+  /**
+   * {@code [identity] accept_on_behalf_of} (env {@code ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF}): accept
+   * calls a gateway makes on behalf of a user ({@link
+   * site.aster.identity.GatewayIdentity#ON_BEHALF_OF_METADATA}). Off (the default), a call carrying
+   * the entry is refused with {@code PERMISSION_DENIED}. {@code AsterServer.Builder
+   * .acceptOnBehalfOf} overrides it.
+   */
+  public boolean acceptOnBehalfOf() {
+    return acceptOnBehalfOf;
+  }
+
+  /**
+   * {@code [[identity.trusted_issuers]]} (env {@code ASTER_IDENTITY_TRUSTED_ISSUERS}, JSON): the
+   * identity providers whose tokens may be forwarded. Needs enrollment.
+   */
+  public List<site.aster.identity.TrustedIssuer> trustedIssuers() {
+    return trustedIssuers;
+  }
+
+  /** {@code [identity] edge_token_max_lifetime_secs} (1..300); {@code null} = 300. */
+  public Long edgeTokenMaxLifetimeSecs() {
+    return edgeTokenMaxLifetimeSecs;
+  }
+
+  /** {@code [identity] clock_leeway_secs} (0..300, applied to iat / nbf); {@code null} = 60. */
+  public Long clockLeewaySecs() {
+    return clockLeewaySecs;
+  }
+
+  /** {@code [identity] max_key_set_age_secs} (60..2592000); {@code null} = 172800. */
+  public Long maxKeySetAgeSecs() {
+    return maxKeySetAgeSecs;
+  }
+
+  /** {@code [identity.publisher]} (env {@code ASTER_IDENTITY_PUBLISHER}, JSON); {@code null}. */
+  public site.aster.identity.IdentityPublisherConfig identityPublisher() {
+    return identityPublisher;
+  }
+
+  /**
+   * {@code [remote_config] enabled} (env {@code ASTER_REMOTE_CONFIG_ENABLED}): serve {@code
+   * aster.ops.NodeConfig} behind {@code aster.config-admin} (default true). Off, a stored record is
+   * ignored.
+   */
+  public boolean remoteConfigEnabled() {
+    return remoteConfigEnabled;
+  }
+
+  /**
+   * {@code [remote_config] lock} (env {@code ASTER_REMOTE_CONFIG_LOCK}, comma-separated): sections
+   * that may not be overridden through NodeConfig, e.g. {@code identity}.
+   */
+  public List<String> remoteConfigLock() {
+    return remoteConfigLock;
+  }
+
+  /**
+   * Where each overridable {@code [identity]} setting came from ({@code aster_config_source_t} per
+   * {@code ASTER_IDENTITY_SETTING_*} index; 0 = not recorded). Binding plumbing.
+   */
+  public byte[] identitySources() {
+    return identitySources.clone();
+  }
+
+  /** Whether any {@code [identity]} / {@code [remote_config]} setting differs from its default. */
+  public boolean hasIdentitySettings() {
+    boolean sourced = false;
+    for (byte s : identitySources) {
+      sourced |= s != 0;
+    }
+    return acceptOnBehalfOf
+        || !trustedIssuers.isEmpty()
+        || edgeTokenMaxLifetimeSecs != null
+        || clockLeewaySecs != null
+        || maxKeySetAgeSecs != null
+        || identityPublisher != null
+        || !remoteConfigEnabled
+        || !remoteConfigLock.isEmpty()
+        || sourced;
   }
 
   public String proxyUrl() {
@@ -749,6 +850,82 @@ public final class AsterConfig {
         throw new IllegalArgumentException("metricsPeerLabelCap must be nonnegative");
       }
       c.metricsPeerLabelCap = cap == 0 ? METRICS_PEER_LABEL_CAP_DEFAULT : cap;
+      return this;
+    }
+
+    /**
+     * See {@link AsterConfig#acceptOnBehalfOf()} (Rust {@code
+     * AsterConfigBuilder::accept_on_behalf_of}).
+     */
+    public Builder acceptOnBehalfOf(boolean v) {
+      c.acceptOnBehalfOf = v;
+      c.identitySources[0] = 0;
+      return this;
+    }
+
+    /** See {@link AsterConfig#trustedIssuers()}; replaces the list. */
+    public Builder trustedIssuers(List<site.aster.identity.TrustedIssuer> issuers) {
+      c.trustedIssuers = issuers == null ? List.of() : List.copyOf(issuers);
+      c.identitySources[1] = 0;
+      return this;
+    }
+
+    /** Add one trusted issuer. */
+    public Builder trustedIssuer(site.aster.identity.TrustedIssuer issuer) {
+      List<site.aster.identity.TrustedIssuer> next = new ArrayList<>(c.trustedIssuers);
+      next.add(issuer);
+      return trustedIssuers(next);
+    }
+
+    /** See {@link AsterConfig#edgeTokenMaxLifetimeSecs()}; {@code null} = the default. */
+    public Builder edgeTokenMaxLifetimeSecs(Long secs) {
+      c.edgeTokenMaxLifetimeSecs = secs;
+      c.identitySources[2] = 0;
+      return this;
+    }
+
+    /** See {@link AsterConfig#clockLeewaySecs()}; {@code null} = the default (0 is a value). */
+    public Builder clockLeewaySecs(Long secs) {
+      c.clockLeewaySecs = secs;
+      c.identitySources[3] = 0;
+      return this;
+    }
+
+    /** See {@link AsterConfig#maxKeySetAgeSecs()}; {@code null} = the default. */
+    public Builder maxKeySetAgeSecs(Long secs) {
+      c.maxKeySetAgeSecs = secs;
+      c.identitySources[4] = 0;
+      return this;
+    }
+
+    /** See {@link AsterConfig#identityPublisher()}; {@code null} = no publisher. */
+    public Builder identityPublisher(site.aster.identity.IdentityPublisherConfig publisher) {
+      c.identityPublisher = publisher;
+      return this;
+    }
+
+    /** See {@link AsterConfig#remoteConfigEnabled()}. */
+    public Builder remoteConfigEnabled(boolean v) {
+      c.remoteConfigEnabled = v;
+      return this;
+    }
+
+    /** See {@link AsterConfig#remoteConfigLock()}. */
+    public Builder remoteConfigLock(List<String> sections) {
+      c.remoteConfigLock = sections == null ? List.of() : List.copyOf(sections);
+      return this;
+    }
+
+    /**
+     * Record where the overridable {@code [identity]} settings came from (binding plumbing: the
+     * Rust loaders fill it; see {@link AsterConfig#identitySources()}).
+     */
+    public Builder identitySources(byte[] sources) {
+      java.util.Arrays.fill(c.identitySources, (byte) 0);
+      if (sources != null) {
+        System.arraycopy(
+            sources, 0, c.identitySources, 0, Math.min(sources.length, IDENTITY_SETTINGS));
+      }
       return this;
     }
 

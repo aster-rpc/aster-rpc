@@ -227,10 +227,14 @@ public final class IrohLibrary implements SymbolLookup {
   public static final int EXPECTED_ABI_MAJOR = 7;
 
   /**
-   * Lowest C ABI minor version this binding runs against (7.5). 7.5 added the handler call identity
-   * ({@code ASTER_DISPATCH_FLAG_HAS_PRINCIPAL}, {@code aster_dispatch_identity}); 7.4 the transfer
-   * metrics ({@code aster_blobs_transfer_stats}, fetch report v2, topology peer traffic, {@code
-   * aster_config_set_metrics}); 7.3 the cluster network settings ({@code
+   * Lowest C ABI minor version this binding runs against (7.7). 7.7 put gateway identity on the
+   * config-driven path ({@code aster_config_set_identity}, {@code aster_dispatch_on_behalf_of},
+   * {@code aster_server_node_properties}, {@code aster_enrollment_mint_user_token}, the publisher
+   * notices, {@code aster_node_config_call}, {@code aster_server_set_audit_outbox}); 7.6 the
+   * on-behalf-of server option and the dispatch identity's {@code actor}. 7.5 added the handler
+   * call identity ({@code ASTER_DISPATCH_FLAG_HAS_PRINCIPAL}, {@code aster_dispatch_identity}); 7.4
+   * the transfer metrics ({@code aster_blobs_transfer_stats}, fetch report v2, topology peer
+   * traffic, {@code aster_config_set_metrics}); 7.3 the cluster network settings ({@code
    * aster_config_set_network}); 7.2 server drain ({@code aster_server_drain}); 7.1 the audit outbox
    * acknowledgement log. 7.0 is a breaking release: {@code aster_hook_failure_mode_t} swapped
    * values so 0 is {@code FAIL_CLOSED}. 6.0 was breaking too: {@code aster_config_t} grew from 280
@@ -244,7 +248,7 @@ public final class IrohLibrary implements SymbolLookup {
    * imports. Version 4.12 adds public listeners and certificate helpers; version 4.11 adds
    * authenticated listeners and 4.10 adds owned Docs receivers.
    */
-  public static final int REQUIRED_ABI_MINOR = 5;
+  public static final int REQUIRED_ABI_MINOR = 7;
 
   /** Packed ABI version of the loaded library: {@code (major << 16) | (minor << 8) | patch}. */
   public int abiVersion() {

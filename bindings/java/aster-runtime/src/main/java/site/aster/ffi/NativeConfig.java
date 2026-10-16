@@ -122,6 +122,24 @@ public final class NativeConfig {
   private static final long M_PEER_LABELS = 4;
   private static final long M_PEER_LABEL_CAP = 8;
 
+  /** {@code sizeof(aster_identity_config_t)} (ABI 7.7). */
+  public static final long IDENTITY_SIZE = 96;
+
+  // aster_identity_config_t offsets and ASTER_IDENTITY_SET_* bits
+  private static final long I_SET = 4;
+  private static final long I_ACCEPT = 8;
+  private static final long I_REMOTE_DISABLED = 12;
+  private static final long I_EDGE_TTL = 16;
+  private static final long I_LEEWAY = 24;
+  private static final long I_KEY_SET_AGE = 32;
+  private static final long I_TRUSTED_ISSUERS = 40;
+  private static final long I_PUBLISHER = 56;
+  private static final long I_REMOTE_LOCK = 72;
+  private static final long I_SOURCES = 88;
+  static final int IDENTITY_SET_EDGE_TOKEN_MAX_LIFETIME = 1;
+  static final int IDENTITY_SET_CLOCK_LEEWAY = 2;
+  static final int IDENTITY_SET_MAX_KEY_SET_AGE = 4;
+
   private static final java.lang.foreign.FunctionDescriptor CONFIG_PAIR =
       java.lang.foreign.FunctionDescriptor.of(
           ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS);
@@ -164,6 +182,75 @@ public final class NativeConfig {
       m.set(ValueLayout.JAVA_INT, M_PEER_LABEL_CAP, c.metricsPeerLabelCap());
       check(callPair("aster_config_set_metrics", seg, m), "aster_config_set_metrics");
     }
+    if (c.hasIdentitySettings()) {
+      putIdentity(c, seg, arena);
+    }
+  }
+
+  /** {@code aster_config_set_identity} (ABI 7.7): {@code [identity]} / {@code [remote_config]}. */
+  private static void putIdentity(AsterConfig c, MemorySegment seg, Arena arena) {
+    MemorySegment id = arena.allocate(IDENTITY_SIZE, 8);
+    id.set(ValueLayout.JAVA_INT, 0, (int) IDENTITY_SIZE);
+    id.set(ValueLayout.JAVA_INT, I_ACCEPT, c.acceptOnBehalfOf() ? 1 : 0);
+    id.set(ValueLayout.JAVA_INT, I_REMOTE_DISABLED, c.remoteConfigEnabled() ? 0 : 1);
+    int set = 0;
+    set |=
+        putLong(id, IDENTITY_SET_EDGE_TOKEN_MAX_LIFETIME, I_EDGE_TTL, c.edgeTokenMaxLifetimeSecs());
+    set |= putLong(id, IDENTITY_SET_CLOCK_LEEWAY, I_LEEWAY, c.clockLeewaySecs());
+    set |= putLong(id, IDENTITY_SET_MAX_KEY_SET_AGE, I_KEY_SET_AGE, c.maxKeySetAgeSecs());
+    id.set(ValueLayout.JAVA_INT, I_SET, set);
+    if (!c.trustedIssuers().isEmpty()) {
+      putBytes(
+          id,
+          I_TRUSTED_ISSUERS,
+          site.aster.identity.IdentityJson.encode(c.trustedIssuers()),
+          arena);
+    }
+    if (c.identityPublisher() != null) {
+      putBytes(
+          id, I_PUBLISHER, site.aster.identity.IdentityJson.encode(c.identityPublisher()), arena);
+    }
+    putList(id, I_REMOTE_LOCK, utf8List(c.remoteConfigLock()), arena);
+    byte[] sources = c.identitySources();
+    for (int i = 0; i < sources.length; i++) {
+      id.set(ValueLayout.JAVA_BYTE, I_SOURCES + i, sources[i]);
+    }
+    check(callPair("aster_config_set_identity", seg, id), "aster_config_set_identity");
+  }
+
+  /**
+   * Read the identity settings of a native config into {@code b} ({@code aster_config_identity}).
+   */
+  private static void applyIdentity(MemorySegment seg, AsterConfig.Builder b, Arena arena) {
+    MemorySegment id = arena.allocate(IDENTITY_SIZE, 8);
+    id.set(ValueLayout.JAVA_INT, 0, (int) IDENTITY_SIZE);
+    check(callPair("aster_config_identity", seg, id), "aster_config_identity");
+    int set = id.get(ValueLayout.JAVA_INT, I_SET);
+    b.acceptOnBehalfOf(id.get(ValueLayout.JAVA_INT, I_ACCEPT) != 0);
+    b.remoteConfigEnabled(id.get(ValueLayout.JAVA_INT, I_REMOTE_DISABLED) == 0);
+    b.edgeTokenMaxLifetimeSecs(getLong(id, set, IDENTITY_SET_EDGE_TOKEN_MAX_LIFETIME, I_EDGE_TTL));
+    b.clockLeewaySecs(getLong(id, set, IDENTITY_SET_CLOCK_LEEWAY, I_LEEWAY));
+    b.maxKeySetAgeSecs(getLong(id, set, IDENTITY_SET_MAX_KEY_SET_AGE, I_KEY_SET_AGE));
+    byte[] issuers = getBytes(id, I_TRUSTED_ISSUERS);
+    b.trustedIssuers(
+        issuers.length == 0
+            ? List.of()
+            : List.of(
+                site.aster.identity.IdentityJson.decode(
+                    issuers, site.aster.identity.TrustedIssuer[].class)));
+    byte[] publisher = getBytes(id, I_PUBLISHER);
+    b.identityPublisher(
+        publisher.length == 0
+            ? null
+            : site.aster.identity.IdentityJson.decode(
+                publisher, site.aster.identity.IdentityPublisherConfig.class));
+    b.remoteConfigLock(strList(getList(id, I_REMOTE_LOCK)));
+    // Last: the setters above count as code changes and drop the sources.
+    byte[] sources = new byte[AsterConfig.IDENTITY_SETTINGS];
+    for (int i = 0; i < sources.length; i++) {
+      sources[i] = id.get(ValueLayout.JAVA_BYTE, I_SOURCES + i);
+    }
+    b.identitySources(sources);
   }
 
   /** Read the network and metrics settings of a native config into {@code b}. */
@@ -191,6 +278,8 @@ public final class NativeConfig {
       check(callPair("aster_config_metrics", seg, m), "aster_config_metrics");
       b.metricsPeerLabels(m.get(ValueLayout.JAVA_INT, M_PEER_LABELS) != 0);
       b.metricsPeerLabelCap(m.get(ValueLayout.JAVA_INT, M_PEER_LABEL_CAP));
+
+      applyIdentity(seg, b, arena);
     }
   }
 

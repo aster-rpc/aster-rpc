@@ -77,6 +77,9 @@ public final class CallContext {
   private final Duration rtt;
   private final BooleanSupplier cancellation;
   private final Supplier<CompletableFuture<Void>> cancelledSignal;
+  private final String actor;
+  private final site.aster.identity.ForwardedIdentity onBehalfOf;
+  private final Supplier<site.aster.identity.NodeProperties> nodeProperties;
 
   private CallContext(Builder builder) {
     this.service = builder.service;
@@ -100,6 +103,9 @@ public final class CallContext {
     this.rtt = builder.rtt;
     this.cancellation = builder.cancellation;
     this.cancelledSignal = builder.cancelledSignal;
+    this.actor = builder.actor;
+    this.onBehalfOf = builder.onBehalfOf;
+    this.nodeProperties = builder.nodeProperties;
   }
 
   public String service() {
@@ -150,6 +156,68 @@ public final class CallContext {
    */
   public String principal() {
     return principal;
+  }
+
+  /**
+   * The gateway that forwarded the call on behalf of a user (its node id; Rust {@code
+   * CallContext::actor}), or {@code null} for a call the peer made as itself. With an actor, {@link
+   * #principal()} is the user ({@code iss|sub}) and {@link #attributes()} carry the token's roles.
+   */
+  public String actor() {
+    return actor;
+  }
+
+  /**
+   * The verified user of a call a gateway forwarded ({@code iss}, {@code sub}, {@code jti}, expiry,
+   * {@code amr}; Rust {@code CallContext::on_behalf_of}), or {@code null}.
+   */
+  public site.aster.identity.ForwardedIdentity onBehalfOf() {
+    return onBehalfOf;
+  }
+
+  /**
+   * How the user signed in (the token's {@code amr}, e.g. {@link
+   * site.aster.identity.GatewayIdentity#AMR_WEBAUTHN}); empty for a call the peer made as itself
+   * (Rust {@code CallContext::auth_methods}).
+   */
+  public java.util.List<String> authMethods() {
+    return onBehalfOf == null ? java.util.List.of() : onBehalfOf.authMethods();
+  }
+
+  /**
+   * Refuse the call with {@code PERMISSION_DENIED} unless it was made on behalf of a user who
+   * signed in with {@code method} (one of {@link #authMethods()}); a call the peer made as itself
+   * is refused too (Rust {@code CallContext::require_auth_method}). {@code @Requires} checks roles
+   * only: use this in handlers for methods that need a stronger sign-in.
+   *
+   * @throws RpcError {@code PERMISSION_DENIED}
+   */
+  public void requireAuthMethod(String method) {
+    if (!authMethods().contains(method)) {
+      throw new RpcError(
+          StatusCode.PERMISSION_DENIED, "this method needs a sign-in with " + method);
+    }
+  }
+
+  /**
+   * The serving node's {@code aster.ops.NodeConfig} properties now (name, tags, typed attributes;
+   * Rust {@code CallContext::node_properties}): {@link site.aster.identity.NodeProperties#EMPTY}
+   * when NodeConfig is off or the context is not backed by a server. Re-read only when the
+   * generation changes. Never use them to authorise.
+   */
+  public site.aster.identity.NodeProperties nodeProperties() {
+    if (nodeProperties == null) {
+      return site.aster.identity.NodeProperties.EMPTY;
+    }
+    site.aster.identity.NodeProperties p = nodeProperties.get();
+    return p == null ? site.aster.identity.NodeProperties.EMPTY : p;
+  }
+
+  /**
+   * One NodeConfig attribute of the serving node, or {@code null} (Rust {@code node_attribute}).
+   */
+  public site.aster.identity.NodeAttribute nodeAttribute(String key) {
+    return nodeProperties().attribute(key);
   }
 
   /** True only for native Iroh endpoint authentication, never for an HTTP auth callback. */
@@ -307,6 +375,9 @@ public final class CallContext {
     private Duration rtt;
     private BooleanSupplier cancellation;
     private Supplier<CompletableFuture<Void>> cancelledSignal;
+    private String actor;
+    private site.aster.identity.ForwardedIdentity onBehalfOf;
+    private Supplier<site.aster.identity.NodeProperties> nodeProperties;
 
     private Builder(String service, String method) {
       this.service = service;
@@ -417,6 +488,24 @@ public final class CallContext {
     /** The signal behind {@link CallContext#cancelled()}; called lazily, once per access. */
     public Builder cancelledSignal(Supplier<CompletableFuture<Void>> signal) {
       this.cancelledSignal = signal;
+      return this;
+    }
+
+    /** The forwarding gateway ({@link CallContext#actor()}). */
+    public Builder actor(String actor) {
+      this.actor = actor;
+      return this;
+    }
+
+    /** The forwarded user ({@link CallContext#onBehalfOf()}). */
+    public Builder onBehalfOf(site.aster.identity.ForwardedIdentity identity) {
+      this.onBehalfOf = identity;
+      return this;
+    }
+
+    /** The source of {@link CallContext#nodeProperties()}; called on each access. */
+    public Builder nodeProperties(Supplier<site.aster.identity.NodeProperties> properties) {
+      this.nodeProperties = properties;
       return this;
     }
 

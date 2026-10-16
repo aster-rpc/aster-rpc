@@ -130,7 +130,10 @@ public enum IrohEventKind {
   ENROLLMENT_RESULT(127),
 
   // Audit outbox acknowledgement log (ABI 7.1)
-  AUDIT_OUTBOX_ACKNOWLEDGEMENTS(128);
+  AUDIT_OUTBOX_ACKNOWLEDGEMENTS(128),
+
+  // aster.ops.NodeConfig admin client (ABI 7.7): JSON {code, result | message}
+  NODE_CONFIG_RESULT(129);
 
   public final int code;
 

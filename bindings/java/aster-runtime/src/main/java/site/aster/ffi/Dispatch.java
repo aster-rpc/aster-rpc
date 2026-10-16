@@ -119,6 +119,13 @@ public final class Dispatch implements AutoCloseable {
    */
   public static final int FLAG_HAS_PRINCIPAL = 0x1000;
 
+  /**
+   * ABI 7.7: a {@code CALL} a gateway forwarded on behalf of a user ({@link #FLAG_HAS_PRINCIPAL} is
+   * set too: {@code peer_ptr} is {@code iss|sub}, the transport peer the gateway). Read the user
+   * with {@link #onBehalfOf}.
+   */
+  public static final int FLAG_ON_BEHALF_OF = 0x2000;
+
   // ── aster_dispatch_identity_t (64 bytes, ABI 7.5) ───────────────────────
 
   public static final MemoryLayout IDENTITY_LAYOUT =
@@ -165,6 +172,12 @@ public final class Dispatch implements AutoCloseable {
   public static final int OPTION_BUILTIN_TOPOLOGY = 2;
   public static final int OPTION_MAX_SESSIONS_PER_CONNECTION = 3;
   public static final int OPTION_HANDLER_TIMEOUT_MS = 4;
+
+  /**
+   * ABI 7.6: accept calls carrying {@code aster-on-behalf-of} (0/1); overrides {@code [identity]
+   * accept_on_behalf_of}.
+   */
+  public static final int OPTION_ACCEPT_ON_BEHALF_OF = 6;
 
   /**
    * Slice for {@link #recv}: a native wait never exceeds this before the handler's own cancellation
@@ -257,6 +270,14 @@ public final class Dispatch implements AutoCloseable {
       h("aster_dispatch_identity", FunctionDescriptor.of(I32, I64, I64, I64, PTR));
   private static final MethodHandle DRAIN =
       h("aster_server_drain", FunctionDescriptor.of(I32, I64, I64, I32, PTR));
+  private static final MethodHandle ON_BEHALF_OF =
+      h("aster_dispatch_on_behalf_of", FunctionDescriptor.of(I32, I64, I64, I64, PTR, PTR, PTR));
+  private static final MethodHandle NODE_PROPERTIES =
+      h("aster_server_node_properties", FunctionDescriptor.of(I32, I64, PTR));
+  private static final MethodHandle NODE_CONFIG_GENERATION =
+      h("aster_server_node_config_generation", FunctionDescriptor.of(I64, I64));
+  private static final MethodHandle SET_AUDIT_OUTBOX =
+      h("aster_server_set_audit_outbox", FunctionDescriptor.of(I32, I64, I64, I64));
 
   // ── builder ──────────────────────────────────────────────────────────────
 
@@ -354,6 +375,22 @@ public final class Dispatch implements AutoCloseable {
             NativeCall.bytes(arena, requiresJson),
             NativeCall.bytes(arena, revokeRequiresJson));
         return this;
+      }
+    }
+
+    /**
+     * {@code aster_server_set_audit_outbox} (ABI 7.7): record every {@code aster.ops.NodeConfig}
+     * set and clear in the durable audit outbox {@code outbox} (an {@code aster_audit_outbox_t}).
+     * {@code UNSUPPORTED} when the config turns NodeConfig off.
+     */
+    public Builder auditOutbox(long outbox) {
+      try {
+        check(
+            (int) SET_AUDIT_OUTBOX.invoke(runtimeHandle, handle, outbox),
+            "aster_server_set_audit_outbox");
+        return this;
+      } catch (Throwable t) {
+        throw rethrow(t);
       }
     }
 
@@ -647,6 +684,92 @@ public final class Dispatch implements AutoCloseable {
       String principal = utf8(out.get(PTR, 24), out.get(I32, 32));
       bufferRelease(out.get(I64, 56));
       return new Identity(peer, principal.isEmpty() ? peer : principal);
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * The forwarded identity of a live call ({@code aster_dispatch_on_behalf_of}, ABI 7.7; only for
+   * {@link #FLAG_ON_BEHALF_OF}): {@code null} for a call that was not forwarded or is over.
+   */
+  public site.aster.identity.ForwardedIdentity onBehalfOf(long callId) {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment ptr = arena.allocate(PTR);
+      MemorySegment len = arena.allocate(I32);
+      MemorySegment buf = arena.allocate(I64);
+      int status = (int) ON_BEHALF_OF.invoke(runtimeHandle, handle, callId, ptr, len, buf);
+      if (status == IrohStatus.NOT_FOUND.code) {
+        return null;
+      }
+      check(status, "aster_dispatch_on_behalf_of");
+      int n = len.get(I32, 0);
+      byte[] bytes = n == 0 ? new byte[0] : ptr.get(PTR, 0).reinterpret(n).toArray(U8);
+      bufferRelease(buf.get(I64, 0));
+      if (bytes.length == 0) {
+        return null;
+      }
+      // The list repeats amr, so it is read in order rather than as a map.
+      ByteBuffer b = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN);
+      int count = b.getInt();
+      String iss = "";
+      String sub = "";
+      String jti = "";
+      java.time.Instant exp = null;
+      java.util.List<String> amr = new java.util.ArrayList<>();
+      for (int i = 0; i < count; i++) {
+        byte[] k = new byte[b.getInt()];
+        b.get(k);
+        byte[] v = new byte[b.getInt()];
+        b.get(v);
+        String value = new String(v, StandardCharsets.UTF_8);
+        switch (new String(k, StandardCharsets.UTF_8)) {
+          case "iss" -> iss = value;
+          case "sub" -> sub = value;
+          case "jti" -> jti = value;
+          case "exp" -> {
+            try {
+              exp = java.time.Instant.ofEpochSecond(Long.parseLong(value));
+            } catch (NumberFormatException ignored) {
+              // left unset
+            }
+          }
+          case "amr" -> amr.add(value);
+          default -> {
+            // a later minor may add keys
+          }
+        }
+      }
+      return new site.aster.identity.ForwardedIdentity(iss, sub, jti, exp, amr);
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * {@code aster_server_node_config_generation} (ABI 7.7): 0 = never changed, or NodeConfig off.
+   */
+  public long nodeConfigGeneration() {
+    try {
+      return (long) NODE_CONFIG_GENERATION.invoke(handle);
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /** {@code aster_server_node_properties} (ABI 7.7) as JSON bytes. */
+  public byte[] nodePropertiesJson() {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment out = arena.allocate(16, 8);
+      check((int) NODE_PROPERTIES.invoke(handle, out), "aster_server_node_properties");
+      MemorySegment ptr = out.get(PTR, 0);
+      long len = out.get(I64, 8);
+      if (ptr.equals(MemorySegment.NULL) || len == 0) {
+        return new byte[0];
+      }
+      byte[] json = ptr.reinterpret(len).toArray(U8);
+      STRING_RELEASE.invoke(ptr, len);
+      return json;
     } catch (Throwable t) {
       throw rethrow(t);
     }
