@@ -305,6 +305,53 @@ malformed value fails `start()` / `connect()` with an error naming it. See
 `examples/typescript/missionControl` (Chapter 5) for the CLI steps, and
 `CHANGELOG.md` for migrating from the retired consumer admission.
 
+## Gateway identity: calls on behalf of a user
+
+An edge (an HTTP front end, a gateway) calls services as itself and names
+the user per call with a JWT. Rust verifies the token before `requires`; the
+handler authorises the user, with the token's roles. All of it is
+configuration on enrolled nodes:
+
+```ts
+// The service: accept forwarded users, trust an identity provider.
+const server = new AsterServer({
+  services: [new Notes()],
+  config: {
+    /* rootPubkey, credential, enrollment … */
+    identity: {
+      acceptOnBehalfOf: true,              // [identity] accept_on_behalf_of
+      trustedIssuers: [{ iss: 'https://accounts.example.com', audiences: ['notes'],
+                         rolesClaim: 'groups', roleMap: { readers: 'notes.read' } }],
+    },
+  },
+});
+
+// In a handler (unary or streaming; `CallContext.current()` works too):
+ctx.principal;                 // 'iss|sub' of the user
+ctx.actor;                     // the edge's node id
+ctx.authMethods;               // e.g. ['webauthn']
+ctx.requireAuthMethod(AMR_WEBAUTHN); // PERMISSION_DENIED otherwise
+ctx.nodeAttribute('tier');     // this node's NodeConfig attribute (never authorises)
+
+// The edge (its credential holds `aster.gateway`):
+const token = bearerToken(req.headers.authorization)            // a provider's token, forwarded
+  ?? await client.mintUserToken('alice', ['notes.read'], [AMR_WEBAUTHN], 60); // or one it mints
+await notes.read(request, { onBehalfOf: token });
+```
+
+- Edge-minted tokens are bounded by the issuer delegation in the edge's
+  credential (`aster.identity.issuable_roles`).
+- Provider keys come from the fleet namespace, written by a node running
+  `identity.publisher` (`[identity.publisher]`); a client with one notices
+  every token it forwards (`noticeToken`), so a rotated key is published at
+  once.
+- `aster.ops.NodeConfig` (`remoteConfig`, on by default) lets a node holding
+  `aster.config-admin` set the node's name, tags, typed attributes and an
+  `[identity]` override: `client.nodeConfig().set({ … })` answers once the
+  change is in effect; `get`, `clear` and `ack` too. Pass
+  `auditOutbox` to `AsterServer` to record every change durably, and
+  `acceptOnBehalfOf` to override the config.
+
 ## Authenticated HTTPS and WebTransport listeners
 
 `RpcServer.startHttp(options, authenticate)` serves the registered services

@@ -5,6 +5,30 @@ All notable changes to `@aster-rpc/aster` (and its native addon
 
 ## Unreleased
 
+### Added: gateway identity (calls on behalf of a user)
+
+On the config-driven path, mirroring Rust and Go:
+
+- `AsterConfig.identity` (`[identity]`: `acceptOnBehalfOf`,
+  `trustedIssuers`, `edgeTokenMaxLifetimeSecs`, `clockLeewaySecs`,
+  `maxKeySetAgeSecs`, `publisher`) and `AsterConfig.remoteConfig`
+  (`[remote_config]`: `enabled`, `lock`), loaded by the Rust loaders from
+  `ASTER_IDENTITY_*` / `ASTER_REMOTE_CONFIG_*` / TOML; where each setting
+  came from is kept for `aster.ops.NodeConfig` `get`.
+- `AsterServer` options `acceptOnBehalfOf` (overrides the config) and
+  `auditOutbox` (records NodeConfig changes); `AsterServer.nodeProperties()`.
+- `CallContext.actor`, `authMethods`, `onBehalfOf`, `requireAuthMethod(m)`,
+  `nodeProperties`, `nodeAttribute(k)`.
+- The `onBehalfOf` call option (the `aster-on-behalf-of` entry);
+  `AsterClientWrapper.mintUserToken`, `noticeKid`, `noticeToken`,
+  `identityPublisherStatus` and `nodeConfig()` (`NodeConfigClient`: `get`,
+  `set`, `clear`, `ack`); `bearerToken`; the `GATEWAY_ROLE`,
+  `CONFIG_ADMIN_ROLE`, `IDENTITY_PUBLISHER_ROLE` and `AMR_*` constants.
+- Native addon: `DispatchEvent.onBehalfOf` (flag `0x2000`),
+  `DispatchServer.nodeProperties()` / `nodeConfigGeneration()`,
+  `DispatchServer.start(…, auditOutbox)`, `nodeConfigCall`, and the addon
+  builds `aster` with `identity-publisher`.
+
 ### Changed (breaking): admission fails closed by default
 
 `AsterConfig.hookFailureMode` now defaults to `'fail_closed'`: with
