@@ -731,7 +731,13 @@ fn coerce_prim(p: Prim, v: &DynValue) -> DynResult<DynValue> {
 }
 
 /// A decimal from a decimal value, a decimal string (plain or exponent
-/// notation), an integer, or a float (its shortest round-trip decimal).
+/// notation), or an integer.
+///
+/// A float is refused, as Python and TypeScript refuse it: a JSON number with
+/// a fraction or past `u64` has already been rounded to an `f64` by the time
+/// it gets here, so its digits may not be the ones the caller sent, and the
+/// spec forbids rounding a decimal (Aster-ContractIdentity.md, `decimal(p,s)`).
+/// Send decimals as strings.
 fn decimal_of(v: &DynValue) -> DynResult<DynDecimal> {
     let parse = |s: &str| {
         DynDecimal::parse(s).ok_or_else(|| DynError::invalid(format!("{s:?} is not a decimal")))
@@ -739,8 +745,10 @@ fn decimal_of(v: &DynValue) -> DynResult<DynDecimal> {
     match v {
         DynValue::Decimal(d) => Ok(d.clone()),
         DynValue::String(s) => parse(s),
-        DynValue::F64(f) if f.is_finite() => parse(&f.to_string()),
-        DynValue::F32(f) if f.is_finite() => parse(&f.to_string()),
+        DynValue::F64(_) | DynValue::F32(_) => Err(DynError::invalid(
+            "a decimal must be a string or an integer, not a float: a float may \
+             already have lost digits (send \"12.34\", not 12.34)",
+        )),
         other => match int_of(other) {
             Some(i) => Ok(DynDecimal::new(i, 0)),
             None => Err(DynError::invalid(format!(

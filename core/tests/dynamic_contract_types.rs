@@ -146,6 +146,37 @@ fn encoder_refuses_what_does_not_fit_and_pads_what_does() {
         .is_ok());
 }
 
+/// CT-2: a JSON number reaches the dynamic codec as an `f64`, so a decimal
+/// with more than 17 significant digits has already been rounded. It is
+/// refused, never encoded rounded; the same digits as a string are exact.
+#[test]
+fn json_float_decimal_is_refused_not_rounded() {
+    let v = vectors();
+    let schema = schema(&v["vector"]);
+    let raw = r#"{"price": "0", "rate": "1", "maybe_price": null,
+                  "amount": 12345678901234567.89}"#;
+    let value = DynValue::from_json(&serde_json::from_str(raw).unwrap());
+    let err = schema.encode("types.v1.Priced", &value).expect_err("float");
+    assert_eq!(err.kind, DynErrorKind::InvalidValue, "{err}");
+    assert!(err.message.contains("not a float"), "{err}");
+    // A plain float too, for decimal(p,s).
+    let value = DynValue::from_json(&json!({
+        "price": 1.5, "rate": "1", "maybe_price": null, "amount": "0"
+    }));
+    assert!(schema.encode("types.v1.Priced", &value).is_err());
+    // The exact digits as a string, and an integer, are accepted.
+    let value = DynValue::from_json(&json!({
+        "price": "0", "rate": 7, "maybe_price": null,
+        "amount": "12345678901234567.89"
+    }));
+    let bytes = schema.encode("types.v1.Priced", &value).unwrap();
+    let back = schema.decode_as("types.v1.Priced", &bytes).unwrap();
+    assert_eq!(
+        back.to_json(&JsonOptions::default())["amount"],
+        "12345678901234567.89"
+    );
+}
+
 #[test]
 fn malformed_decimal_params_are_a_schema_error() {
     let v = vectors();
