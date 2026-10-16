@@ -5,6 +5,29 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Changed: native C ABI 7.7; gateway identity
+
+The native library must be C ABI **7.7** or a later 7.x
+(`REQUIRED_ABI_MINOR = 7`).
+
+### Added (gateway identity, C ABI 7.6-7.7)
+
+- `[identity]`, `[identity.publisher]` and `[remote_config]` on `AsterConfig`
+  (`acceptOnBehalfOf`, `trustedIssuers`, `edgeTokenMaxLifetimeSecs`,
+  `clockLeewaySecs`, `maxKeySetAgeSecs`, `identityPublisher`,
+  `remoteConfigEnabled`, `remoteConfigLock`), read from env and TOML through
+  Rust; where each setting came from round-trips for `aster.ops.NodeConfig`.
+- `AsterServer.Builder.acceptOnBehalfOf(Boolean)` and `.auditOutbox(Config)`,
+  `AsterServer.nodeProperties()` / `auditOutbox()`.
+- `CallContext.actor()`, `onBehalfOf()`, `authMethods()`,
+  `requireAuthMethod(m)`, `nodeProperties()`, `nodeAttribute(k)`.
+- `CallOptions.withOnBehalfOf(jwt)`, `GatewayIdentity` (roles, `AMR_*`,
+  `bearerToken`), `AsterClient.mintUserToken` / `Enrollment.mintUserToken`,
+  `Enrollment.noticeKid` / `noticeToken` / `publisherStatus` (the client
+  notices forwarded tokens itself).
+- `NodeConfigClient` (`AsterClient.nodeConfig(target)`): get / set / clear /
+  ack.
+
 ### Changed: native C ABI 7.5; handler peer and principal
 
 The native library must be C ABI **7.5** or a later 7.x

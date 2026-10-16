@@ -122,6 +122,53 @@ cancels, the deadline passes or the connection goes. The server binds it as
 patterns; threads a handler starts itself do not inherit it. There is no
 Kotlin coroutine context element yet (handlers are not `suspend`).
 
+## Gateway identity
+
+An edge (a web gateway) holding `aster.gateway` calls services on behalf of a
+signed-in user with one JWT per call (C ABI 7.7; `site.aster.identity`). It is
+all configuration on the server: `[identity] accept_on_behalf_of = true` (env
+`ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF`, builder `acceptOnBehalfOf(true)`) for
+tokens the edge mints, and for an identity provider's own
+tokens `[[identity.trusted_issuers]]` (`ASTER_IDENTITY_TRUSTED_ISSUERS`, JSON;
+`AsterConfig.Builder.trustedIssuer(TrustedIssuer.of(iss, audiences)
+.withRoles("groups", roleMap))`); the issuer keys come from the fleet
+namespace, written there by a node running `[identity.publisher]`
+(`identityPublisher(...)`, `ASTER_IDENTITY_PUBLISHER`). The limits are
+`edgeTokenMaxLifetimeSecs`, `clockLeewaySecs` and `maxKeySetAgeSecs`.
+`AsterServer.Builder.acceptOnBehalfOf(Boolean)` overrides the config.
+
+On the edge:
+
+```java
+String token = client.mintUserToken("alice", List.of("notes.read"),
+    List.of(GatewayIdentity.AMR_WEBAUTHN), Duration.ofMinutes(1));
+// or forward the provider's: GatewayIdentity.bearerToken(authorizationHeader)
+client.call(server, "Notes", "read", req, Reply.class,
+    CallOptions.DEFAULT.withOnBehalfOf(token));
+```
+
+Minted roles must be within the credential's `aster.identity.issuable_roles`
+delegation. A client running a publisher notices every forwarded token, so a
+provider's key rotation is published at once (`Enrollment.noticeKid` /
+`noticeToken` / `publisherStatus`).
+
+In the handler, `CallContext.current()` gives `principal()` = `iss|sub`,
+`actor()` = the edge's node id, `attributes()` = the token's roles,
+`authMethods()` and `onBehalfOf()` (issuer, subject, jti, expiry);
+`requireAuthMethod(GatewayIdentity.AMR_WEBAUTHN)` refuses weaker sign-ins
+(`@Requires` checks roles only). A server with `accept_on_behalf_of` off
+refuses the entry with `PERMISSION_DENIED`.
+
+`aster.ops.NodeConfig` is served behind `aster.config-admin` unless
+`[remote_config] enabled = false` (`remoteConfigEnabled(false)`;
+`remoteConfigLock(List.of("identity"))` locks sections). An admin edge uses
+`client.nodeConfig(server)` → `NodeConfigClient.get()` / `set(...)` /
+`clear(gen)` / `ack(gen, timeout)`; handlers read the node's name, tags and
+typed attributes with `CallContext.nodeProperties()` / `nodeAttribute(key)`
+(never for authorisation), and `AsterServer.nodeProperties()` reads them
+outside a call. `AsterServer.Builder.auditOutbox(AuditOutbox.Config)` records
+every set and clear durably.
+
 ## Transfer metrics and the audit acknowledgement log
 
 `IrohBlobs.transferStats()` returns the node-wide `BlobTransferStats` (C ABI
