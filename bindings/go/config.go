@@ -165,6 +165,16 @@ type AsterConfig struct {
 	// Enrollment is the [enrollment] section (ASTER_ENROLLMENT_*).
 	Enrollment EnrollmentConfig
 
+	// ── Gateway identity ([identity], [remote_config]; C ABI 7.7) ──
+
+	// Identity is [identity] and [identity.publisher]: calls on behalf of
+	// users, trusted identity providers, token limits and the issuer-key
+	// publisher (ASTER_IDENTITY_*).
+	Identity IdentityConfig
+	// RemoteConfig is [remote_config]: aster.ops.NodeConfig on or off, and
+	// sections locked against remote overrides (ASTER_REMOTE_CONFIG_*).
+	RemoteConfig RemoteConfig
+
 	// ── Binding-level settings ──
 
 	EndpointAddr string
@@ -436,6 +446,9 @@ func (c *AsterConfig) toNative(a *cArena, extraALPNs []string) (C.aster_config_t
 	if err := c.setMetricsNative(&n); err != nil {
 		return n, err
 	}
+	if err := c.setIdentityNative(a, &n); err != nil {
+		return n, err
+	}
 	return n, nil
 }
 
@@ -531,6 +544,7 @@ func (c *AsterConfig) fromNative(n *C.aster_config_t) {
 	}
 	c.networkFromNative(n)
 	c.metricsFromNative(n)
+	c.identityFromNative(n)
 }
 
 // ─── binding-level sources ─────────────────────────────────────────────────

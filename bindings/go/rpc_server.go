@@ -84,6 +84,16 @@ type ServerOptions struct {
 	// (default: the logger set with SetLogger, else slog.Default()). Rust log
 	// records go to SetLogger's logger.
 	Logger *slog.Logger
+	// AcceptOnBehalfOf, if set, overrides Config.Identity.AcceptOnBehalfOf
+	// (Rust AsterServerBuilder::accept_on_behalf_of): accept calls an edge
+	// holding GatewayRole makes on behalf of a user. aster.ops.NodeConfig
+	// can still override it remotely unless Config.RemoteConfig locks
+	// "identity".
+	AcceptOnBehalfOf *bool
+	// AuditOutbox, if set, durably records every aster.ops.NodeConfig set
+	// and clear (Rust AsterServerBuilder::audit_outbox). The caller keeps
+	// owning it; close it after the server.
+	AuditOutbox *AuditOutbox
 	// Health, if set, starts an ops listener (/healthz, /readyz, /metrics)
 	// for the server's node and ties its readiness to the server: ready once
 	// the server serves, not ready first on Close. Reach it with
@@ -115,6 +125,7 @@ type AsterServer struct {
 	health   *HealthServer
 	issuer   *EnrollmentIssuer
 	grantor  *grantorBackend
+	props    nodeProps
 
 	ctx     context.Context
 	cancel  context.CancelFunc
@@ -226,6 +237,8 @@ func StartServer(ctx context.Context, opts ServerOptions) (*AsterServer, error) 
 		ringCapacity:        opts.RingCapacity,
 		leaseGrantor:        opts.LeaseGrantor,
 		grantor:             grantor,
+		acceptOnBehalfOf:    opts.AcceptOnBehalfOf,
+		auditOutbox:         opts.AuditOutbox,
 	}
 	if opts.MaxSessionsPerConnection > 0 {
 		settings.maxSessionsPerConnection = uint64(opts.MaxSessionsPerConnection)
@@ -592,6 +605,14 @@ func (s *AsterServer) serve(in inbound) {
 		Service: in.svc.Name, Method: in.method.Name, Pattern: in.method.Pattern,
 		PeerID: in.peer, Principal: in.principal, ConnectionID: in.connID, SessionID: in.sessionID, CallID: in.callID,
 		Deadline: in.deadline, IrohAuthenticated: in.flags&dispatchFlagIrohAuthenticated != 0,
+		server: s,
+	}
+	if in.flags&dispatchFlagOnBehalfOf != 0 {
+		// The gateway is the transport peer; the user is the principal.
+		info.Actor = in.peer
+		if f := s.ds.onBehalfOf(in.callID); f != nil {
+			info.OnBehalfOf, info.AuthMethods = f, f.AuthMethods
+		}
 	}
 	if in.flags&dispatchFlagHasMetadata != 0 {
 		info.Metadata = s.ds.kvOut(in.callID, false)

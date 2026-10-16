@@ -10,24 +10,25 @@ public installation source. See [publication setup](../../deploy/go-vanity/READM
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, **C ABI 7.x, 7.5 minimum** (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Preview status (C ABI 7.5 minimum)
+## Preview status (C ABI 7.7 minimum)
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
 TypeScript, Java and .NET. Aster 0.3 is a preview release.
 
 **Native library requirement (for consumers such as Kasm):** this module needs
-`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 7.5 or a later 7.x**.
+`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 7.7 or a later 7.x**.
 It refuses anything else three ways:
 
 - at compile time, `runtime.go` fails with `#error` when the `aster_ffi.h` on
   `CGO_CFLAGS` is not major 7;
 - at run time, `CheckABI` (called by `NewRuntime` and before any config is
   filled) returns an error wrapping `ErrABIMismatch` when the loaded library's major is not
-  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (5; 7.1 added the audit
+  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (7; 7.1 added the audit
   outbox acknowledgement log, 7.2 `aster_server_drain`, 7.3 the cluster
   network settings `aster_config_set_network`, 7.4 the transfer metrics and
   `aster_config_set_metrics`, 7.5 the handler call identity
-  `aster_dispatch_identity`);
+  `aster_dispatch_identity`, 7.6 the on-behalf-of actor, 7.7 gateway identity
+  on the config path);
 - the library itself refuses `aster_runtime_new` from another major and, since
   6.0, will not fill an `aster_config_t` until `aster_abi_accept` has
   succeeded for its major, so a 5.x-built caller cannot have its 280-byte
@@ -232,6 +233,18 @@ the 7.0 header and library together.
   `ErrVerificationFailed`, ... (status codes) and `ErrRpcNotFound`,
   `ErrRpcUnimplemented`, ... (RPC codes); `errors.As` to `*RpcError` /
   `*IrohError`. Native failures carry `aster_last_error_message`.
+- **Gateway identity (ABI 7.7):** `AsterConfig.Identity` (`[identity]`,
+  `[[identity.trusted_issuers]]`, `[identity.publisher]`) and
+  `AsterConfig.RemoteConfig` (`[remote_config]`), read by `ConfigFromEnv` /
+  `ConfigFromTOML`; `ServerOptions.AcceptOnBehalfOf` / `AuditOutbox`. A
+  forwarded call's handler sees `CallInfo.Principal` (`iss|sub`),
+  `CallInfo.Actor` (the gateway), `CallInfo.AuthMethods` / `OnBehalfOf`, and
+  checks `CallInfo.RequireAuthMethod(aster.AMRWebAuthn)`; NodeConfig
+  properties via `CallInfo.NodeAttribute` / `AsterServer.NodeProperties`.
+  Edges: `WithOnBehalfOf(jwt)` per call, `AsterClient.MintUserToken`,
+  `BearerToken`, `Enrollment.NoticeToken` / `NoticeKid` / `PublisherStatus`,
+  and `NewNodeConfigClient(rc)` (`Get` / `Set` / `Clear` / `Ack`). See
+  `identity_test.go`.
 - **Handler call identity (ABI 7.5):** `CallInfo.PeerID` is the transport
   peer (node id over Iroh, remote address over HTTP / WebTransport) and
   `CallInfo.Principal` the `RPCAuthenticator`'s principal, else `PeerID`
@@ -529,6 +542,7 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `node_start.go` | `StartNode`, admission requests, connect/accept/ticket helpers |
 | `gate.go` | `Gate` — Gate-0 policy (`aster_gate_*`) |
 | `enrollment.go` | ABI 5.1 Enrollment from config: `EnrollmentConfig` / `RoleMapping` / `Policy*`, `Enrollment` (status, peer claims, check, revocations), `EnrollmentIssuer` |
+| `identity.go` | ABI 7.7 gateway identity: `IdentityConfig` / `RemoteConfig` (`aster_config_set_identity`), forwarded identity on `CallInfo`, `NodeProperties`, `WithOnBehalfOf`, `MintUserToken`, publisher notices, `NodeConfigClient` |
 | `lease_grantor.go` | ABI 5.1 `LeaseGrantor` (served by `StartServer`) and `AsterClient.LeaseGrantor` |
 | `envelope.go` | AEv1 envelope, zstd, framing (via the C ABI) |
 | `codec.go` | `Codec`, `ForyCodec` (Fory 1.7.6), `WireTyped` |

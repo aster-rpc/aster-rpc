@@ -593,9 +593,14 @@ func Version() (major, minor, patch uint32) {
 // (Blobs.TransferStats, fetch report v2, topology QuicTraffic / BlobTransfer)
 // and the [metrics] peer labels (aster_config_set_metrics); 7.5 the handler
 // call identity (aster_dispatch_identity: CallInfo.PeerID is the transport
-// peer, CallInfo.Principal the Authenticator's principal). This binding needs
-// native ABI 7.5 or a later 7.x.
-const ABIMinorRequired = uint32(5)
+// peer, CallInfo.Principal the Authenticator's principal); 7.6 the gateway's
+// on-behalf-of actor and ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF; 7.7 gateway
+// identity on the config path (AsterConfig.Identity / RemoteConfig via
+// aster_config_set_identity, CallInfo.Actor / AuthMethods / OnBehalfOf,
+// NodeProperties, WithOnBehalfOf, Enrollment.MintUserToken, the publisher
+// notices, NodeConfigClient). This binding needs native ABI 7.7 or a later
+// 7.x.
+const ABIMinorRequired = uint32(7)
 
 var (
 	abiOnce sync.Once

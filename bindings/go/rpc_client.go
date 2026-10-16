@@ -41,6 +41,7 @@ type callOptions struct {
 	idempotent   *bool
 	deadline     time.Time      // zero: none
 	timeout      *time.Duration // nil: none; measured from the call's start
+	onBehalfOf   string         // WithOnBehalfOf's token (also in metadata)
 }
 
 // WithDeadline ends the call at t (DEADLINE_EXCEEDED) unless ctx ends it
@@ -534,6 +535,7 @@ func callUnary[Req, Resp any](ctx context.Context, rc *RpcConnection, service, m
 	if err != nil {
 		return nil, fmt.Errorf("encode request: %w", err)
 	}
+	rc.noticeOnBehalfOf(o)
 	nopts, err := lowerOptions(ctx, service, method, o)
 	if err != nil {
 		return nil, err
@@ -574,6 +576,7 @@ type rpcCall struct {
 }
 
 func openCall(ctx context.Context, rc *RpcConnection, pattern MethodPattern, service, method string, o *callOptions) (*rpcCall, error) {
+	rc.noticeOnBehalfOf(o)
 	nopts, err := lowerOptions(ctx, service, method, o)
 	if err != nil {
 		return nil, err

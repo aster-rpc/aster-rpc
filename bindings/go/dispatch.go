@@ -52,11 +52,13 @@ const (
 	// ABI 7.5: peer_ptr is an Authenticator principal; the transport peer
 	// comes from aster_dispatch_identity.
 	dispatchFlagHasPrincipal = C.ASTER_DISPATCH_FLAG_HAS_PRINCIPAL
+	// ABI 7.7: a gateway forwarded the call on behalf of a user; the actor
+	// is the transport peer, the rest comes from aster_dispatch_on_behalf_of.
+	dispatchFlagOnBehalfOf = C.ASTER_DISPATCH_FLAG_ON_BEHALF_OF
 )
 
-// aster_dispatch_identity_t.flags (ASTER_DISPATCH_IDENTITY_*, ABI 7.5).
-// dispatchIdentityActor is reserved for a gateway's on-behalf-of actor and
-// never set in 7.5.
+// aster_dispatch_identity_t.flags (ASTER_DISPATCH_IDENTITY_*, ABI 7.5;
+// dispatchIdentityActor since 7.6: a gateway's on-behalf-of actor).
 const (
 	dispatchIdentityPrincipal = C.ASTER_DISPATCH_IDENTITY_PRINCIPAL
 	dispatchIdentityActor     = C.ASTER_DISPATCH_IDENTITY_ACTOR
@@ -103,6 +105,8 @@ type serverSettings struct {
 	health                   *HealthServer // attached before start (readiness)
 	leaseGrantor             *LeaseGrantor // serves aster.lease.Grantor (ABI 5.1)
 	grantor                  *grantorBackend
+	acceptOnBehalfOf         *bool        // overrides Config.Identity (ABI 7.6)
+	auditOutbox              *AuditOutbox // NodeConfig set/clear audit (ABI 7.7)
 }
 
 // startDispatchServer registers every service JSON (in order: the index is
@@ -151,12 +155,22 @@ func startDispatchServer(node *Node, serviceJSON []string, s serverSettings) (*d
 	if s.setHandlerTimeout {
 		errs = append(errs, opt(serverOptionHandlerTimeoutMs, s.handlerTimeoutMs))
 	}
+	if s.acceptOnBehalfOf != nil {
+		errs = append(errs, opt(C.ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF, uint64(boolToUint32(*s.acceptOnBehalfOf))))
+	}
 	if err := errors.Join(errs...); err != nil {
 		return fail("aster_server_set_option", err)
 	}
 	if s.health != nil {
 		if err := ffiStatus(func() C.int32_t { return C.aster_server_attach_health(b, C.uint64_t(s.health.handle)) }); err != nil {
 			return fail("aster_server_attach_health", err)
+		}
+	}
+	if s.auditOutbox != nil {
+		if err := ffiStatus(func() C.int32_t {
+			return C.aster_server_set_audit_outbox(rt, b, C.uint64_t(s.auditOutbox.handle))
+		}); err != nil {
+			return fail("aster_server_set_audit_outbox", err)
 		}
 	}
 	if s.grantor != nil {

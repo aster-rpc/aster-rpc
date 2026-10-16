@@ -94,8 +94,20 @@ type CallInfo struct {
 	PeerID string
 	// Principal is the caller id the server's Authenticator resolved
 	// (RPCAuthResponse.Principal), else PeerID. Sessions and interceptors
-	// key on it. (ABI 7.5; a gateway's on-behalf-of actor is reserved.)
+	// key on it. For a call a gateway forwarded on behalf of a user it is
+	// the user, iss|sub (ABI 7.5 / 7.7).
 	Principal string
+	// Actor is the gateway that forwarded the call on behalf of Principal
+	// (the same as PeerID), else "" (Rust CallContext::actor; ABI 7.7).
+	Actor string
+	// AuthMethods are how the forwarded user signed in (the token's amr,
+	// e.g. AMRWebAuthn); empty otherwise (Rust CallContext::auth_methods).
+	// RequireAuthMethod checks one.
+	AuthMethods []string
+	// OnBehalfOf is the verified forwarded identity (issuer, subject, token
+	// id, expiry), nil for a call the peer made as itself. Its roles are
+	// Attributes, which Requires checked.
+	OnBehalfOf *ForwardedIdentity
 	// ConnectionID identifies the peer connection: key per-connection state
 	// on it (ServerOptions.OnConnectionClosed reports its end).
 	ConnectionID uint64
@@ -116,6 +128,8 @@ type CallInfo struct {
 	// IrohAuthenticated reports whether the peer id was authenticated by
 	// the QUIC handshake.
 	IrohAuthenticated bool
+
+	server *AsterServer // NodeProperties / NodeAttribute
 }
 
 type callInfoKey struct{}
