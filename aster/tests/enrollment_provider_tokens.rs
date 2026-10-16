@@ -803,3 +803,85 @@ async fn junk_writers_cannot_evict_a_trusted_issuers_keys() {
     .await
     .expect("test timed out");
 }
+
+/// GI-2: a burst of entries is coalesced into a few rebuilds, and an author's
+/// standing is verified once per credential (at most a few per author), not
+/// once per entry per rebuild.
+#[tokio::test]
+async fn a_burst_of_junk_is_coalesced_and_checked_once_per_author() {
+    const PER_AUTHOR: usize = 300;
+    tokio::time::timeout(Duration::from_secs(300), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let server = start_server(&root, files.path()).await;
+        let keys = server.issuer_keys().unwrap();
+        let publisher =
+            Publisher::start(&root, &server, PUBLISHER, Some(IDENTITY_PUBLISHER_ROLE)).await;
+        let rogue = Publisher::start(&root, &server, ROGUE, Some("data.read")).await;
+        let a1 = IdpKey::es256();
+        publisher
+            .publish(&server, ISS_A, jwks(&[(&a1, "a1")]), now() - 10)
+            .await;
+        wait_keys(&keys, |k| kids(k, ISS_A) == ["a1"]).await;
+        let (rebuilds, checks) = (keys.rebuilds(), keys.evidence_checks());
+
+        // Well-formed sets from two authors that are not publishers: the
+        // rogue, each set carrying a different credential string, and a
+        // docs author that is no node, carrying none.
+        let filler = IdpKey::es256();
+        let set: serde_json::Value = serde_json::from_str(&jwks(&[(&filler, "junk")])).unwrap();
+        let rogue_author = rogue.client.node().docs().default_author().await.unwrap();
+        let stranger = rogue.client.node().docs().create_author().await.unwrap();
+        for n in 0..PER_AUTHOR {
+            for (author, label, chain) in [
+                (&rogue_author, "rogue", Some(format!("{}{n}", rogue.chain))),
+                (&stranger, "stranger", None),
+            ] {
+                let iss = format!("https://burst-{label}-{n}.example.com");
+                let bytes = aster_transport_core::delegation::issuer_keys::encode_key_set(
+                    &iss,
+                    &format!("{iss}/jwks"),
+                    now(),
+                    &set,
+                    chain.as_deref(),
+                )
+                .unwrap();
+                rogue
+                    .fleet
+                    .set_bytes(author, issuer_keys_key(&iss), bytes)
+                    .await
+                    .unwrap();
+            }
+        }
+        rogue
+            .fleet
+            .sync_with_timeout(&[server.id()], Duration::from_secs(60))
+            .await
+            .unwrap();
+        wait_entry_count(&server, &root.fleet, 1 + 2 * PER_AUTHOR).await;
+        // A rotation after the burst: the rebuild that installs it has read
+        // every entry.
+        let a2 = IdpKey::es256();
+        publisher
+            .publish(&server, ISS_A, jwks(&[(&a2, "a2")]), now())
+            .await;
+        wait_keys(&keys, |k| kids(k, ISS_A) == ["a2"]).await;
+
+        let rebuilt = keys.rebuilds() - rebuilds;
+        let checked = keys.evidence_checks() - checks;
+        // Over a thousand relevant events (an insert and a content-ready per
+        // entry); each burst window of up to a second is one rebuild.
+        assert!(
+            rebuilt <= 40,
+            "{rebuilt} rebuilds for {} entries",
+            2 * PER_AUTHOR
+        );
+        // Three authors (the publisher, the rogue with at most four distinct
+        // credentials verified, the stranger), twice over if the minute's
+        // tick forgot their standing mid-test.
+        assert!(checked <= 2 * (1 + 4 + 1), "{checked} evidence checks");
+        assert_eq!(keys.key_sets().len(), 1, "no junk set is held");
+    })
+    .await
+    .expect("test timed out");
+}

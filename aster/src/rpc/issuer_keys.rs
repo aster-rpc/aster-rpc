@@ -47,8 +47,14 @@
 //! acknowledged. A token whose `kid` is not in its issuer's newest set is
 //! refused with `UNAUTHENTICATED`; nothing is fetched. A key removed from the
 //! newest set stops verifying when that set arrives. The cache is rebuilt on
-//! every change to the namespace (and once a minute, so expiries and
-//! late-applied revocations are picked up). When the root rotates, the
+//! changes to the namespace, a burst of events coalesced into one rebuild
+//! (and once a minute, so expiries and late-applied revocations are picked
+//! up). An author's standing is remembered across rebuilds, for a bounded
+//! number of credentials per author and a bounded number of authors, and
+//! forgotten when its credential expires, when an Enrollment policy record
+//! arrives (a revocation or registration), on a root rotation and every
+//! minute; so a burst of entries costs one evidence check per author, not
+//! one per entry per rebuild. When the root rotates, the
 //! watcher re-opens on the new root's fleet namespace: nothing written under
 //! the old root counts any more.
 
@@ -111,6 +117,8 @@ pub(crate) struct IssuerKeys {
     sets: arc_swap::ArcSwap<BTreeMap<String, Arc<Accepted>>>,
     generation: tokio::sync::watch::Sender<u64>,
     notice: std::sync::RwLock<Option<KidNotice>>,
+    /// Publisher-evidence verifications run so far (the costly step).
+    evidence_checks: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for IssuerKeys {
@@ -127,6 +135,7 @@ impl Default for IssuerKeys {
             sets: arc_swap::ArcSwap::default(),
             generation: tokio::sync::watch::Sender::new(0),
             notice: std::sync::RwLock::new(None),
+            evidence_checks: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -204,6 +213,23 @@ impl IssuerKeysHandle {
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
         self.0.generation.subscribe()
     }
+
+    /// How many rebuilds have completed (the value [`subscribe`] carries).
+    ///
+    /// [`subscribe`]: Self::subscribe
+    pub fn rebuilds(&self) -> u64 {
+        *self.0.generation.borrow()
+    }
+
+    /// How many times a key-set author's credential has been verified for
+    /// the publisher role. Each verification walks a credential chain, so
+    /// this stays near the number of distinct authors however many entries
+    /// they write.
+    pub fn evidence_checks(&self) -> u64 {
+        self.0
+            .evidence_checks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 // ── Reading the namespace ───────────────────────────────────────────────────
@@ -213,7 +239,8 @@ pub(crate) use watch::{watch, IssuerKeysWatch};
 
 #[cfg(all(feature = "enrollment", feature = "docs"))]
 mod watch {
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -232,6 +259,19 @@ mod watch {
     const REBUILD_INTERVAL: Duration = Duration::from_secs(60);
     /// The enrollment records whose change can change a publisher's standing.
     const ENROLLMENT_PREFIX: &[u8] = b"aster/enrollment/v1/";
+    /// Enrollment records that are not policy: nodes' observations of each
+    /// other, which change no author's standing.
+    const OBSERVATION_PREFIX: &[u8] = b"aster/enrollment/v1/observations/";
+    /// A burst of events is coalesced into one rebuild: the rebuild waits
+    /// until no event has arrived for this long...
+    const COALESCE_QUIET: Duration = Duration::from_millis(100);
+    /// ...or this long after the first, whichever is sooner.
+    const COALESCE_MAX: Duration = Duration::from_secs(1);
+    /// Most authors whose standing is remembered; past it, all is forgotten.
+    const MAX_REMEMBERED_AUTHORS: usize = 16_384;
+    /// Most distinct credentials verified for one author before its
+    /// remembered refusal stands for every further credential it carries.
+    const MAX_CREDENTIALS_PER_AUTHOR: usize = 4;
 
     /// The watcher task; dropping it stops the updates (the keys stay as
     /// they were).
@@ -261,6 +301,25 @@ mod watch {
         mapping: RoleMapping,
         identity: Arc<LiveIdentity>,
         keys: Arc<IssuerKeys>,
+        /// What each author's credentials established, across rebuilds.
+        standing: HashMap<[u8; 32], Standing>,
+    }
+
+    /// What is known of one key-set author.
+    #[derive(Default)]
+    struct Standing {
+        /// `Some(valid_until)` once a credential showed it to be a publisher.
+        publisher: Option<Option<u64>>,
+        /// Digests of credentials that did not, with the reason; at most
+        /// [`MAX_CREDENTIALS_PER_AUTHOR`].
+        refused: Vec<([u8; 32], &'static str)>,
+    }
+
+    fn digest(credential: Option<&str>) -> [u8; 32] {
+        match credential {
+            Some(chain) => *blake3::hash(chain.as_bytes()).as_bytes(),
+            None => [0; 32],
+        }
     }
 
     /// Fill `keys` from `node`'s copy of `enrollment`'s fleet namespace now,
@@ -283,6 +342,7 @@ mod watch {
             mapping,
             identity,
             keys,
+            standing: HashMap::new(),
         };
         scanner.rebuild().await;
         let node = node.clone();
@@ -293,18 +353,33 @@ mod watch {
             loop {
                 let rebuild = tokio::select! {
                     event = events.recv() => match event {
-                        Ok(Some(event)) => relevant(&event),
+                        Ok(Some(event)) => {
+                            scanner.observe(&event);
+                            // Coalesce the rest of a burst into this rebuild.
+                            if relevant(&event) && !coalesce(&events, &mut scanner).await {
+                                break;
+                            }
+                            relevant(&event)
+                        }
                         // Lagged or failed: rebuild from what is stored.
-                        Err(_) => true,
+                        Err(_) => {
+                            scanner.standing.clear();
+                            true
+                        }
                         Ok(None) => break,
                     },
                     changed = roots.changed() => {
                         if changed.is_err() {
                             break;
                         }
+                        scanner.standing.clear();
                         true
                     }
-                    _ = interval.tick() => true,
+                    _ = interval.tick() => {
+                        // Late-applied revocations and registrations.
+                        scanner.standing.clear();
+                        true
+                    }
                 };
                 // A root rotation moves the fleet namespace: re-open on the
                 // new one (retried every tick until it opens). Until then the
@@ -338,6 +413,37 @@ mod watch {
         Ok(IssuerKeysWatch { task })
     }
 
+    /// Take the events that follow one that called for a rebuild, until the
+    /// burst is quiet or [`COALESCE_MAX`] has passed. `false` when the
+    /// subscription ended.
+    async fn coalesce(events: &crate::docs::DocEvents, scanner: &mut Scanner) -> bool {
+        let until = tokio::time::Instant::now() + COALESCE_MAX;
+        loop {
+            let quiet = (tokio::time::Instant::now() + COALESCE_QUIET).min(until);
+            tokio::select! {
+                event = events.recv() => match event {
+                    Ok(Some(event)) => scanner.observe(&event),
+                    // Rebuilt from what is stored either way.
+                    Err(_) => return true,
+                    Ok(None) => return false,
+                },
+                () = tokio::time::sleep_until(quiet) => return true,
+            }
+        }
+    }
+
+    /// An Enrollment policy record (a registration, a revocation, an issuer
+    /// delegation) may change an author's standing.
+    fn policy_record(event: &DocEvent) -> bool {
+        match event {
+            DocEvent::InsertLocal { entry } | DocEvent::InsertRemote { entry, .. } => {
+                entry.key.starts_with(ENROLLMENT_PREFIX)
+                    && !entry.key.starts_with(OBSERVATION_PREFIX)
+            }
+            _ => false,
+        }
+    }
+
     fn relevant(event: &DocEvent) -> bool {
         match event {
             DocEvent::InsertLocal { entry } | DocEvent::InsertRemote { entry, .. } => {
@@ -355,16 +461,69 @@ mod watch {
             .map_or(0, |elapsed| elapsed.as_secs())
     }
 
-    /// The last author's last credential and what it established: entries of
-    /// one author arrive together and normally carry the same chain.
-    struct Verdict {
-        author: [u8; 32],
-        credential: Option<String>,
-        /// `Some(valid_until)` when the author is a publisher.
-        publisher: Option<Option<u64>>,
-    }
-
     impl Scanner {
+        /// Forget every author's standing when `event` may have changed it.
+        fn observe(&mut self, event: &DocEvent) {
+            if policy_record(event) {
+                self.standing.clear();
+            }
+        }
+
+        /// Whether `author` is known to hold no publisher standing whatever
+        /// credential it carries: its entries need not even be read.
+        fn known_refused(&self, author: &[u8; 32]) -> bool {
+            self.standing.get(author).is_some_and(|standing| {
+                standing.publisher.is_none() && standing.refused.len() >= MAX_CREDENTIALS_PER_AUTHOR
+            })
+        }
+
+        /// [`publisher`](Self::publisher), remembered per author: one
+        /// verification per distinct credential (at most
+        /// [`MAX_CREDENTIALS_PER_AUTHOR`]) until the standing is forgotten.
+        fn standing(
+            &mut self,
+            author: &[u8; 32],
+            credential: Option<&str>,
+            now: u64,
+        ) -> std::result::Result<Option<u64>, &'static str> {
+            if let Some(known) = self.standing.get(author) {
+                match known.publisher {
+                    // Still valid: an author is a publisher, whichever of its
+                    // credentials an entry carries.
+                    Some(valid_until) if valid_until.is_none_or(|until| now < until) => {
+                        return Ok(valid_until)
+                    }
+                    // Its credential expired: verify afresh.
+                    Some(_) => {
+                        self.standing.remove(author);
+                    }
+                    None => {
+                        let digest = digest(credential);
+                        if let Some((_, reason)) =
+                            known.refused.iter().find(|(held, _)| *held == digest)
+                        {
+                            return Err(reason);
+                        }
+                        if known.refused.len() >= MAX_CREDENTIALS_PER_AUTHOR {
+                            return Err("author's credentials refused too often");
+                        }
+                    }
+                }
+            }
+            self.keys.evidence_checks.fetch_add(1, Ordering::Relaxed);
+            let verdict = self.publisher(author, credential, now);
+            if !self.standing.contains_key(author) && self.standing.len() >= MAX_REMEMBERED_AUTHORS
+            {
+                self.standing.clear();
+            }
+            let known = self.standing.entry(*author).or_default();
+            match verdict {
+                Ok(valid_until) => known.publisher = Some(valid_until),
+                Err(reason) => known.refused.push((digest(credential), reason)),
+            }
+            verdict
+        }
+
         /// Whether `author`, carrying `credential`, holds
         /// `aster.identity-publisher` at `now`; `Some(valid_until)` if so.
         fn publisher(
@@ -400,7 +559,7 @@ mod watch {
         /// server does not trust are kept up to
         /// [`unlisted_issuer_quota`] each, so a misbehaving publisher holds
         /// a bounded amount and never displaces another publisher's sets.
-        async fn rebuild(&self) {
+        async fn rebuild(&mut self) {
             let now = unix_now();
             let settings = self.identity.load();
             let leeway = settings.clock_leeway_secs;
@@ -427,7 +586,6 @@ mod watch {
             // publishers appear here, so it is as small as their number.
             let mut unlisted: BTreeMap<[u8; 32], usize> = BTreeMap::new();
             let mut over_quota: BTreeSet<[u8; 32]> = BTreeSet::new();
-            let mut verdict: Option<Verdict> = None;
             loop {
                 let entry = match entries.next().await {
                     Ok(Some(entry)) => entry,
@@ -445,6 +603,10 @@ mod watch {
                 let Some(publisher) = parse_hex32(entry.author.as_str()) else {
                     continue;
                 };
+                if self.known_refused(&publisher) {
+                    // Not a publisher, whatever it carries: left unread.
+                    continue;
+                }
                 let listed = trusted.contains(&entry.key);
                 if !listed && unlisted.get(&publisher).is_some_and(|held| *held >= quota) {
                     // Over quota: skipped before its content is read.
@@ -484,22 +646,7 @@ mod watch {
                         continue;
                     }
                 };
-                let cached = verdict.as_ref().filter(|held| {
-                    held.author == publisher && held.credential == record.credential
-                });
-                let standing = match cached {
-                    Some(held) => held.publisher.ok_or("author is not a publisher"),
-                    None => {
-                        let standing =
-                            self.publisher(&publisher, record.credential.as_deref(), now);
-                        verdict = Some(Verdict {
-                            author: publisher,
-                            credential: record.credential.clone(),
-                            publisher: standing.ok(),
-                        });
-                        standing
-                    }
-                };
+                let standing = self.standing(&publisher, record.credential.as_deref(), now);
                 let valid_until = match standing {
                     Ok(valid_until) => valid_until,
                     Err(reason) => {
