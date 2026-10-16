@@ -174,7 +174,13 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `persistent(dir)` | `ASTER_STORAGE_PATH` | `[storage] path` | in-memory when unset |
 | `gc_interval(d)` | `ASTER_GC_INTERVAL_MS` | `[storage] gc_interval_ms` | `0` / unset = no GC |
 | `blob_zstd_level(n)` | `ASTER_BLOB_ZSTD_LEVEL` | `[storage] blob_zstd_level` | zstd blob transport, on by default at `3`: served beside plain and preferred when fetching, with plain fallback; `0` / `off` = plain only; `5` suits slow or relayed links (`Blobs::with_transport_compression` overrides per client) |
-| `bind_addr(a)` | `ASTER_BIND_ADDR` | `[network] bind_addr` | e.g. `0.0.0.0:9000` |
+| `bind_addr(a)` | `ASTER_BIND_ADDR` | `[network] bind_addr` | e.g. `0.0.0.0:9000`; pins the socket of that address family only |
+| `bind_addr_v6(a)` | `ASTER_BIND_ADDR_V6` | `[network] bind_addr_v6` | e.g. `[::]:9000`: pins the IPv6 socket; `bind_addr` must then be IPv4 or unset; a host without IPv6 fails to start with it set |
+| `advertise_addr(a)` (repeatable) | `ASTER_ADVERTISE_ADDRS` (comma-separated) | `[network] advertise_addrs = [..]` | extra `IP:port` direct addresses to publish (NodePort, load balancer); hints only, see below |
+| `relay_ca_cert(p)` (repeatable) | `ASTER_RELAY_CA_CERTS` (comma-separated paths) | `[network] relay_ca_certs = [..]` | PEM CA bundles trusted for relay TLS, in addition to the WebPKI roots |
+| `relay_ca_only(b)` | `ASTER_RELAY_CA_ONLY` | `[network] relay_ca_only` | trust only `relay_ca_certs` for relay TLS |
+| `discovery_mode(DiscoveryMode)` | `ASTER_DISCOVERY` | `[network] discovery` | `default` (n0 pkarr + DNS at `iroh.link`) / `none` / `local` (mDNS only) / `custom` |
+| `discovery_dns_origin(o)` / `discovery_pkarr_relay(u)` | `ASTER_DISCOVERY_DNS_ORIGIN` / `ASTER_DISCOVERY_PKARR_RELAYS` (comma-separated) | `[network] discovery_dns_origin` / `discovery_pkarr_relays = [..]` | your own iroh-dns-server; either selects `custom` |
 | `reuse_last_port(b)` | `ASTER_REUSE_LAST_PORT` | `[network] reuse_last_port` | default `true`: a persistent node re-binds its last ports when free (see below) |
 | `alpn(bytes)` | — | — | extra inbound ALPNs, merged with `Node::start_with_alpns` |
 | `discovery(b)` | `ASTER_LOCAL_DISCOVERY` | `[network] local_discovery` | mDNS |
@@ -212,6 +218,26 @@ given and never recorded. In-memory nodes are unaffected. Turn it off with
 `[network] reuse_last_port = false`. Two processes must not share one storage directory; if they do, the second never
 takes the first one's port and waits on the store lock without touching the
 record.
+
+**Cluster and air-gapped settings.** Advertised addresses are published with
+the addresses the node discovers (in its address and every discovery record),
+and peers try them like any other. They are hints, never identity: a dial
+verifies the node's key in the TLS handshake, so an address that is wrong,
+stale or reused by another pod cannot reach a different node
+(`core/tests/stale_address_hint.rs`). `relay_ca_certs` secures the TCP/TLS hop
+to a relay only (and, with `custom` discovery, to pkarr relays); peer-to-peer
+traffic is end-to-end encrypted and authenticated by node keys whatever the
+relay presents. A missing or unreadable CA file, or `relay_ca_only` without
+files, fails the start. With discovery `none` or `custom` nothing is sent to
+n0's DNS servers; relays are separate, so also set `relay_urls` or
+`RelayMode::Disabled`. With discovery `none`, dial peers by full address (node
+ID plus direct address or relay URL). See
+[running inside Kubernetes](relay-self-hosted.md#running-inside-kubernetes).
+In the C ABI these settings are `aster_network_config_t` (ABI 7.3,
+`aster_config_set_network`); in Go, `AsterConfig.BindAddrV6`, `AdvertiseAddrs`,
+`RelayCACerts`, `RelayCAOnly`, `Discovery`, `DiscoveryDNSOrigin`,
+`DiscoveryPkarrRelays`. Python, TypeScript, Java and .NET do not expose these
+settings yet; they follow in the next binding mirror pass.
 
 Both `reuse_last_port` and `blob_zstd_level` reach every binding, with the
 same env and TOML names and the same defaults:

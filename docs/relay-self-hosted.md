@@ -8,11 +8,12 @@ the `aster-relay` image that each Aster release publishes.
 
 You may not need one. Inside a single cluster, nodes that dial each other with
 a full address (node ID plus pod IP and port) connect directly; set
-`RelayMode = "disabled"` and skip the relay.
+`RelayMode = "disabled"` and skip the relay. See
+[Running inside Kubernetes](#running-inside-kubernetes).
 
-What's here today: the image, its Kubernetes manifests and the node settings
-that point at it. A fully air-gapped install also needs two Aster features that
-don't exist yet; see [Not yet supported](#not-yet-supported).
+What's here: the image, its Kubernetes manifests, and the node settings that
+point at it, including trust for a private-CA relay certificate and discovery
+that never contacts n0 for air-gapped installs.
 
 ## 1. The image
 
@@ -109,9 +110,10 @@ Steps:
    ```
 
    The config uses `cert_mode = "Reloading"`, so a renewed certificate in the
-   Secret is picked up without a restart. Aster nodes currently accept only
-   certificates that chain to the public WebPKI roots; see
-   [Not yet supported](#not-yet-supported).
+   Secret is picked up without a restart. The certificate can come from a
+   public CA or from your own (cert-manager, an internal PKI); for a private
+   CA, give the nodes its certificate with `relay_ca_certs`
+   ([section 5](#5-point-aster-nodes-at-the-relay)).
 
 2. **Image.** In `kustomization.yaml`, set `newName` to your registry and
    `digest` to `index_digest` from `publication.json`.
@@ -201,6 +203,32 @@ custom mode; address discovery uses UDP 7842 on the same host.
 The hostname must match the relay certificate, and each node's home relay is
 part of the address it publishes, so peers must be able to reach the same URL.
 
+### A relay certificate from a private CA
+
+Nodes verify the relay's certificate against the built-in WebPKI roots. For a
+certificate from your own CA (cert-manager `ClusterIssuer`, an internal PKI),
+give the nodes the CA certificate as a PEM file, for example mounted from a
+ConfigMap or Secret:
+
+| Path | Setting |
+|---|---|
+| Rust | `AsterConfig::builder().relay_ca_cert("/etc/aster/relay-ca.pem")` (repeatable), `.relay_ca_only(true)` |
+| Environment | `ASTER_RELAY_CA_CERTS=/etc/aster/relay-ca.pem` (comma-separated for several), `ASTER_RELAY_CA_ONLY=true` |
+| `aster.toml` | `[network]` `relay_ca_certs = ["/etc/aster/relay-ca.pem"]`, `relay_ca_only = true` |
+| Go | `cfg.RelayCACerts = []string{"/etc/aster/relay-ca.pem"}; cfg.RelayCAOnly = true` |
+| C ABI (7.3) | `aster_network_config_t.relay_ca_certs`, `.relay_ca_only`, set with `aster_config_set_network` |
+
+The CAs are trusted in addition to the WebPKI roots; `relay_ca_only` trusts
+them alone. A file that is missing, unreadable or holds no `CERTIFICATE` block
+fails the node's start. Python, TypeScript, Java and .NET read these settings
+in a later release.
+
+This is transport security for the hop to the relay. It does not affect peer
+identity: traffic between two nodes is end-to-end encrypted and authenticated
+by their node keys, so a relay (trusted or not) cannot read it or stand in for
+a node. With a relay certificate the node does not trust, the node never gets
+a home relay and start-up waits for one.
+
 ## 6. Build the image yourself
 
 [`deploy/relay/Dockerfile`](../deploy/relay/Dockerfile) builds the same image
@@ -227,27 +255,55 @@ container daemon, so the release pipeline assembles the same runtime stage with
 `deploy/relay/build-binary.sh`. The base image pin lives only in the
 Dockerfile; the assembler reads it from there.
 
-## Not yet supported
+## Running inside Kubernetes
 
-These are scheduled Aster changes; the relay side above doesn't change when
-they land.
+Node settings for Aster pods, all on the `[network]` section of `aster.toml`
+or the matching `ASTER_*` variables (Rust builder and Go field names in the
+[configuration reference](aster-rust-getstarted.md#22-configuration-reference)):
 
-- **Private CA trust for relay TLS.** Nodes verify relay certificates against
-  the built-in WebPKI roots only, so a relay whose certificate comes from a
-  private CA (including the cert-manager example) is rejected, and so is a
-  self-signed one. The fix adds a relay CA bundle to `AsterConfig` (a
-  `[network]` key with a matching `ASTER_*` variable and builder method; name
-  not final), passed to iroh's endpoint TLS roots. Until then, use a
-  certificate from a public CA for the relay hostname. That works on an
-  isolated network as long as the nodes can resolve the hostname, because
-  verification itself needs no network access.
-- **Discovery preset without `iroh.link`.** The default address lookup
-  queries n0's DNS service at `iroh.link` to find a node by its bare ID. In an
-  air-gapped network those lookups fail. A preset that turns this off (or
-  points it at your own DNS server) will be another `AsterConfig` setting.
-  Until then, dial peers with full addresses (node ID plus relay URL or
-  direct IP and port).
-- **Node-side network settings** from the same request, also scheduled: a
-  fixed IPv6 bind port next to `[network] bind_addr` (which pins IPv4 only
-  today) and an advertised external address for nodes behind a NodePort or
-  load balancer. They configure nodes, not the relay.
+```toml
+[network]
+bind_addr = "0.0.0.0:7842"        # fixed IPv4 UDP port   (ASTER_BIND_ADDR)
+bind_addr_v6 = "[::]:7842"        # fixed IPv6 UDP port   (ASTER_BIND_ADDR_V6), dual-stack only
+advertise_addrs = ["203.0.113.10:31842"]  # NodePort / LB (ASTER_ADVERTISE_ADDRS)
+discovery = "none"                # never query iroh.link (ASTER_DISCOVERY)
+relay_mode = "disabled"           # direct only, or relay_urls = [...] for a private relay
+```
+
+- **Bind ports.** `bind_addr` pins the socket of its own address family. On a
+  dual-stack cluster, set `bind_addr_v6` too, or the IPv6 socket takes a
+  random port that a default-deny NetworkPolicy won't allow. `bind_addr_v6`
+  must be an IPv6 address and makes the IPv6 bind required: leave it unset on
+  IPv4-only clusters. Allow both UDP ports in the NetworkPolicy.
+- **Advertised addresses.** A node can't see the NodePort or load balancer in
+  front of it. `advertise_addrs` publishes those `IP:port` addresses with the
+  ones it discovers, and peers that find the node through discovery try them.
+  They are hints only: a dial checks the node key in the TLS handshake, so an
+  address that now belongs to another pod fails rather than reaching it.
+  Direct IP transports must be on (`clear_ip_transports` unset).
+- **Direct only, no relay.** `relay_mode = "disabled"` (or
+  `clear_relay_transports = true`). Start-up doesn't wait for a relay. Peers
+  can't find a node by its bare ID through a relay, so dial with a full
+  address: node ID plus pod IP and port, for example from your API.
+- **Private relay.** `relay_urls = ["https://relay.example.internal"]` with
+  `relay_ca_certs` for a private-CA certificate
+  ([section 5](#a-relay-certificate-from-a-private-ca)).
+- **Discovery.** The default preset publishes to and resolves from n0's DNS
+  service at `iroh.link`. In-cluster and air-gapped installs set:
+  - `discovery = "none"`: no lookup service at all; dial by full address.
+  - `discovery = "local"`: mDNS on the local network only (rarely useful in
+    a pod network).
+  - `discovery_dns_origin = "dns.example.internal"` and/or
+    `discovery_pkarr_relays = ["https://dns.example.internal/pkarr"]`: your own
+    iroh-dns-server (this selects `discovery = "custom"`). The pkarr relay's
+    TLS uses `relay_ca_certs` too.
+
+  With `none` or `custom` no lookup goes to n0. Relays are a separate setting:
+  `relay_mode = "default"` still uses the n0 relays, so an air-gapped node
+  also sets `relay_urls` or `relay_mode = "disabled"`.
+- **MTU.** Leave `transport_initial_mtu` unset. QUIC starts at 1200 bytes and
+  probes upward, so a 1450-byte overlay (flannel VXLAN) works.
+
+Go: `cfg.BindAddr`, `cfg.BindAddrV6`, `cfg.AdvertiseAddrs`, `cfg.Discovery =
+aster.DiscoveryNone`, `cfg.RelayMode = "disabled"` (C ABI 7.3). Python,
+TypeScript, Java and .NET pick these settings up in a later release.
