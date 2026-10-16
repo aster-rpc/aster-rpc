@@ -673,11 +673,15 @@ async fn revocations_published_to_the_replica_reach_the_node() {
 
 /// Test 6: a coord-host whose daemon is down restarts from its persisted
 /// fleet copy, unsynchronized, and synchronizes again once the daemon is back.
-/// A fresh node with nothing persisted still fails to start.
+/// A fresh node with nothing persisted still fails to start. The root admits
+/// only the daemon: otherwise, once it publishes to the restarted daemon, the
+/// fleet document's gossip swarm can lead it to the coord-host, which then
+/// synchronizes from the root (`SynchronizationSource::Root`) before its
+/// replica maintenance has re-admitted the daemon.
 #[tokio::test]
 async fn restart_with_a_local_copy_proceeds_while_the_replica_is_down() {
     tokio::time::timeout(Duration::from_secs(150), async {
-        let root = Root::start().await;
+        let root = Root::start_with_policy(Arc::new(DaemonOnly)).await;
         let files = tempfile::tempdir().unwrap();
         root.register(public(DAEMON)).await;
         root.register(public(HOST)).await;
@@ -733,13 +737,23 @@ async fn restart_with_a_local_copy_proceeds_while_the_replica_is_down() {
             enrolled(&host)
                 .check_peer(&public(CLIENT))
                 .await
-                .is_ok_and(|ready| ready.policy_sync.is_some())
+                .is_ok_and(|ready| {
+                    ready.policy_sync.map(|sync| sync.source)
+                        == Some(SynchronizationSource::Replica(public(DAEMON)))
+                })
         })
         .await;
-        assert!(matches!(
-            session_source(&host, DAEMON),
-            Some(AdmissionEvidenceSource::RootAuthoredRecord { .. })
-        ));
+        // Replica freshness is recorded only from an admitted session, and
+        // the daemon presents no credential: its registration admits it.
+        let source = session_source(&host, DAEMON);
+        assert!(
+            matches!(
+                source,
+                Some(AdmissionEvidenceSource::RootAuthoredRecord { .. })
+            ),
+            "the daemon's session rests on its registration: {source:?}"
+        );
+        assert!(root.enrollment.peer_session(&public(HOST)).is_none());
 
         client.close().await;
         host.shutdown().await;
