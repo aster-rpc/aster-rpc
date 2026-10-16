@@ -347,7 +347,7 @@ public final class NativeConfig {
     putStr(seg, IDENTITY_FILE, c.identityFile(), arena);
     putStr(seg, PROXY_URL, c.proxyUrl(), arena);
     seg.set(ValueLayout.JAVA_LONG, HOOK_TIMEOUT_MS, Math.max(0, c.hookTimeoutMs()));
-    // Fail closed unless fail_open is asked for explicitly.
+    // The builder only holds the canonical "fail_open" / "fail_closed".
     seg.set(
         ValueLayout.JAVA_INT,
         HOOK_FAILURE_MODE,

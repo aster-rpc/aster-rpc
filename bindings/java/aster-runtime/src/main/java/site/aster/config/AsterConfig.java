@@ -3,6 +3,7 @@ package site.aster.config;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import org.tomlj.Toml;
 import org.tomlj.TomlParseResult;
 import org.tomlj.TomlTable;
@@ -295,6 +296,20 @@ public final class AsterConfig {
     return hookFailureMode;
   }
 
+  /** Mirrors Rust {@code HookFailureMode::from_config_str}. */
+  private static String canonicalHookFailureMode(String mode) {
+    if (mode == null) {
+      return "fail_closed";
+    }
+    return switch (mode.trim().toLowerCase(Locale.ROOT)) {
+      case "fail_open", "fail-open", "open" -> "fail_open";
+      case "fail_closed", "fail-closed", "closed" -> "fail_closed";
+      default ->
+          throw new IllegalArgumentException(
+              "unknown hook failure mode '" + mode + "' (expected fail_open or fail_closed)");
+    };
+  }
+
   /** Extra inbound ALPNs the node registers. */
   public List<byte[]> alpns() {
     return alpns;
@@ -393,7 +408,7 @@ public final class AsterConfig {
 
   /** Whether any cluster network setting differs from its default. */
   public boolean hasNetworkSettings() {
-    String d = discovery == null ? "" : discovery.trim().toLowerCase(java.util.Locale.ROOT);
+    String d = discovery == null ? "" : discovery.trim().toLowerCase(Locale.ROOT);
     return (bindAddrV6 != null && !bindAddrV6.isEmpty())
         || !advertiseAddrs.isEmpty()
         || !relayCaCerts.isEmpty()
@@ -717,11 +732,15 @@ public final class AsterConfig {
     }
 
     /**
-     * {@code "fail_closed"} (default) or {@code "fail_open"}: what a hook timeout means. Any value
-     * other than {@code "fail_open"} fails closed.
+     * {@code "fail_closed"} (default) or {@code "fail_open"}: what a hook timeout means. Accepts
+     * the same spellings as the Rust core ({@code fail_open} / {@code fail-open} / {@code open},
+     * {@code fail_closed} / {@code fail-closed} / {@code closed}, any case) and stores the
+     * canonical form; {@code null} resets to {@code "fail_closed"}.
+     *
+     * @throws IllegalArgumentException for any other value
      */
     public Builder hookFailureMode(String mode) {
-      c.hookFailureMode = mode;
+      c.hookFailureMode = canonicalHookFailureMode(mode);
       return this;
     }
 
@@ -815,7 +834,7 @@ public final class AsterConfig {
      * @throws IllegalArgumentException for a value other than default / none / local / custom
      */
     public Builder discovery(String mode) {
-      String m = mode == null ? "" : mode.trim().toLowerCase(java.util.Locale.ROOT);
+      String m = mode == null ? "" : mode.trim().toLowerCase(Locale.ROOT);
       switch (m) {
         case "", DISCOVERY_DEFAULT -> c.discovery = DISCOVERY_DEFAULT;
         case DISCOVERY_NONE, DISCOVERY_LOCAL, DISCOVERY_CUSTOM -> c.discovery = m;

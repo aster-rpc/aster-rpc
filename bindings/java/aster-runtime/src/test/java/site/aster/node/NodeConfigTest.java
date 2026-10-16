@@ -56,6 +56,29 @@ final class NodeConfigTest {
   }
 
   @Test
+  void hookFailureModeAcceptsRustSpellingsAndRejectsUnknownValues() {
+    for (String open : List.of("fail_open", "fail-open", "open", " FAIL-OPEN ")) {
+      AsterConfig c = AsterConfig.builder().hookFailureMode(open).build();
+      assertEquals("fail_open", c.hookFailureMode(), open);
+      try (Arena arena = Arena.ofConfined()) {
+        MemorySegment seg = NativeConfig.toNative(c, List.of(), arena);
+        assertEquals(
+            "fail_open",
+            NativeConfig.applyTo(seg, AsterConfig.builder()).build().hookFailureMode(),
+            open);
+      }
+    }
+    for (String closed : List.of("fail_closed", "fail-closed", "Closed")) {
+      assertEquals(
+          "fail_closed", AsterConfig.builder().hookFailureMode(closed).build().hookFailureMode());
+    }
+    for (String bad : List.of("sometimes", "fail_opne", "")) {
+      assertThrows(
+          IllegalArgumentException.class, () -> AsterConfig.builder().hookFailureMode(bad), bad);
+    }
+  }
+
+  @Test
   void javaConfigRoundTripsThroughTheNativeStruct() {
     AsterConfig c =
         AsterConfig.builder()
