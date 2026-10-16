@@ -372,6 +372,9 @@ impl EndpointConfig {
             data_dir: self.data_dir.clone(),
             reuse_last_port: self.reuse_last_port,
             blob_zstd_level: self.blob_zstd_level.map(i32::from),
+            // Cluster settings (bind_addr_v6, advertise_addrs, relay CA,
+            // discovery) are not exposed on this low-level endpoint yet.
+            ..CoreEndpointConfig::default()
         })
     }
 }

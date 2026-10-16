@@ -21,6 +21,7 @@ pub mod hpke_envelope;
 pub mod keys;
 pub mod lease;
 pub mod namespace;
+pub mod network_config;
 pub mod pool;
 pub mod reactor;
 pub mod registry;
@@ -138,6 +139,28 @@ pub struct CoreEndpointConfig {
     pub hook_failure_mode: trust::HookFailureMode,
     /// Bind address string e.g. "0.0.0.0:9000", "127.0.0.1:0", "`[::`]:0"
     pub bind_addr: Option<String>,
+    /// IPv6 bind address, e.g. "`[::`]:7842": pins the IPv6 socket as
+    /// `bind_addr` pins the IPv4 one. Must be IPv6, and `bind_addr` must then
+    /// not be IPv6 too. Unset keeps iroh's default `[::]:0` socket.
+    pub bind_addr_v6: Option<String>,
+    /// Extra direct addresses this node is reachable on but cannot discover
+    /// (a NodePort or load balancer), e.g. "203.0.113.10:31842". Published
+    /// with the discovered addresses; hints only, the TLS handshake still
+    /// verifies the node key. See [`network_config`].
+    pub advertise_addrs: Vec<String>,
+    /// PEM files whose certificates are trusted for relay TLS (and pkarr /
+    /// DNS-over-HTTPS), in addition to the WebPKI roots.
+    pub relay_ca_cert_files: Vec<String>,
+    /// Trust only `relay_ca_cert_files` for relay TLS, not the WebPKI roots.
+    pub relay_ca_only: bool,
+    /// Address lookup: `None` / "default" (n0 pkarr + DNS at iroh.link),
+    /// "none", or "custom" (implied by the two settings below). See
+    /// [`network_config::discovery_plan`].
+    pub discovery: Option<String>,
+    /// DNS origin for custom discovery, e.g. "dns.example.internal".
+    pub discovery_dns_origin: Option<String>,
+    /// Pkarr relay URLs for custom discovery (publish and resolve).
+    pub discovery_pkarr_relays: Vec<String>,
     /// Remove all direct IP (UDP/QUIC) transports; relay-only mode
     pub clear_ip_transports: bool,
     /// Remove all relay transports; direct IP-only mode. Equivalent to
@@ -203,6 +226,13 @@ impl Default for CoreEndpointConfig {
             hook_timeout_ms: 5000,
             hook_failure_mode: trust::HookFailureMode::default(),
             bind_addr: None,
+            bind_addr_v6: None,
+            advertise_addrs: Vec::new(),
+            relay_ca_cert_files: Vec::new(),
+            relay_ca_only: false,
+            discovery: None,
+            discovery_dns_origin: None,
+            discovery_pkarr_relays: Vec::new(),
             clear_ip_transports: false,
             clear_relay_transports: false,
             portmapper_config: None,
@@ -1828,6 +1858,7 @@ fn build_endpoint_config_with_ports(
     }
 
     builder = apply_bind_addrs(builder, config, ports)?;
+    builder = network_config::apply_network_settings(builder, config)?;
 
     match config.portmapper_config.as_deref() {
         None | Some("enabled") => {}
@@ -1849,8 +1880,9 @@ fn build_endpoint_config_with_ports(
     Ok(builder)
 }
 
-/// Apply `config.bind_addr`, with a preferred port substituted for its port
-/// and for the default socket of each other family that has one.
+/// Apply `config.bind_addr` and `config.bind_addr_v6`, with a preferred port
+/// substituted for their port and for the default socket of each other family
+/// that has one.
 ///
 /// `bind_addr` replaces iroh's default socket for its own family only (the
 /// other family keeps `0.0.0.0:0` / `[::]:0`), so a preferred port for the
@@ -1875,6 +1907,28 @@ fn apply_bind_addrs(
         .map_err(|e| anyhow!("invalid bind_addr '{}': {}", addr, e))?;
         configured_v4 = parsed.is_some_and(|a| a.is_ipv4());
         configured_v6 = parsed.is_some_and(|a| a.is_ipv6());
+    }
+    if let Some(ref addr) = config.bind_addr_v6 {
+        let parsed: SocketAddr = addr
+            .trim()
+            .parse()
+            .map_err(|e| anyhow!("invalid bind_addr_v6 '{addr}': {e}"))?;
+        if !parsed.is_ipv6() {
+            return Err(anyhow!("bind_addr_v6 '{addr}' is not an IPv6 address"));
+        }
+        if configured_v6 {
+            return Err(anyhow!(
+                "bind_addr is IPv6 and bind_addr_v6 is set; put the IPv4 address in bind_addr"
+            ));
+        }
+        let addr = match ports.v6 {
+            Some(port) => SocketAddr::new(parsed.ip(), port),
+            None => parsed,
+        };
+        builder = builder
+            .bind_addr(addr)
+            .map_err(|e| anyhow!("invalid bind_addr_v6 '{addr}': {e}"))?;
+        configured_v6 = true;
     }
     if !config.clear_ip_transports {
         if let (false, Some(port)) = (configured_v4, ports.v4) {

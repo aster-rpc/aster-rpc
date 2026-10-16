@@ -10,9 +10,9 @@
 //! The rule:
 //!
 //! - Only a persistent node (one with a data directory) records ports, and
-//!   only when its bind address leaves the port to the OS (no `bind_addr`, or
-//!   one with port 0). An explicit non-zero port is used as given and never
-//!   recorded. [`CoreEndpointConfig::reuse_last_port`] turns it off.
+//!   only when its bind addresses leave the port to the OS (no `bind_addr` /
+//!   `bind_addr_v6`, or port 0). An explicit non-zero port in either is used
+//!   as given and turns recording off. [`CoreEndpointConfig::reuse_last_port`] turns it off.
 //! - After a node starts, the bound IPv4 and IPv6 ports are written to
 //!   [`BIND_PORTS_FILE`] in the data directory, atomically.
 //! - On the next start each recorded port is probed first. A port that is
@@ -72,8 +72,9 @@ impl PreferredPorts {
 #[derive(Debug)]
 pub(crate) struct PortReuse {
     file: PathBuf,
-    /// The configured bind address (port 0), if any.
-    configured: Option<SocketAddr>,
+    /// The configured bind address (port 0) of each family, if any.
+    configured_v4: Option<Ipv4Addr>,
+    configured_v6: Option<Ipv6Addr>,
     /// Whether an IP socket of each family is bound at all.
     v4: bool,
     v6: bool,
@@ -83,54 +84,57 @@ impl PortReuse {
     /// Port reuse for a node with this data directory and endpoint config
     /// (`None` = defaults), or `None` when it does not apply.
     pub(crate) fn for_node(config: Option<&CoreEndpointConfig>, data_dir: &Path) -> Option<Self> {
-        let (reuse, bind_addr, clear_ip) = match config {
+        let (reuse, bind_addr, bind_addr_v6, clear_ip) = match config {
             Some(c) => (
                 c.reuse_last_port,
                 c.bind_addr.as_deref(),
+                c.bind_addr_v6.as_deref(),
                 c.clear_ip_transports,
             ),
-            None => (true, None, false),
+            None => (true, None, None, false),
         };
         if !reuse {
             return None;
         }
-        let configured = match bind_addr {
-            None => None,
-            // An unparsable address is left for the endpoint builder to reject.
-            Some(addr) => match addr.parse::<SocketAddr>() {
-                Ok(addr) if addr.port() == 0 => Some(addr),
+        // Any explicit non-zero port (in either bind address) turns reuse off;
+        // an unparsable address is left for the endpoint builder to reject.
+        let mut configured = Vec::new();
+        for addr in [bind_addr, bind_addr_v6].into_iter().flatten() {
+            match addr.trim().parse::<SocketAddr>() {
+                Ok(addr) if addr.port() == 0 => configured.push(addr),
                 _ => return None,
-            },
-        };
-        // `bind_addr` replaces the default socket of its own family only;
+            }
+        }
+        // A bind address replaces the default socket of its own family only;
         // `clear_ip_transports` removes the defaults.
-        let configured_v4 = configured.is_some_and(|a| a.is_ipv4());
-        let configured_v6 = configured.is_some_and(|a| a.is_ipv6());
-        let v4 = configured_v4 || !clear_ip;
-        let v6 = configured_v6 || !clear_ip;
+        let configured_v4 = configured.iter().find(|a| a.is_ipv4()).map(SocketAddr::ip);
+        let configured_v6 = configured.iter().find(|a| a.is_ipv6()).map(SocketAddr::ip);
+        let v4 = configured_v4.is_some() || !clear_ip;
+        let v6 = configured_v6.is_some() || !clear_ip;
         if !v4 && !v6 {
             return None;
         }
         Some(Self {
             file: data_dir.join(BIND_PORTS_FILE),
-            configured,
+            configured_v4: match configured_v4 {
+                Some(std::net::IpAddr::V4(ip)) => Some(ip),
+                _ => None,
+            },
+            configured_v6: match configured_v6 {
+                Some(std::net::IpAddr::V6(ip)) => Some(ip),
+                _ => None,
+            },
             v4,
             v6,
         })
     }
 
     fn v4_ip(&self) -> Ipv4Addr {
-        match self.configured {
-            Some(SocketAddr::V4(a)) => *a.ip(),
-            _ => Ipv4Addr::UNSPECIFIED,
-        }
+        self.configured_v4.unwrap_or(Ipv4Addr::UNSPECIFIED)
     }
 
     fn v6_ip(&self) -> Ipv6Addr {
-        match self.configured {
-            Some(SocketAddr::V6(a)) => *a.ip(),
-            _ => Ipv6Addr::UNSPECIFIED,
-        }
+        self.configured_v6.unwrap_or(Ipv6Addr::UNSPECIFIED)
     }
 
     /// The recorded ports that are free to bind right now.
@@ -298,6 +302,26 @@ mod tests {
         assert_eq!(with(None, true, true), None);
         assert_eq!(with(None, false, false), None);
         assert!(PortReuse::for_node(None, dir).is_some());
+
+        let with_v6 = |v4: Option<&str>, v6: &str, clear_ip: bool| {
+            let config = CoreEndpointConfig {
+                bind_addr: v4.map(Into::into),
+                bind_addr_v6: Some(v6.into()),
+                clear_ip_transports: clear_ip,
+                ..Default::default()
+            };
+            PortReuse::for_node(Some(&config), dir).map(|r| (r.v4, r.v6, r.v6_ip()))
+        };
+        assert_eq!(
+            with_v6(Some("127.0.0.1:0"), "[::1]:0", true),
+            Some((true, true, Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(
+            with_v6(None, "[::1]:0", true),
+            Some((false, true, Ipv6Addr::LOCALHOST))
+        );
+        assert_eq!(with_v6(Some("127.0.0.1:0"), "[::]:7842", false), None);
+        assert_eq!(with_v6(Some("0.0.0.0:7842"), "[::]:0", false), None);
     }
 
     #[test]

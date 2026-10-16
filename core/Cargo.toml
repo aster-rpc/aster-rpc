@@ -43,6 +43,10 @@ hpke = { version = "0.13", default-features = false, features = ["alloc", "x2551
 rand_core = { version = "0.9", features = ["os_rng"] }
 # Probes whether a persistent node's last bound UDP port is free (bind_ports).
 socket2 = "0.6"
+# Relay CA bundles (network_config): PEM parsing and a trust-anchor check at
+# start. Both already in the graph through iroh; no crypto provider enabled here.
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+rustls-pki-types = { version = "1.12", features = ["std"] }
 
 [features]
 # Delegation chains: bundled compact JWS links verified offline in one call.
@@ -60,6 +64,11 @@ test-hooks = []
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1"
+# relay_private_ca test: an in-process iroh relay with a certificate from a
+# throwaway private CA, and the client-side TLS check against it.
+iroh-relay = { workspace = true, features = ["server"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [[bench]]
 name = "ring_bench"

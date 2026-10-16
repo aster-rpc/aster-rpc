@@ -19,6 +19,8 @@ rust-version = "1.96"
 # source used in this workspace, and a version used when packaging for Aster's
 # Cargo registry. [patch.crates-io] below still unifies transitive references.
 iroh        = { version = "=1.3.2", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh.git", rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
+# Test-only: the in-process relay server behind core's private-CA relay test.
+iroh-relay  = { version = "=1.3.2", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh.git", rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-blobs  = { version = "0.103.10", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "bcd00bb2a888f3d6990ac32d9fab1d8e2d9d73f4" }
 iroh-docs   = { version = "0.101.5", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
 iroh-gossip = { version = "0.101.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
