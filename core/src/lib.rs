@@ -1620,12 +1620,16 @@ impl EndpointHooks for CoreHooksAdapter {
             remote_addr: endpoint_addr_to_core(remote_addr.clone()),
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self.before_connect_tx.send((info, reply_tx)).await.is_err() {
-            return self.before_connect_fallback();
-        }
-        match tokio::time::timeout(self.timeout, reply_rx).await {
-            Ok(Ok(true)) => BeforeConnectOutcome::Accept,
-            Ok(Ok(false)) => BeforeConnectOutcome::Reject,
+        // One deadline covers queueing and the reply: a stalled loop with a
+        // full channel must not park the dial forever.
+        let decision = tokio::time::timeout(self.timeout, async {
+            self.before_connect_tx.send((info, reply_tx)).await.ok()?;
+            reply_rx.await.ok()
+        })
+        .await;
+        match decision {
+            Ok(Some(true)) => BeforeConnectOutcome::Accept,
+            Ok(Some(false)) => BeforeConnectOutcome::Reject,
             _ => self.before_connect_fallback(),
         }
     }
@@ -1653,17 +1657,17 @@ impl EndpointHooks for CoreHooksAdapter {
             outbound,
         };
         let (reply_tx, reply_rx) = oneshot::channel();
-        if self
-            .after_handshake_tx
-            .send((info, reply_tx))
-            .await
-            .is_err()
-        {
-            return self.after_handshake_fallback();
-        }
-        match tokio::time::timeout(self.timeout, reply_rx).await {
-            Ok(Ok(CoreAfterHandshakeDecision::Accept)) => AfterHandshakeOutcome::Accept,
-            Ok(Ok(CoreAfterHandshakeDecision::Reject { error_code, reason })) => {
+        // One deadline covers queueing and the reply: when a stalled loop
+        // has filled the channel, later handshakes still get the failure-mode
+        // decision within `hook_timeout_ms` instead of hanging.
+        let decision = tokio::time::timeout(self.timeout, async {
+            self.after_handshake_tx.send((info, reply_tx)).await.ok()?;
+            reply_rx.await.ok()
+        })
+        .await;
+        match decision {
+            Ok(Some(CoreAfterHandshakeDecision::Accept)) => AfterHandshakeOutcome::Accept,
+            Ok(Some(CoreAfterHandshakeDecision::Reject { error_code, reason })) => {
                 AfterHandshakeOutcome::Reject {
                     error_code: VarInt::from_u32(error_code),
                     reason,
@@ -6194,20 +6198,23 @@ mod hook_failure_mode_tests {
             let server = Arc::clone(server);
             tokio::spawn(async move { server.accept().await })
         };
+        let outcome = connect(server.endpoint_addr_info()).await;
+        acceptor.abort();
+        outcome
+    }
+
+    /// Like [`dial`], but the caller runs the acceptors.
+    async fn connect(server: CoreNodeAddr) -> Option<Option<u64>> {
         let client = CoreNetClient::create_with_config(local_config(false))
             .await
             .unwrap();
-        let outcome = match client
-            .connect_node_addr(server.endpoint_addr_info(), ALPN.to_vec())
-            .await
-        {
+        let outcome = match client.connect_node_addr(server, ALPN.to_vec()).await {
             Err(_) => Some(None),
             Ok(conn) => tokio::time::timeout(Duration::from_secs(2), conn.closed())
                 .await
                 .ok()
                 .map(|info| info.code),
         };
-        acceptor.abort();
         client.close().await;
         outcome
     }
@@ -6251,6 +6258,37 @@ mod hook_failure_mode_tests {
             // Hold the receiver but never answer: the hook times out.
             let _stalled = server.take_hook_receiver().expect("hooks enabled");
             assert_eq!(dial(&server).await, Some(Some(403)));
+            server.close().await;
+        })
+        .await
+        .expect("test hung");
+    }
+
+    /// A stalled loop fills the bounded hook channel (16 slots); every
+    /// connection beyond that must still get the fail-closed decision within
+    /// the hook timeout rather than hang waiting for a free slot.
+    #[tokio::test]
+    async fn stalled_loop_rejects_connections_beyond_channel_capacity() {
+        tokio::time::timeout(BUDGET, async {
+            let server = Arc::new(
+                CoreNetClient::create_with_config(local_config(true))
+                    .await
+                    .unwrap(),
+            );
+            let _stalled = server.take_hook_receiver().expect("hooks enabled");
+            const DIALS: usize = 20;
+            let mut acceptors = tokio::task::JoinSet::new();
+            for _ in 0..DIALS {
+                let server = Arc::clone(&server);
+                acceptors.spawn(async move { server.accept().await });
+            }
+            let mut dials = tokio::task::JoinSet::new();
+            for _ in 0..DIALS {
+                dials.spawn(connect(server.endpoint_addr_info()));
+            }
+            let outcomes = dials.join_all().await;
+            acceptors.abort_all();
+            assert_eq!(outcomes, vec![Some(Some(403)); DIALS]);
             server.close().await;
         })
         .await
