@@ -47,6 +47,7 @@ pub mod pure;
 pub mod raw_webtransport;
 pub mod rpc;
 pub mod server;
+pub mod server_drain;
 pub mod tls;
 pub mod topology;
 pub mod upcall;
@@ -202,8 +203,11 @@ pub mod upcall;
 //   (`aster_audit_outbox_acknowledgements`,
 //   `ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS` = 128,
 //   `audit_acknowledgements.rs`). See `ffi/RENAME_MAP.md` "7.1".
+// - 7.2.0 (additive): `aster_server_drain` and `aster_drain_report_t`
+//   (graceful server drain), `ASTER_DRAIN_CLOSE_CODE`. See
+//   `ffi/RENAME_MAP.md` "7.2".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 1;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 2;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

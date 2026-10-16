@@ -3,6 +3,7 @@
 package aster
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"math"
@@ -87,6 +88,29 @@ type RpcError struct {
 
 func (e *RpcError) Error() string {
 	return fmt.Sprintf("[%s] %s", e.Code, e.Message)
+}
+
+// DrainingDetailKey is the RpcStatus detail key ("true") on the UNAVAILABLE
+// a draining server answers new calls with, and on the error for a call whose
+// connection a draining server closed.
+const DrainingDetailKey = "aster.draining"
+
+// IsDraining reports whether the server was draining: it refused the call,
+// or closed the connection under it. Retrying on the same connection cannot
+// succeed; connect to another replica.
+func (e *RpcError) IsDraining() bool {
+	if e == nil || e.Code != StatusUnavailable {
+		return false
+	}
+	_, ok := e.Details[DrainingDetailKey]
+	return ok
+}
+
+// IsDraining reports whether err is (or wraps) a draining server's answer
+// (see RpcError.IsDraining).
+func IsDraining(err error) bool {
+	var re *RpcError
+	return errors.As(err, &re) && re.IsDraining()
 }
 
 // Is reports whether target is an *RpcError with the same code and either
@@ -895,7 +919,8 @@ func NewRetryInterceptor() *RetryInterceptor {
 // ShouldRetry returns true if the call is idempotent and the error code is
 // in the retryable set.
 func (r *RetryInterceptor) ShouldRetry(ctx *CallContext, err *RpcError) bool {
-	return ctx.Idempotent && r.RetryableCodes[err.Code]
+	// A draining server's answer is never retried on the same connection.
+	return ctx.Idempotent && r.RetryableCodes[err.Code] && !err.IsDraining()
 }
 
 // BackoffSeconds returns the delay before the next retry attempt, in seconds.

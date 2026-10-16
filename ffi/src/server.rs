@@ -347,10 +347,10 @@ pub(crate) struct ServerState {
     table: CallTable,
     attributes: AttributeStore,
     leases: Leases,
-    handle: Mutex<Option<ServerHandle>>,
+    pub(crate) handle: Mutex<Option<ServerHandle>>,
     rt: tokio::runtime::Handle,
     /// An attached ops listener's state (`aster_server_attach_health`).
-    health: Option<HealthState>,
+    pub(crate) health: Option<HealthState>,
     /// Dropped with the server: ends Enrollment's per-connection tasks, which
     /// would otherwise keep the node (and its runtime) alive.
     _enrollment_stop: Option<tokio::sync::watch::Sender<()>>,

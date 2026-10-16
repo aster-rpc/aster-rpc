@@ -1,4 +1,18 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.1)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.2)
+
+## New in 7.2 (server drain; additive)
+
+A dispatch server can be taken out of rotation gracefully instead of closed.
+
+| Item | Role |
+|---|---|
+| `aster_server_drain(rt, server, grace_ms, *report)` | Blocks: sets an attached ops listener not ready; refuses new connections (closed after the handshake with `ASTER_DRAIN_CLOSE_CODE`) and new calls (`UNAVAILABLE`, detail `aster.draining` = `true`; calls on existing sessions still run); closes each connection once idle; at `grace_ms` closes the rest (bindings see `CANCELLED{PEER}`) and waits up to 2 s. A concurrent call with an earlier deadline cuts it short; later calls return the same report. `UNSUPPORTED` on a tokio thread. |
+| `aster_drain_report_t` (64 bytes) | `calls_in_flight`, `calls_completed`, `calls_cancelled`, `calls_refused`, `connections_closed`, `connections_refused`, `elapsed_ms` (u64 each), `deadline_reached`, `reserved` (u32). |
+| `ASTER_DRAIN_CLOSE_CODE` = 503 | QUIC application close code meaning "draining, reconnect elsewhere". |
+
+No existing layout changes and no new event. Go requires 7.2
+(`ABIMinorRequired = 2`, `AsterServer.Drain`). Rust: `AsterServer::drain`,
+`ServerHandle::drain`, `aster::rpc::drain`.
 
 ## New in 7.1 (audit outbox acknowledgement log; additive)
 

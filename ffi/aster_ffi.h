@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 7
 
-#define ASTER_ABI_VERSION_MINOR 1
+#define ASTER_ABI_VERSION_MINOR 2
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -344,6 +344,13 @@
  * `aster_call_recv_payload`).
  */
 #define ASTER_TIMEOUT_INFINITE UINT32_MAX
+
+/**
+ * The QUIC application close code a draining server closes connections
+ * with (new ones at accept, idle ones while draining, the rest at the
+ * deadline). A client seeing it should reconnect to another replica.
+ */
+#define ASTER_DRAIN_CLOSE_CODE 503
 
 /**
  * Default `aster_upcalls_new` capacity (queued upcalls before refusal).
@@ -2826,6 +2833,48 @@ typedef struct aster_dispatch_event_t {
    */
   uint64_t buffer;
 } aster_dispatch_event_t;
+
+/**
+ * What `aster_server_drain` did. 64 bytes. Calls count those admitted to a
+ * handler, not those refused at routing.
+ */
+typedef struct aster_drain_report_t {
+  /**
+   * Calls in flight when the drain started.
+   */
+  uint64_t calls_in_flight;
+  /**
+   * Calls that finished before the deadline (those in flight at the
+   * start, and calls on existing sessions admitted during the drain).
+   */
+  uint64_t calls_completed;
+  /**
+   * Calls still running at the deadline, cancelled by closing their
+   * connection.
+   */
+  uint64_t calls_cancelled;
+  /**
+   * New calls answered `UNAVAILABLE` (detail `aster.draining`).
+   */
+  uint64_t calls_refused;
+  /**
+   * Connections the drain closed with `ASTER_DRAIN_CLOSE_CODE`.
+   */
+  uint64_t connections_closed;
+  /**
+   * New connections refused at accept.
+   */
+  uint64_t connections_refused;
+  /**
+   * How long the drain took, in milliseconds.
+   */
+  uint64_t elapsed_ms;
+  /**
+   * 1 when the deadline passed with work outstanding, else 0.
+   */
+  uint32_t deadline_reached;
+  uint32_t reserved;
+} aster_drain_report_t;
 
 /**
  * Generated server PEM material and SHA-256 of certificate DER (not SPKI).
@@ -7324,6 +7373,32 @@ int32_t aster_dynamic_service_contract_id(const uint8_t *json,
  * Live calls in the server's table (diagnostics / tests).
  */
 uint64_t aster_server_live_calls(aster_server_t server_h);
+
+/**
+ * Drain `server` (ABI 7.2): set an attached ops listener not ready, refuse
+ * new connections (closed after the handshake with
+ * `ASTER_DRAIN_CLOSE_CODE`) and new calls (`UNAVAILABLE`, detail
+ * `aster.draining` = `true`; calls on a session that already exists still
+ * run), close each connection once it has no call in flight and no live
+ * session, and after `grace_ms` close every remaining connection, which
+ * cancels the calls still running (the binding sees `CANCELLED{PEER}`), then
+ * wait up to 2 s for them to end. Blocks until done and fills `out_report`
+ * (may be NULL).
+ *
+ * The server keeps refusing afterwards; follow with `aster_server_destroy`
+ * and the node's close. A second call while a drain runs (from another
+ * thread) moves its deadline earlier when its own `grace_ms` ends sooner --
+ * `0` cuts the drain short -- and returns the same report; a call after the
+ * drain ended returns that report again. `NOT_FOUND` for an unknown server
+ * or one of another runtime; `UNSUPPORTED` on a tokio runtime thread.
+ *
+ * # Safety
+ * `out_report` is NULL or points to writable `aster_drain_report_t`.
+ */
+int32_t aster_server_drain(aster_runtime_t runtime,
+                           aster_server_t server,
+                           uint32_t grace_ms,
+                           struct aster_drain_report_t *out_report);
 
 /**
  * Generate a self-signed ECDSA certificate. Empty SANs default to localhost.

@@ -2179,3 +2179,80 @@ fn topology_opt_in_requires_monitoring_and_enforces_native_role_gate() {
         assert_eq!(aster_runtime_close(rt), OK);
     }
 }
+
+/// ABI 7.2 `aster_server_drain`: new calls are refused as draining while a
+/// call is in flight, the call still running at the deadline is cancelled
+/// (the binding sees CANCELLED{PEER}, the client a draining UNAVAILABLE),
+/// and the report counts both.
+#[test]
+fn drain_refuses_new_calls_and_cancels_at_the_deadline() {
+    use aster_transport_ffi::server_drain::{aster_drain_report_t, aster_server_drain};
+    const UNAVAILABLE: i32 = 14;
+    unsafe {
+        let s = start_server();
+        let rt = s.rt;
+        let (_c, conn) = client(&s);
+        assert_eq!(unary(rt, conn, &echo("echo"), b"hi"), Ok(b"hi".to_vec()));
+
+        let call = open(
+            rt,
+            conn,
+            aster_method_pattern_t::ASTER_METHOD_PATTERN_SERVER_STREAM,
+            &echo("hang"),
+        );
+        assert_eq!(send_payload(rt, call, &[1], true), OK);
+        assert_eq!(recv_item(rt, call, 30_000), Item::Data(b"first".to_vec()));
+
+        let server = s.srv.server;
+        let drain = std::thread::spawn(move || {
+            let mut report = aster_drain_report_t::default();
+            let rc = aster_server_drain(rt, server, 1500, &mut report);
+            (rc, report)
+        });
+        // A new call is refused as draining once the drain starts.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let refused = loop {
+            match unary(rt, conn, &echo("echo"), b"probe") {
+                Ok(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+                Ok(_) => panic!("never refused"),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(refused.0, UNAVAILABLE, "{refused:?}");
+        assert!(refused.1.contains("draining"), "{refused:?}");
+
+        let (rc, report) = drain.join().unwrap();
+        assert_eq!(rc, OK);
+        assert_eq!(report.calls_in_flight, 1, "{report:?}");
+        assert_eq!(report.calls_cancelled, 1, "{report:?}");
+        assert_eq!(report.calls_completed, 0, "{report:?}");
+        assert!(report.calls_refused >= 1, "{report:?}");
+        assert_eq!(report.connections_closed, 1, "{report:?}");
+        assert_eq!(report.deadline_reached, 1, "{report:?}");
+        assert!(report.elapsed_ms >= 1500, "{report:?}");
+
+        match recv_item(rt, call, 30_000) {
+            Item::Trailer(code, message) => {
+                assert_eq!(code, UNAVAILABLE, "{message}");
+                assert!(message.contains("draining"), "{message}");
+            }
+            Item::Data(d) => panic!("expected the drain trailer, got data {d:?}"),
+            Item::Timeout => panic!("expected the drain trailer, timed out"),
+        }
+        s.binding.until("hang cancelled", |o| {
+            o.notes.iter().any(|n| n == "hang:cancelled")
+        });
+        assert!(s
+            .binding
+            .observed()
+            .cancelled
+            .iter()
+            .any(|(_, r, m)| *r == R_PEER && *m == HANG));
+        // A drain already done returns its report.
+        let mut again = aster_drain_report_t::default();
+        assert_eq!(aster_server_drain(rt, server, 0, &mut again), OK);
+        assert_eq!(again, report);
+        let _ = aster_call_release(rt, call);
+        teardown(s);
+    }
+}

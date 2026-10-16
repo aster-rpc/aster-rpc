@@ -286,6 +286,19 @@ OFF(aster_dispatch_event_t, peer_ptr, 80);
 OFF(aster_dispatch_event_t, peer_len, 88);
 OFF(aster_dispatch_event_t, buffer, 96);
 
+/* ABI 7.2: server drain */
+LAYOUT(aster_drain_report_t, 64);
+OFF(aster_drain_report_t, calls_in_flight, 0);
+OFF(aster_drain_report_t, calls_completed, 8);
+OFF(aster_drain_report_t, calls_cancelled, 16);
+OFF(aster_drain_report_t, calls_refused, 24);
+OFF(aster_drain_report_t, connections_closed, 32);
+OFF(aster_drain_report_t, connections_refused, 40);
+OFF(aster_drain_report_t, elapsed_ms, 48);
+OFF(aster_drain_report_t, deadline_reached, 56);
+OFF(aster_drain_report_t, reserved, 60);
+_Static_assert(ASTER_DRAIN_CLOSE_CODE == 503, "drain close code");
+
 LAYOUT(aster_call_options_t, 72);
 OFF(aster_call_options_t, struct_size, 0);
 OFF(aster_call_options_t, version, 4);
@@ -460,7 +473,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 1); /* 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 2); /* 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
     {
         /* A 5.x caller (280-byte aster_config_t, no 6.x handshake) is refused
          * cleanly and nothing is written past, or into, its struct. This runs
@@ -968,8 +981,21 @@ static void test_dispatch_server(void) {
     CHECK(aster_dispatch_is_cancelled(rt, srv, 1) == 1);
     CHECK(aster_dispatch_buffer_release(rt, srv, 0) == ASTER_STATUS_OK);
     CHECK(aster_server_live_calls(srv) == 0);
+    /* ABI 7.2: an idle server drains at once; a second drain returns the
+     * same report; an unknown server is NOT_FOUND. */
+    aster_drain_report_t dr;
+    memset(&dr, 0xff, sizeof dr);
+    CHECK(aster_server_drain(rt, srv, 5000, &dr) == ASTER_STATUS_OK);
+    CHECK(dr.calls_in_flight == 0 && dr.calls_cancelled == 0 && dr.deadline_reached == 0);
+    CHECK(dr.elapsed_ms < 5000 && dr.reserved == 0);
+    aster_drain_report_t again;
+    CHECK(aster_server_drain(rt, srv, 0, &again) == ASTER_STATUS_OK);
+    CHECK(memcmp(&dr, &again, sizeof dr) == 0);
+    CHECK(aster_server_drain(rt, srv, 0, NULL) == ASTER_STATUS_OK);
+    CHECK(aster_server_drain(rt, 424242, 0, NULL) == ASTER_STATUS_NOT_FOUND);
     CHECK(aster_server_destroy(rt, srv) == ASTER_STATUS_OK);
     CHECK(aster_server_destroy(rt, srv) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_server_drain(rt, srv, 0, NULL) == ASTER_STATUS_NOT_FOUND);
 
     aster_call_options_t o;
     memset(&o, 0, sizeof o);

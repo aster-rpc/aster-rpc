@@ -527,4 +527,10 @@ mod lp64 {
         _p = 6,
         host = 8,
     });
+
+    assert_layout!(crate::server_drain::aster_drain_report_t, size = 64, align = 8, {
+        calls_in_flight = 0, calls_completed = 8, calls_cancelled = 16,
+        calls_refused = 24, connections_closed = 32, connections_refused = 40,
+        elapsed_ms = 48, deadline_reached = 56, reserved = 60,
+    });
 }
