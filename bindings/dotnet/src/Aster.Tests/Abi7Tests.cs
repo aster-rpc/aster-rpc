@@ -397,19 +397,41 @@ public class Abi7Tests
         await rig.SlowEntered.Task.WaitAsync(Budget);
         Assert.False(rig.Server.IsDraining);
         var drain = rig.Server.DrainAsync(TimeSpan.FromSeconds(10));
+        // IsDraining is the managed flag, set before the native drain runs on the pool: it does not
+        // witness the server refusing. Wait for the refusal itself, as a client sees it.
         Assert.True(rig.Server.IsDraining);
-        await Task.Delay(300);
-        var refused = await Assert.ThrowsAnyAsync<Exception>(() => rig.Conn.UnaryAsync<EchoRequest, EchoReply>("Abi7", "echo", new EchoRequest()).WaitAsync(Budget));
+        var refused = await RefusedAsDraining(rig.Conn).WaitAsync(Budget);
         Assert.True(RpcError.IsDrainingError(refused), refused.ToString());
         Assert.Equal("slow", (await slow.WaitAsync(Budget)).Message);
         var report = await drain.WaitAsync(Budget);
-        Assert.Equal(1UL, report.CallsInFlight);
+        // The slow call, plus at most one polling echo that was in flight when the native drain began.
+        Assert.InRange(report.CallsInFlight, 1UL, 2UL);
         Assert.True(report.CallsCompleted >= 1);
         Assert.Equal(0UL, report.CallsCancelled);
         Assert.True(report.CallsRefused >= 1);
         Assert.False(report.DeadlineReached);
         Assert.True(report.Elapsed > TimeSpan.Zero);
         await Assert.ThrowsAsync<ObjectDisposedException>(() => rig.Server.DrainAsync(TimeSpan.Zero));
+    }
+
+    /// <summary>
+    /// Calls echo until the server refuses one (the native drain has started); returns that error.
+    /// Calls before then succeed. Bounded by the caller's WaitAsync.
+    /// </summary>
+    private static async Task<Exception> RefusedAsDraining(RpcConnection conn)
+    {
+        while (true)
+        {
+            try
+            {
+                await conn.UnaryAsync<EchoRequest, EchoReply>("Abi7", "echo", new EchoRequest()).WaitAsync(Budget);
+            }
+            catch (Exception e)
+            {
+                return e;
+            }
+            await Task.Delay(10);
+        }
     }
 
     [Fact]
