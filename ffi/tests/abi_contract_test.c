@@ -533,7 +533,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 5); /* 7.5: dispatch identity (peer vs principal); 7.4: transfer metrics, [metrics] peer labels; 7.3: cluster network settings; 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 6); /* 7.6: gateway identity (dispatch identity actor, accept_on_behalf_of option); 7.5: dispatch identity (peer vs principal); 7.4: transfer metrics, [metrics] peer labels; 7.3: cluster network settings; 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
     {
         /* A 5.x caller (280-byte aster_config_t, no 6.x handshake) is refused
          * cleanly and nothing is written past, or into, its struct. This runs
@@ -650,6 +650,7 @@ static void test_enum_values(void) {
     CHECK(ASTER_METHOD_PATTERN_UNARY == 0 && ASTER_METHOD_PATTERN_BIDI_STREAM == 3);
     CHECK(ASTER_SERVER_OPTION_BUILTIN_NODE_INFO == 1 && ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS == 4);
     CHECK(ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT == 5);
+    CHECK(ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF == 6);
     CHECK(ASTER_DISPATCH_FLAG_FIRST_IS_END == 1 && ASTER_DISPATCH_FLAG_NEW_SESSION == 2);
     CHECK(ASTER_DISPATCH_FLAG_IROH_AUTHENTICATED == 4);
     CHECK(ASTER_DISPATCH_FLAG_HAS_METADATA == 0x100 && ASTER_DISPATCH_FLAG_HAS_ATTRIBUTES == 0x200);

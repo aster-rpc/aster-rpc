@@ -226,8 +226,13 @@ pub mod upcall;
 //   transport peer; `aster_dispatch_identity` / `aster_dispatch_identity_t`
 //   return both (plus a reserved `actor` slot). `peer_ptr` keeps its meaning.
 //   See `ffi/RENAME_MAP.md` "7.5".
+// - 7.6.0 (additive): gateway identity. `ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF`
+//   (6) accepts the `aster-on-behalf-of` metadata entry; a forwarded call's
+//   `aster_dispatch_identity` now sets `ASTER_DISPATCH_IDENTITY_ACTOR` and fills
+//   the `actor` slot reserved in 7.5 (the gateway), with `principal` the user.
+//   Layouts unchanged. See `ffi/RENAME_MAP.md` "7.6".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 5;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 6;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

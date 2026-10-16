@@ -28,7 +28,8 @@ fn test_abi_version() {
     // 7.4.0: transfer metrics and [metrics] peer labels (additive);
     // 7.5.0: handler call identity, aster_dispatch_identity (additive).
     assert_eq!(ASTER_ABI_VERSION_MAJOR, 7);
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 5);
+    // 7.6.0: gateway identity, the dispatch identity actor (additive).
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 6);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);

@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 7
 
-#define ASTER_ABI_VERSION_MINOR 5
+#define ASTER_ABI_VERSION_MINOR 6
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -387,9 +387,11 @@
 #define ASTER_DISPATCH_IDENTITY_PRINCIPAL 1
 
 /**
- * `aster_dispatch_identity_t.flags`: reserved for a gateway's on-behalf-of
- * `actor` (`docs/_internal/web_gateway/gateway-identity.md`). Never set in
- * 7.5; `actor_ptr` is NULL.
+ * `aster_dispatch_identity_t.flags`: ABI 7.6, the call was forwarded on
+ * behalf of a user by a gateway (`aster-on-behalf-of`;
+ * `docs/_internal/web_gateway/gateway-identity.md`). `actor_ptr` is the
+ * gateway's node id (the same as `peer`) and `principal` is the user,
+ * `iss|sub`. Clear: `actor_ptr` is NULL.
  */
 #define ASTER_DISPATCH_IDENTITY_ACTOR 2
 
@@ -1102,6 +1104,13 @@ typedef enum aster_server_option_t {
    * transferred non-RPC connections (default 4096; at least 1).
    */
   ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT = 5,
+  /**
+   * ABI 7.6: accept calls made on behalf of a user (the
+   * `aster-on-behalf-of` metadata entry; `[identity] accept_on_behalf_of`)
+   * (0/1; default 0). Off, a call carrying the entry is refused with
+   * `PERMISSION_DENIED`.
+   */
+  ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF = 6,
 } aster_server_option_t;
 
 /**
@@ -3067,7 +3076,8 @@ typedef struct aster_dispatch_event_t {
  * the id the transport resolved). `principal` is the `Authenticator`'s
  * `AuthOutcome.principal`, else the same as `peer` (then the two may share
  * one pointer). `aster_dispatch_event_t.peer_ptr` is always `principal`.
- * `actor` is reserved for a gateway's on-behalf-of caller: NULL / 0 in 7.5.
+ * `actor` (7.6) is the gateway that forwarded the call on behalf of
+ * `principal` (`ASTER_DISPATCH_IDENTITY_ACTOR`), else NULL / 0.
  */
 typedef struct aster_dispatch_identity_t {
   /**
@@ -3085,7 +3095,7 @@ typedef struct aster_dispatch_identity_t {
   uint32_t principal_len;
   uint32_t _p1;
   /**
-   * Reserved (`ASTER_DISPATCH_IDENTITY_ACTOR`): NULL in 7.5.
+   * The forwarding gateway (`ASTER_DISPATCH_IDENTITY_ACTOR`, 7.6), else NULL.
    */
   const uint8_t *actor_ptr;
   uint32_t actor_len;

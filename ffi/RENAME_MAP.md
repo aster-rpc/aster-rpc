@@ -1,4 +1,20 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.5)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.6)
+
+## New in 7.6 (gateway identity; additive)
+
+The C ABI side of gateway identity, slice 1
+(`docs/_internal/web_gateway/gateway-identity.md`): an edge holding
+`aster.gateway` calls a service on behalf of a user with an edge-minted JWT in
+the `aster-on-behalf-of` metadata entry. Layouts do not change.
+
+| Item | Role |
+|---|---|
+| `ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF` (= 6) | `aster_server_set_option` 0/1, default 0. Off, a call carrying `aster-on-behalf-of` is refused with `PERMISSION_DENIED`; on, the entry is verified before Gate 3 and the call runs as the user. The Rust `[identity] accept_on_behalf_of` key; mirroring it through `aster_config_t` is a later slice. |
+| `ASTER_DISPATCH_IDENTITY_ACTOR` (= 2), `actor_ptr` / `actor_len` | Filled for a forwarded call: `actor` is the gateway's node id (the same bytes as `peer`), `principal` is the user (`iss|sub`), and the `CALL` event has `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`. Clear: `actor_ptr` is NULL / 0, as in 7.5. `aster_dispatch_attributes` carries the token's roles only. |
+
+A 7.5 reader that ignores `actor` still sees the user as `principal` and the
+gateway as `peer`. The token's `amr` (`auth_methods()` in Rust) has no C ABI
+slot yet.
 
 ## New in 7.5 (handler call identity; additive)
 

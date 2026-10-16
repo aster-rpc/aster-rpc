@@ -128,6 +128,11 @@ pub enum aster_server_option_t {
     /// Per-kind bound for live foreign calls, sessions, RPC connections and
     /// transferred non-RPC connections (default 4096; at least 1).
     ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT = 5,
+    /// ABI 7.6: accept calls made on behalf of a user (the
+    /// `aster-on-behalf-of` metadata entry; `[identity] accept_on_behalf_of`)
+    /// (0/1; default 0). Off, a call carrying the entry is refused with
+    /// `PERMISSION_DENIED`.
+    ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF = 6,
 }
 
 /// `aster_dispatch_event_t.flags`: the first request frame ended the request
@@ -155,9 +160,11 @@ pub const ASTER_DISPATCH_FLAG_HAS_PRINCIPAL: u32 = 0x1000;
 /// `aster_dispatch_identity_t.flags`: `principal` differs from `peer` (an
 /// `Authenticator` resolved it). Matches `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`.
 pub const ASTER_DISPATCH_IDENTITY_PRINCIPAL: u32 = 0x1;
-/// `aster_dispatch_identity_t.flags`: reserved for a gateway's on-behalf-of
-/// `actor` (`docs/_internal/web_gateway/gateway-identity.md`). Never set in
-/// 7.5; `actor_ptr` is NULL.
+/// `aster_dispatch_identity_t.flags`: ABI 7.6, the call was forwarded on
+/// behalf of a user by a gateway (`aster-on-behalf-of`;
+/// `docs/_internal/web_gateway/gateway-identity.md`). `actor_ptr` is the
+/// gateway's node id (the same as `peer`) and `principal` is the user,
+/// `iss|sub`. Clear: `actor_ptr` is NULL.
 pub const ASTER_DISPATCH_IDENTITY_ACTOR: u32 = 0x2;
 
 /// `timeout_ms` value for "wait without a limit" (`aster_dispatch_recv`,
@@ -173,7 +180,8 @@ pub const ASTER_TIMEOUT_INFINITE: u32 = u32::MAX;
 /// the id the transport resolved). `principal` is the `Authenticator`'s
 /// `AuthOutcome.principal`, else the same as `peer` (then the two may share
 /// one pointer). `aster_dispatch_event_t.peer_ptr` is always `principal`.
-/// `actor` is reserved for a gateway's on-behalf-of caller: NULL / 0 in 7.5.
+/// `actor` (7.6) is the gateway that forwarded the call on behalf of
+/// `principal` (`ASTER_DISPATCH_IDENTITY_ACTOR`), else NULL / 0.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct aster_dispatch_identity_t {
@@ -187,7 +195,7 @@ pub struct aster_dispatch_identity_t {
     pub principal_ptr: *const u8,
     pub principal_len: u32,
     pub _p1: u32,
-    /// Reserved (`ASTER_DISPATCH_IDENTITY_ACTOR`): NULL in 7.5.
+    /// The forwarding gateway (`ASTER_DISPATCH_IDENTITY_ACTOR`, 7.6), else NULL.
     pub actor_ptr: *const u8,
     pub actor_len: u32,
     pub reserved: u32,
@@ -290,6 +298,8 @@ struct BuilderSpec {
     max_sessions: Option<usize>,
     handler_timeout: Option<Option<Duration>>,
     max_foreign_inflight: usize,
+    /// ABI 7.6: `ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF`.
+    accept_on_behalf_of: bool,
     health: Option<HealthState>,
     /// ABI 5.1: the Enrollment the node was started with
     /// (`aster_node_start_enrolled`), wired at start.
@@ -536,6 +546,7 @@ pub unsafe extern "C" fn aster_server_builder_new(
             max_sessions: None,
             handler_timeout: None,
             max_foreign_inflight: aster::binding_support::dispatch::DEFAULT_MAX_FOREIGN_INFLIGHT,
+            accept_on_behalf_of: false,
             health: None,
             enrollment,
             lease_grantor: None,
@@ -684,8 +695,9 @@ pub extern "C" fn aster_server_set_option(
         aster_server_option_t::ASTER_SERVER_OPTION_MAX_SESSIONS_PER_CONNECTION as u32;
     const TIMEOUT: u32 = aster_server_option_t::ASTER_SERVER_OPTION_HANDLER_TIMEOUT_MS as u32;
     const MAX_FOREIGN: u32 = aster_server_option_t::ASTER_SERVER_OPTION_MAX_FOREIGN_INFLIGHT as u32;
+    const ON_BEHALF_OF: u32 = aster_server_option_t::ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF as u32;
     match key {
-        NODE_INFO | TOPOLOGY if value > 1 => {
+        NODE_INFO | TOPOLOGY | ON_BEHALF_OF if value > 1 => {
             return fail(
                 aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
                 "boolean option must be 0 or 1",
@@ -693,6 +705,7 @@ pub extern "C" fn aster_server_set_option(
         }
         NODE_INFO => spec.node_info = value == 1,
         TOPOLOGY => spec.topology = value == 1,
+        ON_BEHALF_OF => spec.accept_on_behalf_of = value == 1,
         MAX_SESSIONS => {
             if value == 0 || value > u32::MAX as u64 {
                 return fail(
@@ -780,6 +793,7 @@ pub unsafe extern "C" fn aster_server_start(
     let (sink, consumer) = RingSink::new_on_with_limit(&rt, capacity, spec.max_foreign_inflight);
     let mut server = Server::new(&node)
         .attributes(attributes.clone())
+        .accept_on_behalf_of(spec.accept_on_behalf_of)
         .dispatch_sink(sink);
     if let Some(max) = spec.max_sessions {
         server = server.max_sessions_per_connection(max);
@@ -1825,7 +1839,7 @@ pub unsafe extern "C" fn aster_dispatch_identity(
         return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
     };
     let principal = call.peer().clone();
-    let (flags, buffer, peer, principal) = match call.transport_peer() {
+    let (mut flags, buffer, peer, principal) = match call.transport_peer() {
         Some(transport) => {
             let (id, tp, tl, pp, pl) = state
                 .leases
@@ -1837,6 +1851,15 @@ pub unsafe extern "C" fn aster_dispatch_identity(
             (0, id, (pp, pl), (pp, pl))
         }
     };
+    // A forwarded call's actor is the gateway, which is the transport peer:
+    // it shares `peer`'s bytes in the same lease.
+    let actor = match call.actor() {
+        Some(_) => {
+            flags |= ASTER_DISPATCH_IDENTITY_ACTOR;
+            peer
+        }
+        None => (ptr::null(), 0),
+    };
     let ident = aster_dispatch_identity_t {
         struct_size: expected,
         flags,
@@ -1846,8 +1869,8 @@ pub unsafe extern "C" fn aster_dispatch_identity(
         principal_ptr: principal.0,
         principal_len: principal.1,
         _p1: 0,
-        actor_ptr: ptr::null(),
-        actor_len: 0,
+        actor_ptr: actor.0,
+        actor_len: actor.1,
         reserved: 0,
         buffer,
     };
