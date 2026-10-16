@@ -3,9 +3,18 @@
 use crate::error::{Error, Result};
 use crate::id::{Hash, NodeId};
 use aster_transport_core::{
-    CoreBlobCompression, CoreBlobCompressionStats, CoreBlobCustody, CoreBlobStatus,
-    CoreBlobsClient, CoreFetchReport, CoreFetchStrategy, CoreFetchTracker, CoreProviderOutcome,
+    CoreBlobCompression, CoreBlobCustody, CoreBlobStatus, CoreBlobsClient, CoreFetchReport,
+    CoreFetchStrategy, CoreFetchTracker, CoreProviderOutcome,
 };
+
+/// How a blob transfer crossed the network: plain or zstd.
+pub use aster_transport_core::CoreBlobEncoding as BlobEncoding;
+/// Finished blob transfers by encoding and result (see [`BlobTransferStats`]).
+pub use aster_transport_core::CoreBlobTransferCounts as BlobTransferCounts;
+/// Blob transfer counters for a whole node, since it started: every transfer,
+/// plain or zstd, fetched or served. See [`Blobs::transfer_stats`]; the
+/// per-peer split is [`PeerView::blob_transfer`](crate::topology::PeerView).
+pub use aster_transport_core::CoreBlobTransferStats as BlobTransferStats;
 
 /// Whether blob fetches compress the transfer with zstd.
 ///
@@ -45,37 +54,6 @@ impl BlobTransportCompression {
             CoreBlobCompression::Off => Self::Off,
             CoreBlobCompression::PreferZstd => Self::PreferZstd,
             CoreBlobCompression::RequireZstd => Self::RequireZstd,
-        }
-    }
-}
-
-/// zstd blob transport counters for a whole node, since it started.
-///
-/// Node-wide, not per fetch: concurrent fetches share them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct BlobCompressionStats {
-    /// Compressed bytes received while fetching.
-    pub fetched_wire_bytes: u64,
-    /// Protocol bytes those decompressed to (payload plus a small protocol
-    /// overhead).
-    pub fetched_plain_bytes: u64,
-    /// Compressed bytes sent while serving.
-    pub served_wire_bytes: u64,
-    /// Protocol bytes those were compressed from.
-    pub served_plain_bytes: u64,
-    /// Transfers that failed on malformed or truncated zstd data, as opposed
-    /// to transport errors or content verification failures.
-    pub decode_errors: u64,
-}
-
-impl From<CoreBlobCompressionStats> for BlobCompressionStats {
-    fn from(s: CoreBlobCompressionStats) -> Self {
-        Self {
-            fetched_wire_bytes: s.fetched_wire_bytes,
-            fetched_plain_bytes: s.fetched_plain_bytes,
-            served_wire_bytes: s.served_wire_bytes,
-            served_plain_bytes: s.served_plain_bytes,
-            decode_errors: s.decode_errors,
         }
     }
 }
@@ -439,9 +417,10 @@ impl Blobs {
         BlobTransportCompression::from_core(self.inner.transport_compression())
     }
 
-    /// zstd transport counters for this node. See [`BlobCompressionStats`].
-    pub fn transport_compression_stats(&self) -> BlobCompressionStats {
-        self.inner.transport_compression_stats().into()
+    /// Blob transfer counters for this node (every client and the serving
+    /// side, plain and zstd), since it started. See [`BlobTransferStats`].
+    pub fn transfer_stats(&self) -> BlobTransferStats {
+        self.inner.transfer_stats()
     }
 
     /// Clone the live Iroh Blobs store behind this facade.

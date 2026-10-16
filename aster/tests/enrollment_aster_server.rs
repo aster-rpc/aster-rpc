@@ -925,14 +925,7 @@ async fn compressed_blob_transport_requires_a_session_like_plain_blobs() {
             client.node().blobs().read_to_bytes(&hash).await.unwrap(),
             payload
         );
-        assert!(
-            client
-                .node()
-                .blobs()
-                .transport_compression_stats()
-                .fetched_wire_bytes
-                > 0
-        );
+        assert!(client.node().blobs().transfer_stats().fetched_wire_bytes > 0);
         assert!(fetch(client.node().blobs(), BlobTransportCompression::Off)
             .await
             .is_ok());

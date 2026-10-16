@@ -20,9 +20,11 @@ use aster_transport_core::{CoreNode, CoreTopoSwarm, CoreTopoSwarmConfig};
 pub use aster_transport_core::{
     AdmittedFn, CoreClusterView as ClusterView, CoreDeclaredLocality as DeclaredLocality,
     CoreLadderLevel as LadderLevel, CoreLevelEstimate as LevelEstimate,
-    CoreLevelSource as LevelSource, CoreLocalitySource as LocalitySource, CorePeerView as PeerView,
-    CoreSeparationVerdict as SeparationVerdict, CoreVerifiedLocality as VerifiedLocality,
-    LocalityVerifyFn, OwnStatementFn, TopoConfig,
+    CoreLevelSource as LevelSource, CoreLocalitySource as LocalitySource,
+    CorePeerBlobStats as PeerBlobStats, CorePeerView as PeerView,
+    CoreProtocolFamily as ProtocolFamily, CoreQuicBytes as QuicBytes,
+    CoreQuicTraffic as QuicTraffic, CoreSeparationVerdict as SeparationVerdict,
+    CoreVerifiedLocality as VerifiedLocality, LocalityVerifyFn, OwnStatementFn, TopoConfig,
 };
 
 /// Reserved enrollment attributes that declare a node's region and zone.

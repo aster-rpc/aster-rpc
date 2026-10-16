@@ -94,12 +94,12 @@ async fn compressing_nodes_fetch_over_zstd() -> anyhow::Result<()> {
     assert_eq!(ids(report.served()), vec![holder.id().to_string()]);
     assert!(report.plain_only().next().is_none());
     assert_eq!(report.bytes_transferred(), data.len() as u64);
-    let fetched = blobs.transport_compression_stats();
-    let served = holder.blobs().transport_compression_stats();
+    let fetched = blobs.transfer_stats();
+    let served = holder.blobs().transfer_stats();
     assert_eq!(fetched.fetched_wire_bytes, served.served_wire_bytes);
     assert_eq!(fetched.fetched_plain_bytes, served.served_plain_bytes);
     assert!(fetched.fetched_wire_bytes * 2 < fetched.fetched_plain_bytes);
-    assert_eq!(fetched.decode_errors, 0);
+    assert_eq!(fetched.fetch_decode_errors, 0);
     println!(
         "aster zstd level 3: payload {} B, wire {} B, ratio {:.2}x",
         data.len(),
@@ -168,13 +168,7 @@ async fn falls_back_to_a_plain_provider() -> anyhow::Result<()> {
     )
     .await??;
     assert_eq!(ids(report.plain_only()), vec![plain.id().to_string()]);
-    assert_eq!(
-        consumer
-            .blobs()
-            .transport_compression_stats()
-            .fetched_wire_bytes,
-        0
-    );
+    assert_eq!(consumer.blobs().transfer_stats().fetched_wire_bytes, 0);
 
     // Off fetches plain without offering zstd at all.
     let off = consumer
@@ -221,14 +215,8 @@ async fn off_switch_serves_and_fetches_plain() -> anyhow::Result<()> {
     )
     .await??;
     assert!(report.plain_only().next().is_none());
-    assert_eq!(
-        off.blobs().transport_compression_stats().fetched_wire_bytes,
-        0
-    );
-    assert_eq!(
-        on.blobs().transport_compression_stats().served_wire_bytes,
-        0
-    );
+    assert_eq!(off.blobs().transfer_stats().fetched_wire_bytes, 0);
+    assert_eq!(on.blobs().transfer_stats().served_wire_bytes, 0);
 
     let back = off.blobs().add_bytes(b"from the off node".to_vec()).await?;
     let report = timeout(
@@ -287,13 +275,7 @@ async fn ordered_fetch_fails_over_from_a_stalled_zstd_provider() -> anyhow::Resu
         stalled.accepted_zstd(),
         "the stalled provider was dialed over zstd"
     );
-    assert!(
-        consumer
-            .blobs()
-            .transport_compression_stats()
-            .fetched_wire_bytes
-            > 0
-    );
+    assert!(consumer.blobs().transfer_stats().fetched_wire_bytes > 0);
 
     let tracked = tracker.report();
     assert_eq!(ids(tracked.attempted()), expected_attempted);

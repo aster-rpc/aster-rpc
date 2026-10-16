@@ -1,6 +1,10 @@
 pub mod bind_ports;
 pub mod blob_custody;
+mod blob_meter;
 pub use blob_custody::{CoreBlobCustody, CoreBlobCustodyError, CoreBlobCustodyLease};
+pub use blob_meter::{
+    CoreBlobEncoding, CoreBlobTransferCounts, CoreBlobTransferStats, CorePeerBlobStats,
+};
 pub mod canonical;
 pub mod contract;
 pub mod datagram;
@@ -40,7 +44,10 @@ pub use topology::locality::{
     LocalityVerifyFn, OwnStatementFn,
 };
 pub use topology::shared::{AdmittedFn, CoreTopoSwarm, CoreTopoSwarmConfig};
-pub use topology::{CoreLadderLevel, CoreLevelEstimate, CorePeerView};
+pub use topology::{
+    CoreLadderLevel, CoreLevelEstimate, CorePeerView, CoreProtocolFamily, CoreQuicBytes,
+    CoreQuicTraffic,
+};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -66,8 +73,7 @@ use iroh_blobs::store::fs::FsStore;
 use iroh_blobs::store::mem::MemStore;
 use iroh_blobs::store::{gc_run_once as blobs_gc_run_once, GcConfig, ProtectCb, ProtectOutcome};
 use iroh_blobs::ticket::BlobTicket;
-use iroh_blobs::transport::zstd::{ZstdStats, ZstdTransform, ZSTD_ALPN};
-use iroh_blobs::transport::TransformedBlobsProtocol;
+use iroh_blobs::transport::zstd::{ZstdTransform, ZSTD_ALPN};
 use iroh_blobs::{BlobFormat, BlobsProtocol, Hash, HashAndFormat, ALPN as BLOBS_ALPN};
 use iroh_docs::api::protocol::{AddrInfoOptions, ShareMode};
 use iroh_docs::api::Doc;
@@ -374,32 +380,15 @@ pub enum CoreBlobCompression {
     RequireZstd,
 }
 
-/// Byte counters for zstd blob transport on one node.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CoreBlobCompressionStats {
-    /// Compressed bytes this node received while fetching.
-    pub fetched_wire_bytes: u64,
-    /// Protocol bytes those decompressed to.
-    pub fetched_plain_bytes: u64,
-    /// Compressed bytes this node sent while serving.
-    pub served_wire_bytes: u64,
-    /// Protocol bytes those were compressed from.
-    pub served_plain_bytes: u64,
-    /// Streams that failed on malformed or truncated zstd data (not on
-    /// transport errors or content verification).
-    pub decode_errors: u64,
-}
-
 /// The node's blob downloaders, one per [`CoreBlobCompression`] mode, and the
-/// zstd counters.
+/// transfer counters.
 struct BlobTransport {
     plain: Downloader,
     prefer_zstd: Downloader,
     require_zstd: Downloader,
     /// Default mode for new blob clients.
     default: CoreBlobCompression,
-    fetch_stats: Arc<ZstdStats>,
-    serve_stats: Option<Arc<ZstdStats>>,
+    meter: Arc<blob_meter::BlobMeter>,
 }
 
 impl BlobTransport {
@@ -423,8 +412,7 @@ impl BlobTransport {
             } else {
                 CoreBlobCompression::Off
             },
-            fetch_stats: fetch.stats().clone(),
-            serve_stats: serve.map(|t| t.stats().clone()),
+            meter: blob_meter::BlobMeter::new(fetch.stats().clone()),
         }
     }
 
@@ -436,20 +424,8 @@ impl BlobTransport {
         }
     }
 
-    fn stats(&self) -> CoreBlobCompressionStats {
-        let fetched = self.fetch_stats.snapshot();
-        let served = self
-            .serve_stats
-            .as_ref()
-            .map(|s| s.snapshot())
-            .unwrap_or_default();
-        CoreBlobCompressionStats {
-            fetched_wire_bytes: fetched.wire_bytes_read,
-            fetched_plain_bytes: fetched.plain_bytes_read,
-            served_wire_bytes: served.wire_bytes_written,
-            served_plain_bytes: served.plain_bytes_written,
-            decode_errors: fetched.decode_errors + served.decode_errors,
-        }
+    fn stats(&self) -> CoreBlobTransferStats {
+        self.meter.stats()
     }
 }
 
@@ -887,11 +863,87 @@ struct RemoteInfoEntry {
     /// Derived topology-v1 state (ladder level, path quality, confidence),
     /// updated by the sampler spawned via [`CoreMonitor::spawn_sampler`].
     topo: topology::PeerTopoState,
+    /// Per-connection QUIC byte bookkeeping, keyed like `connections`.
+    quic_conns: HashMap<u64, QuicConn>,
+    /// Final QUIC bytes of this peer's closed connections, by protocol.
+    quic_closed: CoreQuicTraffic,
+}
+
+/// A connection's protocol and the highest QUIC byte counts read from it.
+///
+/// A connection that has closed no longer upgrades, but its close task may
+/// not have folded its final counts in yet; until then it is counted at these
+/// last-read values, so a peer's totals never dip while a connection churns.
+#[derive(Debug)]
+struct QuicConn {
+    family: CoreProtocolFamily,
+    sent: std::sync::atomic::AtomicU64,
+    received: std::sync::atomic::AtomicU64,
+}
+
+impl QuicConn {
+    fn new(family: CoreProtocolFamily) -> Self {
+        Self {
+            family,
+            sent: Default::default(),
+            received: Default::default(),
+        }
+    }
+
+    /// Raise the last-read counts to `(sent, received)` and return the new
+    /// highs.
+    fn observe(&self, sent: u64, received: u64) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.sent.fetch_max(sent, Relaxed).max(sent),
+            self.received.fetch_max(received, Relaxed).max(received),
+        )
+    }
+}
+
+/// The protocol family of each ALPN this node knows; anything else is
+/// [`CoreProtocolFamily::Other`].
+const PROTOCOL_FAMILIES: &[(&[u8], CoreProtocolFamily)] = &[
+    (BLOBS_ALPN, CoreProtocolFamily::Blobs),
+    (BLOBS_ZSTD_ALPN, CoreProtocolFamily::BlobsZstd),
+    (DOCS_ALPN, CoreProtocolFamily::Docs),
+    (GOSSIP_ALPN, CoreProtocolFamily::Gossip),
+    (reactor::RPC_ALPN, CoreProtocolFamily::Rpc),
+];
+
+fn protocol_family(alpn: &[u8]) -> CoreProtocolFamily {
+    PROTOCOL_FAMILIES
+        .iter()
+        .find(|(a, _)| *a == alpn)
+        .map_or(CoreProtocolFamily::Other, |(_, f)| *f)
 }
 
 impl RemoteInfoEntry {
     fn has_live_connection(&self) -> bool {
         self.connections.values().any(|h| h.upgrade().is_some())
+    }
+
+    /// QUIC bytes by protocol: closed connections' final counts plus each
+    /// remaining connection's current (or, once closed, last-read) counts.
+    fn quic_traffic(&self) -> CoreQuicTraffic {
+        let mut traffic = self.quic_closed;
+        for (conn_id, quic) in &self.quic_conns {
+            let (sent, received) = match self.connections.get(conn_id).and_then(|h| h.upgrade()) {
+                Some(conn) => {
+                    let stats = conn.stats();
+                    quic.observe(stats.udp_tx.bytes, stats.udp_rx.bytes)
+                }
+                None => quic.observe(0, 0),
+            };
+            traffic.add(quic.family, sent, received);
+        }
+        traffic
+    }
+
+    fn view(&self, node_id: &str) -> Option<CorePeerView> {
+        let mut view = self.topo.to_view(node_id, self.has_live_connection())?;
+        view.quic_traffic = self.quic_traffic();
+        Some(view)
     }
 }
 
@@ -961,6 +1013,7 @@ type RemoteMapInner = Arc<RwLock<HashMap<String, RemoteInfoEntry>>>;
 struct TrackedConnection {
     remote_id: String,
     handle: WeakConnectionHandle,
+    family: CoreProtocolFamily,
 }
 
 /// Aborts the wrapped task when dropped.
@@ -1001,6 +1054,7 @@ impl EndpointHooks for MonitorHook {
         let tracked = TrackedConnection {
             remote_id: conn.remote_id().to_string(),
             handle: conn.weak_handle(),
+            family: protocol_family(conn.alpn()),
         };
         self.tx.send(tracked).await.ok();
         AfterHandshakeOutcome::Accept
@@ -1076,6 +1130,9 @@ impl CoreMonitor {
             let mut inner = map.write().unwrap_or_else(|e| e.into_inner());
             let entry = inner.entry(remote_id.clone()).or_default();
             entry.connections.insert(conn_id, handle.clone());
+            entry
+                .quic_conns
+                .insert(conn_id, QuicConn::new(tracked.family));
             entry.aggregate.last_update = SystemTime::now();
         }
 
@@ -1091,6 +1148,15 @@ impl CoreMonitor {
                 let entry = inner.entry(remote_id).or_default();
                 entry.connections.remove(&conn_id);
                 entry.aggregate.last_update = SystemTime::now();
+                let (sent, received) = match &final_stats {
+                    Some(Closed { stats, .. }) => (stats.udp_tx.bytes, stats.udp_rx.bytes),
+                    None => (0, 0),
+                };
+                if let Some(quic) = entry.quic_conns.remove(&conn_id) {
+                    // Never below what a reader already saw.
+                    let (sent, received) = quic.observe(sent, received);
+                    entry.quic_closed.add(quic.family, sent, received);
+                }
                 if let Some(Closed { stats, .. }) = final_stats {
                     entry.aggregate.total_bytes_sent += stats.udp_tx.bytes;
                     entry.aggregate.total_bytes_received += stats.udp_rx.bytes;
@@ -1156,8 +1222,7 @@ impl CoreMonitor {
     /// or has never been sampled.
     pub fn peer_view(&self, node_id: &str) -> Option<CorePeerView> {
         let inner = self.map.read().unwrap_or_else(|e| e.into_inner());
-        let entry = inner.get(node_id)?;
-        entry.topo.to_view(node_id, entry.has_live_connection())
+        inner.get(node_id)?.view(node_id)
     }
 
     /// Topology-v1 snapshots for every known peer (sampled at least once).
@@ -1165,7 +1230,7 @@ impl CoreMonitor {
         let inner = self.map.read().unwrap_or_else(|e| e.into_inner());
         inner
             .iter()
-            .filter_map(|(id, entry)| entry.topo.to_view(id, entry.has_live_connection()))
+            .filter_map(|(id, entry)| entry.view(id))
             .collect()
     }
 
@@ -2181,12 +2246,13 @@ impl CoreNode {
     ) -> Result<Self> {
         let (hook_receiver, (_hook_failure_mode, _hook_timeout)) = hooks;
         let (protect_handler, protect_cb) = gc_protect;
-        let blobs = BlobsProtocol::new(&store, None);
         // zstd blob transport is served on the node's own router, so the same
-        // Gate-0 hooks see it, with the same provider events as the plain
-        // handler (none). It is never an admission ALPN.
+        // Gate-0 hooks see it. It is never an admission ALPN. Both handlers
+        // report their transfers to the node's blob meter.
         let blobs_zstd = blob_zstd_level.map(ZstdTransform::new);
         let blob_transport = Arc::new(BlobTransport::new(&store, &endpoint, blobs_zstd.as_ref()));
+        let meter = blob_transport.meter.clone();
+        let blobs = BlobsProtocol::new(&store, Some(meter.serve_events(CoreBlobEncoding::Plain)));
         let gossip = Gossip::builder().spawn(endpoint.clone());
         let docs_builder = match &docs_root {
             Some(path) => Docs::persistent(path.clone()),
@@ -2228,7 +2294,12 @@ impl CoreNode {
         if let Some(transform) = blobs_zstd {
             router_builder = router_builder.accept(
                 BLOBS_ZSTD_ALPN,
-                TransformedBlobsProtocol::new(&store, None, Arc::new(transform)),
+                blob_meter::MeteredZstdBlobs {
+                    store: store.clone(),
+                    events: meter.serve_events(CoreBlobEncoding::Zstd),
+                    level: transform.level(),
+                    meter: meter.clone(),
+                },
             );
         }
         for alpn in &aster_alpns {
@@ -2413,7 +2484,17 @@ impl CoreNode {
             .collect()
     }
 
-    fn with_declarations(&self, view: CorePeerView) -> CorePeerView {
+    /// Blob transfer counters for the whole node, since it started. The same
+    /// figures as [`CoreBlobsClient::transfer_stats`].
+    pub fn blob_transfer_stats(&self) -> CoreBlobTransferStats {
+        self.inner.blob_transport.stats()
+    }
+
+    /// Bound by declarations, with the peer's blob counters filled in.
+    fn with_declarations(&self, mut view: CorePeerView) -> CorePeerView {
+        if let Ok(id) = view.node_id.parse::<EndpointId>() {
+            view.blob_transfer = self.inner.blob_transport.meter.peer(&id);
+        }
         match self.topology_swarm() {
             Some(swarm) => {
                 let theirs = swarm.declared_locality(&view.node_id);
@@ -3813,14 +3894,37 @@ impl CoreBlobsClient {
         self.compression
     }
 
-    /// zstd transport counters for the whole node (every client and the
-    /// serving side), since the node started.
-    pub fn transport_compression_stats(&self) -> CoreBlobCompressionStats {
+    /// Blob transfer counters for the whole node (every client and both
+    /// serving handlers), since the node started.
+    pub fn transfer_stats(&self) -> CoreBlobTransferStats {
         self.blob_transport.stats()
     }
 
     pub(crate) fn downloader(&self) -> &Downloader {
         self.blob_transport.downloader(self.compression)
+    }
+
+    /// Fetch `hash` from `provider` like `Downloader::download(..).await`, with
+    /// its progress counted by the node's blob meter.
+    async fn download_metered(&self, hash: Hash, provider: EndpointId) -> Result<()> {
+        let mut stream = self
+            .downloader()
+            .download(hash, vec![provider])
+            .stream()
+            .await?;
+        let mut attr = blob_meter::FetchAttribution::new(self.compression);
+        let mut failure = None;
+        while let Some(item) = futures_lite::StreamExt::next(&mut stream).await {
+            self.blob_transport.meter.observe_fetch(&mut attr, &item);
+            match item {
+                DownloadProgressItem::Error(e) => failure = Some(anyhow!(e.to_string())),
+                DownloadProgressItem::DownloadError if failure.is_none() => {
+                    failure = Some(anyhow!("Download error"))
+                }
+                _ => {}
+            }
+        }
+        failure.map_or(Ok(()), Err)
     }
 
     pub async fn add_bytes(&self, data: Vec<u8>) -> Result<String> {
@@ -4158,7 +4262,7 @@ impl CoreBlobsClient {
             mem.add_endpoint_info(addr.clone());
             lookup.add(mem);
         }
-        self.downloader().download(hash, vec![addr.id]).await?;
+        self.download_metered(hash, addr.id).await?;
 
         // If it's a HashSeq (Collection), extract the file contents
         if format == BlobFormat::HashSeq {
@@ -4246,7 +4350,9 @@ impl CoreBlobsClient {
             .await?;
         let tracker = tracker.cloned().unwrap_or_default();
         *tracker.lock() = FetchAccumulator::default();
+        let mut attr = blob_meter::FetchAttribution::new(self.compression);
         while let Some(item) = futures_lite::StreamExt::next(&mut stream).await {
+            self.blob_transport.meter.observe_fetch(&mut attr, &item);
             tracker.lock().observe(item);
         }
         let result = tracker.lock().finish(haf.hash);
@@ -4406,7 +4512,7 @@ impl CoreBlobsClient {
             mem.add_endpoint_info(addr.clone());
             lookup.add(mem);
         }
-        self.downloader().download(hash, vec![addr.id]).await?;
+        self.download_metered(hash, addr.id).await?;
 
         let collection = Collection::load(hash, &self.store).await?;
         let mut files = Vec::new();

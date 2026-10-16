@@ -69,6 +69,128 @@ impl CoreLadderLevel {
     pub fn as_i32(self) -> i32 {
         self as i32
     }
+
+    /// Snake-case name, the `aster.locality.level` metric label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SameHost => "same_host",
+            Self::SameLan => "same_lan",
+            Self::SameSite => "same_site",
+            Self::SameRegion => "same_region",
+            Self::Far => "far",
+        }
+    }
+}
+
+/// What a connection to a peer carries, by its ALPN. iroh opens one
+/// connection per ALPN, so each protocol's QUIC bytes are its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CoreProtocolFamily {
+    /// Plain blobs transfers, including docs entry content.
+    Blobs,
+    /// zstd blobs transfers.
+    BlobsZstd,
+    /// The docs sync protocol (entries, not their content).
+    Docs,
+    Gossip,
+    /// Aster RPC (`aster/1`), every service on one connection.
+    Rpc,
+    /// Anything else: admission, enrollment, custom ALPNs.
+    Other,
+}
+
+impl CoreProtocolFamily {
+    pub const ALL: [Self; 6] = [
+        Self::Blobs,
+        Self::BlobsZstd,
+        Self::Docs,
+        Self::Gossip,
+        Self::Rpc,
+        Self::Other,
+    ];
+
+    /// Kebab-case name, the `protocol` metric label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Blobs => "blobs",
+            Self::BlobsZstd => "blobs-zstd",
+            Self::Docs => "docs",
+            Self::Gossip => "gossip",
+            Self::Rpc => "rpc",
+            Self::Other => "other",
+        }
+    }
+}
+
+/// QUIC-level bytes on a peer's connections: UDP datagram payload, so QUIC
+/// headers, ACKs and retransmits included. Reads somewhat above the
+/// application payload.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoreQuicBytes {
+    pub quic_bytes_sent: u64,
+    pub quic_bytes_received: u64,
+}
+
+impl CoreQuicBytes {
+    fn add(&mut self, sent: u64, received: u64) {
+        self.quic_bytes_sent += sent;
+        self.quic_bytes_received += received;
+    }
+}
+
+/// A peer's QUIC bytes by protocol, cumulative since this node started and
+/// across reconnects. Monotonic: a closed connection's final counts move into
+/// the total as it leaves the live set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CoreQuicTraffic {
+    pub blobs: CoreQuicBytes,
+    pub blobs_zstd: CoreQuicBytes,
+    pub docs: CoreQuicBytes,
+    pub gossip: CoreQuicBytes,
+    pub rpc: CoreQuicBytes,
+    pub other: CoreQuicBytes,
+}
+
+impl CoreQuicTraffic {
+    /// The bytes of one protocol.
+    pub fn get(&self, family: CoreProtocolFamily) -> CoreQuicBytes {
+        match family {
+            CoreProtocolFamily::Blobs => self.blobs,
+            CoreProtocolFamily::BlobsZstd => self.blobs_zstd,
+            CoreProtocolFamily::Docs => self.docs,
+            CoreProtocolFamily::Gossip => self.gossip,
+            CoreProtocolFamily::Rpc => self.rpc,
+            CoreProtocolFamily::Other => self.other,
+        }
+    }
+
+    /// Every protocol with its bytes, in [`CoreProtocolFamily::ALL`] order.
+    pub fn iter(&self) -> impl Iterator<Item = (CoreProtocolFamily, CoreQuicBytes)> + '_ {
+        CoreProtocolFamily::ALL
+            .into_iter()
+            .map(|f| (f, self.get(f)))
+    }
+
+    /// The sum over every protocol.
+    pub fn total(&self) -> CoreQuicBytes {
+        let mut sum = CoreQuicBytes::default();
+        for (_, b) in self.iter() {
+            sum.add(b.quic_bytes_sent, b.quic_bytes_received);
+        }
+        sum
+    }
+
+    pub(crate) fn add(&mut self, family: CoreProtocolFamily, sent: u64, received: u64) {
+        let slot = match family {
+            CoreProtocolFamily::Blobs => &mut self.blobs,
+            CoreProtocolFamily::BlobsZstd => &mut self.blobs_zstd,
+            CoreProtocolFamily::Docs => &mut self.docs,
+            CoreProtocolFamily::Gossip => &mut self.gossip,
+            CoreProtocolFamily::Rpc => &mut self.rpc,
+            CoreProtocolFamily::Other => &mut self.other,
+        };
+        slot.add(sent, received);
+    }
 }
 
 /// Classification of a direct path's remote IP.
@@ -326,6 +448,8 @@ impl PeerTopoState {
             level_source: locality::CoreLevelSource::Measured,
             declared_region: None,
             declared_zone: None,
+            quic_traffic: CoreQuicTraffic::default(),
+            blob_transfer: crate::CorePeerBlobStats::default(),
         })
     }
 }
@@ -439,6 +563,14 @@ pub struct CorePeerView {
     /// The peer's verified declared region and zone, when it has them.
     pub declared_region: Option<String>,
     pub declared_zone: Option<String>,
+    /// QUIC bytes exchanged with the peer by protocol, cumulative since this
+    /// node started and across reconnects. QUIC-level, not payload: see
+    /// [`CoreQuicBytes`].
+    pub quic_traffic: CoreQuicTraffic,
+    /// Exact blob payload (and zstd wire) bytes exchanged with the peer,
+    /// cumulative like `quic_traffic`. Zero from a bare monitor without a
+    /// node's blob store.
+    pub blob_transfer: crate::CorePeerBlobStats,
 }
 
 impl CorePeerView {

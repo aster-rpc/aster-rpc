@@ -80,6 +80,7 @@ mod storage_perms;
 mod ticket;
 mod topology_locality;
 mod topology_shared;
+mod transfer_metrics;
 mod upcall_vectors;
 mod upcalls;
 mod write_authority;
