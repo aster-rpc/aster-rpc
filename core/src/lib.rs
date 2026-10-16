@@ -1124,6 +1124,25 @@ impl RemoteInfoEntry {
 
 type RemoteMapInner = Arc<RwLock<HashMap<String, RemoteInfoEntry>>>;
 
+/// Keep at most `cap` peers in the monitor's map ([`topology::RETAINED_PEERS`]):
+/// past it, forget idle peers (no live connection, no close still to fold
+/// in), least recently active first.
+fn forget_idle_peers(map: &mut HashMap<String, RemoteInfoEntry>, cap: usize) {
+    if map.len() <= cap {
+        return;
+    }
+    let mut idle: Vec<(SystemTime, String)> = map
+        .iter()
+        .filter(|(_, e)| e.quic_conns.is_empty() && !e.has_live_connection())
+        .map(|(id, e)| (e.aggregate.last_update, id.clone()))
+        .collect();
+    idle.sort();
+    let excess = map.len() - cap;
+    for (_, id) in idle.into_iter().take(excess) {
+        map.remove(&id);
+    }
+}
+
 /// Pairing of a connection's remote endpoint id (captured at handshake time)
 /// with a weak handle to the connection. Modeled after the `remote-info.rs`
 /// example in iroh 1.0.0-rc.0: storing a `WeakConnectionHandle` rather than a
@@ -1257,6 +1276,7 @@ impl CoreMonitor {
                 .quic_conns
                 .insert(conn_id, QuicConn::new(tracked.family));
             entry.aggregate.last_update = SystemTime::now();
+            forget_idle_peers(&mut inner, topology::RETAINED_PEERS);
         }
 
         // Track connection close. `WeakConnectionHandle::closed` does not keep
@@ -6426,5 +6446,36 @@ mod hook_failure_mode_tests {
         })
         .await
         .expect("test hung");
+    }
+}
+
+#[cfg(test)]
+mod monitor_retention_tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test scaffolding: a failed unwrap is the test failing"
+    )]
+
+    use super::*;
+
+    /// TM-8: the monitor keeps at most `cap` peers, forgetting idle ones
+    /// oldest first; a peer with a close still to fold in is not idle.
+    #[test]
+    fn idle_peers_past_the_cap_are_forgotten_oldest_first() {
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut map = HashMap::new();
+        for (i, id) in ["a", "b", "c", "d"].into_iter().enumerate() {
+            let mut entry = RemoteInfoEntry::default();
+            entry.aggregate.last_update = t0 + Duration::from_secs(i as u64);
+            map.insert(id.to_string(), entry);
+        }
+        map.get_mut("a")
+            .unwrap()
+            .quic_conns
+            .insert(1, QuicConn::new(CoreProtocolFamily::Rpc));
+        forget_idle_peers(&mut map, 2);
+        let mut kept: Vec<&str> = map.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(kept, ["a", "d"]);
     }
 }

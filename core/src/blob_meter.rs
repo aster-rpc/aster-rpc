@@ -130,7 +130,10 @@ pub struct CoreBlobTransferStats {
 }
 
 /// Blob transfer counters for one peer, since this node started and across
-/// reconnects. Monotonic.
+/// reconnects. Monotonic while the peer is retained: like its peer view, a
+/// peer is forgotten once more than 4096 peers are tracked and it is among the
+/// least recently active with nothing in flight, and a forgotten peer that
+/// returns starts again from zero. Node-wide counters are unaffected.
 ///
 /// Fetch figures are counted when each attempt ends, so an attempt of a fetch
 /// that was cancelled mid-transfer is not included.
@@ -175,6 +178,8 @@ fn slot(encoding: CoreBlobEncoding) -> usize {
 
 #[derive(Debug, Default)]
 struct PeerState {
+    /// [`MeterState::clock`] when this peer last moved a counter.
+    last_active: u64,
     /// Payload bytes by encoding.
     fetched: [u64; 2],
     served: [u64; 2],
@@ -198,11 +203,45 @@ struct MeterState {
     /// while anything but this list holds the `Arc`, the counters can move.
     serve_zstd_live: Vec<(EndpointId, Arc<ZstdStats>)>,
     peers: HashMap<EndpointId, PeerState>,
+    /// Counts peer updates, to order peers by recent activity.
+    clock: u64,
 }
 
 impl MeterState {
+    /// The peer's counters, marked active now. Adding a peer past
+    /// [`RETAINED_PEERS`](crate::topology::RETAINED_PEERS) first forgets the
+    /// least recently active peer with no live serving connection.
     fn peer(&mut self, id: EndpointId) -> &mut PeerState {
-        self.peers.entry(id).or_default()
+        self.peer_capped(id, crate::topology::RETAINED_PEERS)
+    }
+
+    fn peer_capped(&mut self, id: EndpointId, cap: usize) -> &mut PeerState {
+        if !self.peers.contains_key(&id) && self.peers.len() >= cap {
+            self.forget_idle_peers(cap.saturating_sub(1));
+        }
+        self.clock += 1;
+        let peer = self.peers.entry(id).or_default();
+        peer.last_active = self.clock;
+        peer
+    }
+
+    /// Forget the least recently active peers until at most `keep` remain,
+    /// skipping peers some serving connection is still counting for.
+    fn forget_idle_peers(&mut self, keep: usize) {
+        let excess = self.peers.len().saturating_sub(keep);
+        if excess == 0 {
+            return;
+        }
+        let mut idle: Vec<(u64, EndpointId)> = self
+            .peers
+            .iter()
+            .filter(|(id, _)| !self.serve_zstd_live.iter().any(|(p, _)| p == *id))
+            .map(|(id, p)| (p.last_active, *id))
+            .collect();
+        idle.sort_unstable_by_key(|(t, _)| *t);
+        for (_, id) in idle.into_iter().take(excess) {
+            self.peers.remove(&id);
+        }
     }
 
     /// Fold the counters of connections no stream holds any more into the
@@ -546,5 +585,68 @@ impl ProtocolHandler for MeteredZstdBlobs {
         )
         .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iroh_blobs::provider::events::TransferCompleted;
+    use iroh_blobs::provider::TransferStats;
+
+    fn peer_id(i: u32) -> EndpointId {
+        let mut seed = [0u8; 32];
+        seed[..4].copy_from_slice(&i.to_le_bytes());
+        iroh::SecretKey::from_bytes(&seed).public()
+    }
+
+    fn served(n: u64) -> RequestUpdate {
+        RequestUpdate::Completed(TransferCompleted {
+            stats: Box::new(TransferStats {
+                payload_bytes_sent: n,
+                other_bytes_sent: 0,
+                other_bytes_read: 0,
+                duration: std::time::Duration::ZERO,
+            }),
+        })
+    }
+
+    /// TM-8: the per-peer map is bounded like the monitor's peer views, while
+    /// the node-wide counters still count every peer.
+    #[test]
+    fn per_peer_counters_are_bounded() {
+        let meter = BlobMeter::new(Arc::default());
+        let peers = crate::topology::RETAINED_PEERS as u32 + 100;
+        for i in 0..peers {
+            meter.on_serve_update(Some(peer_id(i)), CoreBlobEncoding::Plain, served(10));
+        }
+        assert_eq!(meter.lock().peers.len(), crate::topology::RETAINED_PEERS);
+        assert_eq!(meter.stats().served_payload_bytes, u64::from(peers) * 10);
+        // The most recent peers are the ones kept.
+        assert_eq!(meter.peer(&peer_id(peers - 1)).served_payload_bytes, 10);
+        assert_eq!(meter.peer(&peer_id(0)).served_payload_bytes, 0);
+    }
+
+    /// Eviction takes the least recently active peer, and never one a serving
+    /// connection is still counting for.
+    #[test]
+    fn eviction_skips_active_and_live_peers() {
+        let mut s = MeterState::default();
+        let (a, b, c, d, e) = (peer_id(1), peer_id(2), peer_id(3), peer_id(4), peer_id(5));
+        s.peer_capped(a, 3);
+        s.peer_capped(b, 3);
+        s.peer_capped(c, 3);
+        s.peer_capped(a, 3).served[0] += 1; // a is now more recent than b and c
+        s.serve_zstd_live.push((b, Arc::default())); // b is still being served
+        s.peer_capped(d, 3);
+        assert!(s.peers.contains_key(&a) && s.peers.contains_key(&b));
+        assert!(
+            !s.peers.contains_key(&c),
+            "c was the least recently active idle peer"
+        );
+        s.peer_capped(e, 3);
+        assert!(s.peers.contains_key(&b) && s.peers.contains_key(&d));
+        assert!(!s.peers.contains_key(&a));
+        assert_eq!(s.peers.len(), 3);
     }
 }

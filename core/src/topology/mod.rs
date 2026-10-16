@@ -23,6 +23,12 @@ use iroh::TransportAddr;
 
 /// How often the sampler folds connection stats into per-peer state.
 pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
+/// Peers a node keeps per-peer state for: the monitor's view of each peer
+/// (topology, QUIC bytes) and the blob meter's per-peer counters follow the
+/// same rule. Past this many tracked peers, peers with no live connection (or
+/// serving stream) are forgotten, least recently active first; a forgotten
+/// peer that returns starts again from zero. Peers in use are never dropped.
+pub(crate) const RETAINED_PEERS: usize = 4096;
 /// A ladder-level change must be observed this many consecutive samples
 /// before it takes effect (first assignment is immediate).
 const LEVEL_HOLD_SAMPLES: u32 = 30;
