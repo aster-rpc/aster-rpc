@@ -54,3 +54,34 @@ async fn simultaneous_syncs_in_both_directions_both_complete() {
     a.close().await;
     b.close().await;
 }
+
+/// `join` imports the ticket *and* starts syncing with its peers (TM-6): the
+/// entry arrives without any `start_sync` call.
+#[tokio::test]
+async fn join_starts_syncing_with_the_ticket_peers() {
+    let a = node(53).await;
+    let b = node(54).await;
+    let doc_a = a.docs_client().create().await.unwrap();
+    let author = a.docs_client().create_author().await.unwrap();
+    doc_a
+        .set_bytes(author.clone(), b"k".to_vec(), b"v".to_vec())
+        .await
+        .unwrap();
+    let doc_b = b
+        .docs_client()
+        .join(doc_a.share_with_addr("write".into()).await.unwrap())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !matches!(
+            doc_b.entry_exists(author.clone(), b"k".to_vec()).await,
+            Ok(true)
+        ) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("join alone synced the entry");
+    a.close().await;
+    b.close().await;
+}

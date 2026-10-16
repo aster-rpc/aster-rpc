@@ -5000,6 +5000,9 @@ impl CoreDocsClient {
         }
     }
 
+    /// Import a document from a ticket and start syncing it with the ticket's
+    /// peers. When this returns, a sync with each of them is already in
+    /// flight; a following `leave` or `start_sync` races it.
     pub async fn join(&self, ticket_str: String) -> Result<CoreDoc> {
         let ticket = DocTicket::decode_string(&ticket_str)?;
         if let Ok(lookup) = self.endpoint.address_lookup() {
@@ -5010,8 +5013,10 @@ impl CoreDocsClient {
             }
         }
         Ok(CoreDoc {
-            // The ticket carries replica addresses; importing only its
-            // capability creates an empty local document without syncing.
+            // `DocsApi::import` is `import_namespace` followed by
+            // `start_sync(ticket.nodes)`: the replica addresses registered
+            // above are dialled at once. Use `import_namespace` for a local
+            // document that does not sync until asked.
             doc: self.inner.api().import(ticket).await?,
             store: self.store.clone(),
         })
