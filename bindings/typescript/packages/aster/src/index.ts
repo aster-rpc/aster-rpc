@@ -135,6 +135,17 @@ export {
   type AsterBrandTag,
 } from './brand.js';
 
+// Canonical uuid / ulid / date / decimal types (Aster-ContractIdentity.md
+// "Time, UUID, and Decimal")
+export {
+  uuid, uuidToBytes, uuidFromBytes,
+  ulid, ulidToBytes, ulidFromBytes, generateUlid, ulidTimestamp,
+  date, dateToDays, dateFromDays,
+  Decimal, DecimalSpec, MAX_DECIMAL_PRECISION,
+  ScalarError,
+  type decimal,
+} from './scalars.js';
+
 // Generated-file glue (for files emitted by `aster-gen`)
 export {
   registerGenerated,

@@ -75,7 +75,12 @@ Field types map to wire types per spec §11.3.2.3:
 | `boolean` | `bool` | |
 | `string` | `string` | |
 | `Uint8Array` | `binary` | |
-| `Date` | `timestamp` | |
+| `Date` | `timestamp` | Millisecond precision in JS; Fory TIMESTAMP |
+| `uuid` | `uuid` | String form `8-4-4-4-12`; 16 bytes on the wire |
+| `ulid` | `ulid` | Crockford base32 string; 16 bytes on the wire |
+| `date` | `date` | `YYYY-MM-DD` string; Fory DATE |
+| `Decimal` | `decimal` | Exact decimal, arbitrary precision |
+| `decimal<P, S>` | `decimal(P,S)` | Rescaled to scale `S`; refuses rounding or more than `P` digits |
 | `T[]`, `Array<T>`, `ReadonlyArray<T>` | `list<T>` | |
 | `Map<K,V>` | `map<K,V>` | |
 | `Set<T>` | `set<T>` | |
@@ -98,6 +103,32 @@ export class Quantity {
 Available brands: `i8`, `i16`, `i32`, `i64`, `u8`, `u16`, `u32`,
 `u64`, `f32`, `f64`. `i64` / `u64` wrap `bigint`; the rest wrap
 `number`.
+
+**Identifiers, dates and decimals** follow Aster-ContractIdentity.md
+("Time, UUID, and Decimal"), byte for byte with Rust and Python:
+
+```ts
+import { WireType, Decimal, uuid, ulid, date, generateUlid, type decimal } from '@aster-rpc/aster';
+
+@WireType('shop.v1/Order')
+export class Order {
+  id: uuid = uuid('0190f2a8-1b2c-7d3e-8f40-123456789abc');
+  trace: ulid = generateUlid();
+  day: date = date('2024-03-01');
+  price: decimal<18, 4> = Decimal.parse('0');   // contract type decimal(18,4)
+  total: Decimal = new Decimal(0n);             // contract type decimal
+}
+```
+
+`uuid`, `ulid` and `date` are branded strings: the helpers of the same
+name validate and normalise. The codec sends `uuid` / `ulid` as 16-byte
+BINARY and refuses any other length on decode. A `decimal<P, S>` field
+accepts a `Decimal`, a decimal string, a `bigint` or a safe integer
+(never a fractional `number`), is zero-padded to scale `S`, and a value
+that would need rounding or has more than `P` digits fails with
+`ScalarError`, on encode and on decode. Recursive types (a field that
+refers back to its own type, directly or through a cycle) publish as
+`SELF_REF`.
 
 **Suspicious-field warning.** A plain `number` field whose name
 matches `count|id|size|length|index|offset|timestamp|epoch|...`

@@ -36,6 +36,28 @@ import {
 import { WIRE_TYPE_KEY } from './decorators.js';
 import type { ManifestField } from './contract/manifest.js';
 import type { CanonicalPrimitive } from './wire-types.js';
+import { registerScalarPlan, scalarLeafFor, type ScalarFieldPlan, type ScalarLeaf } from './scalars.js';
+
+function shapeLeaf(f: WireFieldShape): ScalarLeaf {
+  if (f.kind === 'primitive') return scalarLeafFor(f.wire);
+  if (f.kind === 'ref') return { kind: 'ref', tag: f.refTag };
+  return { kind: 'none' };
+}
+
+/** The codec's uuid / ulid / date / decimal conversion plan for one generated wire type. */
+function scalarPlanFromShape(fields: readonly WireFieldShape[]): ScalarFieldPlan[] {
+  return fields.map((f): ScalarFieldPlan => {
+    switch (f.kind) {
+      case 'list':
+      case 'set':
+        return { name: f.name, container: f.kind, value: shapeLeaf(f.element) };
+      case 'map':
+        return { name: f.name, container: 'map', key: shapeLeaf(f.key), value: shapeLeaf(f.value) };
+      default:
+        return { name: f.name, container: 'none', value: shapeLeaf(f) };
+    }
+  });
+}
 
 /**
  * Canonical wire type tokens recognized by the scanner.
@@ -275,6 +297,7 @@ export function registerGenerated(opts: RegisterGeneratedOptions): void {
   for (const shape of opts.WIRE_TYPES) {
     (shape.ctor as any)[WIRE_TYPE_KEY] = shape.tag;
     _wireShapeRegistry.set(shape.ctor, shape);
+    registerScalarPlan(shape.tag, scalarPlanFromShape(shape.fields));
   }
   // New path (aster-gen v2): BUILD_ALL_TYPES uses Type.struct() to build
   // and register all Fory type structs in one pass. Replaces the legacy

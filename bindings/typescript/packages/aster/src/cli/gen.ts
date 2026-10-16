@@ -288,6 +288,8 @@ const BRAND_WIRE: Record<string, string> = {
   i8: 'int8', i16: 'int16', i32: 'varint32', i64: 'varint64',
   u8: 'uint8', u16: 'uint16', u32: 'var_uint32', u64: 'var_uint64',
   f32: 'float32', f64: 'float64',
+  // Canonical scalars (src/scalars.ts): string-branded, 16 bytes / DATE on the wire.
+  uuid: 'uuid', ulid: 'ulid', date: 'date',
 };
 
 /** Maps TypeScript primitive type names to their Aster wire primitive. */
@@ -355,6 +357,33 @@ function readBrand(checker: ts.TypeChecker, t: ts.Type): string | undefined {
   return undefined;
 }
 
+/**
+ * Recognize Aster's `Decimal` (`decimal`) and `decimal<P, S>`
+ * (`decimal(P,S)`, src/scalars.ts). `decimal<P, S>` is
+ * `Decimal & { readonly __asterDecimal?: readonly [P, S] }`.
+ */
+function readDecimal(checker: ts.TypeChecker, t: ts.Type, name: string, loc: string): string | undefined {
+  const spec = checker.getPropertyOfType(t, '__asterDecimal');
+  if (spec) {
+    const decl = spec.valueDeclaration ?? spec.declarations?.[0];
+    let st = decl ? checker.getTypeOfSymbolAtLocation(spec, decl) : undefined;
+    if (st && st.isUnion()) st = st.types.find(u => !(u.flags & (ts.TypeFlags.Undefined | ts.TypeFlags.Null)));
+    const args = st ? checker.getTypeArguments(st as ts.TypeReference) : [];
+    const [p, sc] = args;
+    if (!p || !sc || !p.isNumberLiteral() || !sc.isNumberLiteral()) {
+      throw new ScanError(`decimal field '${name}' needs literal precision and scale, e.g. decimal<18, 4>`, loc);
+    }
+    const P = p.value, S = sc.value;
+    if (!Number.isInteger(P) || !Number.isInteger(S) || P < 1 || P > 1000 || S < 0 || S > P) {
+      throw new ScanError(`decimal<${P}, ${S}> on field '${name}': needs integers 1 <= p <= 1000 and 0 <= s <= p`, loc);
+    }
+    return `decimal(${P},${S})`;
+  }
+  const sym = t.getSymbol();
+  if (sym?.getName() === 'Decimal' && checker.getPropertyOfType(t, 'unscaledValue')) return 'decimal';
+  return undefined;
+}
+
 /** Convert a `ts.Type` into a wire field shape. */
 function typeToField(
   ctx: ScanContext,
@@ -378,6 +407,9 @@ function typeToFieldInner(
   // Brand detection runs before the coarse primitive check: a branded
   // `number & {__asterBrand: 'i32'}` has TypeFlags.Number set but we
   // want to preserve the brand's wire token.
+  const dec = readDecimal(checker, t, name, loc);
+  if (dec) return { name, kind: 'primitive', wire: dec, nullable: false };
+
   const brand = readBrand(checker, t);
   if (brand) {
     const wire = BRAND_WIRE[brand];
@@ -1046,11 +1078,12 @@ function resolveLeaf(
   }
   if (f.kind === 'ref') {
     if (backEdgeTargets.has(f.refTag)) {
-      // SELF_REF: encode the target by wire tag rather than by hash.
-      // The tag is language-neutral (unlike Python's current use of
-      // __module__.__qualname__, which is a latent cross-language
-      // parity gap on the Python side).
-      return { type_kind: 'self_ref', type_primitive: '', type_ref: '', self_ref_name: f.refTag };
+      // SELF_REF: name the target instead of hashing it, as
+      // `package.name` (§11.3.4 Step 3), what Rust and Python write:
+      // `types.v1/Author` is `types.v1.Author`.
+      const { package: pkg, name: tn } = splitTag(f.refTag);
+      const selfRef = pkg ? `${pkg}.${tn}` : tn;
+      return { type_kind: 'self_ref', type_primitive: '', type_ref: '', self_ref_name: selfRef };
     }
     const hash = typeHashes.get(f.refTag);
     if (!hash) {
@@ -1539,10 +1572,14 @@ function wireToManifestType(f: ScanField): string {
         case 'string': return 'str';
         case 'binary': return 'bytes';
         case 'timestamp':
-        case 'uuid': return 'str';
+        case 'date':
+        case 'uuid':
+        case 'ulid': return 'str';
         case 'float32':
         case 'float64': return 'float';
-        default: return 'int'; // int8/16/32/64, uint8/16/32/64
+        default:
+          if (f.wire === 'decimal' || f.wire.startsWith('decimal(')) return 'str';
+          return 'int'; // int8/16/32/64, uint8/16/32/64
       }
     case 'ref': return 'dict';
     case 'list':
@@ -1560,8 +1597,12 @@ function manifestDefault(f: ScanField): unknown {
         case 'string':
         case 'binary':
         case 'timestamp':
-        case 'uuid': return '';
-        default: return 0;
+        case 'date':
+        case 'uuid':
+        case 'ulid': return '';
+        default:
+          if (f.wire === 'decimal' || f.wire.startsWith('decimal(')) return '0';
+          return 0;
       }
     case 'ref': return {};
     case 'list':

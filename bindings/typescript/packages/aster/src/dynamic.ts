@@ -19,6 +19,13 @@ import {
   TypeKind,
 } from './contract/identity.js';
 import { foryTypeFor } from './wire-types.js';
+import {
+  Decimal,
+  registerScalarPlan,
+  scalarLeafFor,
+  type ScalarFieldPlan,
+  type ScalarLeaf,
+} from './scalars.js';
 
 /** A dynamically synthesized type class. */
 export interface DynamicType {
@@ -370,6 +377,7 @@ export class DynamicTypeFactory {
       );
       (typeStruct as { initMeta: (ctor: unknown) => void }).initMeta(cls);
       codec.registerType(typeStruct);
+      registerScalarPlan(tag, scalarPlanFromCanonical(td, typeDefs));
       this.foryRegistered.add(tag);
       typesByTag.set(tag, typeStruct);
       resolved.add(tag);
@@ -519,6 +527,51 @@ function foryFieldTypeFromCanonical(
   return wrap(Type.string());
 }
 
+/** The codec's uuid / ulid / date / decimal conversion plan for a TypeDef. */
+function scalarPlanFromCanonical(
+  td: CanonicalTypeDef,
+  typeDefs: { byHash: ReadonlyMap<string, CanonicalTypeDef> },
+): ScalarFieldPlan[] {
+  const leaf = (kind: number, primitive: string, typeRef: string, selfRef: string): ScalarLeaf => {
+    if (kind === TypeKind.PRIMITIVE) return scalarLeafFor(primitive);
+    if (kind === TypeKind.REF) {
+      const nested = typeDefs.byHash.get(typeRef);
+      return nested ? { kind: 'ref', tag: `${nested.package}/${nested.name}` } : { kind: 'none' };
+    }
+    if (kind === TypeKind.SELF_REF && selfRef) {
+      const { namespace, typeName } = splitWireTag(selfRef);
+      return { kind: 'ref', tag: `${namespace}/${typeName}` };
+    }
+    return { kind: 'none' };
+  };
+  return td.fields.map((f): ScalarFieldPlan => {
+    const value = leaf(f.typeKind, f.typePrimitive, f.typeRef, f.selfRefName);
+    switch (f.container) {
+      case ContainerKind.LIST: return { name: f.name, container: 'list', value };
+      case ContainerKind.SET: return { name: f.name, container: 'set', value };
+      case ContainerKind.MAP:
+        return {
+          name: f.name,
+          container: 'map',
+          value,
+          key: leaf(f.containerKeyKind, f.containerKeyPrimitive, f.containerKeyRef, ''),
+        };
+      default: return { name: f.name, container: 'none', value };
+    }
+  });
+}
+
+/** Defaults for the canonical scalars a TypeDef field can hold (the string forms). */
+function canonicalScalarDefault(primitive: string): unknown {
+  switch (primitive) {
+    case 'uuid': return '00000000-0000-0000-0000-000000000000';
+    case 'ulid': return '00000000000000000000000000';
+    case 'date': return '1970-01-01';
+    case 'timestamp': return new Date(0);
+  }
+  return primitive === 'decimal' || primitive.startsWith('decimal(') ? new Decimal(0n) : undefined;
+}
+
 function canonicalToManifestField(f: CanonicalFieldDef): ManifestField {
   // `defaultForField` branches on `kind` to produce container defaults
   // (empty list / empty Map). Without a correct `kind` here, container
@@ -543,11 +596,19 @@ function canonicalToManifestField(f: CanonicalFieldDef): ManifestField {
     kind = 'string';
     legacyType = 'string';
   }
+  // An optional uuid / ulid / date / decimal starts as null: an empty
+  // string is not a value of those types.
+  if (f.optional && f.container === ContainerKind.NONE && f.typeKind === TypeKind.PRIMITIVE
+      && scalarLeafFor(f.typePrimitive).kind !== 'none') {
+    kind = 'ref';
+  }
   const field: ManifestField & { kind: typeof kind } = {
     name: f.name,
     type: legacyType,
     required: f.required,
-    default: undefined,
+    default: f.container === ContainerKind.NONE && f.typeKind === TypeKind.PRIMITIVE && !f.optional
+      ? canonicalScalarDefault(f.typePrimitive)
+      : undefined,
     kind,
   };
   return field;
@@ -559,6 +620,8 @@ function primitiveToManifestKind(
   switch (primName) {
     case 'string':
     case 'uuid':
+    case 'ulid':
+    case 'date':
       return 'string';
     case 'bool':
       return 'bool';

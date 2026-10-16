@@ -341,7 +341,7 @@ describe('aster-gen cyclic wire type graph', () => {
         {
           id: 2, name: 'children',
           type_kind: 'self_ref', type_primitive: '', type_ref: '',
-          self_ref_name: 'tree/Entry', optional: false, ref_tracked: false,
+          self_ref_name: 'tree.Entry', optional: false, ref_tracked: false,
           container: 'list', container_key_kind: 'primitive',
           container_key_primitive: '', container_key_ref: '',
           required: true, default_value: '',

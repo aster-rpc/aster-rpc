@@ -4,6 +4,8 @@
  * - conformance/vectors/envelope.json      -- AEv1 StreamHeader / CallHeader / RpcStatus
  * - conformance/vectors/compression.json   -- zstd payload compression (Aster-SPEC §5.6)
  * - conformance/vectors/contract-defaults.json -- @ContractDefault lowering into contract_id
+ * - conformance/vectors/contract-types.json -- timestamp / date / decimal / decimal(p,s) /
+ *   uuid / ulid and recursive types: hashes, contract ids, payload bytes, refusals
  *
  * The same vectors are checked by Rust core / aster, so passing here means
  * TS produces and accepts the bytes Rust (and Python) do.
@@ -40,6 +42,12 @@ import {
   setNativeContract,
   registerGenerated,
   getServiceInfo,
+  newXlangFory,
+  createXlangCodec,
+  decodeTypeDefBytes,
+  DynamicTypeFactory,
+  Decimal,
+  ScalarError,
 } from '@aster-rpc/aster';
 import { loadNative } from '../../../bindings/typescript/packages/aster/src/native.js';
 
@@ -237,5 +245,181 @@ describe('contract-defaults.json (§11.3.2.3)', () => {
     expect(() => encodeContractDefault('float64', 'none', 5e-324)).toThrow(/subnormal/);
     expect(encodeContractDefault('float64', 'none', -0)).toBe('0000000000000000');
     expect(encodeContractDefault('varint32', 'none', 7)).toBe('0e');
+  });
+});
+
+// -- contract-types.json ------------------------------------------------------------
+
+describe('contract-types.json (Time, UUID, and Decimal; recursive types)', () => {
+  const doc = load('contract-types.json').vector;
+  const PKG_ROOT = path.join(ROOT, 'bindings/typescript/packages/aster');
+  const FIXTURE = path.join(PKG_ROOT, 'tests/fixtures/contract-types');
+  const GEN_OUT = path.join(FIXTURE, 'aster-rpc.generated.ts');
+  let gen: any;
+  let codec: any;
+  const cls = (fqn: string): any => gen.WIRE_TYPES.find((w: any) => w.tag === fqn.replace(/\.(\w+)$/, '/$1')).ctor;
+
+  beforeAll(async () => {
+    setNativeContract(loadNative() as any);
+    const r = spawnSync('node', [
+      path.join(PKG_ROOT, 'dist/cli/gen.js'),
+      '-p', path.join(FIXTURE, 'tsconfig.json'),
+      '-o', GEN_OUT,
+    ], { encoding: 'utf8', cwd: PKG_ROOT });
+    if (r.status !== 0) throw new Error(`aster-gen failed: ${r.stderr}`);
+    gen = await import(GEN_OUT);
+    const { fory, Type } = newXlangFory();
+    codec = createXlangCodec(fory);
+    registerGenerated({
+      SERVICES: gen.SERVICES, WIRE_TYPES: gen.WIRE_TYPES,
+      buildAllTypes: gen.BUILD_ALL_TYPES, fory, Type, codec,
+    });
+  });
+
+  /** A decoded value in the vector's JSON form (timestamps at JS millisecond precision). */
+  const norm = (v: any): any => {
+    if (v === null || v === undefined) return null;
+    if (v instanceof Date) return v.toISOString();
+    if (v instanceof Decimal) return v.toString();
+    if (v instanceof Map) return Object.fromEntries([...v].map(([k, x]) => [k, norm(x)]));
+    if (v instanceof Set || Array.isArray(v)) return [...v].map(norm);
+    if (typeof v === 'object') return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, norm(x)]));
+    return v;
+  };
+  // "2024-03-01T12:34:56.789012Z" -> "2024-03-01T12:34:56.789Z" (Date holds ms; Fory floors).
+  const msTimestamp = (t: string | null) => t === null ? null : t.replace(/\.(\d{3})\d*Z$/, '.$1Z');
+  const expected = (type: string, value: any): any => type !== 'types.v1.Temporal' ? value : {
+    ...value,
+    at: msTimestamp(value.at),
+    maybe_at: msTimestamp(value.maybe_at),
+    history: value.history.map(msTimestamp),
+  };
+
+  it('aster-gen emits every vector canonical TypeDef and type hash', () => {
+    const src = readFileSync(GEN_OUT, 'utf8');
+    for (const [fqn, t] of Object.entries<any>(doc.types)) {
+      const shape = gen.WIRE_TYPES.find((w: any) => w.tag === fqn.replace(/\.(\w+)$/, '/$1'));
+      expect(shape, fqn).toBeTruthy();
+      expect(shape.typeHashHex, fqn).toBe(t.expected_type_hash);
+      expect(hex(shape.typeDefBytes), fqn).toBe(t.expected_canonical_type_def_hex);
+    }
+    expect(src).toContain('"decimal(18,4)"');
+  });
+
+  it('the Types and Ids contract ids match the vector', () => {
+    const id = (name: string) => {
+      const svc = gen.SERVICES.find((s: any) => s.name === name).ctor;
+      return contractIdFromContract(fromServiceInfo(getServiceInfo(svc)! as any));
+    };
+    expect(id('Types')).toBe(doc.expected_contract_id);
+    expect(id('Ids')).toBe(doc.expected_ids_contract_id);
+  });
+
+  for (const name of Object.keys(doc.payloads).sort()) {
+    it(`decodes Rust payload ${name} and round-trips it`, () => {
+      const c = doc.payloads[name];
+      const got = codec.decode(fromHex(c.hex), cls(c.type));
+      expect(got).toBeInstanceOf(cls(c.type));
+      expect(norm(got)).toEqual(expected(c.type, c.value));
+      expect(norm(codec.decode(codec.encode(got), cls(c.type)))).toEqual(norm(got));
+    });
+  }
+
+  // Byte-identical except a string header: Fory JS writes an ASCII string as
+  // LATIN1 (0x1c for 7 bytes), Fory Rust as UTF-8 (0x1e). Both decode
+  // everywhere; it is not a uuid / ulid / decimal difference (pyfory does
+  // the same). Temporal is left out (a JS Date holds milliseconds, the
+  // vector microseconds), and so are the recursive payloads: Fory JS writes
+  // other type-meta field flags for struct-typed fields than Fory Rust, a
+  // codec difference independent of these types; they decode above.
+  const asForyJsWrites = (h: string) => h.replace('1e' + Buffer.from('primary').toString('hex'), '1c' + Buffer.from('primary').toString('hex'));
+  for (const name of ['identified', 'priced']) {
+    it(`writes Rust's bytes for ${name}`, () => {
+      const c = doc.payloads[name];
+      const got = codec.decode(fromHex(c.hex), cls(c.type));
+      expect(hex(codec.encode(got))).toBe(asForyJsWrites(c.hex));
+    });
+  }
+
+  it('decodes uuid / ulid to their string forms and decimal(p,s) at scale s', () => {
+    const id = codec.decode(fromHex(doc.payloads.identified.hex), cls('types.v1.Identified'));
+    expect(id.id).toBe('0190f2a8-1b2c-7d3e-8f40-123456789abc');
+    expect(id.trace).toBe('01ARZ3NDEKTSV4RRFFQ69G5FAV');
+    expect([...id.names.keys()]).toEqual(['0190f2a8-1b2c-7d3e-8f40-123456789abc']);
+    const p = codec.decode(fromHex(doc.payloads.priced.hex), cls('types.v1.Priced'));
+    expect(p.price).toBeInstanceOf(Decimal);
+    expect([p.price.toString(), p.price.scale]).toEqual(['-12345.6700', 4]);
+    expect([p.rate.toString(), p.rate.scale]).toEqual(['99999', 0]);
+  });
+
+  it('encode rescales to the declared scale, like Rust FixedDecimal', () => {
+    const Priced = cls('types.v1.Priced');
+    const value = new Priced();
+    Object.assign(value, { price: '-12345.67', rate: 99999, maybe_price: Decimal.parse('0.0001'), amount: '1.5' });
+    expect(hex(codec.encode(value))).toBe(doc.payloads.priced.hex);
+    expect(value.price).toBe('-12345.67'); // the caller's object is not modified
+  });
+
+  it('encode refuses a decimal outside its declaration, and floats', () => {
+    const Priced = cls('types.v1.Priced');
+    const priced = (price: unknown) => Object.assign(new Priced(), { price });
+    expect(() => codec.encode(priced('1.23456'))).toThrow(/rounding/);
+    expect(() => codec.encode(priced('123456789012345'))).toThrow(/more than 18 digits/);
+    expect(() => codec.encode(priced('1.23456'))).toThrow(ScalarError);
+    expect(() => codec.encode(priced(1.5))).toThrow(TypeError);
+  });
+
+  it('encode refuses a malformed or wrong-length identifier', () => {
+    const Identified = cls('types.v1.Identified');
+    expect(() => codec.encode(Object.assign(new Identified(), { id: new Uint8Array(15) }))).toThrow(ScalarError);
+    expect(() => codec.encode(Object.assign(new Identified(), { trace: '01ARZ3NDEKTSV4RRFFQ69G5FA' }))).toThrow(ScalarError);
+    expect(() => codec.encode(Object.assign(new Identified(), { id: 'not-a-uuid' }))).toThrow(ScalarError);
+  });
+
+  for (const name of Object.keys(doc.decode_cases).sort()) {
+    it(`decode case ${name}`, () => {
+      const c = doc.decode_cases[name];
+      if (c.refused) {
+        expect(() => codec.decode(fromHex(c.hex), cls(c.type))).toThrow(ScalarError);
+        return;
+      }
+      const got = codec.decode(fromHex(c.hex), cls(c.type));
+      expect(norm(got)).toEqual(c.value);
+      expect(got.price.scale).toBe(4);
+    });
+  }
+
+  it('the dynamic client builds uuid / ulid / decimal(p,s) fields from Rust TypeDefs', () => {
+    const byTag = new Map<string, any>();
+    const byHash = new Map<string, any>();
+    for (const fqn of ['types.v1.Identified', 'types.v1.Priced']) {
+      const t = doc.types[fqn];
+      const td = decodeTypeDefBytes(fromHex(t.expected_canonical_type_def_hex));
+      byTag.set(`${td.package}/${td.name}`, td);
+      byHash.set(t.expected_type_hash, td);
+    }
+    const { fory, Type } = newXlangFory();
+    const dyn = createXlangCodec(fory);
+    const factory = new DynamicTypeFactory();
+    const roots = ['types.v1/Identified', 'types.v1/Priced'];
+    expect(factory.registerFromTypeDefs(roots, { byTag, byHash }, Type, dyn)).toEqual(new Set(roots));
+    const DynIdentified = factory.getType('types.v1/Identified')!;
+    const DynPriced = factory.getType('types.v1/Priced')!;
+
+    const id = dyn.decode(fromHex(doc.payloads.identified.hex), DynIdentified);
+    expect(norm(id)).toEqual(doc.payloads.identified.value);
+    expect(hex(dyn.encode(id))).toBe(asForyJsWrites(doc.payloads.identified.hex));
+    const p: any = dyn.decode(fromHex(doc.payloads.priced.hex), DynPriced);
+    expect(norm(p)).toEqual(doc.payloads.priced.value);
+    for (const c of Object.values<any>(doc.decode_cases)) {
+      const T = c.type === 'types.v1.Priced' ? DynPriced : DynIdentified;
+      if (c.refused) expect(() => dyn.decode(fromHex(c.hex), T)).toThrow(ScalarError);
+      else expect(norm(dyn.decode(fromHex(c.hex), T))).toEqual(c.value);
+    }
+    // What an agent sends: strings for the identifiers and the decimal.
+    const req = new DynPriced({ price: '2.5', rate: 3 });
+    expect(String((dyn.decode(dyn.encode(req), DynPriced) as any).price)).toBe('2.5000');
+    const ids = new DynIdentified({ id: '0190F2A8-1B2C-7D3E-8F40-123456789ABC' });
+    expect((dyn.decode(dyn.encode(ids), DynIdentified) as any).id).toBe('0190f2a8-1b2c-7d3e-8f40-123456789abc');
   });
 });

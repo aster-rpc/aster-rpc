@@ -11,6 +11,7 @@
  */
 
 import { WIRE_TYPE_KEY } from './decorators.js';
+import { scalarsFromWire, scalarsToWire } from './scalars.js';
 
 /** Default compression threshold in bytes (4 KiB). Payloads strictly larger are zstd-compressed by core. */
 export const DEFAULT_COMPRESSION_THRESHOLD = 4096;
@@ -193,12 +194,19 @@ export class ForyCodec implements Codec {
       const ctor = hintType as new (...args: any[]) => any;
       obj = new ctor(obj);
     }
-    const result = this.fory.serialize(obj);
+    // uuid / ulid / date / decimal fields: the string / Decimal forms
+    // become the 16-byte BINARY / DECIMAL carriers Fory writes, and
+    // decimal(p,s) is rescaled or refused (Aster-ContractIdentity.md,
+    // "Time, UUID, and Decimal"). A shallow copy; `obj` is not modified.
+    const tag = getWireType((obj as any)?.constructor) ?? getWireType(hintType);
+    const result = this.fory.serialize(scalarsToWire(obj, tag));
     return new Uint8Array(result);
   }
 
-  decode(payload: Uint8Array, _hintType?: unknown): unknown {
-    return this.fory.deserialize(payload);
+  decode(payload: Uint8Array, hintType?: unknown): unknown {
+    const value = this.fory.deserialize(payload);
+    const tag = getWireType((value as any)?.constructor) ?? getWireType(hintType);
+    return scalarsFromWire(value, tag);
   }
 
   /** Registered wire tags (`namespace/TypeName`). */

@@ -32,10 +32,20 @@ export const CANONICAL_PRIMITIVES = [
   'float32',
   'float64',
   'timestamp',
+  'date',
+  'decimal',
   'uuid',
+  'ulid',
 ] as const;
 
-export type CanonicalPrimitive = (typeof CANONICAL_PRIMITIVES)[number];
+/**
+ * A canonical `type_primitive`: one of {@link CANONICAL_PRIMITIVES}, or a
+ * constrained decimal `decimal(p,s)` (e.g. `decimal(18,4)`).
+ */
+export type CanonicalPrimitive = (typeof CANONICAL_PRIMITIVES)[number] | `decimal(${number},${number})`;
+
+/** `decimal(p,s)` in canonical form (base-10, no leading zeros, no spaces). */
+const FIXED_DECIMAL_RE = /^decimal\([1-9]\d*,(0|[1-9]\d*)\)$/;
 
 /**
  * The Fory `Type` factory expression for a canonical primitive, as source
@@ -61,8 +71,13 @@ export function foryTypeExpr(prim: string): string {
     case 'float32': return 'Type.float32()';
     case 'float64': return 'Type.float64()';
     case 'timestamp': return 'Type.timestamp()';
-    case 'uuid': return 'Type.string()';
+    case 'date': return 'Type.date()';
+    case 'decimal': return 'Type.decimal()';
+    // Fory has no UUID type: 16 raw bytes as BINARY, as Rust and Python send.
+    case 'uuid':
+    case 'ulid': return 'Type.binary()';
     default:
+      if (FIXED_DECIMAL_RE.test(prim)) return 'Type.decimal()';
       throw new Error(`unknown canonical wire primitive '${prim}'`);
   }
 }
@@ -88,8 +103,12 @@ export function foryTypeFor(prim: string, Type: any): any {
     case 'float32': return Type.float32();
     case 'float64': return Type.float64();
     case 'timestamp': return Type.timestamp();
-    case 'uuid': return Type.string();
+    case 'date': return Type.date();
+    case 'decimal': return Type.decimal();
+    case 'uuid':
+    case 'ulid': return Type.binary();
     default:
+      if (FIXED_DECIMAL_RE.test(prim)) return Type.decimal();
       throw new Error(`unknown canonical wire primitive '${prim}'`);
   }
 }

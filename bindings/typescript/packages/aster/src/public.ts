@@ -157,6 +157,18 @@ export { BidiStream } from './decorators.js';
 export { WireType, type WireTypeOptions } from './decorators.js';
 
 /**
+ * Canonical contract types: `uuid` and `ulid` (16 bytes on the wire),
+ * `date`, `Decimal` and `decimal<P, S>` (`decimal(P,S)`).
+ * @group Wire types
+ */
+export {
+  uuid, uuidToBytes, uuidFromBytes,
+  ulid, ulidToBytes, ulidFromBytes, generateUlid, ulidTimestamp,
+  date, Decimal, ScalarError,
+  type decimal,
+} from './scalars.js';
+
+/**
  * Compose capability requirements with OR semantics.
  * @group Authorization
  */
