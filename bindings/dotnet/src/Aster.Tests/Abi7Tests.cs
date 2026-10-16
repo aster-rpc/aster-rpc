@@ -7,7 +7,7 @@ using Aster.Rpc;
 
 namespace Aster.Tests;
 
-/// <summary>C ABI 7.1 – 7.5 (ffi/RENAME_MAP.md "New in 7.x"): layouts, config, metrics, drain, call identity.</summary>
+/// <summary>C ABI 7.1 – 7.7 (ffi/RENAME_MAP.md "New in 7.x"): layouts, config, metrics, drain, call identity (gateway identity: GatewayIdentityTests).</summary>
 public class Abi7Tests
 {
     private static readonly AsterConfig Loopback = new() { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
@@ -16,7 +16,7 @@ public class Abi7Tests
     [Fact]
     public void Layouts_Constants_And_Exports_Match_The_Header()
     {
-        Assert.Equal(5u, Native.RequiredAbiMinor);
+        Assert.Equal(7u, Native.RequiredAbiMinor);
         Assert.Equal(64, Marshal.SizeOf<DrainReportNative>());
         Assert.Equal(96, Marshal.SizeOf<NetworkConfigNative>());
         Assert.Equal(16, Marshal.SizeOf<MetricsConfigNative>());
@@ -30,9 +30,26 @@ public class Abi7Tests
         Assert.Equal(503UL, AsterServer.DrainCloseCode);
         Assert.Equal(2u, Native.FetchReportV2);
         Assert.Equal(new uint[] { 0, 1, 2, 3 }, Enum.GetValues<DiscoveryMode>().Select(m => (uint)m).ToArray());
+        // 7.6 / 7.7 gateway identity
+        Assert.Equal(96, Marshal.SizeOf<IdentityConfigNative>());
+        Assert.Equal(16, Marshal.OffsetOf<IdentityConfigNative>(nameof(IdentityConfigNative.edge_token_max_lifetime_secs)).ToInt32());
+        Assert.Equal(40, Marshal.OffsetOf<IdentityConfigNative>(nameof(IdentityConfigNative.trusted_issuers_json)).ToInt32());
+        Assert.Equal(56, Marshal.OffsetOf<IdentityConfigNative>(nameof(IdentityConfigNative.publisher_json)).ToInt32());
+        Assert.Equal(72, Marshal.OffsetOf<IdentityConfigNative>(nameof(IdentityConfigNative.remote_config_lock)).ToInt32());
+        Assert.Equal(88, Marshal.OffsetOf<IdentityConfigNative>(nameof(IdentityConfigNative.sources)).ToInt32());
+        Assert.Equal(0x2000u, (uint)DispatchFlags.OnBehalfOf);
+        Assert.Equal(6u, (uint)DispatchServerOption.AcceptOnBehalfOf);
+        Assert.Equal(129u, (uint)EventKind.NodeConfigResult);
+        Assert.Equal(2u, Native.DispatchIdentityActor);
+        Assert.Equal((1u, 2u, 4u), (Native.IdentitySetEdgeTokenMaxLifetime, Native.IdentitySetClockLeeway, Native.IdentitySetMaxKeySetAge));
+        Assert.Equal((0u, 1u, 2u, 3u), (Native.NodeConfigGet, Native.NodeConfigSet, Native.NodeConfigClear, Native.NodeConfigAck));
         AbiContractTests.AssertExports([
             "aster_server_drain", "aster_config_set_network", "aster_config_network", "aster_config_set_metrics",
             "aster_config_metrics", "aster_blobs_transfer_stats", "aster_dispatch_identity",
+            "aster_config_set_identity", "aster_config_identity", "aster_server_set_audit_outbox", "aster_dispatch_on_behalf_of",
+            "aster_server_node_properties", "aster_server_node_config_generation", "aster_enrollment_mint_user_token",
+            "aster_enrollment_publisher_notice", "aster_enrollment_publisher_notice_token", "aster_enrollment_publisher_status",
+            "aster_node_config_call",
         ]);
         Assert.True(NativeLibrary.TryLoad("aster_transport_ffi", typeof(Native).Assembly, null, out IntPtr lib));
         Assert.True(NativeLibrary.TryGetExport(lib, "aster_audit_outbox_acknowledgements", out _));
@@ -150,13 +167,13 @@ public class Abi7Tests
 
     internal static readonly object EnvLock = new();
 
-    private static void Env(string name, string value) => Assert.Equal(0, setenv(name, value, 1));
+    internal static void Env(string name, string value) => Assert.Equal(0, setenv(name, value, 1));
 
     [DllImport("libc", SetLastError = true)]
     private static extern int setenv(string name, string value, int overwrite);
 
     [DllImport("libc", SetLastError = true)]
-    private static extern int unsetenv(string name);
+    internal static extern int unsetenv(string name);
 
     [Fact]
     public async Task Node_Starts_With_Discovery_None_And_Advertised_Addresses()

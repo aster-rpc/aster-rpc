@@ -139,6 +139,63 @@ public sealed class Enrollment : IDisposable
 
     internal void Forget(string serverId) => _enrolled.TryRemove(serverId, out _);
 
+    // ── Gateway identity (C ABI 7.7) ──────────────────────────────────────
+
+    private const int MaxMintBytes = 64 * 1024;
+
+    /// <summary>
+    /// Mints a short-lived token for user <paramref name="sub"/> (see <see cref="AsterClient.MintUserToken"/>):
+    /// signed with this node's key, bounded by the issuer delegation in the credential held now
+    /// (<c>aster_enrollment_mint_user_token</c>). A role outside it, a bad lifetime or value is an
+    /// <see cref="IrohException"/> (<c>InvalidArgument</c>).
+    /// </summary>
+    public unsafe string MintUserToken(string sub, IEnumerable<string> roles, IEnumerable<string> amr, TimeSpan ttl)
+    {
+        ArgumentNullException.ThrowIfNull(sub);
+        byte[] body = JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, object?>
+        {
+            ["sub"] = sub,
+            ["roles"] = (roles ?? Array.Empty<string>()).ToArray(),
+            ["amr"] = (amr ?? Array.Empty<string>()).ToArray(),
+            ["ttl_secs"] = ttl <= TimeSpan.Zero ? 0UL : (ulong)Math.Ceiling(ttl.TotalSeconds),
+        });
+        if (body.Length > MaxMintBytes)
+            throw new IrohException(Aster.Status.InvalidArgument, "mint request too large");
+        Bytes output = default;
+        using (var scope = new NativeScope())
+            Native.Check(Native.aster_enrollment_mint_user_token(_runtime.Handle, Live(), scope.Bytes(body), &output),
+                "aster_enrollment_mint_user_token");
+        return System.Text.Encoding.UTF8.GetString(NativeScope.TakeOwned(ref output));
+    }
+
+    /// <summary>
+    /// Tells the node's issuer-key publisher (<c>[identity.publisher]</c>) that a token of <paramref name="iss"/>
+    /// named <paramref name="kid"/>: an unknown kid refreshes the issuer at once (at most every
+    /// <c>min_refresh_secs</c>). <c>NotFound</c> when the node runs no publisher.
+    /// </summary>
+    public void NoticeKid(string iss, string kid)
+    {
+        using var scope = new NativeScope();
+        Native.Check(Native.aster_enrollment_publisher_notice(_runtime.Handle, Live(), scope.Utf8(iss), scope.Utf8(kid)),
+            "aster_enrollment_publisher_notice");
+    }
+
+    /// <summary><see cref="NoticeKid"/> with the <c>iss</c> and <c>kid</c> of a compact JWT (unverified; one that does not parse is ignored).</summary>
+    public void NoticeToken(string token)
+    {
+        using var scope = new NativeScope();
+        Native.Check(Native.aster_enrollment_publisher_notice_token(_runtime.Handle, Live(), scope.Utf8(token)),
+            "aster_enrollment_publisher_notice_token");
+    }
+
+    /// <summary>The publisher's state per issuer. <c>NotFound</c> when the node runs no publisher.</summary>
+    public unsafe IReadOnlyDictionary<string, IssuerPublishStatus> PublisherStatus()
+    {
+        Bytes output = default;
+        Native.Check(Native.aster_enrollment_publisher_status(_runtime.Handle, Live(), &output), "aster_enrollment_publisher_status");
+        return Decode<Dictionary<string, IssuerPublishStatus>>(NativeScope.TakeOwned(ref output), "aster_enrollment_publisher_status");
+    }
+
     private async Task<byte[]> ResultAsync(ulong op, string what, CancellationToken ct)
     {
         Event ev;

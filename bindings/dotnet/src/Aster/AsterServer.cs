@@ -167,6 +167,11 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
                     builder.Option(DispatchServerOption.HandlerTimeoutMs, cap <= TimeSpan.Zero ? 0 : (ulong)Math.Ceiling(cap.TotalMilliseconds));
                 if (options.LeaseGrantor is { } g && leaseSerializer is not null)
                     builder.LeaseGrantor(leaseSerializer.Handle, g);
+                // Gateway identity itself comes from the config (aster_server_builder_new / _start).
+                if (options.AcceptOnBehalfOf is { } accept)
+                    builder.Option(DispatchServerOption.AcceptOnBehalfOf, accept ? 1UL : 0UL);
+                if (options.AuditOutbox is { } outbox)
+                    builder.AuditOutbox(outbox.NativeHandle);
                 // On an enrolled node this also attaches policy, which blocks up to
                 // limits.sync_timeout_ms with replicas: keep it off the caller's thread.
                 var started = builder;
@@ -223,6 +228,27 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
     /// <summary>A ticket for this server (waits briefly for direct addresses).</summary>
     public Task<AsterTicket> TicketAsync(CancellationToken cancellationToken = default)
         => _node.TicketAsync(TimeSpan.FromSeconds(5), cancellationToken);
+
+    private readonly object _propsLock = new();
+    private Func<NodeProperties>? _nodePropertiesFn;
+    private NodeProperties? _props;
+
+    /// <summary>
+    /// The server's <c>aster.ops.NodeConfig</c> properties now (Rust <c>AsterServer::node_config().properties()</c>),
+    /// re-read only when the NodeConfig generation changes. Empty when NodeConfig is off.
+    /// </summary>
+    public NodeProperties NodeProperties()
+    {
+        ulong generation = _dispatch.NodeConfigGeneration;
+        lock (_propsLock)
+        {
+            if (_props is { } cached && cached.Generation == generation) return cached;
+            var json = _dispatch.NodePropertiesJson();
+            try { _props = System.Text.Json.JsonSerializer.Deserialize<NodeProperties>(json, GatewayIdentity.Json) ?? Aster.NodeProperties.Empty; }
+            catch (System.Text.Json.JsonException e) { throw new IrohException(Status.Internal, $"aster_server_node_properties: {e.Message}"); }
+            return _props;
+        }
+    }
 
     /// <summary>The registered services by name.</summary>
     public IReadOnlyDictionary<string, ServiceDefinition> Services => _services;
@@ -461,9 +487,18 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
                 attributes = _dispatch.Attributes(inbound.CallId).GroupBy(kv => kv.Key).ToDictionary(g => g.Key, g => g.Last().Value);
             DateTimeOffset? deadline = inbound.DeadlineUnixMs > 0 ? DateTimeOffset.FromUnixTimeMilliseconds(inbound.DeadlineUnixMs) : null;
             var method = inbound.Method;
+            // A gateway's on-behalf-of call (ABI 7.7): the gateway is the transport peer, the user the principal.
+            string? actor = null;
+            ForwardedIdentity? onBehalfOf = null;
+            if ((flags & DispatchFlags.OnBehalfOf) != 0)
+            {
+                actor = inbound.TransportPeer;
+                onBehalfOf = _dispatch.OnBehalfOf(inbound.CallId);
+            }
             var ctx = new ServerCallContext(inbound.Service.Name, method.Name, method.Pattern, inbound.Peer, inbound.ConnectionId,
                 inbound.SessionId, inbound.SessionKey, inbound.Session, metadata, attributes, deadline, inbound.Cts.Token,
-                (flags & DispatchFlags.IrohAuthenticated) != 0, inbound.TransportPeer, inbound.CallId, inbound.WireCallId);
+                (flags & DispatchFlags.IrohAuthenticated) != 0, inbound.TransportPeer, inbound.CallId, inbound.WireCallId,
+                actor, onBehalfOf, _nodePropertiesFn ??= NodeProperties);
             // Path 2 of the handler-context design: the async-local, scoped to this async method.
             ServerCallContext.SetCurrent(ctx);
             call = new ServerCall(_dispatch, inbound.CallId, inbound.Request, (flags & DispatchFlags.FirstIsEnd) != 0, _codec, ctx);
@@ -640,4 +675,19 @@ public sealed class AsterServerOptions
 
     /// <summary>Cap on any handler's run time (null = Rust's default, 300 s; zero = no cap).</summary>
     public TimeSpan? HandlerTimeout { get; init; }
+
+    /// <summary>
+    /// Overrides <see cref="IdentityConfig.AcceptOnBehalfOf"/> (Rust <c>AsterServerBuilder::accept_on_behalf_of</c>):
+    /// accept calls an edge holding <see cref="GatewayIdentity.GatewayRole"/> makes on behalf of a user. Off, a
+    /// call carrying the entry is refused with <c>PERMISSION_DENIED</c>. <c>aster.ops.NodeConfig</c> can still
+    /// override it remotely unless <see cref="RemoteConfig.Lock"/> holds <c>identity</c>. Null = the config.
+    /// </summary>
+    public bool? AcceptOnBehalfOf { get; init; }
+
+    /// <summary>
+    /// Durably records every <c>aster.ops.NodeConfig</c> set and clear (Rust <c>AsterServerBuilder::audit_outbox</c>);
+    /// a change the outbox does not accept is refused. The caller keeps owning it; dispose it after the server.
+    /// Null = none.
+    /// </summary>
+    public Audit.AuditOutbox? AuditOutbox { get; init; }
 }

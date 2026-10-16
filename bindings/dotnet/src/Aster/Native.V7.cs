@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 
 namespace Aster;
 
-// P/Invoke declarations for the C ABI 7.2 – 7.5 additions (ffi/RENAME_MAP.md "New in 7.x").
+// P/Invoke declarations for the C ABI 7.2 – 7.7 additions (ffi/RENAME_MAP.md "New in 7.x").
 // 7.1 (audit acknowledgements) lives in Native.Audit.cs. Struct sizes are pinned by AbiContractTests.
 internal static unsafe partial class Native
 {
@@ -41,6 +41,46 @@ internal static unsafe partial class Native
 
     [LibraryImport(NativeLib, EntryPoint = "aster_dispatch_identity")]
     public static partial int aster_dispatch_identity(ulong runtime, ulong server, ulong call_id, DispatchIdentityNative* @out);
+
+    // ─── 7.6 / 7.7: gateway identity ────────────────────────────────────────
+
+    /// <summary><c>ASTER_DISPATCH_IDENTITY_ACTOR</c> (7.6): <c>actor_ptr</c> is the forwarding gateway.</summary>
+    public const uint DispatchIdentityActor = 2;
+
+    /// <summary><c>ASTER_IDENTITY_SET_*</c>: which limits of <see cref="IdentityConfigNative"/> are set.</summary>
+    public const uint IdentitySetEdgeTokenMaxLifetime = 1, IdentitySetClockLeeway = 2, IdentitySetMaxKeySetAge = 4;
+
+    /// <summary><c>aster_node_config_method_t</c>.</summary>
+    public const uint NodeConfigGet = 0, NodeConfigSet = 1, NodeConfigClear = 2, NodeConfigAck = 3;
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_config_set_identity")]
+    public static partial int aster_config_set_identity(ConfigNative* config, IdentityConfigNative* identity);
+    [LibraryImport(NativeLib, EntryPoint = "aster_config_identity")]
+    public static partial int aster_config_identity(ConfigNative* config, IdentityConfigNative* @out);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_server_set_audit_outbox")]
+    public static partial int aster_server_set_audit_outbox(ulong runtime, ulong builder, ulong outbox);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_dispatch_on_behalf_of")]
+    public static partial int aster_dispatch_on_behalf_of(ulong runtime, ulong server, ulong call_id, byte** out_ptr, uint* out_len,
+        ulong* out_buffer);
+    [LibraryImport(NativeLib, EntryPoint = "aster_server_node_properties")]
+    public static partial int aster_server_node_properties(ulong server, Bytes* out_json);
+    [LibraryImport(NativeLib, EntryPoint = "aster_server_node_config_generation")]
+    public static partial ulong aster_server_node_config_generation(ulong server);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_enrollment_mint_user_token")]
+    public static partial int aster_enrollment_mint_user_token(ulong runtime, ulong enrollment, Bytes request_json, Bytes* out_token);
+    [LibraryImport(NativeLib, EntryPoint = "aster_enrollment_publisher_notice")]
+    public static partial int aster_enrollment_publisher_notice(ulong runtime, ulong enrollment, Bytes iss, Bytes kid);
+    [LibraryImport(NativeLib, EntryPoint = "aster_enrollment_publisher_notice_token")]
+    public static partial int aster_enrollment_publisher_notice_token(ulong runtime, ulong enrollment, Bytes token);
+    [LibraryImport(NativeLib, EntryPoint = "aster_enrollment_publisher_status")]
+    public static partial int aster_enrollment_publisher_status(ulong runtime, ulong enrollment, Bytes* out_json);
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_node_config_call")]
+    public static partial int aster_node_config_call(ulong runtime, ulong connection, uint method, Bytes request_json, ulong user_data,
+        out ulong out_operation);
 }
 
 /// <summary><c>aster_drain_report_t</c> (64 bytes, ABI 7.2).</summary>
@@ -127,4 +167,25 @@ internal struct DispatchIdentityNative
     public uint actor_len;
     public uint reserved;
     public ulong buffer;
+}
+
+/// <summary>
+/// <c>aster_identity_config_t</c> (96 bytes, ABI 7.7): <c>[identity]</c>, <c>[identity.publisher]</c> and
+/// <c>[remote_config]</c> beside <c>aster_config_t</c>.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct IdentityConfigNative
+{
+    public uint struct_size;
+    public uint set;
+    public uint accept_on_behalf_of;
+    public uint remote_config_disabled;
+    public ulong edge_token_max_lifetime_secs;
+    public ulong clock_leeway_secs;
+    public ulong max_key_set_age_secs;
+    public Bytes trusted_issuers_json;
+    public Bytes publisher_json;
+    public BytesList remote_config_lock;
+    /// <summary><c>aster_config_source_t</c> per <c>ASTER_IDENTITY_SETTING_*</c> index.</summary>
+    public fixed byte sources[8];
 }

@@ -210,6 +210,21 @@ public sealed record AsterConfig
         || !string.IsNullOrWhiteSpace(Enrollment.IssuerDelegationFile) || !string.IsNullOrWhiteSpace(EnrollmentCredentialFile)
         || !string.IsNullOrWhiteSpace(EnrollmentCredentialChain));
 
+    // ── Gateway identity ([identity], [remote_config]; C ABI 7.7) ─────────
+
+    /// <summary>
+    /// <c>[identity]</c> and <c>[identity.publisher]</c>: calls on behalf of users, trusted identity providers,
+    /// token limits and the issuer-key publisher (<c>ASTER_IDENTITY_*</c>). Rust reads and validates them;
+    /// <see cref="AsterServer"/> / <see cref="AsterClient"/> apply them with no application code.
+    /// </summary>
+    public IdentityConfig Identity { get; init; } = new();
+
+    /// <summary>
+    /// <c>[remote_config]</c>: <c>aster.ops.NodeConfig</c> on or off, and sections locked against remote
+    /// overrides (<c>ASTER_REMOTE_CONFIG_*</c>).
+    /// </summary>
+    public RemoteConfig RemoteConfig { get; init; } = new();
+
     // ── Binding-level settings ([connect], [logging]) ─────────────────────
 
     public string? EndpointAddr { get; init; }
@@ -419,14 +434,25 @@ public sealed record AsterConfig
         !string.IsNullOrEmpty(BindAddrV6) || AdvertiseAddrs.Count > 0 || RelayCaCerts.Count > 0 || RelayCaOnly
         || Discovery != DiscoveryMode.Default || !string.IsNullOrEmpty(DiscoveryDnsOrigin) || DiscoveryPkarrRelays.Count > 0;
 
+    private bool HasIdentitySettings
+    {
+        get
+        {
+            var i = Identity;
+            return i.AcceptOnBehalfOf || i.TrustedIssuers.Count > 0 || i.EdgeTokenMaxLifetimeSecs is not null
+                || i.ClockLeewaySecs is not null || i.MaxKeySetAgeSecs is not null || i.Publisher is not null
+                || RemoteConfig.Disabled || RemoteConfig.Lock.Count > 0 || i.Sources.Any(b => b != 0);
+        }
+    }
+
     /// <summary>
-    /// Copies the 7.3 network and 7.4 metrics settings into the config's library-owned storage, which
-    /// <paramref name="scope"/> releases (<c>aster_config_release</c>) when it is disposed.
+    /// Copies the 7.3 network, 7.4 metrics and 7.7 identity settings into the config's library-owned storage,
+    /// which <paramref name="scope"/> releases (<c>aster_config_release</c>) when it is disposed.
     /// </summary>
     private unsafe void SetNetworkAndMetrics(NativeScope scope, ref ConfigNative n)
     {
-        bool network = HasNetworkSettings, metrics = MetricsPeerLabels || MetricsPeerLabelCap != 0;
-        if (!network && !metrics) return;
+        bool network = HasNetworkSettings, metrics = MetricsPeerLabels || MetricsPeerLabelCap != 0, identity = HasIdentitySettings;
+        if (!network && !metrics && !identity) return;
         if (!Enum.IsDefined(Discovery))
             throw new ArgumentException($"Discovery: unknown mode {(uint)Discovery}", nameof(Discovery));
         ConfigNative* cfg = scope.Struct<ConfigNative>();
@@ -454,7 +480,67 @@ public sealed record AsterConfig
             m.peer_label_cap = MetricsPeerLabelCap;
             Native.Check(Native.aster_config_set_metrics(cfg, &m), "aster_config_set_metrics");
         }
+        if (identity)
+            SetIdentity(scope, cfg);
         n = *cfg;
+    }
+
+    private unsafe void SetIdentity(NativeScope scope, ConfigNative* cfg)
+    {
+        var i = Identity;
+        IdentityConfigNative id = default;
+        id.struct_size = (uint)sizeof(IdentityConfigNative);
+        id.accept_on_behalf_of = i.AcceptOnBehalfOf ? 1u : 0u;
+        id.remote_config_disabled = RemoteConfig.Disabled ? 1u : 0u;
+        if (i.EdgeTokenMaxLifetimeSecs is { } edge) { id.edge_token_max_lifetime_secs = edge; id.set |= Native.IdentitySetEdgeTokenMaxLifetime; }
+        if (i.ClockLeewaySecs is { } leeway) { id.clock_leeway_secs = leeway; id.set |= Native.IdentitySetClockLeeway; }
+        if (i.MaxKeySetAgeSecs is { } age) { id.max_key_set_age_secs = age; id.set |= Native.IdentitySetMaxKeySetAge; }
+        if (i.TrustedIssuers.Count > 0)
+            id.trusted_issuers_json = scope.Bytes(System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(i.TrustedIssuers, GatewayIdentity.Json));
+        if (i.Publisher is { } publisher)
+            id.publisher_json = scope.Bytes(System.Text.Json.JsonSerializer.SerializeToUtf8Bytes(publisher, GatewayIdentity.Json));
+        id.remote_config_lock = scope.Utf8List(RemoteConfig.Lock);
+        // A file / env source survives only while the value is still the one loaded.
+        var now = i.Fingerprints();
+        for (int k = 0; k < IdentityConfig.SettingCount; k++)
+            if (k < i.Sources.Length && i.Sources[k] != 0 && i.Loaded is { } loaded && now[k] == loaded[k])
+                id.sources[k] = i.Sources[k];
+        Native.Check(Native.aster_config_set_identity(cfg, &id), "aster_config_set_identity");
+    }
+
+    private static unsafe AsterConfig WithIdentity(in ConfigNative n, AsterConfig c)
+    {
+        IdentityConfigNative id = default;
+        id.struct_size = (uint)sizeof(IdentityConfigNative);
+        fixed (ConfigNative* cfg = &n)
+            Native.Check(Native.aster_config_identity(cfg, &id), "aster_config_identity");
+        uint setBits = id.set;
+        ulong? U(uint bit, ulong v) => (setBits & bit) != 0 ? v : null;
+        var issuers = id.trusted_issuers_json.IsEmpty ? null
+            : System.Text.Json.JsonSerializer.Deserialize<List<TrustedIssuer>>(id.trusted_issuers_json.ToArray(), GatewayIdentity.Json);
+        var publisher = id.publisher_json.IsEmpty ? null
+            : System.Text.Json.JsonSerializer.Deserialize<IdentityPublisherConfig>(id.publisher_json.ToArray(), GatewayIdentity.Json);
+        var sources = new byte[IdentityConfig.SettingCount];
+        for (int k = 0; k < sources.Length; k++) sources[k] = id.sources[k];
+        var identity = new IdentityConfig
+        {
+            AcceptOnBehalfOf = id.accept_on_behalf_of != 0,
+            TrustedIssuers = (IReadOnlyList<TrustedIssuer>?)issuers ?? Array.Empty<TrustedIssuer>(),
+            EdgeTokenMaxLifetimeSecs = U(Native.IdentitySetEdgeTokenMaxLifetime, id.edge_token_max_lifetime_secs),
+            ClockLeewaySecs = U(Native.IdentitySetClockLeeway, id.clock_leeway_secs),
+            MaxKeySetAgeSecs = U(Native.IdentitySetMaxKeySetAge, id.max_key_set_age_secs),
+            Publisher = publisher,
+            Sources = sources,
+        };
+        return c with
+        {
+            Identity = identity with { Loaded = identity.Fingerprints() },
+            RemoteConfig = new RemoteConfig
+            {
+                Disabled = id.remote_config_disabled != 0,
+                Lock = NativeScope.ReadUtf8List(id.remote_config_lock),
+            },
+        };
     }
 
     private static unsafe AsterConfig WithNetworkAndMetrics(in ConfigNative n, AsterConfig c)
@@ -483,7 +569,7 @@ public sealed record AsterConfig
         }
     }
 
-    internal static AsterConfig FromNative(in ConfigNative n, AsterConfig b) => WithNetworkAndMetrics(in n, FromNativeBase(in n, b));
+    internal static AsterConfig FromNative(in ConfigNative n, AsterConfig b) => WithIdentity(in n, WithNetworkAndMetrics(in n, FromNativeBase(in n, b)));
 
     private static AsterConfig FromNativeBase(in ConfigNative n, AsterConfig b)
     {

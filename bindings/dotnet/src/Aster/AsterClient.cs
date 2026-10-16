@@ -42,6 +42,27 @@ public sealed record CallOptions
     /// <summary>Service version (<c>StreamHeader.version</c>).</summary>
     public int Version { get; init; } = 1;
 
+    /// <summary>
+    /// Makes the call on behalf of a user (Rust <c>CallOptions::on_behalf_of</c>): the JWT (a provider's token,
+    /// forwarded unchanged, or one from <see cref="AsterClient.MintUserToken"/>) goes in the
+    /// <see cref="GatewayIdentity.OnBehalfOfMetadata"/> entry, replacing any in <see cref="Metadata"/>. The
+    /// server must accept it and this node must hold <see cref="GatewayIdentity.GatewayRole"/>. A client running
+    /// <c>[identity.publisher]</c> notices the token's key id, so a provider's key rotation is published at once.
+    /// </summary>
+    public string? OnBehalfOf { get; init; }
+
+    /// <summary>The metadata sent: <see cref="Metadata"/> with <see cref="OnBehalfOf"/> replacing any earlier entry.</summary>
+    internal IReadOnlyList<KeyValuePair<string, string>>? EffectiveMetadata()
+    {
+        if (string.IsNullOrEmpty(OnBehalfOf)) return Metadata;
+        var md = new List<KeyValuePair<string, string>>();
+        if (Metadata is { } given)
+            foreach (var kv in given)
+                if (!string.Equals(kv.Key, GatewayIdentity.OnBehalfOfMetadata, StringComparison.OrdinalIgnoreCase)) md.Add(kv);
+        md.Add(new(GatewayIdentity.OnBehalfOfMetadata, OnBehalfOf));
+        return md;
+    }
+
     internal const uint MaxDeadlineMs = 32_767_000;
 
     internal uint DeadlineMs => Deadline is { } d && d > TimeSpan.Zero
@@ -173,11 +194,23 @@ public sealed class AsterClient : IAsyncDisposable
         if (Enrollment is { } enrollment)
             await enrollment.EnrollAsync(addr, force: false, ct).ConfigureAwait(false);
         var conn = await _node.ConnectAsync(addr, AsterServer.AsterAlpn, ct).ConfigureAwait(false);
-        return new RpcConnection(conn, Codec, _interceptors);
+        return new RpcConnection(conn, Codec, _interceptors, enrollment: Enrollment);
     }
 
     /// <summary>The Enrollment installed from the config (null when enrollment is off).</summary>
     public Enrollment? Enrollment => _node.Enrollment;
+
+    /// <summary>
+    /// Mints a short-lived token for user <paramref name="sub"/> with <paramref name="roles"/>, signed in by
+    /// <paramref name="amr"/> (at least one, e.g. <see cref="GatewayIdentity.AmrWebAuthn"/>), valid for
+    /// <paramref name="ttl"/> (at most 5 minutes), signed with this node's key (Rust
+    /// <c>AsterClient::user_token_issuer</c> + <c>Issuer::mint_user_token</c>). The roles must be within the issuer
+    /// delegation (<see cref="GatewayIdentity.IssuableRolesAttribute"/>) of the credential held now; anything else
+    /// is an <see cref="IrohException"/> (<c>InvalidArgument</c>). Attach it with <see cref="CallOptions.OnBehalfOf"/>.
+    /// </summary>
+    public string MintUserToken(string sub, IEnumerable<string> roles, IEnumerable<string> amr, TimeSpan ttl)
+        => (Enrollment ?? throw new IrohException(Status.InvalidArgument, "minting users' tokens needs [enrollment]"))
+            .MintUserToken(sub, roles, amr, ttl);
 
     /// <summary>Whether this client renews its credential (Rust <c>AsterClient::is_renewing</c>).</summary>
     public bool IsRenewing
@@ -263,13 +296,16 @@ public sealed class RpcConnection : IAsyncDisposable
     private readonly ICodec _codec;
     private readonly ClientInterceptors _interceptors;
     private readonly bool _ownsConnection;
+    private readonly Enrollment? _enrollment;
 
-    internal RpcConnection(Connection connection, ICodec codec, ClientInterceptors interceptors, bool ownsConnection = true)
+    internal RpcConnection(Connection connection, ICodec codec, ClientInterceptors interceptors, bool ownsConnection = true,
+        Enrollment? enrollment = null)
     {
         _connection = connection;
         _codec = codec;
         _interceptors = interceptors;
         _ownsConnection = ownsConnection;
+        _enrollment = enrollment;
     }
 
     public Connection Connection => _connection;
@@ -283,7 +319,19 @@ public sealed class RpcConnection : IAsyncDisposable
     /// circuit breaker (stateful) per service or per peer.
     /// </summary>
     public RpcConnection WithInterceptors(IEnumerable<IInterceptor> interceptors)
-        => new(_connection, _codec, new ClientInterceptors(interceptors), ownsConnection: false);
+        => new(_connection, _codec, new ClientInterceptors(interceptors), ownsConnection: false, _enrollment);
+
+    /// <summary>The call's options; a forwarded token is handed to this client's issuer-key publisher, if it runs one.</summary>
+    private CallSpec Spec(string service, string method, CallOptions? options)
+    {
+        if (options?.OnBehalfOf is { Length: > 0 } token && _enrollment is { } e)
+        {
+            // The publisher ignores tokens of issuers it does not publish; NOT_FOUND = no publisher.
+            try { e.NoticeToken(token); }
+            catch (Exception ex) when (ex is IrohException or ObjectDisposedException) { }
+        }
+        return new CallSpec(service, method, options);
+    }
 
     private string? Peer()
     {
@@ -313,7 +361,7 @@ public sealed class RpcConnection : IAsyncDisposable
         public readonly byte[] Method = Encoding.UTF8.GetBytes(method);
         // The current Activity (any source) is the parent of the call: traceparent / baggage go out as
         // call metadata and the Rust client span nests under it (design §5.4).
-        public readonly byte[] Metadata = Tracing.Inject(options?.Metadata) is { Count: > 0 } md ? KvList.Encode(md) : Array.Empty<byte>();
+        public readonly byte[] Metadata = Tracing.Inject(options?.EffectiveMetadata()) is { Count: > 0 } md ? KvList.Encode(md) : Array.Empty<byte>();
         public readonly uint SessionId = unchecked((uint)(options?.SessionId ?? 0));
         public readonly uint DeadlineMs = options?.DeadlineMs ?? 0;
         public readonly int Version = options?.Version ?? 1;
@@ -345,7 +393,7 @@ public sealed class RpcConnection : IAsyncDisposable
         CallOptions? options, CancellationToken cancellationToken)
     {
         byte[] req = _codec.Encode(request);
-        var spec = new CallSpec(service, method, options);
+        var spec = Spec(service, method, options);
         cancellationToken.ThrowIfCancellationRequested();
         // Pooled fast path: one blocking native call (header + request in one write). A
         // cancellable token gets a native cancel token (ABI 4.5), so cancelling it aborts the call
@@ -418,7 +466,7 @@ public sealed class RpcConnection : IAsyncDisposable
     private async IAsyncEnumerable<TResp> ServerStreamCore<TReq, TResp>(string service, string method, TReq request,
         CallOptions? options, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await using var call = await PayloadCall.OpenAsync(this, PatternServerStream, new CallSpec(service, method, options), cancellationToken)
+        await using var call = await PayloadCall.OpenAsync(this, PatternServerStream, Spec(service, method, options), cancellationToken)
             .ConfigureAwait(false);
         call.Send(_codec.Encode(request), end: true);
         await foreach (var payload in call.ReadResponsesAsync(cancellationToken).ConfigureAwait(false))
@@ -445,7 +493,7 @@ public sealed class RpcConnection : IAsyncDisposable
     private async Task<TResp> ClientStreamCore<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
         CallOptions? options, CancellationToken cancellationToken)
     {
-        await using var call = await PayloadCall.OpenAsync(this, PatternClientStream, new CallSpec(service, method, options), cancellationToken)
+        await using var call = await PayloadCall.OpenAsync(this, PatternClientStream, Spec(service, method, options), cancellationToken)
             .ConfigureAwait(false);
         using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var sending = Task.Run(() => call.SendAllAsync(requests, _codec, sendCts.Token), CancellationToken.None);
@@ -502,7 +550,7 @@ public sealed class RpcConnection : IAsyncDisposable
     private async IAsyncEnumerable<TResp> BidiStreamCore<TReq, TResp>(string service, string method, IAsyncEnumerable<TReq> requests,
         CallOptions? options, [EnumeratorCancellation] CancellationToken cancellationToken)
     {
-        await using var call = await PayloadCall.OpenAsync(this, PatternBidiStream, new CallSpec(service, method, options), cancellationToken)
+        await using var call = await PayloadCall.OpenAsync(this, PatternBidiStream, Spec(service, method, options), cancellationToken)
             .ConfigureAwait(false);
         using var sendCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var sending = Task.Run(() => call.SendAllAsync(requests, _codec, sendCts.Token), CancellationToken.None);

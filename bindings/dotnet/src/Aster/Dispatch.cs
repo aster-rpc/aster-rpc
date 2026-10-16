@@ -46,6 +46,11 @@ internal enum DispatchFlags : uint
     HasInboundTrace = 0x800,
     /// <summary>ABI 7.5: an <c>Authenticator</c> resolved a principal other than the transport peer; <c>peer_ptr</c> is that principal.</summary>
     HasPrincipal = 0x1000,
+    /// <summary>
+    /// ABI 7.7: a gateway forwarded the call on behalf of a user (<see cref="HasPrincipal"/> is set too): the
+    /// principal is <c>iss|sub</c>, the transport peer the gateway, the rest <c>aster_dispatch_on_behalf_of</c>.
+    /// </summary>
+    OnBehalfOf = 0x2000,
 }
 
 /// <summary><c>aster_server_option_t</c>.</summary>
@@ -55,6 +60,8 @@ internal enum DispatchServerOption : uint
     BuiltinTopology = 2,
     MaxSessionsPerConnection = 3,
     HandlerTimeoutMs = 4,
+    /// <summary>ABI 7.6: 0/1, overrides <c>[identity] accept_on_behalf_of</c>.</summary>
+    AcceptOnBehalfOf = 6,
 }
 
 /// <summary>
@@ -138,6 +145,13 @@ internal sealed class DispatchServer : IDisposable
         public Builder Option(DispatchServerOption key, ulong value)
         {
             Native.Check(Native.aster_server_set_option(_handle, (uint)key, value), "aster_server_set_option");
+            return this;
+        }
+
+        /// <summary>Records every NodeConfig set / clear in <paramref name="outbox"/> (<c>aster_server_set_audit_outbox</c>, ABI 7.7).</summary>
+        public Builder AuditOutbox(ulong outbox)
+        {
+            Native.Check(Native.aster_server_set_audit_outbox(_runtime, _handle, outbox), "aster_server_set_audit_outbox");
             return this;
         }
 
@@ -344,6 +358,35 @@ internal sealed class DispatchServer : IDisposable
         if (r != 0) throw IrohException.FromStatus(r, "aster_dispatch_identity");
         try { return id.peer_len == 0 ? "" : Encoding.UTF8.GetString((byte*)id.peer_ptr, (int)id.peer_len); }
         finally { BufferRelease(id.buffer); }
+    }
+
+    /// <summary>
+    /// The forwarded identity of a call a gateway made on behalf of a user (<c>aster_dispatch_on_behalf_of</c>,
+    /// ABI 7.7); null for other calls or once the call is over.
+    /// </summary>
+    public unsafe ForwardedIdentity? OnBehalfOf(ulong callId)
+    {
+        if (_disposed) return null;
+        byte* ptr = null;
+        uint len = 0;
+        ulong buffer = 0;
+        int r = Native.aster_dispatch_on_behalf_of(_runtime, _handle, callId, &ptr, &len, &buffer);
+        if (r == (int)Status.NotFound) return null;
+        if (r != 0) throw IrohException.FromStatus(r, "aster_dispatch_on_behalf_of");
+        try { return ForwardedIdentity.FromKv(len == 0 ? Array.Empty<KeyValuePair<string, string>>() : KvList.Decode(new ReadOnlySpan<byte>(ptr, (int)len))); }
+        finally { BufferRelease(buffer); }
+    }
+
+    /// <summary>The NodeConfig generation in effect (<c>aster_server_node_config_generation</c>, ABI 7.7).</summary>
+    public ulong NodeConfigGeneration => _disposed ? 0 : Native.aster_server_node_config_generation(_handle);
+
+    /// <summary>The NodeConfig properties as JSON (<c>aster_server_node_properties</c>, ABI 7.7).</summary>
+    public unsafe byte[] NodePropertiesJson()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        Bytes output = default;
+        Native.Check(Native.aster_server_node_properties(_handle, &output), "aster_server_node_properties");
+        return NativeScope.TakeOwned(ref output);
     }
 
     /// <summary>

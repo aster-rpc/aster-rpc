@@ -177,6 +177,8 @@ public enum EventKind : uint
     EnrollmentResult = 127,
     /// <summary>ABI 7.1: a page of the audit outbox acknowledgement log (JSON payload); <c>handle</c> = the outbox.</summary>
     AuditOutboxAcknowledgements = 128,
+    /// <summary>ABI 7.7: <c>aster_node_config_call</c> completed (JSON <c>{code, result | message}</c>).</summary>
+    NodeConfigResult = 129,
 
     // Errors
     OperationCancelled = 98,

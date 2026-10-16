@@ -83,6 +83,7 @@ public sealed class AuditOutbox : IDisposable, IAsyncDisposable
     }
     private AuditOutbox(Runtime runtime, ulong handle, int eventJsonLimit)
     { _runtime = runtime; _handle = new(runtime, handle); _eventJsonLimit = eventJsonLimit; }
+    internal ulong NativeHandle => Handle;
     private ulong Handle => !_handle.IsClosed ? unchecked((ulong)_handle.DangerousGetHandle().ToInt64())
         : throw new ObjectDisposedException(nameof(AuditOutbox));
 

@@ -77,8 +77,12 @@ public sealed class ServerCallContext
         int sessionId, ulong sessionKey, object? session,
         IReadOnlyList<KeyValuePair<string, string>> metadata, IReadOnlyDictionary<string, string> attributes,
         DateTimeOffset? deadline, CancellationToken cancellationToken, bool irohAuthenticated = false,
-        string? transportPeer = null, ulong callId = 0, int wireCallId = 0)
+        string? transportPeer = null, ulong callId = 0, int wireCallId = 0,
+        string? actor = null, ForwardedIdentity? onBehalfOf = null, Func<NodeProperties>? nodeProperties = null)
     {
+        Actor = actor;
+        OnBehalfOf = onBehalfOf;
+        _nodeProperties = nodeProperties;
         Service = service;
         Method = method;
         Pattern = pattern;
@@ -135,6 +139,53 @@ public sealed class ServerCallContext
 
     /// <summary>An <c>Authenticator</c> resolved a principal different from the transport <see cref="Peer"/>.</summary>
     public bool HasPrincipal => !string.Equals(Peer, PeerId, StringComparison.Ordinal);
+
+    // ── Gateway identity (C ABI 7.7) ──────────────────────────────────────
+
+    private readonly Func<NodeProperties>? _nodeProperties;
+
+    /// <summary>
+    /// The gateway that forwarded the call on behalf of <see cref="Principal"/> (the same as <see cref="Peer"/>),
+    /// else null (Rust <c>CallContext::actor</c>). For a forwarded call <see cref="Principal"/> is the user,
+    /// <c>iss|sub</c>, and <see cref="Attributes"/> carry the token's roles, which Gate 3 checked.
+    /// </summary>
+    public string? Actor { get; }
+
+    /// <summary>The verified forwarded identity (issuer, subject, token id, expiry, sign-in methods); null for a call the peer made as itself.</summary>
+    public ForwardedIdentity? OnBehalfOf { get; }
+
+    /// <summary>How the forwarded user signed in (the token's <c>amr</c>, e.g. <see cref="GatewayIdentity.AmrWebAuthn"/>); empty otherwise (Rust <c>CallContext::auth_methods</c>).</summary>
+    public IReadOnlyList<string> AuthMethods => OnBehalfOf?.AuthMethods ?? Array.Empty<string>();
+
+    /// <summary>
+    /// Throws <see cref="Interceptors.RpcError"/> (<c>PERMISSION_DENIED</c>) unless the call was made on behalf
+    /// of a user who signed in with <paramref name="method"/> (one of <see cref="AuthMethods"/>); a call the
+    /// peer made as itself is refused too (Rust <c>CallContext::require_auth_method</c>). Requirements check
+    /// roles only; use this in handlers that need a stronger sign-in.
+    /// </summary>
+    public void RequireAuthMethod(string method)
+    {
+        foreach (var m in AuthMethods)
+            if (m == method) return;
+        throw new Interceptors.RpcError(Interceptors.StatusCode.PermissionDenied, "this method needs a sign-in with " + method);
+    }
+
+    /// <summary>
+    /// The serving node's <c>aster.ops.NodeConfig</c> properties (Rust <c>CallContext::node_properties</c>),
+    /// cached per NodeConfig generation; empty when NodeConfig is off. They describe the node and never authorise.
+    /// </summary>
+    public NodeProperties NodeProperties
+    {
+        get
+        {
+            if (_nodeProperties is null) return Aster.NodeProperties.Empty;
+            try { return _nodeProperties(); }
+            catch (Exception e) when (e is IrohException or ObjectDisposedException) { return Aster.NodeProperties.Empty; }
+        }
+    }
+
+    /// <summary>One NodeConfig attribute of the serving node, or null (Rust <c>CallContext::node_attribute</c>). Gate 3 never reads these.</summary>
+    public Aster.NodeAttribute? NodeAttribute(string key) => NodeProperties.Attributes.TryGetValue(key, out var a) ? a : null;
 
     /// <summary>
     /// Provenance: true only for transport-authenticated Iroh calls (the caller proved <see cref="Peer"/>
