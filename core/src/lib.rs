@@ -764,9 +764,10 @@ pub struct CoreHookHandshakeInfo {
     /// The connection being admitted, so admission can close it later.
     #[cfg(feature = "enrollment")]
     pub connection: CoreWeakConnection,
-    /// This node dialed the connection (QUIC client side). The hook runs for
-    /// both directions; admission may treat a dial it made itself differently
-    /// from one it accepted.
+    /// This node dialed the connection (QUIC client side). Outbound
+    /// handshakes reach a receiver only after
+    /// [`CoreHookReceiver::include_outbound_handshakes`]; otherwise the
+    /// adapter accepts them itself.
     #[cfg(feature = "enrollment")]
     pub outbound: bool,
 }
@@ -1369,15 +1370,36 @@ pub struct CoreHooksAdapter {
     timeout: Duration,
     before_connect_failure_mode: trust::HookFailureMode,
     after_handshake_failure_mode: trust::HookFailureMode,
+    /// Shared with the receiver: whether `after_handshake` forwards this
+    /// node's own (outbound) connections instead of accepting them.
+    outbound_handshakes: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Receiver side for hook events. Stored in `CoreNetClient`.
+///
+/// `after_handshake_rx` carries only inbound connections by default: Gate 0
+/// decides who may connect *to* this node, so the adapter accepts the
+/// handshake of a connection this node dialed without asking (its dial was
+/// already offered to `before_connect`). A consumer that must also see its
+/// own connections opts in with [`Self::include_outbound_handshakes`].
 pub struct CoreHookReceiver {
     pub before_connect_rx: mpsc::Receiver<(CoreHookConnectInfo, oneshot::Sender<bool>)>,
     pub after_handshake_rx: mpsc::Receiver<(
         CoreHookHandshakeInfo,
         oneshot::Sender<CoreAfterHandshakeDecision>,
     )>,
+    outbound_handshakes: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl CoreHookReceiver {
+    /// Forward the handshakes of this node's own outbound connections to
+    /// `after_handshake_rx` too (flagged `outbound`), where an unanswered one
+    /// falls back to the failure mode like an inbound one. Enrollment uses
+    /// this to gate and track its own connections; host admission loops don't.
+    pub fn include_outbound_handshakes(&self) {
+        self.outbound_handshakes
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
 }
 
 impl CoreHooksAdapter {
@@ -1407,16 +1429,19 @@ impl CoreHooksAdapter {
     ) -> (Self, CoreHookReceiver) {
         let (bc_tx, bc_rx) = mpsc::channel(16);
         let (ah_tx, ah_rx) = mpsc::channel(16);
+        let outbound_handshakes = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let adapter = Self {
             before_connect_tx: bc_tx,
             after_handshake_tx: ah_tx,
             timeout: Duration::from_millis(timeout_ms),
             before_connect_failure_mode,
             after_handshake_failure_mode,
+            outbound_handshakes: Arc::clone(&outbound_handshakes),
         };
         let receiver = CoreHookReceiver {
             before_connect_rx: bc_rx,
             after_handshake_rx: ah_rx,
+            outbound_handshakes,
         };
         (adapter, receiver)
     }
@@ -1487,6 +1512,16 @@ impl EndpointHooks for CoreHooksAdapter {
     }
 
     async fn after_handshake<'a>(&'a self, conn: &'a Connection) -> AfterHandshakeOutcome {
+        let outbound = conn.side() == iroh::endpoint::Side::Client;
+        // Gate 0 admits peers connecting to this node; its own dials were
+        // offered to `before_connect` and are not admission requests.
+        if outbound
+            && !self
+                .outbound_handshakes
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return AfterHandshakeOutcome::Accept;
+        }
         let info = CoreHookHandshakeInfo {
             remote_endpoint_id: conn.remote_id().to_string(),
             alpn: conn.alpn().to_vec(),
@@ -1496,7 +1531,7 @@ impl EndpointHooks for CoreHooksAdapter {
             #[cfg(feature = "enrollment")]
             connection: CoreWeakConnection(conn.weak_handle()),
             #[cfg(feature = "enrollment")]
-            outbound: conn.side() == iroh::endpoint::Side::Client,
+            outbound,
         };
         let (reply_tx, reply_rx) = oneshot::channel();
         if self
@@ -6071,6 +6106,90 @@ mod hook_failure_mode_tests {
             drop(server.take_hook_receiver().expect("hooks enabled"));
             assert_eq!(dial(&server).await, None);
             server.close().await;
+        })
+        .await
+        .expect("test hung");
+    }
+
+    /// `node` dials a hookless peer and reports how the connection ended,
+    /// like [`dial`].
+    async fn dial_out(node: &CoreNetClient) -> Option<Option<u64>> {
+        let peer = Arc::new(
+            CoreNetClient::create_with_config(local_config(false))
+                .await
+                .unwrap(),
+        );
+        let acceptor = {
+            let peer = Arc::clone(&peer);
+            tokio::spawn(async move { peer.accept().await })
+        };
+        let outcome = match node
+            .connect_node_addr(peer.endpoint_addr_info(), ALPN.to_vec())
+            .await
+        {
+            Err(_) => Some(None),
+            Ok(conn) => tokio::time::timeout(Duration::from_secs(2), conn.closed())
+                .await
+                .ok()
+                .map(|info| info.code),
+        };
+        acceptor.abort();
+        peer.close().await;
+        outcome
+    }
+
+    /// Gate 0 is about who may connect *to* this node: with hooks on and no
+    /// admission loop answering, the node's own dial is accepted at the
+    /// handshake without reaching the receiver, while an inbound connection
+    /// still fails closed.
+    #[tokio::test]
+    async fn outbound_handshake_bypasses_unanswered_admission() {
+        tokio::time::timeout(BUDGET, async {
+            let node = Arc::new(
+                CoreNetClient::create_with_config(local_config(true))
+                    .await
+                    .unwrap(),
+            );
+            let mut stalled = node.take_hook_receiver().expect("hooks enabled");
+            assert_eq!(dial_out(&node).await, None, "outbound dial rejected");
+            assert!(
+                stalled.after_handshake_rx.try_recv().is_err(),
+                "outbound handshake reached the admission receiver"
+            );
+            assert_eq!(dial(&node).await, Some(Some(403)), "inbound admitted");
+            node.close().await;
+        })
+        .await
+        .expect("test hung");
+    }
+
+    /// A consumer that opts in (enrollment) sees its own handshakes, flagged
+    /// outbound, and leaving one unanswered fails it closed.
+    #[tokio::test]
+    async fn included_outbound_handshake_is_forwarded() {
+        tokio::time::timeout(BUDGET, async {
+            let node = Arc::new(
+                CoreNetClient::create_with_config(local_config(true))
+                    .await
+                    .unwrap(),
+            );
+            let mut rx = node.take_hook_receiver().expect("hooks enabled");
+            rx.include_outbound_handshakes();
+            let (connects, handshakes) = (rx.before_connect_rx, &mut rx.after_handshake_rx);
+            drop(connects); // before_connect falls open
+            let dial = dial_out(&node);
+            tokio::pin!(dial);
+            let (_info, reply) = tokio::select! {
+                outcome = &mut dial => panic!("dial ended unanswered: {outcome:?}"),
+                request = handshakes.recv() => request.expect("handshake request"),
+            };
+            #[cfg(feature = "enrollment")]
+            assert!(_info.outbound);
+            // Unanswered: the fail-closed fallback rejects it, so the dial
+            // fails or the connection is closed.
+            drop(reply);
+            assert_ne!(dial.await, None, "unanswered outbound handshake admitted");
+            node.close().await;
         })
         .await
         .expect("test hung");

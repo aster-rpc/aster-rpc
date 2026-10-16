@@ -530,6 +530,7 @@ impl AdmissionHub {
         let CoreHookReceiver {
             mut before_connect_rx,
             mut after_handshake_rx,
+            ..
         } = receiver;
 
         let h = hub.clone();

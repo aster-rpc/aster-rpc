@@ -897,6 +897,9 @@ impl EnrollmentService {
     }
 
     fn spawn_hook_loop(&self, mut hooks: CoreHookReceiver) {
+        // Outbound handshakes too: replica sync tracks and gates its own
+        // connections in `after_handshake`.
+        hooks.include_outbound_handshakes();
         let weak = self.this.clone();
         tokio::spawn(async move {
             loop {

@@ -298,12 +298,6 @@ async def test_admission_outbound_yields_connect_requests():
         assert isinstance(inbound, HandshakeRequest)
         assert inbound.peer == client.id
         inbound.accept()
-        # The dialer's own handshake is an admission request too; left
-        # unanswered it would fail closed after hook_timeout_ms.
-        own = await asyncio.wait_for(client_adm.recv(), timeout=10)
-        assert isinstance(own, HandshakeRequest)
-        assert own.peer == server.id
-        own.accept()
         await asyncio.wait_for(dial, timeout=10)
         alpn, _ = await _accept_one(server)
         assert alpn == APP_ALPN

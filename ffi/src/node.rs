@@ -1040,6 +1040,7 @@ pub(crate) fn spawn_hook_drainers(
     let CoreHookReceiver {
         before_connect_rx,
         after_handshake_rx,
+        ..
     } = receiver;
 
     let current_gate = |slot: &Option<Arc<GateSlot>>| -> Option<Arc<GateEntry>> {

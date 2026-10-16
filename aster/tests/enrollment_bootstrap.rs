@@ -389,6 +389,7 @@ async fn reciprocal_validation_rejects_rogue_replica_and_failopen_install() {
             .bind_addr("127.0.0.1:0")
             .secret_key(key(10))
             .hooks(true)
+            .hook_failure_mode(aster::HookFailureMode::FailOpen)
             .build(),
         vec![ENROLLMENT_ALPN.to_vec()],
     )

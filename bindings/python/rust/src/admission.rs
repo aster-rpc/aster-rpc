@@ -512,6 +512,7 @@ pub(crate) fn spawn_gate_drainer(receiver: CoreHookReceiver, gate: Arc<RwLock<Co
     let CoreHookReceiver {
         mut before_connect_rx,
         mut after_handshake_rx,
+        ..
     } = receiver;
     pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
         while let Some((_info, reply)) = before_connect_rx.recv().await {
@@ -711,6 +712,7 @@ impl Admission {
         let CoreHookReceiver {
             mut before_connect_rx,
             after_handshake_rx,
+            ..
         } = receiver;
         let before = if outbound {
             Some(before_connect_rx)

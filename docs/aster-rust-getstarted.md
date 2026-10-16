@@ -500,8 +500,9 @@ For a single allowed identity (e.g. *only* the root node), use a one-element set
 > observability hooks that must never block a peer. Either way, make sure the
 > loop actually runs (`take_admission` returns the handle once) — without a
 > live loop draining `next_handshake`, every decision hits the fallback. The
-> node's own outbound connections raise handshake requests on the same loop,
-> so answer those too.
+> node's own outbound connections never reach `next_handshake`: Gate 0 admits
+> peers connecting *to* this node, so its own dials are accepted at the
+> handshake (gate them with `next_connect` instead).
 
 **Per-method instead of per-connection?** If you'd rather admit a broad set but
 restrict only some methods to specific identities, use Gate 3 (§4.6): map each
@@ -968,9 +969,8 @@ with `AsterConfigBuilder::hooks(true)`.
 - **Interceptors** apply to unary calls; streaming calls are not yet intercepted.
 - `Admission` exposes separate `next_handshake()` (inbound) and `next_connect()`
   (outbound) streams; with hooks enabled, unhandled outbound connect hooks wait
-  for the hook timeout before a default accept. `next_handshake()` also yields
-  the handshakes of this node's own outbound connections; left unanswered they
-  fail closed like inbound ones.
+  for the hook timeout before a default accept. `next_handshake()` yields only
+  inbound connections; this node's own are accepted at the handshake.
 
 ---
 
