@@ -135,7 +135,7 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 		"READ_GROUP_STATUS": 5, "READ_PROBE_CLIENT": 6, "READ_AUDIT_STREAM": 7, "READ_RECOVERY_EXPORT": 8,
 		"TAG_MUTATION_REQUEST": 0xD0, "TAG_PLACEMENT_REPORT": 0xDE,
 		"UPCALL_KIND_TOPOLOGY_SNAPSHOT": 17, "UPCALL_KIND_PLACEMENT_POLICY": 32, "UPCALL_KIND_PLACEMENT_PROVISION": 33,
-		"HOOK_FAILURE_FAIL_OPEN": 0, "HOOK_FAILURE_FAIL_CLOSED": 1, "UPCALL_DEFAULT_CAPACITY": 1024,
+		"HOOK_FAILURE_FAIL_CLOSED": 0, "HOOK_FAILURE_FAIL_OPEN": 1, "UPCALL_DEFAULT_CAPACITY": 1024,
 	}
 	got := abiEnums()
 	for name, w := range want {
@@ -176,9 +176,9 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 	if ASTER_EVENT_TOPOLOGY_SNAPSHOT != 120 {
 		t.Error("topology snapshot event drifted from header")
 	}
-	// ABI 6.0 grew aster_config_t (280 -> 288); the binding needs 6.0+.
-	if major, minor, _ := Version(); major != 6 || ABIVersionMajor != 6 || minor < ABIMinorRequired || ABIMinorRequired != 0 {
-		t.Errorf("library ABI %d.%d, binding needs 6.%d+ (major %d)", major, minor, ABIMinorRequired, ABIVersionMajor)
+	// ABI 7.0 swapped the hook failure mode values; the binding needs 7.0+.
+	if major, minor, _ := Version(); major != 7 || ABIVersionMajor != 7 || minor < ABIMinorRequired || ABIMinorRequired != 0 {
+		t.Errorf("library ABI %d.%d, binding needs 7.%d+ (major %d)", major, minor, ABIMinorRequired, ABIVersionMajor)
 	}
 	if ASTER_EVENT_ENROLLMENT_RESULT != 127 || AdmissionErrorNotAdmitted != 1 || AdmissionErrorDenied != 2 ||
 		AdmissionErrorClockSkew != 3 || AdmissionErrorUnavailable != 4 {
@@ -203,8 +203,8 @@ func TestABI_VersionMatchesHeader(t *testing.T) {
 	if got := major<<16 | minor<<8 | patch; got != headerABIVersion {
 		t.Errorf("library ABI %#x != header ASTER_ABI_VERSION %#x", got, headerABIVersion)
 	}
-	if major != 6 || ABIVersionMajor != 6 {
-		t.Errorf("expected ABI major 6, lib=%d binding=%d", major, ABIVersionMajor)
+	if major != 7 || ABIVersionMajor != 7 {
+		t.Errorf("expected ABI major 7, lib=%d binding=%d", major, ABIVersionMajor)
 	}
 	if err := CheckABI(); err != nil {
 		t.Fatal(err)

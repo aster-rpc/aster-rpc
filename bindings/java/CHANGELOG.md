@@ -5,6 +5,15 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Changed (breaking): native C ABI 7.0, zero means fail closed
+
+The native library must be C ABI **7.0** or a later 7.x
+(`IrohLibrary.EXPECTED_ABI_MAJOR = 7`, `REQUIRED_ABI_MINOR = 0`). ABI 7.0
+swaps `aster_hook_failure_mode_t` so `FAIL_CLOSED` is 0 and `FAIL_OPEN` is 1:
+a zero-filled native config or a 0 upcall failure mode now fails closed.
+`FailureMode.FAIL_CLOSED.code` is 0 and `FAIL_OPEN.code` is 1; the layout is
+unchanged. A 6.x library is refused when the binding loads.
+
 ### Changed (breaking): admission fails closed by default
 
 `AsterConfig.hookFailureMode()` now defaults to `"fail_closed"`: with
@@ -23,9 +32,8 @@ old behaviour.
 `fromFile()` read `ASTER_BLOB_ZSTD_LEVEL` / `[storage] blob_zstd_level` and
 `ASTER_REUSE_LAST_PORT` / `[network] reuse_last_port` through Rust. Before,
 both settings were lost when the config crossed the C ABI, so neither could
-be turned off from Java. `aster_config_t` is now 288 bytes, and the native
-library must be C ABI **6.0** or a later 6.x (`IrohLibrary.EXPECTED_ABI_MAJOR = 6`,
-`REQUIRED_ABI_MINOR = 0`). 6.0 is a breaking ABI release because the struct grew
+be turned off from Java. `aster_config_t` is now 288 bytes, which needs C ABI
+6.0 or later (now 7.0, above). 6.0 is a breaking ABI release because the struct grew
 from 280 to 288 bytes; loading the library also performs the new
 `aster_abi_accept(6)` handshake, without which the library refuses to fill an
 `aster_config_t`.

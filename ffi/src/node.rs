@@ -1490,6 +1490,23 @@ mod tests {
         assert_eq!(unsafe { aster_config_release(&mut c) }, 0);
     }
 
+    /// ABI 7.0: a caller that zero-fills `aster_config_t` instead of calling
+    /// `aster_config_init` gets fail-closed admission, not fail-open.
+    #[test]
+    fn zeroed_config_fails_closed() {
+        let mut c: aster_config_t = unsafe { std::mem::zeroed() };
+        c.struct_size = std::mem::size_of::<aster_config_t>() as u32;
+        assert_eq!(
+            c.hook_failure_mode,
+            aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_CLOSED as u32
+        );
+        let cfg = unsafe { lower_config(&c) }.expect("a zeroed config is valid");
+        assert_eq!(cfg.hook_failure_mode, HookFailureMode::FailClosed);
+        c.hook_failure_mode = aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_OPEN as u32;
+        let cfg = unsafe { lower_config(&c) }.expect("explicit fail-open");
+        assert_eq!(cfg.hook_failure_mode, HookFailureMode::FailOpen);
+    }
+
     #[test]
     fn lower_rejects_malformed_configs() {
         crate::aster_abi_accept(crate::ASTER_ABI_VERSION_MAJOR);

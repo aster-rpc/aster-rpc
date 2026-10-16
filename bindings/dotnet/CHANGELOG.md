@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed (breaking): native C ABI 7.0, zero means fail closed
+
+Requires native C ABI **7.0** or a later 7.x (`Native.AbiVersionMajor` = 7,
+`Native.RequiredAbiMinor` = 0). ABI 7.0 swaps `aster_hook_failure_mode_t`:
+`HookFailureMode.FailClosed` is now 0 and `FailOpen` 1, so a zero-filled
+native config or `default(HookFailureMode)` fails closed. The layout is
+unchanged; `Native.EnsureAbi` refuses a 6.x library.
+
 ### Changed (breaking): admission fails closed by default
 
 `AsterConfig.HookFailureMode` now defaults to `HookFailureMode.FailClosed`:
@@ -18,9 +26,8 @@ off, 1..19) and `ReuseLastPort` (`null` = default on). `FromEnv` / `FromToml`
 read `ASTER_BLOB_ZSTD_LEVEL` / `[storage] blob_zstd_level` and
 `ASTER_REUSE_LAST_PORT` / `[network] reuse_last_port`. Before, both were lost
 when the native config was copied and rebuilt, so they stayed on. The
-`aster_config_t` mirror grows to 288 bytes; requires native C ABI **6.0** or
-a later 6.x (`Native.AbiVersionMajor` = 6, `Native.RequiredAbiMinor` = 0). 6.0
-is a breaking ABI release because the struct grew from 280 to 288 bytes; the
+`aster_config_t` mirror grows to 288 bytes, which needs native C ABI 6.0 or
+later (now 7.0, above). 6.0 is a breaking ABI release because the struct grew from 280 to 288 bytes; the
 binding performs the new `aster_abi_accept(6)` handshake (`Native.EnsureAbi`)
 before filling a config, without which the library refuses to write one.
 

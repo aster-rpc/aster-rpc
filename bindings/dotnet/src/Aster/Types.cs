@@ -270,10 +270,10 @@ public enum RelayMode : uint
 /// <summary>Hook failure mode. Mirrors aster_hook_failure_mode_t.</summary>
 public enum HookFailureMode : uint
 {
+    /// <summary>Default (and the zero value since C ABI 7.0): reject when the hook times out or is gone.</summary>
+    FailClosed = 0,
     /// <summary>Explicit opt-in: accept when the hook times out or is gone.</summary>
-    FailOpen = 0,
-    /// <summary>Default: reject when the hook times out or is gone.</summary>
-    FailClosed = 1,
+    FailOpen = 1,
 }
 
 /// <summary>Strongly-typed wrapper for an <see cref="Endpoint"/> handle (a node handle since ABI 4.0).</summary>

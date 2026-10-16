@@ -9,10 +9,10 @@ package aster
 
 #include "aster_ffi.h"
 
-// This binding is written against C ABI 6.x: building it with another
+// This binding is written against C ABI 7.x: building it with another
 // major's aster_ffi.h is a compile error, not a runtime surprise.
-#if ASTER_ABI_VERSION_MAJOR != 6
-#error "sdk.getaster.now/go needs aster_ffi.h from C ABI 6.x (libaster_transport_ffi 6.0 or later 6.x)"
+#if ASTER_ABI_VERSION_MAJOR != 7
+#error "sdk.getaster.now/go needs aster_ffi.h from C ABI 7.x (libaster_transport_ffi 7.0 or later 7.x)"
 #endif
 */
 import "C"
@@ -584,9 +584,9 @@ func Version() (major, minor, patch uint32) {
 }
 
 // ABIMinorRequired is the lowest ABI minor version (within ABIVersionMajor)
-// this binding runs against. ABI 6.0 grew aster_config_t to 288 bytes
-// (blob_zstd_level, reuse_last_port); this binding needs native ABI 6.0 or a
-// later 6.x.
+// this binding runs against. ABI 7.0 swapped aster_hook_failure_mode_t so
+// 0 = FAIL_CLOSED (6.0 grew aster_config_t to 288 bytes); this binding needs
+// native ABI 7.0 or a later 7.x.
 const ABIMinorRequired = uint32(0)
 
 var (

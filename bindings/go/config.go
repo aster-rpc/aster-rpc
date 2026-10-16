@@ -80,9 +80,8 @@ type AsterConfig struct {
 	// HookTimeoutMs is the admission-hook timeout; 0 = 5000 ms.
 	HookTimeoutMs uint64
 	// HookFailureMode is what a stalled or missing admission loop does after
-	// HookTimeoutMs: HookFailClosed (the DefaultConfig value) rejects,
-	// HookFailOpen (explicit opt-in) accepts. HookFailOpen is the C enum's 0,
-	// so a zero-value AsterConfig fails open: start from DefaultConfig.
+	// HookTimeoutMs: HookFailClosed (the default, and the zero value since
+	// C ABI 7.0) rejects, HookFailOpen (explicit opt-in) accepts.
 	HookFailureMode uint32
 	// EnableHooks raises admission events (Node.Admissions) when no Gate is attached.
 	EnableHooks          bool

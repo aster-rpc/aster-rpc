@@ -1,4 +1,34 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x changelog (current: 6.0)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.0)
+
+## 7.0 (breaking: `aster_hook_failure_mode_t` values swap so zero fails closed)
+
+| Constant | 6.x | 7.0 |
+|---|---|---|
+| `ASTER_HOOK_FAILURE_FAIL_CLOSED` | 1 | **0** |
+| `ASTER_HOOK_FAILURE_FAIL_OPEN` | 0 | **1** |
+
+**Why.** Admission fails closed by default, but in 6.x the value 0 meant
+fail-open, so a caller that zero-filled `aster_config_t` instead of calling
+`aster_config_init` (and Go's zero-value `AsterConfig{}` / `EndpointConfig{}`)
+let a stalled or missing admission loop admit everyone. In 7.0 the zero value
+fails closed, for `aster_config_t.hook_failure_mode` and for the `failure_mode`
+argument of `aster_upcall_set_policy` / `aster_upcall_set_default_policy`.
+
+**Why a major release.** No layout changes, but the same number now means the
+opposite mode: a 6.x caller passing its `FAIL_CLOSED` (1) would get fail-open.
+A minor bump would let that caller through a "same major, minor >= required"
+check; 7.0 refuses it at the handshake instead (`aster_runtime_new(6, ...)` and
+`aster_abi_accept(6)` return `ASTER_STATUS_ABI_MISMATCH`, so the config fill
+functions stay locked). Covered by `ffi/tests/abi_handshake.rs` and
+`test_abi_version` / `test_enum_values` / `test_config` in
+`ffi/tests/abi_contract_test.c` (a zero-filled struct is fail-closed).
+
+Bindings move by updating their expected major: Go (`ABIVersionMajor` 7 from
+the header, `#error` for another major, `HookFailClosed` / `FailureModeClosed`
+are now 0 so zero values fail closed), Java (`IrohLibrary.EXPECTED_ABI_MAJOR`
+7, `FailureMode.FAIL_CLOSED.code` 0) and .NET (`Native.AbiVersionMajor` 7,
+`HookFailureMode.FailClosed` = 0) require 7.0. Python and TypeScript do not use
+the C ABI.
 
 ## 6.0 (breaking: `aster_config_t` grew; blob compression level and port reuse)
 

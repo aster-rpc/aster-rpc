@@ -5,10 +5,10 @@ package site.aster.upcall;
  * aster_hook_failure_mode_t}): error, timeout, overload, shutdown or an undecodable answer.
  */
 public enum FailureMode {
+  /** Deny (the default; 0 since C ABI 7.0). */
+  FAIL_CLOSED(0),
   /** Allow. */
-  FAIL_OPEN(0),
-  /** Deny (the default). */
-  FAIL_CLOSED(1);
+  FAIL_OPEN(1);
 
   public final int code;
 

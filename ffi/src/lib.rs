@@ -189,7 +189,15 @@ pub mod upcall;
 //   successful `aster_runtime_new(6, ...)`. Readers of an `aster_config_t`
 //   check `struct_size` before reading past it. See `ffi/RENAME_MAP.md`
 //   "6.0".
-pub const ASTER_ABI_VERSION_MAJOR: u32 = 6;
+// - 7.0.0 (breaking): `aster_hook_failure_mode_t` values swap so zero fails
+//   closed: `ASTER_HOOK_FAILURE_FAIL_CLOSED` = 0, `ASTER_HOOK_FAILURE_FAIL_OPEN`
+//   = 1. A zero-filled `aster_config_t` (`hook_failure_mode`) or a 0
+//   `failure_mode` passed to `aster_upcall_set_policy` /
+//   `_set_default_policy` now rejects instead of accepting. Layouts are unchanged; a 6.x
+//   caller's literal 0/1 would mean the opposite mode, so it is refused at
+//   the handshake (`aster_runtime_new(6, ...)` / `aster_abi_accept(6)`). See
+//   `ffi/RENAME_MAP.md` "7.0".
+pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
 pub const ASTER_ABI_VERSION_MINOR: u32 = 0;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
@@ -277,15 +285,15 @@ pub enum aster_relay_mode_t {
 
 /// Hook fallback behavior when callback processing is unavailable.
 ///
-/// `aster_config_init` fills `ASTER_HOOK_FAILURE_FAIL_CLOSED` (the default);
-/// `ASTER_HOOK_FAILURE_FAIL_OPEN` is an explicit opt-in. Its value 0 predates
-/// that default, so a zero-filled `aster_config_t` that skips
-/// `aster_config_init` falls open.
+/// `ASTER_HOOK_FAILURE_FAIL_CLOSED` (0) is the default, so a zero-filled
+/// `aster_config_t` (one that skipped `aster_config_init`) fails closed too;
+/// `ASTER_HOOK_FAILURE_FAIL_OPEN` (1) is an explicit opt-in. Before ABI 7.0
+/// the values were the other way round.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum aster_hook_failure_mode_t {
-    ASTER_HOOK_FAILURE_FAIL_OPEN = 0,
-    ASTER_HOOK_FAILURE_FAIL_CLOSED = 1,
+    ASTER_HOOK_FAILURE_FAIL_CLOSED = 0,
+    ASTER_HOOK_FAILURE_FAIL_OPEN = 1,
 }
 
 /// Event kinds

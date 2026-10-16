@@ -20,8 +20,9 @@ fn test_abi_version() {
     // observability + health, aster_node_metrics_prometheus removed; 4.7.0:
     // independent event and operation bounds; 4.8.0: bounded foreign dispatch;
     // 4.16.0: topology views, snapshots and RPC gating; 5.1.0: Enrollment;
-    // 6.0.0: aster_config_t grew 280 -> 288 (blob_zstd_level, reuse_last_port).
-    assert_eq!(ASTER_ABI_VERSION_MAJOR, 6);
+    // 6.0.0: aster_config_t grew 280 -> 288 (blob_zstd_level, reuse_last_port);
+    // 7.0.0: aster_hook_failure_mode_t swapped so 0 = FAIL_CLOSED.
+    assert_eq!(ASTER_ABI_VERSION_MAJOR, 7);
     assert_eq!(ASTER_ABI_VERSION_MINOR, 0);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();

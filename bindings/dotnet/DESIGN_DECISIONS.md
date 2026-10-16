@@ -4,13 +4,13 @@
 **Target:** .NET 9+
 **ABI contract:** Rust FFI via source-generated P/Invoke (`LibraryImport`)
 **Native library:** `libaster_transport_ffi.{dylib,so}` / `aster_transport_ffi.dll` from `target/release` (falls back to `target/debug`; override with `-p:NativeLibraryPath=...`)
-**C header:** `ffi/aster_ffi.h`, ABI 6.x (`aster_*` symbols; `aster_runtime_new(6, ...)`, `aster_abi_accept(6)`)
+**C header:** `ffi/aster_ffi.h`, ABI 7.x (`aster_*` symbols; `aster_runtime_new(7, ...)`, `aster_abi_accept(7)`)
 **Build:** `dotnet build`, cross-platform via .NET runtime
 
-## STATUS (ABI 6.0, 2026-10-15)
+## STATUS (ABI 7.0, 2026-10-16)
 
-- **ABI:** needs `libaster_transport_ffi` ABI 6.x (`Native.AbiVersionMajor` = 6,
-  `Native.RequiredAbiMinor` = 0; 6.0 is breaking: `aster_config_t` grew from 280 to 288 bytes (`blob_zstd_level`, `reuse_last_port`; `AsterConfig.BlobZstdLevel` / `ReuseLastPort`), and `Native.EnsureAbi` performs the `aster_abi_accept(6)` handshake before a config is filled; 5.1 added Enrollment from configuration and the lease grantor (`Native.Enrollment.cs`); 5.0 removed the Fory attestation functions and is otherwise 4.17: owned raw WebTransport and media controls, with 4.12 for explicit public listeners and certificate helpers (4.11 added owned authenticated HTTPS/WebTransport listeners, 4.10 added independently owned Doc event receivers, 4.6 added observability and health, and 4.5 added cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
+- **ABI:** needs `libaster_transport_ffi` ABI 7.x (`Native.AbiVersionMajor` = 7,
+  `Native.RequiredAbiMinor` = 0; 7.0 is breaking: `aster_hook_failure_mode_t` swapped so 0 is `FAIL_CLOSED` (`HookFailureMode.FailClosed` = 0); 6.0 was breaking too: `aster_config_t` grew from 280 to 288 bytes (`blob_zstd_level`, `reuse_last_port`; `AsterConfig.BlobZstdLevel` / `ReuseLastPort`), and `Native.EnsureAbi` performs the `aster_abi_accept(7)` handshake before a config is filled; 5.1 added Enrollment from configuration and the lease grantor (`Native.Enrollment.cs`); 5.0 removed the Fory attestation functions and is otherwise 4.17: owned raw WebTransport and media controls, with 4.12 for explicit public listeners and certificate helpers (4.11 added owned authenticated HTTPS/WebTransport listeners, 4.10 added independently owned Doc event receivers, 4.6 added observability and health, and 4.5 added cancel tokens); 4.0 removed the reactor, framed calls, the node factories and
   bare endpoints, all unused here since the 3.5 port). Struct
   mirrors of the 3.1–3.5 types are in `src/Aster/NativeStructs.cs`, P/Invokes in
   `src/Aster/Native.V3.cs` / `Native.Dispatch.cs` (3.5); sizes are asserted in `NodeTests.Native_Struct_Sizes_Match_Header`.

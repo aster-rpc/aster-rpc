@@ -1,7 +1,7 @@
 # Aster .NET binding
 
 The .NET API wraps Aster's shared Rust engine through the C ABI. This checkout
-targets .NET 9 and requires native C ABI **6.0 or newer within major 6**.
+targets .NET 9 and requires native C ABI **7.0 or newer within major 7**.
 `Runtime` checks compatibility when it opens. Supply the native library through
 the repository build or an explicit build property:
 

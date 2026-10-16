@@ -13,6 +13,7 @@ import java.util.concurrent.TimeoutException;
 import site.aster.config.AsterConfig;
 import site.aster.event.IrohEvent;
 import site.aster.handle.IrohRuntime;
+import site.aster.upcall.FailureMode;
 
 /**
  * Marshals {@link AsterConfig} to and from the C ABI {@code aster_config_t} (ABI 3.2) and starts
@@ -138,7 +139,11 @@ public final class NativeConfig {
     seg.set(ValueLayout.JAVA_LONG, HOOK_TIMEOUT_MS, Math.max(0, c.hookTimeoutMs()));
     // Fail closed unless fail_open is asked for explicitly.
     seg.set(
-        ValueLayout.JAVA_INT, HOOK_FAILURE_MODE, "fail_open".equals(c.hookFailureMode()) ? 0 : 1);
+        ValueLayout.JAVA_INT,
+        HOOK_FAILURE_MODE,
+        "fail_open".equals(c.hookFailureMode())
+            ? FailureMode.FAIL_OPEN.code
+            : FailureMode.FAIL_CLOSED.code);
     seg.set(ValueLayout.JAVA_INT, ENABLE_HOOKS, c.enableHooks() ? 1 : 0);
     seg.set(ValueLayout.JAVA_INT, ENABLE_MONITORING, c.enableMonitoring() ? 1 : 0);
     seg.set(ValueLayout.JAVA_INT, LOCAL_DISCOVERY, c.localDiscovery() ? 1 : 0);
@@ -210,7 +215,9 @@ public final class NativeConfig {
     b.proxyUrl(getStr(seg, PROXY_URL));
     b.hookTimeoutMs((int) seg.get(ValueLayout.JAVA_LONG, HOOK_TIMEOUT_MS));
     b.hookFailureMode(
-        seg.get(ValueLayout.JAVA_INT, HOOK_FAILURE_MODE) == 1 ? "fail_closed" : "fail_open");
+        seg.get(ValueLayout.JAVA_INT, HOOK_FAILURE_MODE) == FailureMode.FAIL_OPEN.code
+            ? "fail_open"
+            : "fail_closed");
     b.enableHooks(seg.get(ValueLayout.JAVA_INT, ENABLE_HOOKS) != 0);
     b.enableMonitoring(seg.get(ValueLayout.JAVA_INT, ENABLE_MONITORING) != 0);
     b.localDiscovery(seg.get(ValueLayout.JAVA_INT, LOCAL_DISCOVERY) != 0);

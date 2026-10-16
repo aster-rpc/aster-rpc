@@ -29,10 +29,10 @@ public class NodeTests
     }
 
     [Fact]
-    public void Abi_Is_6_x()
+    public void Abi_Is_7_x()
     {
         var (major, minor, _) = Runtime.Version;
-        Assert.Equal(6, major);
+        Assert.Equal(7, major);
         Assert.True(minor >= (int)Native.RequiredAbiMinor, $"native library ABI {Native.AbiVersionMajor}.{minor} < {Native.AbiVersionMajor}.{Native.RequiredAbiMinor}");
     }
 
@@ -64,7 +64,7 @@ public class NodeTests
         Assert.Equal("127.0.0.1:0", n.bind_addr.ToUtf8String());
         Assert.Equal(c.SecretKey, n.secret_key.ToArray());
         Assert.Equal(1234ul, n.gc_interval_ms);
-        Assert.Equal(0u, n.hook_failure_mode);
+        Assert.Equal(1u, n.hook_failure_mode);
         Assert.Equal(2u, n.portmapper);
         Assert.Equal(99ul, n.transport_max_concurrent_bidi_streams);
         Assert.Equal((1u << 0) | (1u << 7) | (1u << 10), n.transport_set);
@@ -77,6 +77,7 @@ public class NodeTests
         var c = new AsterConfig();
         Assert.Equal(HookFailureMode.FailClosed, c.HookFailureMode);
         Assert.Equal((uint)HookFailureMode.FailClosed, c.ToNative(scope).hook_failure_mode);
+        Assert.Equal(HookFailureMode.FailClosed, default(HookFailureMode));
     }
 
     [Fact]

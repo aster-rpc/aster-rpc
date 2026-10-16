@@ -339,7 +339,7 @@ public class AbiContractTests
     public void Runtime_Version_Is_Consistent()
     {
         var (major, minor, patch) = Runtime.Version;
-        Assert.Equal(6, major); // ASTER_ABI_VERSION_MAJOR this binding targets
+        Assert.Equal(7, major); // ASTER_ABI_VERSION_MAJOR this binding targets
         Assert.True(major >= 0);
         Assert.True(minor >= 0);
         Assert.True(patch >= 0);
@@ -447,8 +447,8 @@ public class AbiContractTests
         Assert.Equal(3u, (uint)Lease.LeaseStatus.Lost);
         Assert.Equal(107u, (uint)EventKind.LeaseAcquired);
         Assert.Equal(108u, (uint)EventKind.LeaseStatus);
-        Assert.Equal(0u, (uint)HookFailureMode.FailOpen);
-        Assert.Equal(1u, (uint)HookFailureMode.FailClosed);
+        Assert.Equal(0u, (uint)HookFailureMode.FailClosed); // 7.0: zero fails closed
+        Assert.Equal(1u, (uint)HookFailureMode.FailOpen);
         Assert.Equal(1024, Upcall.Upcalls.DefaultCapacity);
         // UCv1 enum bytes (design §3): deny reasons and fence rejections.
         Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6 }, Enum.GetValues<Lease.DenyReason>().Select(r => (byte)r).Order().ToArray());

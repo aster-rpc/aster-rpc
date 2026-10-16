@@ -12,7 +12,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define ASTER_ABI_VERSION_MAJOR 6
+#define ASTER_ABI_VERSION_MAJOR 7
 
 #define ASTER_ABI_VERSION_MINOR 0
 
@@ -622,14 +622,14 @@ typedef enum aster_relay_mode_t {
 /**
  * Hook fallback behavior when callback processing is unavailable.
  *
- * `aster_config_init` fills `ASTER_HOOK_FAILURE_FAIL_CLOSED` (the default);
- * `ASTER_HOOK_FAILURE_FAIL_OPEN` is an explicit opt-in. Its value 0 predates
- * that default, so a zero-filled `aster_config_t` that skips
- * `aster_config_init` falls open.
+ * `ASTER_HOOK_FAILURE_FAIL_CLOSED` (0) is the default, so a zero-filled
+ * `aster_config_t` (one that skipped `aster_config_init`) fails closed too;
+ * `ASTER_HOOK_FAILURE_FAIL_OPEN` (1) is an explicit opt-in. Before ABI 7.0
+ * the values were the other way round.
  */
 typedef enum aster_hook_failure_mode_t {
-  ASTER_HOOK_FAILURE_FAIL_OPEN = 0,
-  ASTER_HOOK_FAILURE_FAIL_CLOSED = 1,
+  ASTER_HOOK_FAILURE_FAIL_CLOSED = 0,
+  ASTER_HOOK_FAILURE_FAIL_OPEN = 1,
 } aster_hook_failure_mode_t;
 
 /**

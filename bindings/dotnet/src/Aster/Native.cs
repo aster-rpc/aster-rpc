@@ -19,7 +19,7 @@ internal static partial class Native
     private const string NativeLib = "aster_transport_ffi";
 
     /// <summary>ABI major this binding is written against (<c>ASTER_ABI_VERSION_MAJOR</c>).</summary>
-    public const uint AbiVersionMajor = 6;
+    public const uint AbiVersionMajor = 7;
 
     /// <summary>
     /// ABI 6.0 handshake: until a caller proves its major, the library refuses to fill an

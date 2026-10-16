@@ -4,7 +4,7 @@
 /* Test-only native oracle: signatures compile against the actual public C header. */
 uint32_t aster_abi_version(void) { return ASTER_ABI_VERSION; }
 
-/* C ABI 6.0: IrohLibrary calls the handshake on load; the stub accepts its
+/* C ABI 6.0+: IrohLibrary calls the handshake on load; the stub accepts its
  * own major. */
 int32_t aster_abi_accept(uint32_t expected_abi_major) {
   return expected_abi_major == ASTER_ABI_VERSION_MAJOR ? 0 : -1;

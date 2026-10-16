@@ -25,7 +25,8 @@ const (
 	RelayModeStaging  uint32 = C.ASTER_RELAY_MODE_STAGING
 )
 
-// Hook failure modes (aster_hook_failure_mode_t).
+// Hook failure modes (aster_hook_failure_mode_t). HookFailClosed is 0 (C ABI
+// 7.0), so a zero-value AsterConfig or EndpointConfig fails closed.
 const (
 	HookFailOpen   uint32 = C.ASTER_HOOK_FAILURE_FAIL_OPEN
 	HookFailClosed uint32 = C.ASTER_HOOK_FAILURE_FAIL_CLOSED
@@ -51,7 +52,7 @@ type EndpointConfig struct {
 	ProxyURL             string
 	ProxyFromEnv         bool
 	DataDir              string // -> AsterConfig.StoragePath ("" = in memory)
-	HookFailureMode      uint32 // HookFailClosed (DefaultEndpointConfig) or HookFailOpen (the zero value)
+	HookFailureMode      uint32 // HookFailClosed (the zero value and DefaultEndpointConfig) or HookFailOpen
 	BlobZstdLevel        *int   // -> AsterConfig.BlobZstdLevel (nil = 3, 0 = off)
 	ReuseLastPort        *bool  // -> AsterConfig.ReuseLastPort (nil = on)
 }

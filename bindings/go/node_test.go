@@ -98,6 +98,39 @@ func TestConfig_DefaultsEnvTOML(t *testing.T) {
 	}
 }
 
+// C ABI 7.0: HookFailClosed is 0, so zero-value configs fail closed.
+func TestConfig_ZeroValueFailsClosed(t *testing.T) {
+	if HookFailClosed != 0 || HookFailOpen != 1 || FailureModeClosed != 0 {
+		t.Fatalf("closed=%d open=%d upcall closed=%d", HookFailClosed, HookFailOpen, FailureModeClosed)
+	}
+	var zero AsterConfig
+	if zero.HookFailureMode != HookFailClosed {
+		t.Fatalf("zero AsterConfig: %d", zero.HookFailureMode)
+	}
+	var a cArena
+	defer a.free()
+	n, err := zero.toNative(&a, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uint32(n.hook_failure_mode) != HookFailClosed {
+		t.Fatalf("zero AsterConfig lowers to hook_failure_mode %d", n.hook_failure_mode)
+	}
+	var zeroEndpoint EndpointConfig
+	c, err := zeroEndpoint.toAsterConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HookFailureMode != HookFailClosed {
+		t.Fatalf("zero EndpointConfig: %d", c.HookFailureMode)
+	}
+	open := DefaultConfig()
+	open.HookFailureMode = HookFailOpen
+	if n, err := open.toNative(&a, nil); err != nil || uint32(n.hook_failure_mode) != HookFailOpen {
+		t.Fatalf("explicit fail-open: %v %d", err, n.hook_failure_mode)
+	}
+}
+
 func TestConfig_NativeRoundTrip(t *testing.T) {
 	mtu := uint32(1300)
 	idle := uint64(9000)

@@ -9,7 +9,7 @@ namespace Aster;
 internal static unsafe partial class Native
 {
     /// <summary>Minimum ABI minor (of <see cref="AbiVersionMajor"/>) for everything this binding declares.</summary>
-    public const uint RequiredAbiMinor = 0; // 6.0: aster_config_t grew 280 -> 288 bytes (blob_zstd_level, reuse_last_port).
+    public const uint RequiredAbiMinor = 0; // 7.0: aster_hook_failure_mode_t swapped (0 = FAIL_CLOSED); 6.0 grew aster_config_t 280 -> 288 bytes.
 
     // ─── 3.1: AEv1 envelope + zstd ──────────────────────────────────────────
 

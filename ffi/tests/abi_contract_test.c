@@ -460,7 +460,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 6 && ASTER_ABI_VERSION_MINOR == 0); /* 6.0: aster_config_t grew 280 -> 288 */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 0); /* 7.0: hook failure mode 0 = FAIL_CLOSED */
     {
         /* A 5.x caller (280-byte aster_config_t, no 6.x handshake) is refused
          * cleanly and nothing is written past, or into, its struct. This runs
@@ -483,7 +483,13 @@ static void test_abi_version(void) {
         memcpy(v5.b, &v5size, sizeof v5size);
         aster_operation_t op5 = 0;
         CHECK(aster_node_start(0, (const aster_config_t *)&v5, 0, 0, &op5) == ASTER_STATUS_INVALID_ARGUMENT);
-        /* This (6.x) caller passes the handshake. */
+        /* A 6.x caller (same layout, opposite aster_hook_failure_mode_t
+         * values) is refused at the handshake too. */
+        aster_runtime_t rt6 = 0;
+        CHECK(aster_runtime_new(6, NULL, &rt6) == ASTER_STATUS_ABI_MISMATCH && rt6 == 0);
+        CHECK(aster_abi_accept(6) == ASTER_STATUS_ABI_MISMATCH);
+        CHECK(aster_config_init((aster_config_t *)&v5) == ASTER_STATUS_ABI_MISMATCH);
+        /* This (7.x) caller passes the handshake. */
         CHECK(aster_abi_accept(ASTER_ABI_VERSION_MAJOR) == ASTER_STATUS_OK);
     }
     CHECK(ASTER_EVENT_ENROLLMENT_RESULT == 127);
@@ -522,7 +528,7 @@ static void test_enum_values(void) {
     CHECK(ASTER_EVENT_ERROR == 99);
     CHECK(ASTER_RELAY_MODE_DISABLED == 2);
     CHECK(ASTER_RELAY_MODE_STAGING == 3);
-    CHECK(ASTER_HOOK_FAILURE_FAIL_CLOSED == 1);
+    CHECK(ASTER_HOOK_FAILURE_FAIL_CLOSED == 0 && ASTER_HOOK_FAILURE_FAIL_OPEN == 1); /* 7.0: zero fails closed */
     CHECK(ASTER_HOOK_DECISION_DENY == 1);
     CHECK(ASTER_CONNECTION_TYPE_UDP_RELAY == 3);
     CHECK(ASTER_PATH_KIND_RELAY == 2);
@@ -756,6 +762,13 @@ static void test_config(void) {
     CHECK(aster_config_from_toml(missing, &f) == ASTER_STATUS_INVALID_ARGUMENT);
     CHECK(f.storage == NULL);
     CHECK(aster_config_init(NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+
+    /* A caller that zero-fills the struct instead of calling
+     * aster_config_init gets fail-closed admission (7.0). */
+    aster_config_t z;
+    memset(&z, 0, sizeof z);
+    z.struct_size = sizeof z;
+    CHECK(z.hook_failure_mode == ASTER_HOOK_FAILURE_FAIL_CLOSED);
 }
 
 static int wait_event(aster_runtime_t rt, aster_operation_t op, aster_event_t *out) {

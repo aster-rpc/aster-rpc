@@ -7,30 +7,35 @@ The module path is `sdk.getaster.now/go` (Go 1.25+). This guide uses
 discovery and public release tags; the module path alone is not yet a working
 public installation source. See [publication setup](../../deploy/go-vanity/README.md).
 **Target:** Go 1.25+ (Fory Go 1.7.6 requires it)
-**ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, **C ABI 6.x, 6.0 minimum** (`aster_*` symbols)
+**ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, **C ABI 7.x, 7.0 minimum** (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Preview status (C ABI 6.0 minimum)
+## Preview status (C ABI 7.0 minimum)
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
 TypeScript, Java and .NET. Aster 0.3 is a preview release.
 
 **Native library requirement (for consumers such as Kasm):** this module needs
-`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 6.0 or a later 6.x**.
+`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 7.0 or a later 7.x**.
 It refuses anything else three ways:
 
 - at compile time, `runtime.go` fails with `#error` when the `aster_ffi.h` on
-  `CGO_CFLAGS` is not major 6;
+  `CGO_CFLAGS` is not major 7;
 - at run time, `CheckABI` (called by `NewRuntime` and before any config is
   filled) returns an error wrapping `ErrABIMismatch` when the loaded library's major is not
-  `ABIVersionMajor` (6) or its minor is below `ABIMinorRequired` (0);
+  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (0);
 - the library itself refuses `aster_runtime_new` from another major and, since
-  6.0, will not fill an `aster_config_t` until `aster_abi_accept(6)` has
-  succeeded, so a 5.x-built caller cannot have its 280-byte struct overrun.
+  6.0, will not fill an `aster_config_t` until `aster_abi_accept` has
+  succeeded for its major, so a 5.x-built caller cannot have its 280-byte
+  struct overrun and a 6.x-built caller cannot pass the old hook failure mode
+  values.
 
-ABI 6.0 is a breaking release only because `aster_config_t` grew from 280 to
-288 bytes (`blob_zstd_level`, `reuse_last_port`); a module built for 5.x must
-be rebuilt against the 6.0 header and library together.
+ABI 7.0 is a breaking release only because `aster_hook_failure_mode_t`
+swapped values so that 0 is `FAIL_CLOSED`: a zero-value `AsterConfig` or
+`EndpointConfig` now fails closed (`HookFailClosed` is 0). ABI 6.0 grew
+`aster_config_t` from 280 to 288 bytes (`blob_zstd_level`,
+`reuse_last_port`). A module built for an older major must be rebuilt against
+the 7.0 header and library together.
 
 - **Codec:** Apache Fory Go **1.7.6** (`xlang`, `compatible`, no ref tracking),
   safe for concurrent use (a pool of Fory instances, no global lock). Payload types implement `aster.WireTyped`
@@ -91,7 +96,7 @@ be rebuilt against the 6.0 header and library together.
   bridge, Prometheus renderer) lives in Rust; the binding starts it and wraps the
   rest. `InitObservability(ObservabilityConfig{...})` (before the first server;
   otherwise `StartServer` / `StartHealth` run the implicit environment-only
-  start) and `ShutdownObservability`. Floor: the binding requires ABI 6.0 or newer
+  start) and `ShutdownObservability`. Floor: the binding requires ABI 7.0 or newer
   (`ABIMinorRequired`, checked by `CheckABI` / `NewRuntime`).
   - *Logs:* Rust `tracing` events reach `log/slog`. One goroutine on a locked OS
     thread polls `aster_log_poll`; `SetLogger(*slog.Logger)` picks the

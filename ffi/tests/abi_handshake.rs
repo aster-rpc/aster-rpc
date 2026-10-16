@@ -1,5 +1,6 @@
 //! ABI 6.0: a caller built for 5.x is refused cleanly and nothing writes past
-//! its 280-byte `aster_config_t`.
+//! its 280-byte `aster_config_t`. ABI 7.0 (same layout, swapped
+//! `aster_hook_failure_mode_t` values) refuses a 6.x caller the same way.
 //!
 //! One test in its own binary (its own process): the ABI handshake is
 //! process-wide, so the "not yet accepted" state must not be shared with
@@ -47,8 +48,8 @@ impl V5Buffer {
 
 #[test]
 fn a_5x_caller_is_refused_without_writing_past_its_struct() {
-    assert_eq!(ASTER_ABI_VERSION_MAJOR, 6);
-    assert_eq!(aster_abi_version() >> 16, 6);
+    assert_eq!(ASTER_ABI_VERSION_MAJOR, 7);
+    assert_eq!(aster_abi_version() >> 16, 7);
     assert_eq!(std::mem::size_of::<aster_config_t>(), 288);
 
     unsafe {
@@ -57,7 +58,7 @@ fn a_5x_caller_is_refused_without_writing_past_its_struct() {
         let mut buf = V5Buffer::new();
         assert_eq!(aster_config_init(buf.as_config()), MISMATCH);
         assert!(
-            last_error().contains("aster_abi_accept(6)"),
+            last_error().contains("aster_abi_accept(7)"),
             "{}",
             last_error()
         );
@@ -87,6 +88,14 @@ fn a_5x_caller_is_refused_without_writing_past_its_struct() {
         assert_eq!(aster_config_init(buf.as_config()), MISMATCH);
         assert!(buf.untouched());
 
+        // A 6.x caller has the right layout but the opposite hook failure
+        // mode values: refused at the handshake as well.
+        assert_eq!(aster_runtime_new(6, ptr::null(), &mut rt), MISMATCH);
+        assert_eq!(rt, 0);
+        assert_eq!(aster_abi_accept(6), MISMATCH);
+        assert_eq!(aster_config_init(buf.as_config()), MISMATCH);
+        assert!(buf.untouched());
+
         // A 5.x struct handed to a reader is refused on struct_size before
         // anything past 280 bytes is read.
         let mut v5 = V5Buffer::new();
@@ -100,7 +109,7 @@ fn a_5x_caller_is_refused_without_writing_past_its_struct() {
         );
         assert_eq!(aster_config_release(v5.as_config()), INVALID);
 
-        // A 6.x caller passes the handshake and the fill works.
+        // A 7.x caller passes the handshake and the fill works.
         assert_eq!(aster_abi_accept(ASTER_ABI_VERSION_MAJOR), 0);
         let mut cfg: aster_config_t = std::mem::zeroed();
         assert_eq!(aster_config_init(&mut cfg), 0);
