@@ -17,4 +17,6 @@ uuid = { version = "1", features = ["v4"] }
 tokio = { workspace = true }
 aster-exec = { path = "../aster-exec", features = ["service"] }
 async-trait = "0.1"
+base64 = "0.22"
+hex = "0.4"
 tempfile = "3"

@@ -14,7 +14,7 @@ use crate::{
     ledger::{LedgerError, RequestLedger, ReservationPhase, request_key},
     policy::{
         ExecGrantStore, ExecGrantV1, ExecOperationV1, GrantError, MAX_ISSUED_AT_SKEW_SECONDS,
-        parse_node_id as identity_bytes,
+        grant_subject, is_user_principal, parse_node_id as identity_bytes,
     },
     unix_millis as now_ms,
 };
@@ -23,7 +23,7 @@ use aster::delegation::{
     LeafClaims, LeafKind, RevokedDelegates, TrustContext, VerifiedChain, verify_chain,
 };
 use aster::enrollment::{AdmissionError, EnrollmentRevoked};
-use aster::rpc::{Call, RpcStatus, ServiceDispatch, StatusCode, async_trait};
+use aster::rpc::{Call, CallContext, RpcStatus, ServiceDispatch, StatusCode, async_trait};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::{Duration, Instant};
@@ -133,10 +133,117 @@ impl Drop for InflightAdmission {
     }
 }
 
+/// Who made an Exec call, read from the call context: a node calling as
+/// itself, or a user whose identity a gateway edge forwarded in
+/// `aster-on-behalf-of`. The core verified the forwarded token and the
+/// edge's `aster.gateway` role before dispatch; Exec then authorizes the user
+/// (`iss|sub`) under the grant naming it, with the edge as the actor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExecCaller {
+    id: String,
+    forwarded: Option<Forwarded>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Forwarded {
+    actor: String,
+    issuer: String,
+    jti: String,
+    auth_methods: Vec<String>,
+}
+
+fn unauthenticated() -> ExecErrorV1 {
+    error(
+        ExecErrorCodeV1::Unauthenticated,
+        "authenticated node identity required",
+    )
+}
+
+impl ExecCaller {
+    /// A node calling as itself; `id` is its 64-hex identity.
+    pub fn node(id: impl Into<String>) -> Result<Self, ExecErrorV1> {
+        let id = id.into();
+        if identity_bytes(&id).is_none() {
+            return Err(unauthenticated());
+        }
+        Ok(Self {
+            id,
+            forwarded: None,
+        })
+    }
+
+    /// A user principal (`iss|sub`) forwarded by the gateway edge `actor`,
+    /// with the token's issuer, `jti` and `amr` for the audit.
+    pub fn forwarded(
+        principal: impl Into<String>,
+        actor: impl Into<String>,
+        issuer: impl Into<String>,
+        jti: impl Into<String>,
+        auth_methods: Vec<String>,
+    ) -> Result<Self, ExecErrorV1> {
+        let (id, actor) = (principal.into(), actor.into());
+        if !is_user_principal(&id) || identity_bytes(&actor).is_none() {
+            return Err(error(
+                ExecErrorCodeV1::Unauthenticated,
+                "forwarded identity is not usable for Exec",
+            ));
+        }
+        Ok(Self {
+            id,
+            forwarded: Some(Forwarded {
+                actor,
+                issuer: issuer.into(),
+                jti: jti.into(),
+                auth_methods,
+            }),
+        })
+    }
+
+    /// The caller of the call `context` describes. Without a forwarded
+    /// identity it must be a node: an authenticator-resolved principal is
+    /// never taken for a user.
+    pub fn from_context(context: &CallContext) -> Result<Self, ExecErrorV1> {
+        match context.on_behalf_of() {
+            Some(user) => Self::forwarded(
+                user.principal(),
+                user.actor(),
+                user.issuer(),
+                user.jti(),
+                user.auth_methods().to_vec(),
+            ),
+            None => Self::node(context.principal()),
+        }
+    }
+
+    /// The node id, or the forwarded user principal (`iss|sub`).
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The forwarding edge, when the call was forwarded.
+    pub fn edge(&self) -> Option<&str> {
+        self.forwarded.as_ref().map(|f| f.actor.as_str())
+    }
+
+    /// The call's own authority: the node itself, or the edge acting for
+    /// the user, which needs the edge enrolled and the user's grant.
+    fn authority(&self) -> Authority {
+        match &self.forwarded {
+            None => Authority::own(&self.id),
+            Some(forwarded) => Authority {
+                actor: forwarded.actor.clone(),
+                principal: self.id.clone(),
+            },
+        }
+    }
+}
+
 /// Whose grant an operation runs under. A caller acting for itself is its own
 /// principal; an on-behalf-of submission names another principal, whose grant
-/// applies while the caller (the actor) stays enrolled. Cached standings are
-/// keyed by [`Authority::key`].
+/// applies while the caller (the actor) stays enrolled. A forwarded call is
+/// the edge (actor) acting for the user (principal). Cached standings are
+/// keyed by [`Authority::key`]. The actor of a two-party authority is always
+/// a node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Authority {
     actor: String,
@@ -151,7 +258,9 @@ impl Authority {
         }
     }
 
-    /// The authority a job's follow-up calls and revocation checks use.
+    /// The authority a job's follow-up calls and revocation checks use. A
+    /// job submitted through a gateway is its user's own (`caller_id`): the
+    /// edge was a conduit, so only the user's grant keeps it running.
     fn of_job(job: &JobStatusV1) -> Self {
         Self {
             actor: job.caller_id.clone(),
@@ -171,14 +280,18 @@ impl Authority {
         }
     }
 
+    /// Inverse of [`key`](Self::key). The actor is a node, so a two-party key
+    /// is a node id, `/`, then the principal (which may contain `/`, as an
+    /// issuer URL does). A lone user principal never has that shape
+    /// ([`is_user_principal`]).
     fn parse(key: &str) -> Self {
-        match key.split_once('/') {
-            Some((actor, principal)) => Self {
-                actor: actor.into(),
-                principal: principal.into(),
-            },
-            None => Self::own(key),
+        if key.len() > 65 && key.as_bytes()[64] == b'/' && identity_bytes(&key[..64]).is_some() {
+            return Self {
+                actor: key[..64].into(),
+                principal: key[65..].into(),
+            };
         }
+        Self::own(key)
     }
 }
 
@@ -449,14 +562,18 @@ impl ExecService {
 
     /// Read the actor's enrollment and the principal's grant (the same node
     /// unless acting on another's behalf). A definite denial from either
-    /// wins; otherwise any unevaluated part leaves the standing unknown.
-    async fn read_standing(
-        &self,
-        actor: [u8; 32],
-        principal: [u8; 32],
-        target: [u8; 32],
-    ) -> Standing {
-        let enrollment = self.enrollment.check(&actor).await;
+    /// wins; otherwise any unevaluated part leaves the standing unknown. A
+    /// user principal acting as itself (the owner of a job submitted through
+    /// a gateway) has no enrollment: its grant alone decides.
+    async fn read_standing(&self, authority: &Authority, target: [u8; 32]) -> Standing {
+        let Some(principal) = grant_subject(&authority.principal) else {
+            return Standing::Denied(unauthenticated());
+        };
+        let enrollment = match identity_bytes(&authority.actor) {
+            Some(actor) => self.enrollment.check(&actor).await,
+            None if authority.actor == authority.principal => Ok(()),
+            None => return Standing::Denied(unauthenticated()),
+        };
         if let Err(AdmissionError::Denied(_)) = enrollment {
             return Standing::Denied(error(
                 ExecErrorCodeV1::PermissionDenied,
@@ -499,21 +616,12 @@ impl ExecService {
     async fn refresh_standing(&self, caller: &str) -> Standing {
         let started = Instant::now();
         let authority = Authority::parse(caller);
-        let (Some(actor_bytes), Some(principal_bytes)) = (
-            identity_bytes(&authority.actor),
-            identity_bytes(&authority.principal),
-        ) else {
-            return Standing::Denied(error(
-                ExecErrorCodeV1::Unauthenticated,
-                "invalid node identity",
-            ));
-        };
         let Some(target_bytes) = identity_bytes(&self.ceiling.target_id) else {
             return Standing::Unknown(ExecErrorV1::invalid("invalid target identity"));
         };
         let standing = tokio::time::timeout(
             AUTHORITY_READ_TIMEOUT,
-            self.read_standing(actor_bytes, principal_bytes, target_bytes),
+            self.read_standing(&authority, target_bytes),
         )
         .await
         .unwrap_or_else(|_| {
@@ -642,6 +750,7 @@ impl ExecService {
     }
 
     /// Authorize a caller under its own grant.
+    #[cfg(test)]
     async fn authorize(
         &self,
         caller: &str,
@@ -651,14 +760,23 @@ impl ExecService {
         self.authorize_as(&Authority::own(caller), target, op).await
     }
 
+    /// The authority a follow-up call on `job` runs under: a forwarded user
+    /// acts through the edge of this call (which must be enrolled), a node
+    /// under the job's own authority.
+    fn job_authority(caller: &ExecCaller, job: &JobStatusV1) -> Authority {
+        match caller.forwarded {
+            Some(_) => caller.authority(),
+            None => Authority::of_job(job),
+        }
+    }
+
     /// Checks that need no policy read: the caller's identity, the target,
     /// the owner's local ceiling and its denied callers.
+    /// A user principal reaches here only through [`ExecCaller::forwarded`]
+    /// or as the owner of a job submitted that way.
     fn precheck(&self, caller: &str, target: &str, op: ExecOperationV1) -> Result<(), ExecErrorV1> {
-        if identity_bytes(caller).is_none() {
-            return Err(error(
-                ExecErrorCodeV1::Unauthenticated,
-                "authenticated node identity required",
-            ));
+        if identity_bytes(caller).is_none() && !is_user_principal(caller) {
+            return Err(unauthenticated());
         }
         if target != self.ceiling.target_id
             || self.ceiling.version != 1
@@ -807,26 +925,27 @@ impl ExecService {
     /// grant never authorizes another principal's job.
     async fn owned(
         &self,
-        caller: &str,
+        caller: &ExecCaller,
         job: &JobRefV1,
         op: ExecOperationV1,
     ) -> Result<JobStatusV1, ExecErrorV1> {
-        self.precheck(caller, &job.target_id, op)?;
+        self.precheck(caller.id(), &job.target_id, op)?;
         let status = match self.runtime.status(job).await {
             Ok(status) => status,
             Err(failure) => {
                 // Only an authorized caller learns why the lookup failed.
-                self.authorize(caller, &job.target_id, op).await?;
+                self.authorize_as(&caller.authority(), &job.target_id, op)
+                    .await?;
                 return Err(failure);
             }
         };
-        if status.caller_id != caller || status.job != *job {
+        if status.caller_id != caller.id() || status.job != *job {
             return Err(error(
                 ExecErrorCodeV1::PermissionDenied,
                 "job access denied",
             ));
         }
-        self.authorize_as(&Authority::of_job(&status), &job.target_id, op)
+        self.authorize_as(&Self::job_authority(caller, &status), &job.target_id, op)
             .await?;
         Ok(status)
     }
@@ -902,20 +1021,40 @@ impl ExecService {
                 unresolved
             })
     }
+    /// Submit for the node `caller` (see [`submit_as`](Self::submit_as)).
     pub async fn submit(
         &self,
         caller: &str,
+        request: ExecRequestV1,
+    ) -> Result<JobStatusV1, ExecErrorV1> {
+        self.submit_as(&ExecCaller::node(caller)?, request).await
+    }
+
+    /// Submit for `caller`: a node under its own grant, a node acting for a
+    /// principal under that principal's action chain, or a gateway-forwarded
+    /// user under the grant naming it (`iss|sub`).
+    pub async fn submit_as(
+        &self,
+        exec_caller: &ExecCaller,
         mut request: ExecRequestV1,
     ) -> Result<JobStatusV1, ExecErrorV1> {
         request.validate()?;
-        let authority = match &request.on_behalf_of {
-            None => Authority::own(caller),
-            Some(on_behalf) if on_behalf.principal == caller => {
+        let caller = exec_caller.id();
+        let authority = match (&exec_caller.forwarded, &request.on_behalf_of) {
+            (None, None) => Authority::own(caller),
+            (Some(_), None) => exec_caller.authority(),
+            // An action chain names its actor's key; a forwarded user has none.
+            (Some(_), Some(_)) => {
+                return Err(ExecErrorV1::invalid(
+                    "a call forwarded by a gateway cannot carry on_behalf_of",
+                ));
+            }
+            (None, Some(on_behalf)) if on_behalf.principal == caller => {
                 return Err(ExecErrorV1::invalid(
                     "on_behalf_of names the caller; submit without it",
                 ));
             }
-            Some(on_behalf) => Authority {
+            (None, Some(on_behalf)) => Authority {
                 actor: caller.into(),
                 principal: on_behalf.principal.clone(),
             },
@@ -943,6 +1082,14 @@ impl ExecService {
             .ceiling
             .authorize_submit(&authority.principal, &grant, &request)?;
         let delegation = match &request.on_behalf_of {
+            // A forwarded token is not bound to this request, so it cannot
+            // meet a grant that demands single-use, request-bound authority.
+            None if exec_caller.forwarded.is_some() && grant.require_request_digest => {
+                return Err(error(
+                    ExecErrorCodeV1::PermissionDenied,
+                    "the principal's grant requires a chain bound to this request",
+                ));
+            }
             None => None,
             Some(on_behalf) => {
                 let verified = match early {
@@ -992,8 +1139,13 @@ impl ExecService {
                 .existing_submission(&key, reservation, &request, digest)
                 .await;
         }
+        // One shape for every submission: whose grant applies (principal)
+        // and who acted (actor; the caller itself unless delegated or
+        // forwarded), then the evidence for the delegation, if any.
         let mut payload = serde_json::json!({
             "caller": caller,
+            "principal": authority.principal,
+            "actor": authority.actor,
             "target": request.target_id,
             "request_id": request.request_id,
             "job_id": job_id,
@@ -1003,11 +1155,16 @@ impl ExecService {
         });
         if let Some(chain) = &delegation {
             payload["on_behalf_of"] = serde_json::json!({
-                "principal": authority.principal,
-                "actor": authority.actor,
                 "chain_digest": hex::encode(chain.digest()),
                 "chain_jtis": chain.jtis(),
                 "issuers": chain.issuers().iter().map(hex::encode).collect::<Vec<_>>(),
+            });
+        }
+        if let Some(forwarded) = &exec_caller.forwarded {
+            payload["forwarded"] = serde_json::json!({
+                "issuer": forwarded.issuer,
+                "jti": forwarded.jti,
+                "auth_methods": forwarded.auth_methods,
             });
         }
         let event = AuditEvent {
@@ -1385,7 +1542,7 @@ impl ExecService {
             caller: caller.to_owned(),
         })
     }
-    async fn watch(&self, caller: String, mut call: Call) {
+    async fn watch(&self, caller: Result<ExecCaller, ExecErrorV1>, mut call: Call) {
         let request: WatchRequestV1 = match call
             .recv_request()
             .await
@@ -1402,8 +1559,11 @@ impl ExecService {
                 return;
             }
         };
-        let _permit = match self.watch_permit(&caller) {
-            Ok(permit) => permit,
+        let (caller, _permit) = match caller.and_then(|caller| {
+            self.watch_permit(caller.id())
+                .map(|permit| (caller, permit))
+        }) {
+            Ok(admitted) => admitted,
             Err(failure) => {
                 if let Ok(bytes) = serde_json::to_vec(&Err::<JobEventV1, _>(failure)) {
                     let _ = call.send(bytes).await;
@@ -1433,7 +1593,7 @@ impl ExecService {
                     .await?;
                 // Output authority is independently required for output bytes.
                 self.authorize_as(
-                    &Authority::of_job(&status),
+                    &Self::job_authority(&caller, &status),
                     &request.job.target_id,
                     ExecOperationV1::Output,
                 )
@@ -1504,7 +1664,7 @@ impl ExecService {
     async fn run(
         &self,
         method: &str,
-        caller: &str,
+        caller: &ExecCaller,
         raw: &[u8],
     ) -> Result<serde_json::Value, ExecErrorV1> {
         fn decode<T: serde::de::DeserializeOwned>(raw: &[u8]) -> Result<T, ExecErrorV1> {
@@ -1516,8 +1676,12 @@ impl ExecService {
         }
         match method {
             "targets" => {
-                self.authorize(caller, &self.ceiling.target_id, ExecOperationV1::Discover)
-                    .await?;
+                self.authorize_as(
+                    &caller.authority(),
+                    &self.ceiling.target_id,
+                    ExecOperationV1::Discover,
+                )
+                .await?;
                 encode(vec![TargetRefV1 {
                     target_id: self.ceiling.target_id.clone(),
                 }])
@@ -1525,7 +1689,11 @@ impl ExecService {
             "capabilities" => {
                 let req: TargetRefV1 = decode(raw)?;
                 let grant = self
-                    .authorize(caller, &req.target_id, ExecOperationV1::Discover)
+                    .authorize_as(
+                        &caller.authority(),
+                        &req.target_id,
+                        ExecOperationV1::Discover,
+                    )
                     .await?;
                 let mut caps = self.runtime.capabilities().await?;
                 caps.profiles.retain(|p| {
@@ -1541,7 +1709,7 @@ impl ExecService {
                     .min(self.ceiling.max_output_bytes);
                 encode(caps)
             }
-            "submit" => encode(self.submit(caller, decode(raw)?).await?.job),
+            "submit" => encode(self.submit_as(caller, decode(raw)?).await?.job),
             "status" => {
                 let req: JobRefV1 = decode(raw)?;
                 encode(self.owned(caller, &req, ExecOperationV1::Status).await?)
@@ -1567,8 +1735,9 @@ impl ExecService {
                     timestamp_ms: now_ms(),
                     kind: "exec.cancel.intent.v1".into(),
                     payload: serde_json::json!({
-                        "caller": caller,
-                        "principal": job.principal_id,
+                        "caller": caller.id(),
+                        "principal": job.principal_id.as_deref().unwrap_or(caller.id()),
+                        "actor": caller.edge().unwrap_or(caller.id()),
                         "job_id": req.job.job_id,
                         "target": req.job.target_id,
                     }),
@@ -1628,15 +1797,18 @@ impl ServiceDispatch for ExecService {
         Some(MAX_REQUEST_FRAME_BYTES as u32)
     }
     async fn dispatch(&self, method: &str, mut call: Call) {
-        let caller = call.peer().to_string();
+        // The node itself, or the user a gateway forwarded (the core has
+        // verified the token and the edge's `aster.gateway` role).
+        let caller = ExecCaller::from_context(call.context());
         if method == "watch" {
             self.watch(caller, call).await;
             return;
         }
-        let result = match call.recv_request().await {
-            Some(raw) if raw.len() <= MAX_REQUEST_FRAME_BYTES => {
+        let result = match (call.recv_request().await, caller) {
+            (Some(raw), Ok(caller)) if raw.len() <= MAX_REQUEST_FRAME_BYTES => {
                 self.run(method, &caller, &raw).await
             }
+            (Some(_), Err(failure)) => Err(failure),
             _ => Err(ExecErrorV1::invalid("invalid Exec frame")),
         };
         match serde_json::to_vec(&result) {
@@ -2576,10 +2748,17 @@ mod on_behalf_tests {
     #[derive(Default)]
     struct Admitted {
         revoked: StdMutex<Vec<[u8; 32]>>,
+        /// Nodes whose enrollment the root has revoked.
+        denied: StdMutex<Vec<[u8; 32]>>,
     }
     #[async_trait]
     impl EnrollmentAdmission for Admitted {
-        async fn check(&self, _: &[u8; 32]) -> Result<(), AdmissionError> {
+        async fn check(&self, node: &[u8; 32]) -> Result<(), AdmissionError> {
+            if self.denied.lock().unwrap().contains(node) {
+                return Err(AdmissionError::Denied(
+                    aster::enrollment::DenialReason::NodeRevoked,
+                ));
+            }
             Ok(())
         }
         fn delegate_revoked(&self, key: &[u8; 32]) -> bool {
@@ -2592,6 +2771,9 @@ mod on_behalf_tests {
     }
     fn id(key: &SecretKey) -> String {
         key.public_key().to_hex()
+    }
+    fn node(key: &SecretKey) -> ExecCaller {
+        ExecCaller::node(id(key)).unwrap()
     }
     fn now() -> u64 {
         now_ms() / 1000
@@ -2633,7 +2815,7 @@ mod on_behalf_tests {
     }
     impl GrantTable {
         fn insert(&self, grant: ExecGrantV1) {
-            let holder = identity_bytes(&grant.caller).unwrap();
+            let holder = grant_subject(&grant.caller).unwrap();
             self.grants.lock().unwrap().insert(holder, grant);
         }
     }
@@ -2944,9 +3126,10 @@ mod on_behalf_tests {
 
         let intent = f.audit.0.lock().unwrap()[0].payload.clone();
         assert_eq!(intent["caller"], id(&a));
+        assert_eq!(intent["principal"], id(&h));
+        assert_eq!(intent["actor"], id(&a));
+        assert!(intent.get("forwarded").is_none());
         let recorded = &intent["on_behalf_of"];
-        assert_eq!(recorded["principal"], id(&h));
-        assert_eq!(recorded["actor"], id(&a));
         assert_eq!(recorded["chain_digest"], hex::encode(chain.digest()));
         let jtis = recorded["chain_jtis"].as_array().unwrap();
         assert_eq!(jtis.len(), 2);
@@ -2958,7 +3141,7 @@ mod on_behalf_tests {
         // The actor follows its job under H's grant; it holds none itself.
         let job = status.job.clone();
         f.service
-            .owned(&id(&a), &job, ExecOperationV1::Status)
+            .owned(&node(&a), &job, ExecOperationV1::Status)
             .await
             .unwrap();
         // H's revocation cancels the job: its authority is H's grant.
@@ -3002,7 +3185,7 @@ mod on_behalf_tests {
         let _ = f.service.reconcile_policy().await;
         assert!(f.runtime.cancelled.lock().unwrap().is_empty());
         f.service
-            .owned(&id(&a), &running.job, ExecOperationV1::Status)
+            .owned(&node(&a), &running.job, ExecOperationV1::Status)
             .await
             .unwrap();
     }
@@ -3185,5 +3368,171 @@ mod on_behalf_tests {
             principal: "22".repeat(32),
         };
         assert_eq!(Authority::parse(&acting.key()), acting);
+        // A user principal's issuer is usually a URL, with `/` in it.
+        let user = "https://idp.example/realms/a|alice/b";
+        let own_user = Authority::own(user);
+        assert_eq!(Authority::parse(&own_user.key()), own_user);
+        let forwarded = Authority {
+            actor: "11".repeat(32),
+            principal: user.into(),
+        };
+        assert_eq!(Authority::parse(&forwarded.key()), forwarded);
+    }
+
+    const ISSUER: &str = "https://idp.example";
+    const ALICE: &str = "https://idp.example|alice";
+
+    fn user(principal: &str, edge: &SecretKey) -> ExecCaller {
+        ExecCaller::forwarded(
+            principal,
+            id(edge),
+            ISSUER,
+            "jti-0001",
+            vec!["webauthn".into()],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn only_user_principals_and_node_actors_are_forwarded() {
+        let edge = id(&key(9));
+        assert!(ExecCaller::forwarded(ALICE, &edge, ISSUER, "j", vec![]).is_ok());
+        for (principal, actor) in [
+            (edge.as_str(), edge.as_str()),
+            ("no-separator", edge.as_str()),
+            ("|alice", edge.as_str()),
+            (ALICE, "not-a-node"),
+        ] {
+            let failure = ExecCaller::forwarded(principal, actor, ISSUER, "j", vec![]).unwrap_err();
+            assert_eq!(failure.code, ExecErrorCodeV1::Unauthenticated);
+        }
+        // A node calling as itself is never taken for a user.
+        assert!(ExecCaller::node(ALICE).is_err());
+    }
+
+    /// Gateway identity, slice 7: an edge forwards alice (`iss|sub`); her
+    /// job runs under the grant naming her, and the audit names alice as
+    /// principal and the edge as actor, with the token's issuer and jti.
+    #[tokio::test]
+    async fn a_forwarded_user_submits_under_the_grant_naming_it() {
+        let f = fixture();
+        let (edge, other_edge) = (key(7), key(8));
+        f.grants.insert(grant(&f.cwd, ALICE, &f.target));
+        let status = f
+            .service
+            .submit_as(&user(ALICE, &edge), request(&f))
+            .await
+            .unwrap();
+        assert_eq!(status.caller_id, ALICE);
+        assert_eq!(status.principal_id, None);
+        assert!(
+            f.grants
+                .reads
+                .lock()
+                .unwrap()
+                .contains(&grant_subject(ALICE).unwrap())
+        );
+
+        let intent = f.audit.0.lock().unwrap()[0].payload.clone();
+        assert_eq!(intent["caller"], ALICE);
+        assert_eq!(intent["principal"], ALICE);
+        assert_eq!(intent["actor"], id(&edge));
+        assert_eq!(intent["forwarded"]["issuer"], ISSUER);
+        assert_eq!(intent["forwarded"]["jti"], "jti-0001");
+        assert_eq!(intent["forwarded"]["auth_methods"][0], "webauthn");
+        assert!(intent.get("on_behalf_of").is_none());
+
+        // Alice follows her job through any gateway; the edge itself and
+        // another user cannot.
+        let job = status.job.clone();
+        f.service
+            .owned(&user(ALICE, &other_edge), &job, ExecOperationV1::Status)
+            .await
+            .unwrap();
+        denied(
+            f.service
+                .owned(&node(&edge), &job, ExecOperationV1::Status)
+                .await,
+        );
+        denied(
+            f.service
+                .owned(
+                    &user("https://idp.example|bob", &edge),
+                    &job,
+                    ExecOperationV1::Status,
+                )
+                .await,
+        );
+        // Bob holds no grant, and alice's grant is no use to the edge.
+        denied(
+            f.service
+                .submit_as(&user("https://idp.example|bob", &edge), request(&f))
+                .await,
+        );
+        denied(f.service.submit(&id(&edge), request(&f)).await);
+    }
+
+    /// A forwarded token is not bound to the request, so a grant that
+    /// requires request-bound chains refuses it; and a forwarded call cannot
+    /// also carry an action chain.
+    #[tokio::test]
+    async fn a_forwarded_user_meets_no_digest_bound_grant_and_carries_no_chain() {
+        let f = fixture();
+        let (h, o, edge) = (key(1), key(2), key(7));
+        let mut required = grant(&f.cwd, ALICE, &f.target);
+        required.require_request_digest = true;
+        f.grants.insert(required);
+        let failure = denied(f.service.submit_as(&user(ALICE, &edge), request(&f)).await);
+        assert!(failure.safe_message.contains("requires"), "{failure:?}");
+
+        f.grants.insert(grant(&f.cwd, &id(&h), &f.target));
+        let chain = action(
+            &o,
+            &principal_delegates(&h, &o),
+            &edge.public_key(),
+            &[],
+            None,
+        );
+        let failure = f
+            .service
+            .submit_as(&user(ALICE, &edge), on_behalf(request(&f), &h, &chain))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.code, ExecErrorCodeV1::InvalidArgument);
+        assert!(f.runtime.jobs.lock().unwrap().is_empty());
+    }
+
+    /// A revoked edge can forward nothing more, but the job it submitted is
+    /// alice's: it runs while her grant stands and is cancelled when it goes.
+    #[tokio::test]
+    async fn a_revoked_edge_stops_forwarding_and_the_users_grant_keeps_its_job() {
+        let f = fixture();
+        let edge = key(7);
+        f.grants.insert(grant(&f.cwd, ALICE, &f.target));
+        let running = f
+            .service
+            .submit_as(&user(ALICE, &edge), request(&f))
+            .await
+            .unwrap();
+
+        f.admission
+            .denied
+            .lock()
+            .unwrap()
+            .push(edge.public_key().to_bytes());
+        f.service.invalidate_peer(&id(&edge));
+        denied(f.service.submit_as(&user(ALICE, &edge), request(&f)).await);
+        let _ = f.service.reconcile_policy().await;
+        assert!(f.runtime.cancelled.lock().unwrap().is_empty());
+
+        let mut revoked = grant(&f.cwd, ALICE, &f.target);
+        revoked.status = GrantStatusV1::Revoked;
+        f.grants.insert(revoked);
+        f.service.invalidate_all();
+        let _ = f.service.reconcile_policy().await;
+        assert_eq!(
+            *f.runtime.cancelled.lock().unwrap(),
+            vec![running.job.job_id]
+        );
     }
 }

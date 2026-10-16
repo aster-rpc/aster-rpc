@@ -38,7 +38,10 @@ pub(super) fn identity(value: &str) -> Result<[u8; 32]> {
 }
 pub(super) use crate::files::read_bounded as bounded;
 fn validate(grant: &ExecGrantV1, root: &str, audience: &str, revoked: bool) -> Result<Vec<u8>> {
-    let caller = identity(&grant.caller)?;
+    // A node identity, or a user principal (`iss|sub`) forwarded by a gateway.
+    let caller = aster_exec::policy::grant_subject(&grant.caller).ok_or_else(|| {
+        Error::usage("caller must be a node identity or a user principal (iss|sub)")
+    })?;
     let target = identity(&grant.target)?;
     identity(&grant.issuer)?;
     let expected = if revoked {
@@ -347,6 +350,19 @@ mod tests {
     use super::*;
     fn grant() -> ExecGrantV1 {
         serde_json::from_value(json!({"version":1,"issuer":"11".repeat(32),"audience":"fleet","caller":"22".repeat(32),"target":"33".repeat(32),"revision":1,"issued_at":1,"status":"active","account_alias":"builder","profiles":["open"],"operations":["submit"],"cwd_roots":["/srv/build"],"max_timeout_ms":1000,"max_output_bytes":4096,"cancel_on_revocation":true})).unwrap()
+    }
+    #[test]
+    fn a_grant_may_name_a_forwarded_user() {
+        let mut g = grant();
+        g.caller = "https://idp.example|alice".into();
+        let user = aster_exec::policy::grant_subject(&g.caller).unwrap();
+        let target = identity(&g.target).unwrap();
+        assert_eq!(
+            validate(&g, &g.issuer.clone(), "fleet", false).unwrap(),
+            grant_key(&user, &target)
+        );
+        g.caller = "alice".into();
+        assert!(validate(&g, &g.issuer.clone(), "fleet", false).is_err());
     }
     #[tokio::test]
     async fn publishes_exact_root_record_durably_and_replays_idempotently() {

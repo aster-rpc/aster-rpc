@@ -125,6 +125,46 @@ fn identity(text: &str) -> Result<[u8; 32], GrantError> {
     parse_node_id(text).ok_or(GrantError::InvalidRecord)
 }
 
+/// Longest forwarded user principal (`iss|sub`) an Exec grant can name.
+pub const MAX_USER_PRINCIPAL_BYTES: usize = 512;
+/// Domain separator for a user principal's grant subject.
+const USER_SUBJECT_CONTEXT: &str = "aster-exec grant subject v1: forwarded user principal";
+
+/// Whether `text` is a forwarded user principal, `iss|sub`, as the core
+/// derives it from an `aster-on-behalf-of` token (`aster::rpc::identity`):
+/// both parts non-empty, no control characters, at most
+/// [`MAX_USER_PRINCIPAL_BYTES`]. It is never a node identity, and never
+/// starts with a node identity followed by `/`, so it cannot be mistaken for
+/// an `actor/principal` authority key.
+pub fn is_user_principal(text: &str) -> bool {
+    let Some((issuer, subject)) = text.split_once('|') else {
+        return false;
+    };
+    let ambiguous =
+        text.len() > 64 && text.as_bytes()[64] == b'/' && parse_node_id(&text[..64]).is_some();
+    !issuer.is_empty()
+        && !subject.is_empty()
+        && text.len() <= MAX_USER_PRINCIPAL_BYTES
+        && !text.chars().any(char::is_control)
+        && !ambiguous
+}
+
+/// The 32-byte subject a grant is stored under: a node's own identity, or a
+/// domain-separated BLAKE3 hash of a forwarded user principal (`iss|sub`).
+/// The grant still names the principal in `caller`, and every check compares
+/// that text, so the hash only locates the record.
+pub fn grant_subject(principal: &str) -> Option<[u8; 32]> {
+    if let Some(node) = parse_node_id(principal) {
+        return Some(node);
+    }
+    is_user_principal(principal)
+        .then(|| blake3::derive_key(USER_SUBJECT_CONTEXT, principal.as_bytes()))
+}
+
+fn subject(text: &str) -> Result<[u8; 32], GrantError> {
+    grant_subject(text).ok_or(GrantError::InvalidRecord)
+}
+
 pub fn grant_key(caller: &[u8; 32], target: &[u8; 32]) -> Vec<u8> {
     let mut pair = [0u8; 64];
     pair[..32].copy_from_slice(caller);
@@ -246,7 +286,7 @@ impl ExecGrantStore {
     }
 
     fn validate(&self, key: &[u8], grant: &ExecGrantV1) -> Result<(), GrantError> {
-        let caller = identity(&grant.caller)?;
+        let caller = subject(&grant.caller)?;
         let target = identity(&grant.target)?;
         if key != grant_key(&caller, &target)
             || grant.version != 1
@@ -333,7 +373,7 @@ impl ExecGrantStore {
         };
         if identity(&binding.issuer).ok() != Some(self.context.root)
             || binding.audience != self.context.audience
-            || identity(&binding.caller)
+            || subject(&binding.caller)
                 .ok()
                 .zip(identity(&binding.target).ok())
                 .is_none_or(|(caller, target)| key.as_bytes() != grant_key(&caller, &target))
@@ -534,5 +574,43 @@ mod tests {
             reopened.grant_for(&caller, &target, 4),
             Err(GrantError::PolicyUnavailable)
         ));
+    }
+
+    /// A grant can name a forwarded user (`iss|sub`); it is stored under that
+    /// principal's own subject and nowhere else.
+    #[test]
+    fn grants_name_forwarded_users_by_their_own_subject() {
+        let alice = "https://idp.example|alice";
+        let subject = grant_subject(alice).unwrap();
+        assert_ne!(subject, grant_subject("https://idp.example|bob").unwrap());
+        let node = "ab".repeat(32);
+        assert_eq!(grant_subject(&node), parse_node_id(&node));
+        let ambiguous = format!("{node}/realm|alice");
+        let long = format!("i|{}", "x".repeat(MAX_USER_PRINCIPAL_BYTES));
+        for bad in ["alice", "|alice", "iss|", "iss|a\nb", &ambiguous, &long] {
+            assert_eq!(grant_subject(bad), None, "{bad:?}");
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let (root, namespace, target) = ([1; 32], [4; 32], [3; 32]);
+        let store = ExecGrantStore::open(
+            &temp.path().join("grants.redb"),
+            root,
+            namespace,
+            "fleet".into(),
+        )
+        .unwrap();
+        let mut record = grant(root, [0; 32], target, 1, GrantStatusV1::Active);
+        record.caller = alice.into();
+        // Bob's key does not hold alice's grant.
+        let bob = grant_subject("https://idp.example|bob").unwrap();
+        assert!(matches!(
+            store.observe(key_text(&bob, &target), record.clone()),
+            Err(GrantError::InvalidRecord)
+        ));
+        store
+            .observe(key_text(&subject, &target), record.clone())
+            .unwrap();
+        assert_eq!(store.grant_for(&subject, &target, 2).unwrap(), record);
     }
 }

@@ -399,6 +399,8 @@ dependencies = [
  "aster",
  "aster-exec",
  "async-trait",
+ "base64 0.22.1",
+ "hex",
  "serde",
  "serde_json",
  "tempfile",

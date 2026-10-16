@@ -27,18 +27,29 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Client {
     connection: Arc<RpcConnection>,
     call_timeout: Duration,
+    on_behalf_of: Option<String>,
 }
 impl Client {
     pub fn new(connection: RpcConnection) -> Self {
         Self {
             connection: Arc::new(connection),
             call_timeout: Duration::from_secs(30),
+            on_behalf_of: None,
         }
     }
     /// Connection/setup timeouts belong to the caller; this bounds control RPCs,
     /// independently of the server-side execution timeout in each request.
     pub fn with_call_timeout(mut self, timeout: Duration) -> Self {
         self.call_timeout = timeout;
+        self
+    }
+    /// Call on behalf of a user: every call carries `jwt` in the
+    /// `aster-on-behalf-of` metadata entry. For a gateway edge holding
+    /// `aster.gateway`; the target runs the call as the token's `iss|sub`
+    /// under the Exec grant naming it. The unary control calls carry it
+    /// (`watch` has no client method here).
+    pub fn on_behalf_of(mut self, jwt: impl Into<String>) -> Self {
+        self.on_behalf_of = Some(jwt.into());
         self
     }
     async fn call<A: Serialize, R: DeserializeOwned>(
@@ -53,13 +64,13 @@ impl Client {
             ..Default::default()
         };
         let bytes = serde_json::to_vec(request).map_err(Error::Encoding)?;
+        let mut options = CallOptions::new().deadline(self.call_timeout);
+        if let Some(jwt) = &self.on_behalf_of {
+            options = options.on_behalf_of(jwt.clone());
+        }
         let reply = self
             .connection
-            .unary_with(
-                &header,
-                bytes,
-                &CallOptions::new().deadline(self.call_timeout),
-            )
+            .unary_with(&header, bytes, &options)
             .await
             .map_err(Error::Transport)?;
         let result: std::result::Result<R, ExecErrorV1> =
