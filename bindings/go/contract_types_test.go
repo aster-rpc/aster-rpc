@@ -100,11 +100,32 @@ type ctPriced struct {
 
 func (ctPriced) AsterWireType() string { return "types.v1/Priced" }
 
+// A cycle whose spanning tree depends on codepoint (not UTF-16) order:
+// Ａ (U+FF21) and 𝔸 (U+1D538). Contract identity only, as in Rust.
+type ctOrd struct {
+	Wide *ctWide
+	Math *ctMath
+}
+
+func (ctOrd) AsterWireType() string { return "types.v1/Ord" }
+
+type ctWide struct {
+	Back *ctOrd
+	Math *ctMath
+}
+
+func (ctWide) AsterWireType() string { return "types.v1/\uff21" }
+
+type ctMath struct{ Wide *ctWide }
+
+func (ctMath) AsterWireType() string { return "types.v1/\U0001d538" }
+
 var ctTypes = map[string]any{
 	"types.v1.Temporal": ctTemporal{}, "types.v1.TreeNode": ctTreeNode{}, "types.v1.Chain": ctChain{},
 	"types.v1.Author": ctAuthor{}, "types.v1.Book": ctBook{}, "types.v1.Alpha": ctAlpha{},
 	"types.v1.Beta": ctBeta{}, "types.v1.Gamma": ctGamma{}, "types.v1.Forest": ctForest{},
 	"types.v1.Identified": ctIdentified{}, "types.v1.Priced": ctPriced{},
+	"types.v1.Ord": ctOrd{}, "types.v1.\uff21": ctWide{}, "types.v1.\U0001d538": ctMath{},
 }
 
 type ctVectors struct {

@@ -76,3 +76,22 @@ export class Priced {
   maybe_price: decimal<18, 4> | null = null;
   amount: Decimal = new Decimal(0n);
 }
+
+// A cycle whose spanning tree depends on codepoint (not UTF-16) order:
+// Ａ (U+FF21) and 𝔸 (U+1D538). Contract identity only, as in Rust.
+@WireType('types.v1/Ord')
+export class CpOrd {
+  wide: CpWide | null = null;
+  math: CpMath | null = null;
+}
+
+@WireType('types.v1/\uFF21')
+export class CpWide {
+  back: CpOrd | null = null;
+  math: CpMath | null = null;
+}
+
+@WireType('types.v1/\u{1D538}')
+export class CpMath {
+  wide: CpWide | null = null;
+}

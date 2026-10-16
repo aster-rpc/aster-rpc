@@ -81,6 +81,25 @@ public sealed class CtPriced
     public ForyDecimal Amount { get; set; }
 }
 
+// A cycle whose spanning tree depends on codepoint (not UTF-16) order: Ａ (U+FF21) and 𝔸
+// (U+1D538). Contract identity only, as in Rust.
+[ForyStruct, WireType("types.v1/Ord")]
+public sealed class CtOrd
+{
+    public CtWide? Wide { get; set; }
+    public CtMath? Math { get; set; }
+}
+
+[ForyStruct, WireType("types.v1/\uFF21")]
+public sealed class CtWide
+{
+    public CtOrd? Back { get; set; }
+    public CtMath? Math { get; set; }
+}
+
+[ForyStruct, WireType("types.v1/\U0001D538")]
+public sealed class CtMath { public CtWide? Wide { get; set; } }
+
 /// <summary>
 /// conformance/vectors/contract-types.json: the .NET contract types (timestamp, date, decimal,
 /// decimal(p,s), uuid, ulid) and recursive types (SELF_REF) give Rust's TypeDef bytes, type hashes
@@ -103,6 +122,9 @@ public class ContractTypeVectorTests
         ["types.v1.Forest"] = typeof(CtForest),
         ["types.v1.Identified"] = typeof(CtIdentified),
         ["types.v1.Priced"] = typeof(CtPriced),
+        ["types.v1.Ord"] = typeof(CtOrd),
+        ["types.v1.\uFF21"] = typeof(CtWide),
+        ["types.v1.\U0001D538"] = typeof(CtMath),
     };
 
     private static ForyCodec Codec()

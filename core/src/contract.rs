@@ -1100,12 +1100,13 @@ pub fn spanning_tree_back_edges(
         visited.insert(v.to_string());
         let empty = HashSet::new();
         let successors = graph.get(v).unwrap_or(&empty);
-        // Filter to only SCC members, then sort
+        // Filter to only SCC members, then sort by NFC codepoints, the order
+        // `scc_processing_order` and every binding use.
         let mut member_successors: Vec<&String> = successors
             .iter()
             .filter(|w| member_set.contains(w.as_str()))
             .collect();
-        member_successors.sort();
+        member_successors.sort_by_cached_key(|w| nfc_codepoints(w));
 
         for w in member_successors {
             if !visited.contains(w.as_str()) {
@@ -1976,6 +1977,23 @@ mod tests {
         // so Book is hashed first and Author's REF can carry Book's hash.
         assert_eq!(order[0], "Book");
         assert_eq!(order[1], "Author");
+    }
+
+    // CT-3: successors are visited in NFC-codepoint order. "A\u{30A}" is
+    // after "B" once normalised (U+00C5), though its raw first codepoint is
+    // smaller, so the DFS from "S" takes "B" first and the edge S -> A-ring
+    // is the back-edge.
+    #[test]
+    fn spanning_tree_visits_successors_in_nfc_codepoint_order() {
+        let ring = "A\u{30A}".to_string();
+        let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
+        graph.insert("S".into(), [ring.clone(), "B".into()].into_iter().collect());
+        graph.insert("B".into(), [ring.clone()].into_iter().collect());
+        graph.insert(ring.clone(), ["S".to_string()].into_iter().collect());
+        let members = vec!["S".to_string(), "B".to_string(), ring.clone()];
+        let back = spanning_tree_back_edges("S", &members, &graph);
+        assert!(back.contains(&("S".to_string(), ring.clone())), "{back:?}");
+        assert!(!back.contains(&("B".to_string(), ring)), "{back:?}");
     }
 
     // ---- NFC normalization tests ----

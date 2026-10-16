@@ -84,6 +84,31 @@ struct Gamma {
     next: Vec<Alpha>,
 }
 
+/// A three-type cycle whose spanning tree depends on ordering names by
+/// codepoint (CT-3): `Ａ` (U+FF21) sorts before `𝔸` (U+1D538) by codepoint
+/// but after it by UTF-16 code unit (a surrogate pair starts at U+D835), so a
+/// binding that orders successors by UTF-16 visits `𝔸` first from `Ord` and
+/// breaks different edges. Contract identity only (a cycle through `Option`).
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/Ord")]
+struct CpOrd {
+    wide: Option<Box<CpWide>>,
+    math: Option<Box<CpMath>>,
+}
+
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/\u{FF21}")]
+struct CpWide {
+    back: Option<Box<CpOrd>>,
+    math: Option<Box<CpMath>>,
+}
+
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/\u{1D538}")]
+struct CpMath {
+    wide: Option<Box<CpWide>>,
+}
+
 /// A non-recursive holder of a recursive type: an ordinary `REF` to it.
 #[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "types.v1/Forest")]
@@ -263,6 +288,22 @@ fn three_cycle_breaks_only_the_closing_edge() {
     let closing = field(&gamma, "next");
     assert_eq!(closing.type_kind, TypeKind::SelfRef);
     assert_eq!(closing.self_ref_name, "types.v1.Alpha");
+}
+
+#[test]
+fn spanning_tree_orders_names_by_codepoint_not_utf16() {
+    // Codepoint order from Ord: Ord -> Ａ -> 𝔸 is the tree; Ａ -> Ord,
+    // 𝔸 -> Ａ and Ord -> 𝔸 are the back-edges.
+    let ord = CpOrd::aster_type_def();
+    assert_eq!(field(&ord, "wide").type_ref, CpWide::aster_type_hash_hex());
+    assert_eq!(field(&ord, "math").type_kind, TypeKind::SelfRef);
+    assert_eq!(field(&ord, "math").self_ref_name, "types.v1.\u{1D538}");
+    let wide = CpWide::aster_type_def();
+    assert_eq!(field(&wide, "back").type_kind, TypeKind::SelfRef);
+    assert_eq!(field(&wide, "math").type_ref, CpMath::aster_type_hash_hex());
+    let math = CpMath::aster_type_def();
+    assert_eq!(field(&math, "wide").type_kind, TypeKind::SelfRef);
+    assert_eq!(field(&math, "wide").self_ref_name, "types.v1.\u{FF21}");
 }
 
 #[test]
@@ -642,6 +683,9 @@ fn actual() -> Value {
             "types.v1.Chain": type_entry::<Chain>(),
             "types.v1.Identified": type_entry::<Identified>(),
             "types.v1.Priced": type_entry::<Priced>(),
+            "types.v1.Ord": type_entry::<CpOrd>(),
+            "types.v1.\u{FF21}": type_entry::<CpWide>(),
+            "types.v1.\u{1D538}": type_entry::<CpMath>(),
         },
         "service": "Types v1, xlang, SHARED; unary methods echo_temporal(Temporal)->Temporal, plant(TreeNode)->Forest, author(Book)->Author, cycle(Alpha)->Gamma",
         "expected_contract_id": contract_id(&service()),
@@ -816,7 +860,7 @@ fn contract_types_vector() {
                 "timestamp": "Fory xlang TIMESTAMP (type id 38): int64 seconds + uint32 nanos since the Unix epoch, UTC",
                 "date": "Fory xlang DATE (type id 39): varint64 days since 1970-01-01",
                 "decimal": "Fory xlang DECIMAL (type id 40): varint32 scale, then the unscaled value (zig-zag varint64 << 1, or a flagged little-endian magnitude)",
-                "self_ref": "an edge outside an SCC's spanning tree (DFS from the codepoint-smallest member, successors in codepoint order) is type_kind SELF_REF (2) with self_ref_name = the target's package.name; tree edges are REF (1) to the target's hash",
+                "self_ref": "an edge outside an SCC's spanning tree (DFS from the codepoint-smallest member, successors in codepoint order: Unicode scalar values after NFC, not UTF-16 code units, see types.v1.Ord) is type_kind SELF_REF (2) with self_ref_name = the target's package.name; tree edges are REF (1) to the target's hash",
                 "box": "Rust Box<T> is transparent in both the contract and the wire",
                 "uuid": "contract type uuid: Fory xlang BINARY (type id 41) of exactly 16 bytes (varuint32 length 16, then the bytes); a decoder refuses any other length. String form 8-4-4-4-12 lowercase hex",
                 "ulid": "contract type ulid (an identity distinct from uuid): the same 16-byte BINARY wire; string form 26 characters of Crockford base32",

@@ -5,7 +5,7 @@
     "date": "Fory xlang DATE (type id 39): varint64 days since 1970-01-01",
     "decimal": "Fory xlang DECIMAL (type id 40): varint32 scale, then the unscaled value (zig-zag varint64 << 1, or a flagged little-endian magnitude)",
     "decimal(p,s)": "type_primitive is the ASCII string decimal(p,s) with no spaces, e.g. decimal(18,4). Wire: Fory DECIMAL with scale exactly s; the encoder zero-pads to scale s and refuses a value that needs rounding or has more than p digits; the decoder applies the same rule. decode_cases lists payloads a decoder must accept (with the value) or refuse",
-    "self_ref": "an edge outside an SCC's spanning tree (DFS from the codepoint-smallest member, successors in codepoint order) is type_kind SELF_REF (2) with self_ref_name = the target's package.name; tree edges are REF (1) to the target's hash",
+    "self_ref": "an edge outside an SCC's spanning tree (DFS from the codepoint-smallest member, successors in codepoint order: Unicode scalar values after NFC, not UTF-16 code units, see types.v1.Ord) is type_kind SELF_REF (2) with self_ref_name = the target's package.name; tree edges are REF (1) to the target's hash",
     "timestamp": "Fory xlang TIMESTAMP (type id 38): int64 seconds + uint32 nanos since the Unix epoch, UTC",
     "ulid": "contract type ulid (an identity distinct from uuid): the same 16-byte BINARY wire; string form 26 characters of Crockford base32",
     "uuid": "contract type uuid: Fory xlang BINARY (type id 41) of exactly 16 bytes (varuint32 length 16, then the bytes); a decoder refuses any other length. String form 8-4-4-4-12 lowercase hex"
@@ -369,6 +369,32 @@
         "name": "Identified",
         "package": "types.v1"
       },
+      "types.v1.Ord": {
+        "expected_canonical_type_def_hex": "002274797065732e76310e4f7264020c02126d6174680202003674797065732e76312ef09d94b801000000020001000412776964650102202f40ca0d9c35b31f5ae1a3a03f3bc75372b8c10543a44a230606ac93651e9fe6020100000002000100000c000c",
+        "expected_type_hash": "bac4610c0d626e6a2967a8a096c4b82d28f871c824ec7da847673f7d9397be1e",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "wide",
+            "optional": true,
+            "self_ref_name": "",
+            "type_kind": 1,
+            "type_primitive": "",
+            "type_ref": "2f40ca0d9c35b31f5ae1a3a03f3bc75372b8c10543a44a230606ac93651e9fe6"
+          },
+          {
+            "container": 0,
+            "name": "math",
+            "optional": true,
+            "self_ref_name": "types.v1.𝔸",
+            "type_kind": 2,
+            "type_primitive": "",
+            "type_ref": ""
+          }
+        ],
+        "name": "Ord",
+        "package": "types.v1"
+      },
       "types.v1.Priced": {
         "expected_canonical_type_def_hex": "002274797065732e76311a507269636564040c021a616d6f756e74001e646563696d616c00020000000002000100042e6d617962655f70726963650036646563696d616c2831382c342900020100000002000100061670726963650036646563696d616c2831382c3429000200000000020001000812726174650032646563696d616c28352c302900020000000002000100000c000c",
         "expected_type_hash": "1411e52384fe870d7ed4e6440e8d720d68e706d4023a5d44490b75d4b24b7227",
@@ -490,6 +516,49 @@
           }
         ],
         "name": "TreeNode",
+        "package": "types.v1"
+      },
+      "types.v1.Ａ": {
+        "expected_canonical_type_def_hex": "002274797065732e76310eefbca1020c02126261636b0202003274797065732e76312e4f7264010000000200010004126d61746801022070b5e7a4553c8095d09cf582db46a2860c999268ac56d5e4c0702a55637aa368020100000002000100000c000c",
+        "expected_type_hash": "2f40ca0d9c35b31f5ae1a3a03f3bc75372b8c10543a44a230606ac93651e9fe6",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "back",
+            "optional": true,
+            "self_ref_name": "types.v1.Ord",
+            "type_kind": 2,
+            "type_primitive": "",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "math",
+            "optional": true,
+            "self_ref_name": "",
+            "type_kind": 1,
+            "type_primitive": "",
+            "type_ref": "70b5e7a4553c8095d09cf582db46a2860c999268ac56d5e4c0702a55637aa368"
+          }
+        ],
+        "name": "Ａ",
+        "package": "types.v1"
+      },
+      "types.v1.𝔸": {
+        "expected_canonical_type_def_hex": "002274797065732e763112f09d94b8010c0212776964650202003274797065732e76312eefbca10100000002000100000c000c",
+        "expected_type_hash": "70b5e7a4553c8095d09cf582db46a2860c999268ac56d5e4c0702a55637aa368",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "wide",
+            "optional": true,
+            "self_ref_name": "types.v1.Ａ",
+            "type_kind": 2,
+            "type_primitive": "",
+            "type_ref": ""
+          }
+        ],
+        "name": "𝔸",
         "package": "types.v1"
       }
     }

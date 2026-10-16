@@ -3,8 +3,8 @@
 // Regenerate with: npx aster-gen
 
 import { RpcPattern } from '@aster-rpc/aster';
-import { Gamma as T0_Gamma, Beta as T1_Beta, Alpha as T2_Alpha, Book as T3_Book, Author as T4_Author, Chain as T5_Chain, TreeNode as T6_TreeNode, Forest as T7_Forest, Identified as T8_Identified, Priced as T9_Priced, Temporal as T10_Temporal } from './src/types.js';
-import { TypesService as T11_TypesService, IdsService as T12_IdsService } from './src/service.js';
+import { Gamma as T0_Gamma, Beta as T1_Beta, Alpha as T2_Alpha, Book as T3_Book, Author as T4_Author, Chain as T5_Chain, TreeNode as T6_TreeNode, Forest as T7_Forest, Identified as T8_Identified, CpWide as T9_CpWide, CpMath as T10_CpMath, CpOrd as T11_CpOrd, Priced as T12_Priced, Temporal as T13_Temporal } from './src/types.js';
+import { TypesService as T14_TypesService, IdsService as T15_IdsService } from './src/service.js';
 
 export const WIRE_TYPES = [
   {
@@ -124,7 +124,45 @@ export const WIRE_TYPES = [
     typeDefBytes: new Uint8Array([0x00, 0x22, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x76, 0x31, 0x2a, 0x49, 0x64, 0x65, 0x6e, 0x74, 0x69, 0x66, 0x69, 0x65, 0x64, 0x05, 0x0c, 0x02, 0x1e, 0x68, 0x69, 0x73, 0x74, 0x6f, 0x72, 0x79, 0x00, 0x12, 0x75, 0x6c, 0x69, 0x64, 0x00, 0x02, 0x00, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x0a, 0x69, 0x64, 0x00, 0x12, 0x75, 0x75, 0x69, 0x64, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x16, 0x6e, 0x61, 0x6d, 0x65, 0x73, 0x00, 0x1a, 0x73, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x00, 0x02, 0x00, 0x00, 0x03, 0x00, 0x12, 0x75, 0x75, 0x69, 0x64, 0x00, 0x01, 0x00, 0x08, 0x1a, 0x70, 0x61, 0x72, 0x65, 0x6e, 0x74, 0x00, 0x12, 0x75, 0x75, 0x69, 0x64, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x0a, 0x16, 0x74, 0x72, 0x61, 0x63, 0x65, 0x00, 0x12, 0x75, 0x6c, 0x69, 0x64, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
-    ctor: T9_Priced,
+    ctor: T9_CpWide,
+    tag: "types.v1/Ａ",
+    fields: [
+    { name: "back", kind: 'ref', refTag: "types.v1/Ord", nullable: true },
+    { name: "math", kind: 'ref', refTag: "types.v1/𝔸", nullable: true },
+    ],
+    fieldNameSet: new Set(["back", "math"]),
+    nestedTypes: new Map([["back", T11_CpOrd], ["math", T10_CpMath]]),
+    elementTypes: new Map([]),
+    typeHashHex: "4e572718a44f240f66a20f14c846ff14f5c01b48e50cade9fb25386ff75d08f2",
+    typeDefBytes: new Uint8Array([0x00, 0x22, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x76, 0x31, 0x0e, 0xef, 0xbc, 0xa1, 0x02, 0x0c, 0x02, 0x12, 0x62, 0x61, 0x63, 0x6b, 0x02, 0x02, 0x00, 0x32, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0x4f, 0x72, 0x64, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x12, 0x6d, 0x61, 0x74, 0x68, 0x02, 0x02, 0x00, 0x36, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0xf0, 0x9d, 0x94, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
+  },
+  {
+    ctor: T10_CpMath,
+    tag: "types.v1/𝔸",
+    fields: [
+    { name: "wide", kind: 'ref', refTag: "types.v1/Ａ", nullable: true },
+    ],
+    fieldNameSet: new Set(["wide"]),
+    nestedTypes: new Map([["wide", T9_CpWide]]),
+    elementTypes: new Map([]),
+    typeHashHex: "a94e453c54aa89412d93729a627f2bc30e5781cb055bfac303e4e3691e8861fd",
+    typeDefBytes: new Uint8Array([0x00, 0x22, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x76, 0x31, 0x12, 0xf0, 0x9d, 0x94, 0xb8, 0x01, 0x0c, 0x02, 0x12, 0x77, 0x69, 0x64, 0x65, 0x01, 0x02, 0x20, 0x4e, 0x57, 0x27, 0x18, 0xa4, 0x4f, 0x24, 0x0f, 0x66, 0xa2, 0x0f, 0x14, 0xc8, 0x46, 0xff, 0x14, 0xf5, 0xc0, 0x1b, 0x48, 0xe5, 0x0c, 0xad, 0xe9, 0xfb, 0x25, 0x38, 0x6f, 0xf7, 0x5d, 0x08, 0xf2, 0x02, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
+  },
+  {
+    ctor: T11_CpOrd,
+    tag: "types.v1/Ord",
+    fields: [
+    { name: "wide", kind: 'ref', refTag: "types.v1/Ａ", nullable: true },
+    { name: "math", kind: 'ref', refTag: "types.v1/𝔸", nullable: true },
+    ],
+    fieldNameSet: new Set(["wide", "math"]),
+    nestedTypes: new Map([["wide", T9_CpWide], ["math", T10_CpMath]]),
+    elementTypes: new Map([]),
+    typeHashHex: "d7306eb1d8148ba953d265533f4866162161bf618349c069ba26db921e9fa9fd",
+    typeDefBytes: new Uint8Array([0x00, 0x22, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x76, 0x31, 0x0e, 0x4f, 0x72, 0x64, 0x02, 0x0c, 0x02, 0x12, 0x6d, 0x61, 0x74, 0x68, 0x01, 0x02, 0x20, 0xa9, 0x4e, 0x45, 0x3c, 0x54, 0xaa, 0x89, 0x41, 0x2d, 0x93, 0x72, 0x9a, 0x62, 0x7f, 0x2b, 0xc3, 0x0e, 0x57, 0x81, 0xcb, 0x05, 0x5b, 0xfa, 0xc3, 0x03, 0xe4, 0xe3, 0x69, 0x1e, 0x88, 0x61, 0xfd, 0x02, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x12, 0x77, 0x69, 0x64, 0x65, 0x02, 0x02, 0x00, 0x32, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x76, 0x31, 0x2e, 0xef, 0xbc, 0xa1, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
+  },
+  {
+    ctor: T12_Priced,
     tag: "types.v1/Priced",
     fields: [
     { name: "price", kind: 'primitive', wire: "decimal(18,4)", nullable: false },
@@ -139,7 +177,7 @@ export const WIRE_TYPES = [
     typeDefBytes: new Uint8Array([0x00, 0x22, 0x74, 0x79, 0x70, 0x65, 0x73, 0x2e, 0x76, 0x31, 0x1a, 0x50, 0x72, 0x69, 0x63, 0x65, 0x64, 0x04, 0x0c, 0x02, 0x1a, 0x61, 0x6d, 0x6f, 0x75, 0x6e, 0x74, 0x00, 0x1e, 0x64, 0x65, 0x63, 0x69, 0x6d, 0x61, 0x6c, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x04, 0x2e, 0x6d, 0x61, 0x79, 0x62, 0x65, 0x5f, 0x70, 0x72, 0x69, 0x63, 0x65, 0x00, 0x36, 0x64, 0x65, 0x63, 0x69, 0x6d, 0x61, 0x6c, 0x28, 0x31, 0x38, 0x2c, 0x34, 0x29, 0x00, 0x02, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x06, 0x16, 0x70, 0x72, 0x69, 0x63, 0x65, 0x00, 0x36, 0x64, 0x65, 0x63, 0x69, 0x6d, 0x61, 0x6c, 0x28, 0x31, 0x38, 0x2c, 0x34, 0x29, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x08, 0x12, 0x72, 0x61, 0x74, 0x65, 0x00, 0x32, 0x64, 0x65, 0x63, 0x69, 0x6d, 0x61, 0x6c, 0x28, 0x35, 0x2c, 0x30, 0x29, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x0c, 0x00, 0x0c]),
   },
   {
-    ctor: T10_Temporal,
+    ctor: T13_Temporal,
     tag: "types.v1/Temporal",
     fields: [
     { name: "at", kind: 'primitive', wire: "timestamp", nullable: false },
@@ -390,6 +428,77 @@ export function BUILD_ALL_TYPES(
     codec.registerType(typeStruct);
     typesByTag.set("types.v1/Identified", typeStruct);
   }
+  // types.v1/Ａ
+  {
+    const typeStruct = Type.struct(
+      { namespace: "types.v1", typeName: "Ａ" },
+      {
+      "back": (typesByTag.get("types.v1/Ord") ?? Type.struct({ namespace: "types.v1", typeName: "Ord" })).clone().setNullable(true),
+      "math": (typesByTag.get("types.v1/𝔸") ?? Type.struct({ namespace: "types.v1", typeName: "𝔸" })).clone().setNullable(true)
+      },
+      { withConstructor: true },
+    );
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T9_CpWide.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T9_CpWide);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
+    }
+    codec.registerType(typeStruct);
+    typesByTag.set("types.v1/Ａ", typeStruct);
+  }
+  // types.v1/𝔸
+  {
+    const typeStruct = Type.struct(
+      { namespace: "types.v1", typeName: "𝔸" },
+      {
+      "wide": (typesByTag.get("types.v1/Ａ") ?? Type.struct({ namespace: "types.v1", typeName: "Ａ" })).clone().setNullable(true)
+      },
+      { withConstructor: true },
+    );
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T10_CpMath.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T10_CpMath);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
+    }
+    codec.registerType(typeStruct);
+    typesByTag.set("types.v1/𝔸", typeStruct);
+  }
+  // types.v1/Ord
+  {
+    const typeStruct = Type.struct(
+      { namespace: "types.v1", typeName: "Ord" },
+      {
+      "wide": (typesByTag.get("types.v1/Ａ") ?? Type.struct({ namespace: "types.v1", typeName: "Ａ" })).clone().setNullable(true),
+      "math": (typesByTag.get("types.v1/𝔸") ?? Type.struct({ namespace: "types.v1", typeName: "𝔸" })).clone().setNullable(true)
+      },
+      { withConstructor: true },
+    );
+    // initMeta can only be called once per class (sets non-configurable
+    // property on the prototype). Skip if already initialized.
+    const proto = T11_CpOrd.prototype;
+    if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
+      try {
+        typeStruct.initMeta(T11_CpOrd);
+        Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
+      } catch (e: any) {
+        // already initialized — skip
+      }
+    }
+    codec.registerType(typeStruct);
+    typesByTag.set("types.v1/Ord", typeStruct);
+  }
   // types.v1/Priced
   {
     const typeStruct = Type.struct(
@@ -404,10 +513,10 @@ export function BUILD_ALL_TYPES(
     );
     // initMeta can only be called once per class (sets non-configurable
     // property on the prototype). Skip if already initialized.
-    const proto = T9_Priced.prototype;
+    const proto = T12_Priced.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(T9_Priced);
+        typeStruct.initMeta(T12_Priced);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -431,10 +540,10 @@ export function BUILD_ALL_TYPES(
     );
     // initMeta can only be called once per class (sets non-configurable
     // property on the prototype). Skip if already initialized.
-    const proto = T10_Temporal.prototype;
+    const proto = T13_Temporal.prototype;
     if (!proto.hasOwnProperty('__foryTypeInfoInit__')) {
       try {
-        typeStruct.initMeta(T10_Temporal);
+        typeStruct.initMeta(T13_Temporal);
         Object.defineProperty(proto, '__foryTypeInfoInit__', { value: true, configurable: true });
       } catch (e: any) {
         // already initialized — skip
@@ -449,7 +558,7 @@ export function BUILD_ALL_TYPES(
 
 export const SERVICES = [
   {
-    ctor: T11_TypesService,
+    ctor: T14_TypesService,
     name: "Types",
     version: 1,
     scoped: "shared",
@@ -460,8 +569,8 @@ export const SERVICES = [
     {
       name: "echo_temporal",
       pattern: RpcPattern.UNARY,
-      requestType: T10_Temporal,
-      responseType: T10_Temporal,
+      requestType: T13_Temporal,
+      responseType: T13_Temporal,
       acceptsCtx: false,
       idempotent: false,
       timeout: undefined,
@@ -524,7 +633,7 @@ export const SERVICES = [
     ],
   },
   {
-    ctor: T12_IdsService,
+    ctor: T15_IdsService,
     name: "Ids",
     version: 1,
     scoped: "shared",
@@ -536,7 +645,7 @@ export const SERVICES = [
       name: "price",
       pattern: RpcPattern.UNARY,
       requestType: T8_Identified,
-      responseType: T9_Priced,
+      responseType: T12_Priced,
       acceptsCtx: false,
       idempotent: false,
       timeout: undefined,

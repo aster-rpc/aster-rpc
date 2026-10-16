@@ -911,7 +911,7 @@ function tarjanSccs(wireTypes: ScannedWireType[]): ScannedWireType[][] {
     const v = byTag.get(vTag);
     if (v) {
       // Sort deps for deterministic output across runs.
-      const deps = [...wireTypeDeps(v)].filter(t => byTag.has(t)).sort();
+      const deps = [...wireTypeDeps(v)].filter(t => byTag.has(t)).sort(byFqnCodepoints);
       for (const wTag of deps) {
         if (!index.has(wTag)) {
           strongconnect(wTag);
@@ -936,11 +936,36 @@ function tarjanSccs(wireTypes: ScannedWireType[]): ScannedWireType[][] {
   }
 
   // Visit in deterministic tag order so SCC output is stable.
-  const roots = [...wireTypes].map(w => w.tag).sort();
+  const roots = [...wireTypes].map(w => w.tag).sort(byFqnCodepoints);
   for (const t of roots) {
     if (!index.has(t)) strongconnect(t);
   }
   return sccs;
+}
+
+/** The codepoints of `s` after NFC normalisation. */
+function nfcCodepoints(s: string): number[] {
+  return Array.from(s.normalize('NFC'), c => c.codePointAt(0)!);
+}
+
+/**
+ * Order wire tags as every binding orders type names (§11.3.4 Step 3): by
+ * the NFC codepoints of the `package.name` FQN. Not `Array.prototype.sort()`'s
+ * default, which compares UTF-16 code units and so puts a supplementary-plane
+ * character (a surrogate pair from U+D800) before U+E000..U+FFFF, and not the
+ * tag, whose `/` sorts after `.` where the FQN has `.`.
+ */
+function byFqnCodepoints(a: string, b: string): number {
+  const fqn = (tag: string) => {
+    const { package: pkg, name } = splitTag(tag);
+    return nfcCodepoints(pkg ? `${pkg}.${name}` : name);
+  };
+  const x = fqn(a);
+  const y = fqn(b);
+  for (let i = 0; i < Math.min(x.length, y.length); i++) {
+    if (x[i] !== y[i]) return x[i]! - y[i]!;
+  }
+  return x.length - y.length;
 }
 
 /**
@@ -949,9 +974,13 @@ function tarjanSccs(wireTypes: ScannedWireType[]): ScannedWireType[][] {
  * in the spanning tree resolve to REF via the already-computed hashes;
  * back-edges resolve to SELF_REF so the cycle can be broken without a
  * fixed-point hash iteration. Mirrors Python's `_spanning_tree_dfs` in
- * `identity.py`.
+ * `identity.py`. `order` is the DFS post-order (leaves of the spanning
+ * tree first), the order the members are hashed in.
  */
-function sccBackEdges(scc: ScannedWireType[]): Map<string, Set<string>> {
+function sccBackEdges(scc: ScannedWireType[]): {
+  backEdges: Map<string, Set<string>>;
+  order: ScannedWireType[];
+} {
   const result = new Map<string, Set<string>>();
   if (scc.length === 1) {
     const w = scc[0]!;
@@ -959,23 +988,23 @@ function sccBackEdges(scc: ScannedWireType[]): Map<string, Set<string>> {
     if (deps.has(w.tag)) {
       result.set(w.tag, new Set([w.tag]));
     }
-    return result;
+    return { backEdges: result, order: scc };
   }
 
-  // Multi-node SCC: DFS from the lexicographically smallest tag (matches
-  // Python's NFC-sorted choice of start node — deterministic and
-  // language-independent).
+  // Multi-node SCC: DFS from the codepoint-smallest member, successors in
+  // codepoint order (the spec's rule; Rust, Python, Java, Go and .NET).
   const memberTags = new Set(scc.map(w => w.tag));
   const byTag = new Map<string, ScannedWireType>();
   for (const w of scc) byTag.set(w.tag, w);
-  const start = [...memberTags].sort()[0]!;
+  const start = [...memberTags].sort(byFqnCodepoints)[0]!;
 
   const visited = new Set<string>();
+  const order: ScannedWireType[] = [];
   function dfs(tag: string): void {
     visited.add(tag);
     const w = byTag.get(tag);
     if (!w) return;
-    const deps = [...wireTypeDeps(w)].filter(t => memberTags.has(t)).sort();
+    const deps = [...wireTypeDeps(w)].filter(t => memberTags.has(t)).sort(byFqnCodepoints);
     for (const r of deps) {
       if (!visited.has(r)) {
         dfs(r);
@@ -984,9 +1013,10 @@ function sccBackEdges(scc: ScannedWireType[]): Map<string, Set<string>> {
         result.get(tag)!.add(r);
       }
     }
+    order.push(w);
   }
   dfs(start);
-  return result;
+  return { backEdges: result, order };
 }
 
 // ─── Type hash computation ───────────────────────────────────────────────────
@@ -1209,8 +1239,8 @@ function computeTypeHashes(wireTypes: ScannedWireType[]): {
   const ordered: ScannedWireType[] = [];
 
   for (const scc of sccs) {
-    const backEdgesBySource = sccBackEdges(scc);
-    for (const w of scc) {
+    const { backEdges: backEdgesBySource, order } = sccBackEdges(scc);
+    for (const w of order) {
       const backEdgeTargets = backEdgesBySource.get(w.tag) ?? new Set<string>();
       const td = wireTypeToTypeDef(w, hashes, backEdgeTargets);
       const canonical = native.canonicalBytesFromJson('TypeDef', JSON.stringify(td));

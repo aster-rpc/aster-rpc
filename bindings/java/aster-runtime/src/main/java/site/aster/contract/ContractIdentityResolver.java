@@ -179,7 +179,7 @@ public final class ContractIdentityResolver {
       Set<String> visited,
       Set<Edge> backEdges) {
     visited.add(v);
-    Set<String> targets = new TreeSet<>();
+    Set<String> targets = new TreeSet<>(NFC_ORDER);
     for (String t : graph.getOrDefault(v, Set.of())) {
       if (members.contains(t)) {
         targets.add(t);
@@ -227,7 +227,7 @@ public final class ContractIdentityResolver {
   private static void dfsPost(
       String v, Set<Edge> spanningTreeEdges, Set<String> visited, List<String> postOrder) {
     visited.add(v);
-    Set<String> successors = new TreeSet<>();
+    Set<String> successors = new TreeSet<>(NFC_ORDER);
     for (Edge e : spanningTreeEdges) {
       if (e.src().equals(v) && !visited.contains(e.tgt())) {
         successors.add(e.tgt());
@@ -508,10 +508,18 @@ public final class ContractIdentityResolver {
 
   // ── Misc helpers ──────────────────────────────────────────────────────────
 
-  /** NFC codepoint ordering for FQN strings — matches Python's sort key. */
+  /**
+   * NFC codepoint ordering for FQN strings — matches Python's sort key and Rust's {@code
+   * nfc_codepoints}. Not {@link String}'s natural order: that compares UTF-16 code units, which
+   * puts a supplementary-plane character (a surrogate pair from U+D800) before U+E000..U+FFFF.
+   */
+  static final Comparator<String> NFC_ORDER =
+      Comparator.comparing(
+          ContractIdentityResolver::codepointsNfc, ContractIdentityResolver::compareInts);
+
   static List<String> sortByNfc(List<String> items) {
     List<String> copy = new ArrayList<>(items);
-    copy.sort(Comparator.comparing(s -> codepointsNfc(s), ContractIdentityResolver::compareInts));
+    copy.sort(NFC_ORDER);
     return copy;
   }
 

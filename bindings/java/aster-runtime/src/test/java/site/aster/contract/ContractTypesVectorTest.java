@@ -140,6 +140,25 @@ final class ContractTypesVectorTest {
     public BigDecimal amount = BigDecimal.ZERO;
   }
 
+  // A cycle whose spanning tree depends on codepoint (not UTF-16) order: Ａ (U+FF21) and 𝔸
+  // (U+1D538). Contract identity only, as in Rust.
+  @WireType("types.v1/Ord")
+  public static final class CpOrd {
+    public @Nullable CpWide wide;
+    public @Nullable CpMath math;
+  }
+
+  @WireType("types.v1/\uFF21")
+  public static final class CpWide {
+    public @Nullable CpOrd back;
+    public @Nullable CpMath math;
+  }
+
+  @WireType("types.v1/\uD835\uDD38")
+  public static final class CpMath {
+    public @Nullable CpWide wide;
+  }
+
   static final List<Class<?>> TYPES =
       List.of(
           Temporal.class,
@@ -152,7 +171,10 @@ final class ContractTypesVectorTest {
           Gamma.class,
           Forest.class,
           Identified.class,
-          Priced.class);
+          Priced.class,
+          CpOrd.class,
+          CpWide.class,
+          CpMath.class);
 
   // ── vector ───────────────────────────────────────────────────────────────
 

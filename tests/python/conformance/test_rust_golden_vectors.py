@@ -365,6 +365,28 @@ class Forest:
     trees: list[TreeNode] = field(default_factory=list)
 
 
+# A cycle whose spanning tree depends on codepoint (not UTF-16) order:
+# Ａ (U+FF21) and 𝔸 (U+1D538). Contract identity only, as in Rust.
+@wire_type("types.v1/Ord")
+@dataclass
+class CpOrd:
+    wide: Optional[CpWide] = None
+    math: Optional[CpMath] = None
+
+
+@wire_type("types.v1/\uff21")
+@dataclass
+class CpWide:
+    back: Optional[CpOrd] = None
+    math: Optional[CpMath] = None
+
+
+@wire_type("types.v1/\U0001d538")
+@dataclass
+class CpMath:
+    wide: Optional[CpWide] = None
+
+
 _ZERO_UUID = uuid.UUID(int=0)
 _ZERO_ULID = ULID(bytes(16))
 Money = aster_decimal(18, 4)
@@ -403,12 +425,16 @@ _TYPE_CLASSES = [
     Identified,
     Priced,
 ]
+# Contract identity only: pyfory 1.7.5 cannot register a type named like
+# `𝔸` (its meta-string encoder lower-cases an uppercase first letter and
+# then refuses the non-ASCII result), so these stay out of the codec.
+_IDENTITY_ONLY = [CpOrd, CpWide, CpMath]
 
 
 def _types_type_defs():
     from aster.contract.identity import build_type_graph, resolve_with_cycles
 
-    return resolve_with_cycles(build_type_graph(_TYPE_CLASSES))
+    return resolve_with_cycles(build_type_graph(_TYPE_CLASSES + _IDENTITY_ONLY))
 
 
 @pytest.mark.parametrize("fqn", sorted(_TYPES["types"]))

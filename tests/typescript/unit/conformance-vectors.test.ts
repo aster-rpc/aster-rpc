@@ -257,7 +257,7 @@ describe('contract-types.json (Time, UUID, and Decimal; recursive types)', () =>
   const GEN_OUT = path.join(FIXTURE, 'aster-rpc.generated.ts');
   let gen: any;
   let codec: any;
-  const cls = (fqn: string): any => gen.WIRE_TYPES.find((w: any) => w.tag === fqn.replace(/\.(\w+)$/, '/$1')).ctor;
+  const cls = (fqn: string): any => gen.WIRE_TYPES.find((w: any) => w.tag === fqn.replace(/\.([^.]+)$/, '/$1')).ctor;
 
   beforeAll(async () => {
     setNativeContract(loadNative() as any);
@@ -298,7 +298,7 @@ describe('contract-types.json (Time, UUID, and Decimal; recursive types)', () =>
   it('aster-gen emits every vector canonical TypeDef and type hash', () => {
     const src = readFileSync(GEN_OUT, 'utf8');
     for (const [fqn, t] of Object.entries<any>(doc.types)) {
-      const shape = gen.WIRE_TYPES.find((w: any) => w.tag === fqn.replace(/\.(\w+)$/, '/$1'));
+      const shape = gen.WIRE_TYPES.find((w: any) => w.tag === fqn.replace(/\.([^.]+)$/, '/$1'));
       expect(shape, fqn).toBeTruthy();
       expect(shape.typeHashHex, fqn).toBe(t.expected_type_hash);
       expect(hex(shape.typeDefBytes), fqn).toBe(t.expected_canonical_type_def_hex);
