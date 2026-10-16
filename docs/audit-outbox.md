@@ -36,6 +36,14 @@ logical retained data, not an exact physical database file size. No unacknowledg
 records are evicted. When admission fails, an application requiring mandatory
 auditing must refuse its associated operation.
 
+The [acknowledgement log](#acknowledgement-log) is bounded separately and is not
+charged to the retained-data budget, so it can never cause a submit to be refused.
+Each entry is a fixed 80-byte row: the default 100,000 entries are about 8 MiB of
+row data, and the 1,000,000-entry maximum about 80 MiB. Size the volume for
+`max_retained_bytes` plus the acknowledgement log plus database overhead. At the
+defaults, 256 MiB plus about 8 MiB, with headroom for the database file, which
+does not shrink in v1.
+
 Storage surviving is essential. Local durability cannot protect against disk loss,
 operator deletion or records missing from a restored backup. Content-bound IDs
 prevent a restored sequence from silently colliding with different earlier content;
@@ -97,6 +105,52 @@ and .NET uses `AuditOutboxException.Kind`.
 Status includes `storage_recovered` (Python) or `storageRecovered` (TypeScript and
 Java): the database performed a physical repair during this open and subsequently
 passed the outbox's logical validation. Credentials are excluded from status.
+
+## Acknowledgement log
+
+Acknowledged records are deleted, so the outbox also keeps a bounded log of what the
+receiver acknowledged. For each acknowledged event it holds:
+
+- the full event ID;
+- its sequence;
+- the `batch_id` the receiver echoed in its durable acknowledgement;
+- the local time the acknowledgement was committed;
+- a `cursor` that increases with every logged acknowledgement and is never reused,
+  even across restarts.
+
+The log row is written in the same durable transaction that deletes the record.
+After any crash an event is therefore either still pending or present in the log;
+it is never deleted without its log entry, and never logged without its deletion.
+A process-kill test covers both sides of that commit.
+
+The log is bounded by count and age, configured on open:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `acknowledgement_log_max_entries` | 100,000 | Oldest entries beyond this are pruned. 0 disables the log. Maximum 1,000,000. |
+| `acknowledgement_log_max_age_ms` | 7 days | Entries acknowledged longer ago are pruned. 0 removes the age bound. |
+
+Pruning runs on each acknowledgement and on open, lowest cursor first.
+An entry can outlive its age bound until the next acknowledgement or reopen.
+A replayed event acknowledged late gets a new, higher cursor.
+
+Read the log by cursor. `after` is exclusive, so start at 0 and pass the last
+`cursor` you processed to continue. A page holds 1–1000 entries, oldest first. If
+the consumer falls behind the bounds, it sees a gap in cursors, never a reordering.
+Live consumers wait for the next acknowledgement instead of polling:
+
+| Language | Page | Wait / follow |
+| --- | --- | --- |
+| Rust | `outbox.acknowledgements(after, limit)` | `outbox.wait_acknowledgements(after, limit, timeout)` |
+| Go | `outbox.Acknowledgements(ctx, after, limit)` | `WaitAcknowledgements(ctx, after, limit, wait)`; `WatchAcknowledgements(ctx, after)` returns a channel |
+| C ABI 7.1 | `aster_audit_outbox_acknowledgements` with `wait_ms` 0 | the same call with `wait_ms` > 0 |
+
+Python, TypeScript, Java and .NET do not expose the log yet. The log records
+receiver acknowledgements only. Quarantine is a disposition, not an
+acknowledgement, and remains visible through `export`.
+
+A Go sender and receiver, including the log, are in
+`bindings/go/examples/audit_outbox`.
 
 ## Receiver responsibility
 
@@ -175,11 +229,16 @@ The fixture at `tests/audit_outbox/receiver.py` illustrates exact-byte storage a
 commit-before-ACK using SQLite with full synchronous commits. It binds loopback
 and is a test fixture, not a deployable production service.
 
+For a Go service, `bindings/go/examples/audit_outbox/receiver.go` is an
+ordinary `http.Handler` that implements these rules with no Aster dependency. Its
+tests drive it from the outbox through a lost acknowledgement and a conflicting
+retry.
+
 ## Failures and operator actions
 
 | Result | Outbox behaviour |
 | --- | --- |
-| Valid full-batch durable ACK | Delete the batch in a durable local transaction. |
+| Valid full-batch durable ACK | Delete the batch and log each acknowledgement in one durable local transaction. |
 | Transport failure or missing/malformed 2xx ACK | Keep the records and retry. |
 | 401/403 | Retry and expose an authorization error; rotate credentials to recover. |
 | 408/425/429/5xx | Retry with bounded backoff, respecting bounded `Retry-After`. |
