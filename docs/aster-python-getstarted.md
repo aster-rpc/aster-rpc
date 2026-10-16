@@ -273,6 +273,74 @@ native crossing. Streamed responses are read ahead in Rust and handed over in
 batches. Session ids come from the connection's shared counter, so Python and
 Rust clients on one connection never collide.
 
+### Calling on behalf of a user (gateway identity)
+
+The Rust guide's §4.7.1 describes the model; in Python it is the same
+configuration and the same checks, all in Rust. An edge that signs users in
+itself calls a service **as the user** with one JWT per call: a token it
+mints, or an identity provider's token forwarded unchanged. The service
+verifies it before Gate 3, so `requires` checks the token's roles.
+
+- **The service accepts it:** `AsterConfig(identity_accept_on_behalf_of=True)`
+  (`[identity] accept_on_behalf_of`, `ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF`);
+  `AsterServer(accept_on_behalf_of=...)` overrides it. Off, a call carrying
+  the entry is refused with `PERMISSION_DENIED`.
+- **The edge may forward:** its credential grants `aster.gateway`
+  (`aster.identity.GATEWAY_ROLE`).
+- **The edge may issue the roles:** its credential carries
+  `aster.identity.issuable_roles` (comma-separated).
+
+```python
+from aster import CallOptions
+from aster.identity import AMR_WEBAUTHN
+
+# On the edge (an enrolled AsterClient), after checking alice's passkey:
+token = client.mint_user_token("alice", ["data.read"], [AMR_WEBAUTHN], ttl=120)
+data = (await client.client(Data)).with_options(CallOptions(on_behalf_of=token))
+reply = await data.read(req)
+```
+
+`aster.bearer_token(header)` takes the token out of an `Authorization:
+Bearer` header for forwarding a provider's token unchanged. In the handler,
+`ctx.principal` is `iss|sub`, `ctx.actor` the edge (also `ctx.peer`),
+`ctx.auth_methods` the token's `amr`, `ctx.attributes["aster.role"]` the
+token's roles, and `ctx.on_behalf_of` the whole verified identity
+(`ForwardedIdentity`: `issuer`, `subject`, `jti`, `expires_at`). For methods
+that need a stronger sign-in, call `ctx.require_auth_method(AMR_WEBAUTHN)`
+(raises `PermissionDeniedError`).
+
+Providers are `identity_trusted_issuers=[TrustedIssuer(iss=..., audiences=(...,),
+roles_claim="groups", role_map={...})]` (`[[identity.trusted_issuers]]`;
+needs Enrollment). Their keys come from the fleet namespace, written by the
+node running `identity_publisher=IdentityPublisherConfig(...)`
+(`[identity.publisher]`), whose credential grants
+`aster.identity-publisher`. On an `AsterClient` that runs the publisher, every
+token a typed client sends is noticed, so a new key id is published at once;
+`client.enrollment.notice_token(jwt)`, `notice_kid(iss, kid)` and
+`publisher_status()` are the explicit forms (`LookupError` without a
+publisher).
+
+**NodeConfig.** Every `AsterServer` serves `aster.ops.NodeConfig` behind
+`aster.config-admin` (`remote_config_enabled=False` turns it off,
+`remote_config_lock=("identity",)` locks the `[identity]` override). An admin:
+
+```python
+from aster.identity import IdentityOverride
+
+admin = await client.node_config()            # NodeConfigClient
+view = await admin.get()                      # view.setting("identity.accept_on_behalf_of").source
+ack = await admin.set(name="core-1", tags=["eu"], attributes={"tier": 3},
+                      identity=IdentityOverride(accept_on_behalf_of=False))
+await admin.ack(ack.generation, timeout=5)
+await admin.clear()
+```
+
+Handlers read the properties with `ctx.node_properties` / `ctx.node_attribute("tier")`
+(and the server with `server.node_properties()`); they describe the node and
+never authorise. `AsterServer(audit_outbox=...)` records every `set` / `clear`.
+`setting_sources` on `AsterConfig` carries where each overridable setting came
+from, so `get` reports `file` / `env` / `code`.
+
 ## 5. Gate 0: connection-level admission
 
 Gate 0 runs in Rust. With Enrollment configured it is Enrollment's
