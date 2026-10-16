@@ -1,0 +1,30 @@
+[package]
+name = "gateway-identity"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Gateway identity example: an HTTP edge calls an Aster service on behalf of browser users (OIDC and passkeys)."
+
+# Every dependency is already in the workspace graph at these versions.
+[dependencies]
+aster = { path = "../../../aster", default-features = false, features = ["rpc", "enrollment", "docs", "identity-publisher"] }
+salvo = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+fory-core = "=1.7.6"
+fory-derive = "=1.7.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+tempfile = "3"
+# WebAuthn verification (ES256) and the stand-in provider's ES256 tokens: the
+# version the transport core verifies JWTs with.
+aws-lc-rs = "1.18"
+# The stand-in provider serves its JWK set over HTTPS from a throwaway CA,
+# as the identity-publisher tests do.
+rcgen = "0.14"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

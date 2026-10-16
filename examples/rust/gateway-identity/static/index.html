@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Aster gateway example</title>
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; }
+  fieldset { margin: 1rem 0; }
+  button { margin: .25rem .25rem .25rem 0; }
+  pre { background: #f4f4f4; padding: .75rem; white-space: pre-wrap; word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>Calling an Aster service on behalf of a user</h1>
+<p>User: <input id="user" value="alice"></p>
+
+<fieldset>
+  <legend>1. OIDC (the provider's token, forwarded unchanged)</legend>
+  <button id="oidc">Sign in with the stand-in provider</button>
+</fieldset>
+
+<fieldset>
+  <legend>2. Passkey (the edge mints a token with amr: webauthn)</legend>
+  <button id="register">Register a passkey</button>
+  <button id="login">Sign in with the passkey</button>
+</fieldset>
+
+<fieldset>
+  <legend>Call the service</legend>
+  <button data-call="whoami">whoami</button>
+  <button data-call="read">read (needs notes.read)</button>
+  <button data-call="publish">publish (needs notes.write + passkey)</button>
+  <button id="signout">Forget the OIDC token</button>
+</fieldset>
+
+<pre id="out">Signed out.</pre>
+
+<script>
+const out = (value) => {
+  document.getElementById("out").textContent =
+    typeof value === "string" ? value : JSON.stringify(value, null, 2);
+};
+const user = () => document.getElementById("user").value;
+const b64 = (buffer) => btoa(String.fromCharCode(...new Uint8Array(buffer)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+const unb64 = (text) => Uint8Array.from(
+  atob(text.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+let bearer = null;
+
+async function post(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const reply = await response.json();
+  if (!response.ok) throw new Error(`${response.status}: ${reply.error}`);
+  return reply;
+}
+
+document.getElementById("oidc").onclick = async () => {
+  try {
+    // A real provider signs the user in through a redirect; the stand-in
+    // just hands out an ID token.
+    bearer = (await post("/idp/sign-in", { user: user() })).token;
+    out("Signed in with the provider. The edge forwards this token:\n" + bearer);
+  } catch (error) { out(String(error)); }
+};
+
+document.getElementById("register").onclick = async () => {
+  try {
+    const options = await post("/webauthn/register/options", { user: user() });
+    const credential = await navigator.credentials.create({ publicKey: {
+      challenge: unb64(options.challenge),
+      rp: options.rp,
+      user: { id: unb64(options.user.id), name: options.user.name, displayName: options.user.displayName },
+      pubKeyCredParams: [{ type: "public-key", alg: options.alg }],
+      authenticatorSelection: { userVerification: options.userVerification, residentKey: "discouraged" },
+      attestation: "none",
+    }});
+    out(await post("/webauthn/register", {
+      user: user(),
+      clientDataJSON: b64(credential.response.clientDataJSON),
+      attestationObject: b64(credential.response.attestationObject),
+    }));
+  } catch (error) { out(String(error)); }
+};
+
+document.getElementById("login").onclick = async () => {
+  try {
+    const options = await post("/webauthn/login/options", { user: user() });
+    const assertion = await navigator.credentials.get({ publicKey: {
+      challenge: unb64(options.challenge),
+      rpId: options.rpId,
+      allowCredentials: options.allowCredentials.map((id) => ({ type: "public-key", id: unb64(id) })),
+      userVerification: options.userVerification,
+    }});
+    bearer = null; // calls now use the passkey session (cookie)
+    out(await post("/webauthn/login", {
+      user: user(),
+      credentialId: b64(assertion.rawId),
+      clientDataJSON: b64(assertion.response.clientDataJSON),
+      authenticatorData: b64(assertion.response.authenticatorData),
+      signature: b64(assertion.response.signature),
+    }));
+  } catch (error) { out(String(error)); }
+};
+
+document.getElementById("signout").onclick = () => { bearer = null; out("OIDC token forgotten."); };
+
+for (const button of document.querySelectorAll("[data-call]")) {
+  button.onclick = async () => {
+    const headers = bearer ? { authorization: `Bearer ${bearer}` } : {};
+    const response = await fetch(`/api/${button.dataset.call}`, { headers });
+    out({ status: response.status, ...(await response.json()) });
+  };
+}
+</script>
+</body>
+</html>

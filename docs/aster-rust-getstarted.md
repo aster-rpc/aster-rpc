@@ -1027,13 +1027,12 @@ aster enroll node --subject <edge-node-id> --audience my-fleet \
 On the edge (an `AsterClient` enrolled with that credential):
 
 ```rust
-use aster::rpc::identity::Issuer;
-use aster::rpc::CallOptions;
+use aster::rpc::{CallOptions, AMR_WEBAUTHN};
 use std::time::Duration;
 
-let issuer = Issuer::from_enrollment(client.node(), client.enrollment().unwrap())?;
+let issuer = client.user_token_issuer()?;
 // After the edge has checked alice's passkey assertion:
-let token = issuer.mint_user_token("alice", ["data.read"], ["webauthn"], Duration::from_secs(120))?;
+let token = issuer.mint_user_token("alice", ["data.read"], [AMR_WEBAUTHN], Duration::from_secs(120))?;
 let reply = DataClient::new(client.rpc())
     .with_options(CallOptions::new().on_behalf_of(token))
     .read(req)
@@ -1096,7 +1095,13 @@ fleet namespace Enrollment already uses, under
 too. A token whose `kid` is not there is refused. A record counts only when
 its docs author (the node that wrote it) holds a credential granting
 `aster.identity-publisher`; the record carries that credential, so the
-publisher needs no session with each service. The newest record per issuer
+publisher needs no session with each service. Anyone holding the fleet
+namespace's write secret can write entries there, so a service reads every
+entry and counts nothing before its author is shown to be a publisher: other
+authors change nothing, however much they write. A publisher has one record
+per issuer; of its records for issuers the service does not trust, at most
+`max(trusted issuers, 1) × 4` are kept, so one misbehaving publisher cannot
+displace another's keys. The newest record per issuer
 wins, so publishing a new key set rotates keys without a restart, and a key
 dropped from it stops verifying once it syncs. A set older than
 `[identity] max_key_set_age_secs` (default 172800, 48 hours; 60..=2592000,
@@ -1189,6 +1194,135 @@ services' limit no lower than the publisher's.
 root's fleet namespace. The new root must seal a new write grant there, and
 the publisher needs a credential from the new root; until then nothing is
 published, and services hold no keys for the issuer.
+
+#### 4.7.1.3 Calling Aster services on behalf of users (an edge, end to end)
+
+The runnable example is `examples/rust/gateway-identity`: a browser signs in
+at a Salvo edge, and the edge calls a `Notes` service over iroh as that user.
+
+```sh
+cargo run -p gateway-identity     # then open http://localhost:8080
+cargo test -p gateway-identity    # the same flows, no browser
+```
+
+It starts the whole fleet in one process (a root, a stand-in OpenID provider
+serving its JWK set over HTTPS, the service, the edge). In a deployment each
+part is its own node, configured as below.
+
+**The service** (`AsterServer`, from `AsterConfig`):
+
+```toml
+[enrollment]                         # as for every enrolled node
+audience = "my-fleet"
+fleet_namespace = "<id>"
+
+[identity]
+accept_on_behalf_of = true
+
+[[identity.trusted_issuers]]         # the OIDC provider
+iss = "https://accounts.example.com"
+audiences = ["notes-edge"]           # the edge's client id (or a token-exchange audience)
+roles_claim = "groups"
+role_map = { "readers" = "notes.read", "writers" = "notes.write" }
+```
+
+Its methods use `requires` as for any caller, and read the user from the
+`CallContext`. A method that needs a passkey sign-in checks `amr` with
+`require_auth_method`; `requires` cannot express it, because the contract's
+capability requirements are roles only:
+
+```rust
+#[aster::service(name = "Notes", version = 1)]
+pub trait Notes {
+    async fn whoami(&self, ctx: &CallContext) -> aster::Result<Caller>;
+
+    #[rpc(requires = require_role("notes.write"))]
+    async fn publish(&self, ctx: &CallContext) -> aster::Result<Caller>;
+}
+
+#[aster::rpc::async_trait]
+impl Notes for NotesImpl {
+    async fn publish(&self, ctx: &CallContext) -> aster::Result<Caller> {
+        ctx.require_auth_method(AMR_WEBAUTHN)?;   // PERMISSION_DENIED otherwise
+        // ctx.principal() = "iss|sub", ctx.actor() = Some(edge id),
+        // ctx.auth_methods() = ["webauthn"]
+        Ok(caller(ctx))
+    }
+    // whoami …
+}
+```
+
+**The edge** (`AsterClient`) needs one credential and, if it also publishes
+the provider's keys, `[identity.publisher]`:
+
+```sh
+cat > edge-attributes.json <<'EOF'
+{"aster.role": {"type": "string", "value": "aster.gateway,aster.identity-publisher"},
+ "aster.identity.issuable_roles": {"type": "string", "value": "notes.read,notes.write"}}
+EOF
+aster enroll node --subject <edge-node-id> --audience my-fleet \
+  --attributes edge-attributes.json --out edge.credential
+aster enroll identity-publisher --seal-to <edge-node-id> ...   # §4.7.1.2
+```
+
+- `aster.gateway` lets it forward identities at all;
+- `aster.identity.issuable_roles` bounds what it may mint (a minted token
+  with another role is refused);
+- `aster.identity-publisher` and the sealed grant let it write the
+  provider's keys. Leave both out when another node publishes.
+
+Per HTTP request the edge attaches exactly one JWT. Build the generated
+client once; `with_options` gives a cheap per-request copy:
+
+```rust
+use aster::rpc::{bearer_token, CallOptions, AMR_WEBAUTHN};
+
+let notes = NotesClient::new(edge.rpc());           // once
+let issuer = edge.user_token_issuer()?;              // once
+
+// Sign-in path 1, OIDC: forward the provider's token unchanged.
+let jwt = bearer_token(&authorization_header).ok_or(Unauthorized)?.to_string();
+
+// Sign-in path 2, passkey: the edge verified the WebAuthn assertion and holds
+// a session for the user; mint a token for this request only.
+let jwt = issuer.mint_user_token(&user, ["notes.read", "notes.write"],
+                                 [AMR_WEBAUTHN], Duration::from_secs(60))?;
+
+let reply = notes
+    .with_options(CallOptions::new().deadline(Duration::from_secs(15)).on_behalf_of(jwt))
+    .publish()
+    .await?;
+```
+
+Map `UNAUTHENTICATED` to HTTP 401 and `PERMISSION_DENIED` to 403. The
+example's `webauthn` module is a minimal ES256 relying party over `aws-lc-rs`
+(registration with attestation `none`, assertion with the RP ID hash, the
+user-present and optionally user-verified flags, `clientDataJSON` type,
+challenge and origin, the signature over `authenticatorData ‖
+SHA-256(clientDataJSON)`, and the signature counter); a production edge may
+use a full WebAuthn library instead. Keep challenges single-use and short
+lived, and minted tokens short (the edge mints per request).
+
+**Changing trusted issuers without a restart.** `[identity]` is the first
+section `aster.ops.NodeConfig` can override (§4.7.2). An admin holding
+`aster.config-admin` adds or replaces issuers; `set` answers once the new set
+is live, and a provider whose keys are already in the fleet namespace is
+trusted at once:
+
+```rust
+let api = NodeConfigClient::new(admin.rpc());
+api.set(NodeConfigSetRequest::new().identity(IdentityOverride {
+    trusted_issuers: Some(vec![
+        TrustedIssuer::new("https://accounts.example.com", ["notes-edge"])
+            .roles_claim("groups")
+            .map_role("readers", "notes.read"),
+    ]),
+    ..Default::default()
+})).await?;
+```
+
+Lock the section with `[remote_config] lock = ["identity"]` on nodes whose
+issuers only the local file may set.
 
 ### 4.7.2 Remote overrides (`aster.ops.NodeConfig`)
 

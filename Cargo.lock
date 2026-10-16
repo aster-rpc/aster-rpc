@@ -2265,6 +2265,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "gateway-identity"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "aster",
+ "aws-lc-rs",
+ "base64 0.22.1",
+ "fory-core",
+ "fory-derive",
+ "hex",
+ "rcgen 0.14.8",
+ "rustls",
+ "salvo",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls",
+]
+
+[[package]]
 name = "genawaiter"
 version = "0.99.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
