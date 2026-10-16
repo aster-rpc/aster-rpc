@@ -17,6 +17,7 @@
 mod issue;
 pub(crate) mod jws;
 pub(crate) mod links;
+pub mod on_behalf_of;
 mod rotation;
 mod verify;
 

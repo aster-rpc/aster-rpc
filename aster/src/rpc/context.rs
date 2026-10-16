@@ -30,6 +30,7 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 use super::codec::StreamHeader;
+use super::identity::ForwardedIdentity;
 use super::server::PeerProvenance;
 
 tokio::task_local! {
@@ -47,9 +48,14 @@ const FLAG_POLL: Duration = Duration::from_millis(25);
 /// the [`Authenticator`](super::Authenticator)'s resolved principal and
 /// [`attributes`](Self::attributes) the merged set Gate 3 checked.
 ///
-/// Fields are private and read through accessors, so later additions (a
-/// gateway's on-behalf-of `actor()`, see
-/// `docs/_internal/web_gateway/gateway-identity.md`) are not breaking.
+/// For a call an edge forwarded on behalf of a user (the
+/// `aster-on-behalf-of` entry, see [`identity`](super::identity)),
+/// [`principal`](Self::principal) is the user (`iss|sub`),
+/// [`actor`](Self::actor) and [`peer`](Self::peer) are the edge, and
+/// [`attributes`](Self::attributes) carry the token's roles.
+///
+/// Fields are private and read through accessors, so later additions are not
+/// breaking.
 #[derive(Clone)]
 pub struct CallContext {
     inner: Arc<Inner>,
@@ -71,6 +77,8 @@ struct Inner {
     /// Fired by the dispatcher when it ends the call itself (deadline, or a
     /// peer cancel it observed).
     ended: Notify,
+    /// The verified on-behalf-of identity, for a forwarded call.
+    forwarded: Option<Arc<ForwardedIdentity>>,
 }
 
 pub(crate) struct CallContextParts {
@@ -83,6 +91,7 @@ pub(crate) struct CallContextParts {
     pub deadline: Option<Instant>,
     pub cancelled: Arc<AtomicBool>,
     pub signal: Option<Arc<CancelSignal>>,
+    pub forwarded: Option<Arc<ForwardedIdentity>>,
 }
 
 impl CallContext {
@@ -100,6 +109,7 @@ impl CallContext {
                 cancelled: p.cancelled,
                 signal: p.signal,
                 ended: Notify::new(),
+                forwarded: p.forwarded,
             }),
         }
     }
@@ -140,10 +150,37 @@ impl CallContext {
             .unwrap_or(&self.inner.principal)
     }
 
-    /// The verified caller: the [`Authenticator`](super::Authenticator)'s
-    /// `AuthOutcome.principal` when it resolved one, else [`peer`](Self::peer).
+    /// The verified caller: for a forwarded call the user, `iss|sub` of its
+    /// on-behalf-of token; else the [`Authenticator`](super::Authenticator)'s
+    /// `AuthOutcome.principal` when it resolved one; else [`peer`](Self::peer).
     pub fn principal(&self) -> &str {
         &self.inner.principal
+    }
+
+    /// The edge that forwarded this call on behalf of
+    /// [`principal`](Self::principal) (its node id, which is also
+    /// [`peer`](Self::peer)). `None` for a call made by the peer as itself.
+    pub fn actor(&self) -> Option<&str> {
+        self.inner
+            .forwarded
+            .as_deref()
+            .map(ForwardedIdentity::actor)
+    }
+
+    /// How the user signed in (the token's `amr`, e.g. `webauthn`, `pwd`,
+    /// `apikey`), for a forwarded call; empty otherwise. A method can demand
+    /// passkey-level sign-in by checking it.
+    pub fn auth_methods(&self) -> &[String] {
+        self.inner
+            .forwarded
+            .as_deref()
+            .map_or(&[], ForwardedIdentity::auth_methods)
+    }
+
+    /// The whole verified on-behalf-of identity (issuer, subject, `jti`,
+    /// expiry), for a forwarded call.
+    pub fn on_behalf_of(&self) -> Option<&ForwardedIdentity> {
+        self.inner.forwarded.as_deref()
     }
 
     /// How the transport learned [`peer`](Self::peer).
@@ -278,6 +315,7 @@ impl fmt::Debug for CallContext {
             .field("method", &self.method())
             .field("peer", &self.peer())
             .field("principal", &self.principal())
+            .field("actor", &self.actor())
             .field("provenance", &self.provenance())
             .field("attributes", &self.attributes())
             .field("session_id", &self.session_id())

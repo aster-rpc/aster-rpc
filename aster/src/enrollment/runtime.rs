@@ -186,7 +186,10 @@ impl RoleMapping {
         let mut out = HashMap::new();
         if self.config.include_attributes {
             for (key, value) in claims.attributes.iter().flatten() {
-                if key == ROLE_ATTRIBUTE || key == &self.config.attribute {
+                if key == ROLE_ATTRIBUTE
+                    || key == &self.config.attribute
+                    || key == crate::rpc::identity::ISSUABLE_ROLES_ATTRIBUTE
+                {
                     continue;
                 }
                 let text = match value {
@@ -227,6 +230,16 @@ impl AttributeSource for EnrollmentAttributes {
             session,
             attributes: self.mapping.attributes(evidence.claims()),
         })
+    }
+
+    /// The issuer delegation in the peer's live, unexpired credential.
+    fn issuable_roles(&self, peer: &str) -> Option<BTreeSet<String>> {
+        let key = parse_hex32(peer)?;
+        let (_, evidence) = self.enrollment.peer_session(&key)?;
+        if evidence.expires_at().is_some_and(|exp| unix_now() >= exp) {
+            return None;
+        }
+        crate::rpc::identity::issuable_from_claims(evidence.claims())
     }
 }
 

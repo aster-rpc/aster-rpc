@@ -33,6 +33,7 @@ pub mod drain;
 pub mod dynamic;
 pub mod empty;
 pub(crate) mod foreign;
+pub mod identity;
 pub mod interceptor;
 pub mod lease;
 pub(crate) mod observe;
@@ -75,6 +76,7 @@ pub use contract::{
 pub use drain::{draining_status, DrainReport, DRAINING_DETAIL_KEY, DRAIN_CLOSE_CODE};
 pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationError};
 pub use empty::Empty;
+pub use identity::{ForwardedIdentity, GATEWAY_ROLE, ON_BEHALF_OF_METADATA};
 pub use interceptor::{CircuitBreaker, ClientCallContext, Interceptor, Pipeline, RetryPolicy};
 #[cfg(feature = "otel")]
 pub use observe::otel::{current_trace_context, with_trace_context, ExtractContext};

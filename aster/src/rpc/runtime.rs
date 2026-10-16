@@ -477,6 +477,7 @@ impl AsterServerBuilder {
             allow(unused_mut)
         )]
         let mut config = builder.build();
+        let accept_on_behalf_of = config.identity_accept_on_behalf_of;
 
         // The deployment ROOT public key, resolved once, here. Coordination
         // consumes this rather than asking for the same key again: one
@@ -583,7 +584,9 @@ impl AsterServerBuilder {
         };
 
         let attributes = self.attributes.unwrap_or_default();
-        let mut server = Server::new(&node).attributes(attributes.clone());
+        let mut server = Server::new(&node)
+            .attributes(attributes.clone())
+            .accept_on_behalf_of(accept_on_behalf_of);
         // Deferred: the slot is wired in before the acceptor starts, so no
         // call can ever see a server without it.
         let late_slot = self

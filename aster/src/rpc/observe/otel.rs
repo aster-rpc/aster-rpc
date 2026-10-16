@@ -662,6 +662,21 @@ impl CallOtel {
         Some(span)
     }
 
+    /// A forwarded call's audit fields on its OTel span.
+    pub(crate) fn on_behalf_of(
+        &self,
+        span: &Span,
+        identity: &crate::rpc::identity::ForwardedIdentity,
+    ) {
+        if !self.b.traces || span.is_disabled() {
+            return;
+        }
+        span.set_attribute("aster.principal", identity.principal().to_string());
+        span.set_attribute("aster.actor", identity.actor().to_string());
+        span.set_attribute("aster.on_behalf_of.iss", identity.issuer().to_string());
+        span.set_attribute("aster.on_behalf_of.jti", identity.jti().to_string());
+    }
+
     /// Evaluate the extractors onto `span` (§4.4); those named in
     /// `propagate_as_baggage` also go into the context outbound calls made
     /// under the span carry.

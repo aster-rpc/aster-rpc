@@ -120,6 +120,18 @@ impl CallOptions {
         self
     }
 
+    /// Make the call on behalf of a user: attach `jwt` as the
+    /// [`aster-on-behalf-of`](super::identity::ON_BEHALF_OF_METADATA) entry,
+    /// replacing any earlier one. Mint an edge token with
+    /// [`identity::Issuer::mint_user_token`](super::identity::Issuer). The
+    /// server must accept the entry and this node must hold `aster.gateway`.
+    pub fn on_behalf_of(mut self, jwt: impl Into<String>) -> Self {
+        let key = super::identity::ON_BEHALF_OF_METADATA;
+        self.metadata.retain(|(k, _)| !k.eq_ignore_ascii_case(key));
+        self.metadata.push((key.to_string(), jwt.into()));
+        self
+    }
+
     /// Override the serialization mode.
     pub fn serialization_mode(mut self, mode: SerializationMode) -> Self {
         self.serialization_mode = Some(mode);

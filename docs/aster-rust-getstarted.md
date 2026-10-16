@@ -195,6 +195,7 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `proxy_from_env(b)` | `ASTER_PROXY_FROM_ENV` | `[network] proxy_from_env` | `HTTP(S)_PROXY` |
 | `transport_<knob>(v)` | `ASTER_TRANSPORT_<KNOB>` | `[network] transport_<knob>` | `max_concurrent_bidi_streams`, `max_concurrent_uni_streams`, `stream_receive_window`, `receive_window`, `send_window`, `max_idle_timeout_ms`, `keep_alive_interval_ms`, `initial_mtu`, `datagram_receive_buffer_size`, `datagram_send_buffer_size`, `send_fairness`, `enable_segmentation_offload` |
 | `identity_file(p)` | `ASTER_IDENTITY_FILE` | `[identity] file` | `.aster-identity` credential file |
+| `accept_on_behalf_of(b)` | `ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF` | `[identity] accept_on_behalf_of` | default `false`: accept calls a gateway makes for a user (§4.7.1); off, such calls are refused |
 | `health_port(p)` | `ASTER_HEALTH_PORT` | `[health] port` | health/metrics HTTP port; `0` (default) = disabled unless `health(true)` |
 | `health_host(h)` | `ASTER_HEALTH_HOST` | `[health] host` | default `127.0.0.1`; `0.0.0.0` for pod probes |
 | `health(b)` | `ASTER_HEALTH_ENABLED` | `[health] enabled` | force on (port `0` → ephemeral) or off; unset = on iff port ≠ 0 |
@@ -981,6 +982,76 @@ Code deeper in the call reads the same context without a parameter:
 handler: a task the handler `tokio::spawn`s does **not** inherit it — pass a
 clone instead. Hand-written `ServiceDispatch` impls get it from
 `call.context()`.
+
+### 4.7.1 Calling on behalf of a user (gateway identity)
+
+An edge (a gateway, an HTTP front end) that signs users in itself — session
+cookie, API key, passkey — calls services over iroh **as the user**: it mints
+a short-lived JWT signed with its own node key and sends it in the
+`aster-on-behalf-of` call-metadata entry. The service verifies it before
+Gate 3, so `requires` checks the **token's** roles (the edge's own roles never
+apply to the call) and the handler sees the user.
+
+Three things make it work, all configuration:
+
+- **The service accepts it:** `[identity] accept_on_behalf_of = true`
+  (`AsterConfig::builder().accept_on_behalf_of(true)`). Off (the default), a
+  call carrying the entry is refused with `PERMISSION_DENIED`, never run as
+  the edge.
+- **The edge may forward:** its enrollment credential grants the role
+  `aster.gateway` (`aster.role` attribute, or your `[enrollment.roles]`
+  mapping). Without it, `PERMISSION_DENIED`.
+- **The edge may issue these roles:** its credential carries the issuer
+  delegation, the string attribute `aster.identity.issuable_roles`
+  (comma-separated). A token claiming a role outside it is refused with
+  `PERMISSION_DENIED`. A delegated issuer can sign that attribute only with
+  `--attribute-key aster.identity.issuable_roles` in its delegation.
+
+```sh
+cat > edge-attributes.json <<'EOF'
+{"aster.role": {"type": "string", "value": "aster.gateway"},
+ "aster.identity.issuable_roles": {"type": "string", "value": "data.read,data.write"}}
+EOF
+aster enroll node --subject <edge-node-id> --audience my-fleet \
+  --attributes edge-attributes.json --out edge.credential
+```
+
+On the edge (an `AsterClient` enrolled with that credential):
+
+```rust
+use aster::rpc::identity::Issuer;
+use aster::rpc::CallOptions;
+use std::time::Duration;
+
+let issuer = Issuer::from_enrollment(client.node(), client.enrollment().unwrap())?;
+// After the edge has checked alice's passkey assertion:
+let token = issuer.mint_user_token("alice", ["data.read"], ["webauthn"], Duration::from_secs(120))?;
+let reply = DataClient::new(client.rpc())
+    .with_options(CallOptions::new().on_behalf_of(token))
+    .read(req)
+    .await?;
+```
+
+`mint_user_token` refuses roles outside the delegation and lifetimes above 5
+minutes, as the service would. In the handler:
+
+| Accessor | Value for a forwarded call |
+|---|---|
+| `principal()` | `iss|sub`: the edge's node id, `|`, the user (`<edge-id>|alice`) |
+| `actor()` | `Some(edge node id)`; `None` for a call made by the peer as itself |
+| `peer()` | the edge (the transport peer) |
+| `auth_methods()` | the token's `amr` (`["webauthn"]`); require passkey sign-in by checking it |
+| `attributes()` | `aster.role` = the token's roles only |
+| `on_behalf_of()` | the whole verified identity: issuer, subject, `jti`, expiry |
+
+The service checks: `iss` is the transport peer (another node's token, or one
+replayed by another gateway, is `UNAUTHENTICATED`), the Ed25519 signature,
+`exp` (never extended) and `iat`/`nbf` with 60 s leeway, and `exp - iat` ≤ 5
+min. Both limits are fixed for now. A call without the entry is authorised as
+the peer, exactly as before. Accepted calls record `principal`, `actor`,
+`obo_iss` and `obo_jti` on their `rpc` span and log under
+`aster::rpc::identity` (debug). Tokens from external identity providers (OIDC)
+come in a later release.
 
 ### 4.8 Client interceptors (deadline / retry / circuit breaker)
 

@@ -28,6 +28,16 @@ pub trait AttributeSource: Send + Sync + 'static {
     /// `peer`'s verified attributes, or `None` when this source knows
     /// nothing of it.
     fn attributes(&self, peer: &str) -> Option<SourcedAttributes>;
+
+    /// The roles `peer` may issue in an edge-minted on-behalf-of token: the
+    /// issuer delegation in its verified credential
+    /// ([`ISSUABLE_ROLES_ATTRIBUTE`](super::identity::ISSUABLE_ROLES_ATTRIBUTE)).
+    /// `None` (the default) means the peer holds no issuer delegation and
+    /// cannot mint at all. Never derived from runtime attributes.
+    fn issuable_roles(&self, peer: &str) -> Option<BTreeSet<String>> {
+        let _ = peer;
+        None
+    }
 }
 
 /// What an [`AttributeSource`] reports for a peer it knows.
@@ -192,6 +202,14 @@ impl AttributeStore {
     /// of it, replacing any previous source.
     pub fn set_source(&self, source: Arc<dyn AttributeSource>) {
         *self.source.write().unwrap() = Some(source);
+    }
+
+    /// The roles `peer` may issue in an edge-minted on-behalf-of token, from
+    /// the source alone (see [`AttributeSource::issuable_roles`]).
+    #[cfg_attr(not(feature = "delegation"), allow(dead_code))]
+    pub(crate) fn issuable_roles(&self, peer: &str) -> Option<BTreeSet<String>> {
+        let source = self.source.read().unwrap().clone();
+        source.and_then(|source| source.issuable_roles(peer))
     }
 
     fn sourced(&self, peer: &str) -> Option<SourcedAttributes> {

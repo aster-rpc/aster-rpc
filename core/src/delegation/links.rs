@@ -324,7 +324,7 @@ pub(crate) struct LinkPayload {
 }
 
 /// An explicit `null` is not the same as omission: it cannot erase a value.
-fn some<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+pub(crate) fn some<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
 ) -> Result<Option<T>, D::Error> {
     T::deserialize(deserializer).map(Some)
@@ -548,7 +548,7 @@ fn valid_string(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_STRING_BYTES && !value.chars().any(char::is_control)
 }
 
-fn valid_jti(value: &str) -> bool {
+pub(crate) fn valid_jti(value: &str) -> bool {
     (16..=64).contains(&value.len())
         && value
             .bytes()

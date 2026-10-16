@@ -14,6 +14,7 @@
 //! | [`DISPATCH`] | info | with the `otel` feature and an OTel tracer provider, the `rpc` span is created at info instead (with `otel.kind = server` and the caller's trace context as parent), so the OTel span filter can export it without debug logs |
 //! | [`CLIENT`] | info | with the `otel` feature and an OTel tracer provider: one `rpc.client` span per outgoing call, whose trace context goes out in the call metadata |
 //! | [`DISPATCH`] | warn | a corrupt request frame -- one that does not inflate, or a client-stream / bidi request that does not decode (the call fails with `INVALID_ARGUMENT`) |
+//! | [`IDENTITY`] | debug | gateway identity (`aster-on-behalf-of`): `on-behalf-of accepted` (fields `principal`, `actor`, `iss`, `sub`, `jti`) and `on-behalf-of refused` (`actor`, `service`, `method`, `reason`); the call's `rpc` span also records `principal`, `actor`, `obo_iss`, `obo_jti` |
 //! | [`SESSION`] | debug | session opened, sessions reaped with their connection, HTTP session ended |
 //! | [`FOREIGN`] | debug / trace | foreign (binding) dispatch: call delivered (trace), cancelled / expired / abandoned (debug) |
 //! | [`ADMISSION`] | debug / info | Gate 0: inbound peer accepted (debug) or rejected (info); outbound dial allowed / blocked (debug). With Enrollment, one event per connection decision (fields `peer`, `alpn`, `decision`, `reason`, `source` or `detail`): allows at debug, denials at info, at most one info line per denied peer per 10 s and 32 a second overall (the rest at debug, counted in `suppressed`); an outbound dial blocked because on-demand enrollment failed (debug) |
@@ -29,6 +30,8 @@ pub const SERVER: &str = "aster::rpc::server";
 pub const DISPATCH: &str = "aster::rpc::dispatch";
 /// Outgoing calls (`RpcConnection`): the client span, with the `otel` feature.
 pub const CLIENT: &str = "aster::rpc::client";
+/// Gateway identity: on-behalf-of calls accepted or refused.
+pub const IDENTITY: &str = "aster::rpc::identity";
 /// Session-scoped service instances.
 pub const SESSION: &str = "aster::rpc::session";
 /// Foreign (language-binding) dispatch.

@@ -673,6 +673,7 @@ impl Foreign {
             deadline,
             parts,
             transport_peer,
+            forwarded,
             obs,
             call_admission,
         } = d;
@@ -765,6 +766,7 @@ impl Foreign {
             header: header.clone(),
             peer: peer_id.clone(),
             transport_peer: transport_peer_id.clone(),
+            forwarded,
             attributes: attributes.clone(),
             trace_context,
             inbound_trace: inbound_trace.clone(),
@@ -867,6 +869,8 @@ pub(crate) struct Delivery {
     pub(crate) parts: CallParts,
     /// See [`ForeignCall::transport_peer_id`].
     pub(crate) transport_peer: Option<String>,
+    /// The verified on-behalf-of identity, for a forwarded call.
+    pub(crate) forwarded: Option<Arc<crate::rpc::identity::ForwardedIdentity>>,
     pub(crate) obs: CallObs,
     pub(crate) call_admission: DispatchPermit,
 }
@@ -1122,6 +1126,8 @@ pub(crate) struct CallState {
     peer: Arc<str>,
     /// See [`ForeignCall::transport_peer_id`].
     transport_peer: Option<Arc<str>>,
+    /// The verified on-behalf-of identity, for a forwarded call.
+    forwarded: Option<Arc<crate::rpc::identity::ForwardedIdentity>>,
     /// The caller's attributes (shared with the [`ForeignCall`]), so bindings
     /// that answer by id can read them later ([`CallRef::attributes`]).
     attributes: Arc<PeerAttributes>,
@@ -1483,6 +1489,17 @@ impl CallRef {
     /// different principal (the same as [`ForeignCall::transport_peer_id`]).
     pub fn transport_peer(&self) -> Option<&Arc<str>> {
         self.0.transport_peer.as_ref()
+    }
+
+    /// For a call an edge forwarded on behalf of a user: that edge's node id
+    /// (the transport peer). `peer()` is then the user's principal.
+    pub fn actor(&self) -> Option<&str> {
+        self.0.forwarded.as_deref().map(|f| f.actor())
+    }
+
+    /// The verified on-behalf-of identity, for a forwarded call.
+    pub fn on_behalf_of(&self) -> Option<&crate::rpc::identity::ForwardedIdentity> {
+        self.0.forwarded.as_deref()
     }
 
     /// The caller's attributes (the same as [`ForeignCall::attributes`]).

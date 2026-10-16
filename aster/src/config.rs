@@ -339,6 +339,14 @@ pub struct AsterConfig {
 
     /// Path to a `.aster-identity` file.
     pub identity_file: Option<PathBuf>,
+    /// Accept calls made on behalf of a user: the `aster-on-behalf-of`
+    /// metadata entry, verified before Gate 3 (see `aster::rpc::identity`).
+    /// Default `false`: a call carrying the entry is refused with
+    /// `PERMISSION_DENIED` rather than run as the peer.
+    ///
+    /// Env: `ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF`; TOML:
+    /// `[identity] accept_on_behalf_of`.
+    pub identity_accept_on_behalf_of: bool,
 
     /// Port of the health/readiness/metrics HTTP listener (`aster::ops`,
     /// feature `health`). `0` (the default) means disabled unless
@@ -615,6 +623,9 @@ impl AsterConfig {
             if let Some(value) = toml_path(identity, "file", label)? {
                 self.identity_file = Some(value);
             }
+            if let Some(value) = toml_bool(identity, "accept_on_behalf_of", label)? {
+                self.identity_accept_on_behalf_of = value;
+            }
         }
 
         self.enrollment.apply_toml(raw, label)?;
@@ -861,6 +872,9 @@ impl AsterConfig {
         }
         if let Some(value) = env_bool("ASTER_HEALTH_ENABLED")? {
             self.health_enabled = Some(value);
+        }
+        if let Some(value) = env_bool("ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF")? {
+            self.identity_accept_on_behalf_of = value;
         }
         if let Some(value) = env_bool("ASTER_METRICS_PEER_LABELS")? {
             self.metrics_peer_labels = value;
@@ -1249,6 +1263,7 @@ impl Default for AsterConfig {
             log_level: "info".into(),
             log_mask: true,
             identity_file: None,
+            identity_accept_on_behalf_of: false,
             health_port: 0,
             health_host: "127.0.0.1".into(),
             health_enabled: None,
@@ -1602,6 +1617,13 @@ impl AsterConfigBuilder {
     /// Health listener bind host (default `127.0.0.1`).
     pub fn health_host(mut self, host: impl Into<String>) -> Self {
         self.config.health_host = host.into();
+        self
+    }
+
+    /// Accept calls made on behalf of a user (see
+    /// [`AsterConfig::identity_accept_on_behalf_of`]).
+    pub fn accept_on_behalf_of(mut self, accept: bool) -> Self {
+        self.config.identity_accept_on_behalf_of = accept;
         self
     }
 
@@ -2167,6 +2189,7 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     const ASTER_ENV_KEYS: &[&str] = &[
+        "ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF",
         "ASTER_ROOT_PUBKEY",
         "ASTER_ROOT_PUBKEY_FILE",
         "ASTER_ENROLLMENT_CREDENTIAL",
@@ -2963,6 +2986,35 @@ mod binding_knob_tests {
         assert_eq!(
             AsterConfig::from_file(&path).unwrap().blob_zstd_level,
             Some(3)
+        );
+    }
+
+    #[test]
+    fn identity_accept_on_behalf_of_from_toml_env_and_builder() {
+        let _lock = lock_env();
+        let _env = super::tests_env_guard();
+
+        assert!(!AsterConfig::default().identity_accept_on_behalf_of);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        fs::write(&path, "[identity]\naccept_on_behalf_of = true\n").unwrap();
+        assert!(
+            AsterConfig::from_file(&path)
+                .unwrap()
+                .identity_accept_on_behalf_of
+        );
+        env::set_var("ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF", "false");
+        assert!(
+            !AsterConfig::from_file(&path)
+                .unwrap()
+                .identity_accept_on_behalf_of
+        );
+        env::remove_var("ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF");
+        assert!(
+            AsterConfig::builder()
+                .accept_on_behalf_of(true)
+                .build()
+                .identity_accept_on_behalf_of
         );
     }
 

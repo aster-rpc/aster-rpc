@@ -47,6 +47,7 @@ use super::foreign::{
     DispatchAdmission, DispatchEvent, DispatchPermit, DispatchSendError, DispatchSink, Foreign,
     ForeignService, ForeignSession,
 };
+use super::identity::{ForwardedIdentity, OnBehalfOfPolicy};
 use super::observe::{CallInfo, CallObs, ConnObs, Telemetry};
 use super::sessions::{
     check_shared, missing_session, ServiceKey, SessionFactory, SessionInstance, SessionStore,
@@ -215,6 +216,8 @@ pub struct Server {
     session_probes: Registry,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
+    /// `Some` when the server accepts `aster-on-behalf-of` (off by default).
+    on_behalf_of: Option<OnBehalfOfPolicy>,
     routes: AlpnRoutes,
     max_sessions_per_connection: usize,
     handler_timeout: Option<Duration>,
@@ -249,6 +252,7 @@ impl Server {
             session_probes: HashMap::new(),
             attributes: AttributeStore::new(),
             authenticator: None,
+            on_behalf_of: None,
             routes: HashMap::new(),
             max_sessions_per_connection: DEFAULT_MAX_SESSIONS_PER_CONNECTION,
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
@@ -374,6 +378,16 @@ impl Server {
         f: impl Fn(&super::ExtractContext<'_>) -> Option<String> + Send + Sync + 'static,
     ) -> Self {
         self.telemetry.extractors.push(key.into(), Arc::new(f));
+        self
+    }
+
+    /// Accept calls made on behalf of a user (the `aster-on-behalf-of`
+    /// metadata entry; see [`identity`](super::identity)). Off by default:
+    /// a call carrying the entry is then refused with `PERMISSION_DENIED`
+    /// rather than run as the peer. [`AsterServer`](crate::rpc::AsterServer)
+    /// sets it from `[identity] accept_on_behalf_of`.
+    pub fn accept_on_behalf_of(mut self, accept: bool) -> Self {
+        self.on_behalf_of = accept.then(OnBehalfOfPolicy::default);
         self
     }
 
@@ -508,6 +522,7 @@ impl Server {
             sessions: Arc::new(SessionStore::new(self.max_sessions_per_connection)),
             attributes: self.attributes.clone(),
             authenticator: self.authenticator.clone(),
+            on_behalf_of: self.on_behalf_of,
             public_transport: false,
             handler_timeout: self.handler_timeout,
             deadlines: self.deadlines.clone(),
@@ -693,6 +708,8 @@ pub struct Dispatcher {
     sessions: Arc<SessionStore>,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
+    /// `Some` when `aster-on-behalf-of` is accepted.
+    on_behalf_of: Option<OnBehalfOfPolicy>,
     /// Anonymous transport policy: no address-derived authority or sessions.
     public_transport: bool,
     handler_timeout: Option<Duration>,
@@ -734,6 +751,7 @@ impl Dispatcher {
         Self {
             authenticator: None,
             attributes: AttributeStore::new(),
+            on_behalf_of: None,
             public_transport: true,
             ..self.clone()
         }
@@ -1045,20 +1063,32 @@ impl Dispatcher {
             call_admission,
             drain: Some(self.drain.admit()),
             transport_peer: None,
+            forwarded: None,
+            forwarded_applied: false,
         };
         if self.authenticator.is_some() {
             return Route::Authenticate(routed);
         }
-        let attributes = if self.public_transport {
+        let mut attributes = if self.public_transport {
             HashMap::new()
         } else {
             self.attributes.get(&parts.peer_id)
         };
+        // Gateway identity, before Gate 3: a forwarded call is authorised as
+        // the user, with the token's roles only.
+        let forwarded = match self.forwarded(&routed.header, parts, &parts.peer_id, &attributes) {
+            Ok(forwarded) => forwarded,
+            Err(status) => return Route::Reject(status),
+        };
+        if let Some(identity) = &forwarded {
+            attributes = identity.attributes();
+        }
         if let Err(status) = gate3(&*routed.meta, &routed.header, &attributes) {
             return Route::Reject(status);
         }
         Route::Dispatch(Routed {
             attributes,
+            forwarded,
             ..routed
         })
     }
@@ -1086,13 +1116,17 @@ impl Dispatcher {
             }
             Route::Dispatch(mut routed) => {
                 open_routed(&mut obs, &mut routed, &parts.peer_id);
+                apply_forwarded(&obs, &mut routed, &mut parts, &mut transport_peer);
                 routed
             }
             Route::Authenticate(mut routed) => {
                 open_routed(&mut obs, &mut routed, &parts.peer_id);
                 transport_peer = Some(parts.peer_id.clone());
                 match self.authenticate(routed, &mut parts).await {
-                    Ok(Some(routed)) => routed,
+                    Ok(Some(mut routed)) => {
+                        apply_forwarded(&obs, &mut routed, &mut parts, &mut transport_peer);
+                        routed
+                    }
                     Ok(None) => {
                         // The transport has already stopped listening. Drop
                         // authentication without emitting a terminal response.
@@ -1121,6 +1155,7 @@ impl Dispatcher {
             attributes,
             deadline,
             session_scoped,
+            forwarded,
             ..
         } = routed;
         obs.dispatching(&header, &parts.peer_id, &attributes);
@@ -1178,6 +1213,7 @@ impl Dispatcher {
             deadline,
             cancelled: parts.cancelled.clone(),
             signal: parts.cancel_notify.clone(),
+            forwarded,
         });
         let Some(at) = deadline else {
             let handler = super::observe::scoped(
@@ -1240,6 +1276,9 @@ impl Dispatcher {
         parts: &mut CallParts,
     ) -> std::result::Result<Option<Routed>, RpcStatus> {
         let (mut attrs, credentialed) = self.attributes.resolve(&parts.peer_id);
+        // The transport's id, before an authenticator may replace it: an
+        // edge-minted token must be signed by this peer.
+        let transport = parts.peer_id.clone();
         if let Some(auth) = self.authenticator.as_ref() {
             // Authentication spends the same routed deadline as the handler.
             // Register before invoking the hook, so a stalled foreign auth
@@ -1300,7 +1339,12 @@ impl Dispatcher {
                 attrs.entry(k).or_insert(v);
             }
         }
+        let forwarded = self.forwarded(&routed.header, parts, &transport, &attrs)?;
+        if let Some(identity) = &forwarded {
+            attrs = identity.attributes();
+        }
         gate3(&*routed.meta, &routed.header, &attrs)?;
+        routed.forwarded = forwarded;
         if let Target::HttpSession { factory, sid } = &routed.target {
             let instance = self
                 .sessions
@@ -1312,11 +1356,34 @@ impl Dispatcher {
         Ok(Some(routed))
     }
 
+    /// Resolve `header`'s `aster-on-behalf-of` entry for a call from
+    /// `transport` whose own Gate-3 attributes are `peer_attributes`.
+    fn forwarded(
+        &self,
+        header: &StreamHeader,
+        parts: &CallParts,
+        transport: &str,
+        peer_attributes: &HashMap<String, String>,
+    ) -> std::result::Result<Option<Arc<ForwardedIdentity>>, RpcStatus> {
+        super::identity::resolve(
+            self.on_behalf_of.as_ref(),
+            header,
+            parts.provenance,
+            transport,
+            peer_attributes,
+            &self.attributes,
+        )
+        .map(|identity| identity.map(Arc::new))
+    }
+
     /// Hand a routed foreign call to the binding (synchronous; see
     /// `Foreign::deliver`).
-    fn deliver_foreign(&self, mut routed: Routed, parts: CallParts, mut obs: CallObs) {
+    fn deliver_foreign(&self, mut routed: Routed, mut parts: CallParts, mut obs: CallObs) {
         // From the serve loop's fast path the call is not open yet.
         open_routed(&mut obs, &mut routed, &parts.peer_id);
+        let mut transport_peer = routed.transport_peer.take();
+        apply_forwarded(&obs, &mut routed, &mut parts, &mut transport_peer);
+        routed.transport_peer = transport_peer;
         obs.dispatching(&routed.header, &parts.peer_id, &routed.attributes);
         let Routed {
             header,
@@ -1326,6 +1393,7 @@ impl Dispatcher {
             deadline,
             call_admission,
             transport_peer,
+            forwarded,
             ..
         } = routed;
         let (svc, session) = match target {
@@ -1342,6 +1410,7 @@ impl Dispatcher {
                 deadline,
                 parts,
                 transport_peer,
+                forwarded,
                 obs,
                 call_admission: call_admission.expect("foreign route admission"),
             },
@@ -1639,8 +1708,13 @@ pub struct Routed {
     /// the call is opened, so it ends exactly when the call does.
     drain: Option<DrainTicket>,
     /// The transport's caller id, set when an authenticator resolved a
-    /// different principal (which then replaced `CallParts::peer_id`).
+    /// different principal (which then replaced `CallParts::peer_id`), or
+    /// when the call was forwarded on behalf of a user.
     transport_peer: Option<String>,
+    /// The verified on-behalf-of identity, for a forwarded call.
+    forwarded: Option<Arc<ForwardedIdentity>>,
+    /// `forwarded` has replaced `CallParts::peer_id` and been recorded.
+    forwarded_applied: bool,
 }
 
 impl Routed {
@@ -1739,6 +1813,31 @@ fn open_routed(obs: &mut CallObs, routed: &mut Routed, peer: &str) {
     if let Some(ticket) = routed.drain.take() {
         obs.hold_drain_ticket(ticket);
     }
+}
+
+/// A forwarded call runs as the user: its principal replaces
+/// `CallParts::peer_id` (as an authenticator's would), the edge is kept as the
+/// transport peer, and the identity goes on the call's span. Once per call.
+fn apply_forwarded(
+    obs: &CallObs,
+    routed: &mut Routed,
+    parts: &mut CallParts,
+    transport_peer: &mut Option<String>,
+) {
+    if routed.forwarded_applied {
+        return;
+    }
+    let Some(identity) = routed.forwarded.clone() else {
+        return;
+    };
+    routed.forwarded_applied = true;
+    obs.on_behalf_of(&identity);
+    let edge = std::mem::replace(&mut parts.peer_id, identity.principal().to_string());
+    // An authenticator may already have replaced the peer id; the edge is
+    // still the transport's id.
+    let edge = transport_peer.take().unwrap_or(edge);
+    routed.transport_peer = Some(edge.clone());
+    *transport_peer = Some(edge);
 }
 
 /// Finish the telemetry of a call refused before any handler ran. The header
@@ -2007,9 +2106,11 @@ impl Call {
         self.ctx.method()
     }
 
-    /// The caller id dispatch uses: the [`Authenticator`] principal when one
-    /// resolved it, else the transport's peer id (hex). The context separates
-    /// the two ([`CallContext::peer`] / [`CallContext::principal`]).
+    /// The caller id dispatch uses: for a call forwarded on behalf of a user,
+    /// that user (`iss|sub`); else the [`Authenticator`] principal when one
+    /// resolved it; else the transport's peer id (hex). The context separates
+    /// them ([`CallContext::peer`] / [`CallContext::principal`] /
+    /// [`CallContext::actor`]).
     pub fn peer(&self) -> &str {
         self.ctx.principal()
     }

@@ -183,6 +183,10 @@ impl CallObs {
             method = header.method.as_str(),
             call_id = header.call_id,
             peer,
+            principal = tracing::field::Empty,
+            actor = tracing::field::Empty,
+            obo_iss = tracing::field::Empty,
+            obo_jti = tracing::field::Empty,
         );
     }
 
@@ -200,6 +204,22 @@ impl CallObs {
         }
         #[cfg(not(feature = "otel"))]
         let _ = (header, peer, attributes);
+    }
+
+    /// Record a forwarded call's identity on its `rpc` span: the audit fields
+    /// (principal, actor, issuer, `jti`). No-op on a disabled span.
+    pub(crate) fn on_behalf_of(&self, identity: &super::identity::ForwardedIdentity) {
+        if self.span.is_disabled() {
+            return;
+        }
+        self.span.record("principal", identity.principal());
+        self.span.record("actor", identity.actor());
+        self.span.record("obo_iss", identity.issuer());
+        self.span.record("obo_jti", identity.jti());
+        #[cfg(feature = "otel")]
+        if let Some(o) = &self.otel {
+            o.on_behalf_of(&self.span, identity);
+        }
     }
 
     /// Whether opening needs the decoded header even when no debug log
