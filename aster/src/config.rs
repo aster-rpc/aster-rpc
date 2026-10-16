@@ -78,6 +78,39 @@ impl DiscoveryMode {
     }
 }
 
+/// Where a setting's value came from, lowest precedence first. Reported by
+/// `aster.ops.NodeConfig` `get` next to each effective value.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum ConfigSource {
+    /// The built-in default.
+    #[default]
+    Default,
+    /// An `aster.toml` file.
+    File,
+    /// An `ASTER_*` environment variable.
+    Env,
+    /// Set in code (an [`AsterConfigBuilder`] method or a field assignment).
+    Code,
+    /// A remote override (`aster.ops.NodeConfig`).
+    Override,
+}
+
+impl ConfigSource {
+    /// The wire spelling: `default`, `file`, `env`, `code` or `override`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::File => "file",
+            Self::Env => "env",
+            Self::Code => "code",
+            Self::Override => "override",
+        }
+    }
+}
+
+/// The [`AsterConfig::setting_sources`] key of `[identity] accept_on_behalf_of`.
+pub const SETTING_ACCEPT_ON_BEHALF_OF: &str = "identity.accept_on_behalf_of";
+
 /// Published service metadata loaded from `.aster-identity`.
 ///
 /// Values are JSON so callers can inspect token/contract metadata without
@@ -347,6 +380,26 @@ pub struct AsterConfig {
     /// Env: `ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF`; TOML:
     /// `[identity] accept_on_behalf_of`.
     pub identity_accept_on_behalf_of: bool,
+
+    /// Serve `aster.ops.NodeConfig`, the remote overrides of overridable
+    /// sections (`[identity]` today). Default `true`; `false` turns the
+    /// service off, and the node then ignores any override it stored earlier.
+    ///
+    /// Env: `ASTER_REMOTE_CONFIG_ENABLED`; TOML: `[remote_config] enabled`.
+    pub remote_config_enabled: bool,
+    /// Overridable sections this node refuses to have overridden, e.g.
+    /// `["identity"]`. A stored override of a section locked later is
+    /// ignored. An unknown name fails `AsterServer` start.
+    ///
+    /// Env: `ASTER_REMOTE_CONFIG_LOCK` (comma-separated); TOML:
+    /// `[remote_config] lock`.
+    pub remote_config_lock: Vec<String>,
+    /// Where each overridable setting came from, keyed `section.field`
+    /// (e.g. [`SETTING_ACCEPT_ON_BEHALF_OF`]). Kept by the file, env and
+    /// builder paths. An absent key is a default, or a direct field
+    /// assignment, which is reported as [`ConfigSource::Code`] when the value
+    /// differs from the default.
+    pub setting_sources: BTreeMap<String, ConfigSource>,
 
     /// Port of the health/readiness/metrics HTTP listener (`aster::ops`,
     /// feature `health`). `0` (the default) means disabled unless
@@ -625,6 +678,17 @@ impl AsterConfig {
             }
             if let Some(value) = toml_bool(identity, "accept_on_behalf_of", label)? {
                 self.identity_accept_on_behalf_of = value;
+                self.setting_sources
+                    .insert(SETTING_ACCEPT_ON_BEHALF_OF.into(), ConfigSource::File);
+            }
+        }
+
+        if let Some(remote) = toml_section(raw, "remote_config", label)? {
+            if let Some(value) = toml_bool(remote, "enabled", label)? {
+                self.remote_config_enabled = value;
+            }
+            if let Some(value) = toml_string_list(remote, "lock", label)? {
+                self.remote_config_lock = non_empty(value);
             }
         }
 
@@ -875,6 +939,14 @@ impl AsterConfig {
         }
         if let Some(value) = env_bool("ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF")? {
             self.identity_accept_on_behalf_of = value;
+            self.setting_sources
+                .insert(SETTING_ACCEPT_ON_BEHALF_OF.into(), ConfigSource::Env);
+        }
+        if let Some(value) = env_bool("ASTER_REMOTE_CONFIG_ENABLED")? {
+            self.remote_config_enabled = value;
+        }
+        if let Some(value) = env_list("ASTER_REMOTE_CONFIG_LOCK") {
+            self.remote_config_lock = value;
         }
         if let Some(value) = env_bool("ASTER_METRICS_PEER_LABELS")? {
             self.metrics_peer_labels = value;
@@ -1264,6 +1336,9 @@ impl Default for AsterConfig {
             log_mask: true,
             identity_file: None,
             identity_accept_on_behalf_of: false,
+            remote_config_enabled: true,
+            remote_config_lock: Vec::new(),
+            setting_sources: BTreeMap::new(),
             health_port: 0,
             health_host: "127.0.0.1".into(),
             health_enabled: None,
@@ -1624,6 +1699,27 @@ impl AsterConfigBuilder {
     /// [`AsterConfig::identity_accept_on_behalf_of`]).
     pub fn accept_on_behalf_of(mut self, accept: bool) -> Self {
         self.config.identity_accept_on_behalf_of = accept;
+        self.config
+            .setting_sources
+            .insert(SETTING_ACCEPT_ON_BEHALF_OF.into(), ConfigSource::Code);
+        self
+    }
+
+    /// Serve `aster.ops.NodeConfig` (on by default; see
+    /// [`AsterConfig::remote_config_enabled`]).
+    pub fn remote_config(mut self, enabled: bool) -> Self {
+        self.config.remote_config_enabled = enabled;
+        self
+    }
+
+    /// Lock overridable sections against remote override (see
+    /// [`AsterConfig::remote_config_lock`]).
+    pub fn remote_config_lock<I, S>(mut self, sections: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.config.remote_config_lock = sections.into_iter().map(Into::into).collect();
         self
     }
 
@@ -3016,6 +3112,52 @@ mod binding_knob_tests {
                 .build()
                 .identity_accept_on_behalf_of
         );
+    }
+
+    #[test]
+    fn remote_config_keys_and_setting_sources_follow_resolution_order() {
+        let _lock = lock_env();
+        let _env = super::tests_env_guard();
+        let source = |c: &AsterConfig| c.setting_sources.get(SETTING_ACCEPT_ON_BEHALF_OF).copied();
+
+        let defaults = AsterConfig::default();
+        assert!(defaults.remote_config_enabled);
+        assert!(defaults.remote_config_lock.is_empty());
+        assert_eq!(source(&defaults), None);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        fs::write(
+            &path,
+            "[identity]\naccept_on_behalf_of = true\n\
+             [remote_config]\nenabled = false\nlock = [\"identity\"]\n",
+        )
+        .unwrap();
+        let file = AsterConfig::from_file(&path).unwrap();
+        assert!(!file.remote_config_enabled);
+        assert_eq!(file.remote_config_lock, vec!["identity".to_string()]);
+        assert_eq!(source(&file), Some(ConfigSource::File));
+
+        env::set_var("ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF", "false");
+        env::set_var("ASTER_REMOTE_CONFIG_ENABLED", "true");
+        env::set_var("ASTER_REMOTE_CONFIG_LOCK", " identity , ");
+        let env_over = AsterConfig::from_file(&path).unwrap();
+        assert!(env_over.remote_config_enabled);
+        assert_eq!(env_over.remote_config_lock, vec!["identity".to_string()]);
+        assert_eq!(source(&env_over), Some(ConfigSource::Env));
+        env::remove_var("ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF");
+        env::remove_var("ASTER_REMOTE_CONFIG_ENABLED");
+        env::remove_var("ASTER_REMOTE_CONFIG_LOCK");
+
+        let code = AsterConfig::from_file(&path)
+            .unwrap()
+            .into_builder()
+            .accept_on_behalf_of(false)
+            .remote_config(true)
+            .remote_config_lock(Vec::<String>::new())
+            .build();
+        assert_eq!(source(&code), Some(ConfigSource::Code));
+        assert!(code.remote_config_enabled && code.remote_config_lock.is_empty());
     }
 
     #[test]

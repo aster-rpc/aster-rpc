@@ -13,7 +13,9 @@ enrollment = ["delegation", "aster_transport_core/enrollment"]
 delegation = ["aster_transport_core/delegation"]
 default = ["blobs", "docs", "gossip"]
 blobs = ["dep:iroh-blobs"]
-docs = ["blobs"]
+# blake3 is already in the graph through iroh-blobs; docs uses it to derive
+# the node-config namespace (`aster.ops.NodeConfig`) from the node identity.
+docs = ["blobs", "dep:blake3"]
 gossip = ["dep:iroh-gossip"]
 # Rust-native RPC (envelope + payload codec, dispatch, client stub). Off by
 # default so Step-1 consumers don't compile Fory. See docs/_internal/aster-rust.md.
@@ -24,6 +26,7 @@ rpc = [
     "dep:async-trait",
     "dep:aster-macros",
     "dep:serde",
+    "dep:arc-swap",
 ]
 # Coordination (§15 Slice 0). Two features, deliberately:
 #

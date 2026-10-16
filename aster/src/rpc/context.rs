@@ -31,6 +31,7 @@ use tokio::time::Instant;
 
 use super::codec::StreamHeader;
 use super::identity::ForwardedIdentity;
+use super::node_config::{AttrValue, NodeProperties};
 use super::server::PeerProvenance;
 
 tokio::task_local! {
@@ -79,6 +80,8 @@ struct Inner {
     ended: Notify,
     /// The verified on-behalf-of identity, for a forwarded call.
     forwarded: Option<Arc<ForwardedIdentity>>,
+    /// This node's NodeConfig properties when the call was routed.
+    node_properties: Arc<NodeProperties>,
 }
 
 pub(crate) struct CallContextParts {
@@ -92,6 +95,7 @@ pub(crate) struct CallContextParts {
     pub cancelled: Arc<AtomicBool>,
     pub signal: Option<Arc<CancelSignal>>,
     pub forwarded: Option<Arc<ForwardedIdentity>>,
+    pub node_properties: Arc<NodeProperties>,
 }
 
 impl CallContext {
@@ -110,6 +114,7 @@ impl CallContext {
                 signal: p.signal,
                 ended: Notify::new(),
                 forwarded: p.forwarded,
+                node_properties: p.node_properties,
             }),
         }
     }
@@ -199,6 +204,22 @@ impl CallContext {
     /// One attribute, by key.
     pub fn attribute(&self, key: &str) -> Option<&str> {
         self.inner.attributes.get(key).map(String::as_str)
+    }
+
+    /// **This node's** properties (name, tags, typed attributes) as the root
+    /// or an issuer last set them through `aster.ops.NodeConfig`, as of when
+    /// the call was routed. They describe the node, not the caller, and never
+    /// authorise: Gate 3 does not read them, and they are kept apart from the
+    /// caller's [`attributes`](Self::attributes) by name and by type. Empty
+    /// when no record is set or the service is off.
+    pub fn node_properties(&self) -> &NodeProperties {
+        &self.inner.node_properties
+    }
+
+    /// One of this node's NodeConfig attributes, by key (see
+    /// [`node_properties`](Self::node_properties)).
+    pub fn node_attribute(&self, key: &str) -> Option<&AttrValue> {
+        self.inner.node_properties.attribute(key)
     }
 
     /// The service being called.

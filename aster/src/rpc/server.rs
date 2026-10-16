@@ -47,7 +47,8 @@ use super::foreign::{
     DispatchAdmission, DispatchEvent, DispatchPermit, DispatchSendError, DispatchSink, Foreign,
     ForeignService, ForeignSession,
 };
-use super::identity::{ForwardedIdentity, OnBehalfOfPolicy};
+use super::identity::{ForwardedIdentity, LiveIdentity};
+use super::node_config::LiveProperties;
 use super::observe::{CallInfo, CallObs, ConnObs, Telemetry};
 use super::sessions::{
     check_shared, missing_session, ServiceKey, SessionFactory, SessionInstance, SessionStore,
@@ -216,8 +217,11 @@ pub struct Server {
     session_probes: Registry,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
-    /// `Some` when the server accepts `aster-on-behalf-of` (off by default).
-    on_behalf_of: Option<OnBehalfOfPolicy>,
+    /// The `[identity]` settings in force (on-behalf-of is off by default),
+    /// shared by every dispatcher and swapped live by `aster.ops.NodeConfig`.
+    identity: Arc<LiveIdentity>,
+    /// This node's NodeConfig properties, handed to handlers per call.
+    node_properties: LiveProperties,
     routes: AlpnRoutes,
     max_sessions_per_connection: usize,
     handler_timeout: Option<Duration>,
@@ -252,7 +256,8 @@ impl Server {
             session_probes: HashMap::new(),
             attributes: AttributeStore::new(),
             authenticator: None,
-            on_behalf_of: None,
+            identity: Arc::default(),
+            node_properties: LiveProperties::default(),
             routes: HashMap::new(),
             max_sessions_per_connection: DEFAULT_MAX_SESSIONS_PER_CONNECTION,
             handler_timeout: Some(DEFAULT_HANDLER_TIMEOUT),
@@ -386,9 +391,24 @@ impl Server {
     /// a call carrying the entry is then refused with `PERMISSION_DENIED`
     /// rather than run as the peer. [`AsterServer`](crate::rpc::AsterServer)
     /// sets it from `[identity] accept_on_behalf_of`.
-    pub fn accept_on_behalf_of(mut self, accept: bool) -> Self {
-        self.on_behalf_of = accept.then(OnBehalfOfPolicy::default);
+    pub fn accept_on_behalf_of(self, accept: bool) -> Self {
+        let mut settings = self.identity.load();
+        settings.accept_on_behalf_of = accept;
+        self.identity.store(settings);
         self
+    }
+
+    /// The live `[identity]` settings every dispatcher of this server reads.
+    #[cfg(feature = "docs")]
+    pub(crate) fn live_identity(&self) -> Arc<LiveIdentity> {
+        self.identity.clone()
+    }
+
+    /// The live NodeConfig properties handlers read through
+    /// [`CallContext::node_properties`].
+    #[cfg(feature = "docs")]
+    pub(crate) fn live_properties(&self) -> LiveProperties {
+        self.node_properties.clone()
     }
 
     /// Set an already-boxed authenticator (used by [`AsterServer`](crate::rpc::AsterServer)).
@@ -522,7 +542,8 @@ impl Server {
             sessions: Arc::new(SessionStore::new(self.max_sessions_per_connection)),
             attributes: self.attributes.clone(),
             authenticator: self.authenticator.clone(),
-            on_behalf_of: self.on_behalf_of,
+            identity: Some(self.identity.clone()),
+            node_properties: self.node_properties.clone(),
             public_transport: false,
             handler_timeout: self.handler_timeout,
             deadlines: self.deadlines.clone(),
@@ -708,8 +729,11 @@ pub struct Dispatcher {
     sessions: Arc<SessionStore>,
     attributes: AttributeStore,
     authenticator: Option<Arc<dyn Authenticator>>,
-    /// `Some` when `aster-on-behalf-of` is accepted.
-    on_behalf_of: Option<OnBehalfOfPolicy>,
+    /// The server's live `[identity]` settings; `None` on a public transport,
+    /// which never accepts `aster-on-behalf-of`.
+    identity: Option<Arc<LiveIdentity>>,
+    /// This node's NodeConfig properties (never Gate-3 attributes).
+    node_properties: LiveProperties,
     /// Anonymous transport policy: no address-derived authority or sessions.
     public_transport: bool,
     handler_timeout: Option<Duration>,
@@ -751,7 +775,7 @@ impl Dispatcher {
         Self {
             authenticator: None,
             attributes: AttributeStore::new(),
-            on_behalf_of: None,
+            identity: None,
             public_transport: true,
             ..self.clone()
         }
@@ -1214,6 +1238,7 @@ impl Dispatcher {
             cancelled: parts.cancelled.clone(),
             signal: parts.cancel_notify.clone(),
             forwarded,
+            node_properties: self.node_properties.load(),
         });
         let Some(at) = deadline else {
             let handler = super::observe::scoped(
@@ -1365,8 +1390,9 @@ impl Dispatcher {
         transport: &str,
         peer_attributes: &HashMap<String, String>,
     ) -> std::result::Result<Option<Arc<ForwardedIdentity>>, RpcStatus> {
+        let policy = self.identity.as_deref().and_then(LiveIdentity::policy);
         super::identity::resolve(
-            self.on_behalf_of.as_ref(),
+            policy.as_ref(),
             header,
             parts.provenance,
             transport,

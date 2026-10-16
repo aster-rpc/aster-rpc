@@ -99,9 +99,24 @@ pub struct AsterServerBuilder {
     enrollment_overrides: crate::enrollment::runtime::Overrides,
     // Late activation: application services arrive later as an `RpcSurface`.
     deferred_surface: bool,
+    // Durable audit of `aster.ops.NodeConfig` changes.
+    #[cfg(feature = "docs")]
+    audit: Option<Arc<dyn super::node_config::AuditSink>>,
 }
 
 impl AsterServerBuilder {
+    /// Record every `aster.ops.NodeConfig` `set` and `clear` in `outbox`
+    /// (kinds `aster.node_config.set` / `aster.node_config.clear`, with the
+    /// caller, time and generation) before it is stored. A change the outbox
+    /// refuses is not made (`UNAVAILABLE`). Without an outbox, changes are
+    /// recorded only in the stored record and under the `aster::audit` log
+    /// target.
+    #[cfg(all(feature = "audit-outbox", feature = "docs"))]
+    pub fn audit_outbox(mut self, outbox: crate::audit_outbox::AuditOutbox) -> Self {
+        self.audit = Some(Arc::new(outbox));
+        self
+    }
+
     /// Serve `/healthz`, `/readyz` and `/metrics` on `config.host:config.port`
     /// (see [`crate::ops`]), overriding the config's `[health]` keys. Without
     /// this, the listener starts when [`AsterConfig::is_health_enabled`].
@@ -478,6 +493,16 @@ impl AsterServerBuilder {
         )]
         let mut config = builder.build();
         let accept_on_behalf_of = config.identity_accept_on_behalf_of;
+        // `aster.ops.NodeConfig`: what it overrides and what the file locks,
+        // checked before the node starts.
+        super::node_config::validate_locks(&config.remote_config_lock)?;
+        #[cfg(feature = "docs")]
+        let remote_config = config.remote_config_enabled.then(|| {
+            (
+                config.remote_config_lock.clone(),
+                config.setting_sources.clone(),
+            )
+        });
 
         // The deployment ROOT public key, resolved once, here. Coordination
         // consumes this rather than asking for the same key again: one
@@ -610,6 +635,9 @@ impl AsterServerBuilder {
         // Enrollment: installed before anything is served. It owns Gate 0
         // (every non-enrollment ALPN), feeds Gate 3 the roles of each peer's
         // live session, and, as a delegated issuer, serves renewals.
+        #[cfg(feature = "docs")]
+        #[cfg_attr(not(all(feature = "enrollment", feature = "docs")), allow(unused_mut))]
+        let mut config_authority: Option<Arc<dyn super::AttributeSource>> = None;
         #[cfg(all(feature = "enrollment", feature = "docs"))]
         let enrollment = match &enrollment_plan {
             None => None,
@@ -621,10 +649,13 @@ impl AsterServerBuilder {
                         return Err(err);
                     }
                 };
-                attributes.set_source(Arc::new(crate::enrollment::runtime::EnrollmentAttributes {
+                let source = Arc::new(crate::enrollment::runtime::EnrollmentAttributes {
                     enrollment: installed.enrollment.clone(),
                     mapping: plan.mapping.clone(),
-                }));
+                });
+                // NodeConfig admits a change only on a credential's own role.
+                config_authority = Some(source.clone());
+                attributes.set_source(source);
                 if let Some(issuer) = &installed.issuer {
                     server = server.register(issuer.clone());
                 }
@@ -638,6 +669,42 @@ impl AsterServerBuilder {
                     });
                 });
                 Some(installed)
+            }
+        };
+        // Baseline `aster.ops.NodeConfig` — on unless `[remote_config]` turns
+        // it off. The stored record is applied before anything is served.
+        #[cfg(feature = "docs")]
+        let node_config = match remote_config {
+            None => None,
+            Some((locks, sources)) => {
+                let init = super::node_config::Init {
+                    identity: server.live_identity(),
+                    properties: server.live_properties(),
+                    base_identity: super::identity::IdentitySettings {
+                        accept_on_behalf_of,
+                    },
+                    sources,
+                    locks,
+                    authority: config_authority,
+                    audit: self.audit,
+                };
+                match super::node_config::NodeConfigHandle::open(&node, init).await {
+                    Ok(handle) => {
+                        server = server.register_arc(Arc::new(RequireGuard {
+                            inner: super::node_config::NodeConfigServer::new(
+                                super::node_config::LiveNodeConfig {
+                                    handle: handle.clone(),
+                                },
+                            ),
+                            requires: Some(super::require_role(super::CONFIG_ADMIN_ROLE)),
+                        }));
+                        Some(handle)
+                    }
+                    Err(err) => {
+                        node.shutdown().await;
+                        return Err(err);
+                    }
+                }
             }
         };
         // Baseline `aster.ops.NodeInfo` — registered unless disabled, with the
@@ -805,6 +872,8 @@ impl AsterServerBuilder {
             dispatcher,
             http,
             identity_handle,
+            #[cfg(feature = "docs")]
+            node_config,
             #[cfg(feature = "binding-support")]
             call_table,
             #[cfg(feature = "coordination")]
@@ -914,6 +983,9 @@ pub struct AsterServer {
     /// Live identity served by the baseline `aster.ops.NodeInfo` service
     /// (`None` when the baseline service was disabled).
     identity_handle: Option<NodeIdentityHandle>,
+    /// `aster.ops.NodeConfig` (`None` when `[remote_config]` turns it off).
+    #[cfg(feature = "docs")]
+    node_config: Option<super::node_config::NodeConfigHandle>,
     /// The table foreign calls are answered through (binding support).
     #[cfg(feature = "binding-support")]
     call_table: super::foreign::CallTable,
@@ -996,6 +1068,15 @@ impl AsterServer {
     /// ```
     pub fn node_identity(&self) -> Option<NodeIdentityHandle> {
         self.identity_handle.clone()
+    }
+
+    /// A read-only handle to this server's `aster.ops.NodeConfig` state: the
+    /// record, the effective settings and their sources, and the properties
+    /// handlers see. `None` when `[remote_config] enabled = false`. Changes
+    /// come only from admins over RPC.
+    #[cfg(feature = "docs")]
+    pub fn node_config(&self) -> Option<super::node_config::NodeConfigHandle> {
+        self.node_config.clone()
     }
 
     /// The table through which the binding answers foreign calls

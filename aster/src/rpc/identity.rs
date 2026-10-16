@@ -123,6 +123,41 @@ impl ForwardedIdentity {
     }
 }
 
+/// The `[identity]` settings a server has in force: the file and environment
+/// values, with any `aster.ops.NodeConfig` override applied. Slice 2 adds the
+/// trusted issuers here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IdentitySettings {
+    /// Accept the `aster-on-behalf-of` entry (`[identity] accept_on_behalf_of`).
+    pub accept_on_behalf_of: bool,
+}
+
+/// The [`IdentitySettings`] every dispatcher of one server reads, per call.
+/// Swapped atomically by `aster.ops.NodeConfig`: a call routed after
+/// [`store`](Self::store) returns sees the new settings, with no restart.
+#[derive(Debug, Default)]
+pub(crate) struct LiveIdentity {
+    current: arc_swap::ArcSwap<IdentitySettings>,
+}
+
+impl LiveIdentity {
+    pub(crate) fn load(&self) -> IdentitySettings {
+        IdentitySettings::clone(&self.current.load())
+    }
+
+    pub(crate) fn store(&self, settings: IdentitySettings) {
+        self.current.store(std::sync::Arc::new(settings));
+    }
+
+    /// The verification policy in force, `None` when the entry is refused.
+    pub(crate) fn policy(&self) -> Option<OnBehalfOfPolicy> {
+        self.current
+            .load()
+            .accept_on_behalf_of
+            .then(OnBehalfOfPolicy::default)
+    }
+}
+
 /// How a server verifies `aster-on-behalf-of`. Present only when the server
 /// accepts the entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

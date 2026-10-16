@@ -20,6 +20,7 @@
 //! | [`ADMISSION`] | debug / info | Gate 0: inbound peer accepted (debug) or rejected (info); outbound dial allowed / blocked (debug). With Enrollment, one event per connection decision (fields `peer`, `alpn`, `decision`, `reason`, `source` or `detail`): allows at debug, denials at info, at most one info line per denied peer per 10 s and 32 a second overall (the rest at debug, counted in `suppressed`); an outbound dial blocked because on-demand enrollment failed (debug) |
 //! | [`UPCALL`] | trace / debug / warn | binding upcalls: issued / answered (trace), cancelled or late answers (debug), a decision upcall that fell back to its failure mode (warn) |
 //! | [`OPS`] | info / debug | ops (health/metrics) listener bound and shut down (info); per-connection serve errors (debug) |
+//! | [`AUDIT`] | info | `aster.ops.NodeConfig` changes (fields `kind`, `node_id`, `principal`, `generation`); the durable copy goes to the audit outbox when one is configured |
 //!
 //! The lower layers log under their own crate names: `aster_transport_core`
 //! (reactor, framing) and `iroh` / `iroh_*` (QUIC, relay, discovery).
@@ -42,3 +43,5 @@ pub const ADMISSION: &str = "aster::admission";
 pub const OPS: &str = "aster::ops";
 /// Upcalls into binding code (`binding_support::upcall`).
 pub const UPCALL: &str = "aster::upcall";
+/// Audit events (the binding log bridge's audit channel).
+pub const AUDIT: &str = "aster::audit";
