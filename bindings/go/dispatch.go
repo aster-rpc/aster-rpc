@@ -49,6 +49,17 @@ const (
 	dispatchFlagHasAttributes     = C.ASTER_DISPATCH_FLAG_HAS_ATTRIBUTES
 	dispatchFlagHasTrace          = C.ASTER_DISPATCH_FLAG_HAS_TRACE
 	dispatchFlagHasInboundTrace   = C.ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE
+	// ABI 7.5: peer_ptr is an Authenticator principal; the transport peer
+	// comes from aster_dispatch_identity.
+	dispatchFlagHasPrincipal = C.ASTER_DISPATCH_FLAG_HAS_PRINCIPAL
+)
+
+// aster_dispatch_identity_t.flags (ASTER_DISPATCH_IDENTITY_*, ABI 7.5).
+// dispatchIdentityActor is reserved for a gateway's on-behalf-of actor and
+// never set in 7.5.
+const (
+	dispatchIdentityPrincipal = C.ASTER_DISPATCH_IDENTITY_PRINCIPAL
+	dispatchIdentityActor     = C.ASTER_DISPATCH_IDENTITY_ACTOR
 )
 
 // aster_server_option_t.
@@ -366,6 +377,21 @@ func (d *dispatchServer) kvOut(callID uint64, attributes bool) []MetadataEntry {
 	d.releaseBuffer(buf)
 	kv, _ := decodeKV(raw)
 	return kv
+}
+
+// transportPeer reads a live call's transport peer id (ABI 7.5
+// aster_dispatch_identity); ok is false once the call is over.
+func (d *dispatchServer) transportPeer(callID uint64) (peer string, ok bool) {
+	var id C.aster_dispatch_identity_t
+	id.struct_size = C.uint32_t(unsafe.Sizeof(id))
+	if C.aster_dispatch_identity(d.rt, d.handle, C.uint64_t(callID), &id) != C.ASTER_STATUS_OK {
+		return "", false
+	}
+	if id.peer_ptr != nil && id.peer_len > 0 {
+		peer = C.GoStringN((*C.char)(unsafe.Pointer(id.peer_ptr)), C.int(id.peer_len))
+	}
+	d.releaseBuffer(id.buffer)
+	return peer, true
 }
 
 // abandon ends the call with INTERNAL "handler dropped call" unless it ended.

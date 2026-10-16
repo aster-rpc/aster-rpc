@@ -18,6 +18,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -179,14 +180,14 @@ func httpListenerAllRPCPatterns(t *testing.T, public bool) {
 				}
 			}
 		}
-		if !ok || info.IrohAuthenticated || (!public && (info.PeerID != "alice" || role != "admin")) || (public && len(info.Attributes) != 0) {
+		if !ok || info.IrohAuthenticated || (!public && (info.Principal != "alice" || info.PeerID == info.Principal || role != "admin")) || (public && info.Principal != info.PeerID) || (public && len(info.Attributes) != 0) {
 			t.Errorf("HTTP auth context: %+v", info)
 			return "invalid"
 		}
 		if public {
 			return "public"
 		}
-		return info.PeerID
+		return info.Principal
 	}
 	service := NewService("HTTPTest", 1,
 		Unary("echo", func(ctx context.Context, r *testEchoRequest) (*testEchoReply, error) {
@@ -395,6 +396,15 @@ func assertHTTPPortsReleased(t *testing.T, addr string, quic bool) {
 	}
 }
 
+func hasEntry(entries []MetadataEntry, key, value string) bool {
+	for _, e := range entries {
+		if e.Key == key && e.Value == value {
+			return true
+		}
+	}
+	return false
+}
+
 func TestHTTPListener_AuthenticatedHTTPSAndOwnership(t *testing.T) {
 	seen := make(chan *CallInfo, 1)
 	srv, up := httpListenerFixture(t, func(ctx context.Context, req *testEchoRequest) (*testEchoReply, error) {
@@ -457,24 +467,36 @@ func TestHTTPListener_AuthenticatedHTTPSAndOwnership(t *testing.T) {
 		default:
 		}
 	}
-	response, status, err := httpListenerCall(client, l.TCPAddr(), "Bearer valid", payload)
+	frames, status, err := httpListenerFramesCallHeaders(client, l.TCPAddr(), "Bearer valid", "echo", map[string]string{"x-request-tag": "t1"}, payload)
 	if err != nil || status.Code != StatusOK {
 		t.Fatalf("accepted: status=%+v err=%v", status, err)
 	}
+	response := bytes.Join(frames, nil)
 	var reply testEchoReply
 	if err := srv.codec.Decode(response, &reply); err != nil || reply.Message != "https" || reply.Count != 42 || !bytes.Equal(reply.Data, []byte{1, 2, 255}) {
 		t.Fatalf("response %+v, %v", reply, err)
 	}
 	info := <-seen
-	if info.PeerID != "alice" || info.IrohAuthenticated {
+	if info.Principal != "alice" || info.IrohAuthenticated {
 		t.Fatalf("resolved principal/provenance: %+v", info)
+	}
+	// ABI 7.5: the transport peer (the client's address over HTTP) stays
+	// apart from the Authenticator's principal.
+	if !strings.Contains(info.PeerID, "127.0.0.1:") {
+		t.Fatalf("transport peer %q (principal %q)", info.PeerID, info.Principal)
+	}
+	if info.CallID == 0 || info.Service != "HTTPTest" || info.Method != "echo" || info.Deadline.IsZero() {
+		t.Fatalf("call identity/deadline: %+v", info)
+	}
+	if !hasEntry(info.Attributes, "aster.role", "admin") || !hasEntry(info.Metadata, "x-request-tag", "t1") {
+		t.Fatalf("attributes/metadata: %+v", info)
 	}
 	_, status, err = httpListenerCall(client, l.TCPAddr(), "Bearer bob", payload)
 	if err != nil || status.Code != StatusOK {
 		t.Fatalf("second principal: status=%+v err=%v", status, err)
 	}
 	info = <-seen
-	if info.PeerID != "bob" || info.IrohAuthenticated {
+	if info.Principal != "bob" || info.PeerID == "bob" || info.IrohAuthenticated {
 		t.Fatalf("HTTP connection reused another principal: %+v", info)
 	}
 	if err := l.Stop(10 * time.Millisecond); err != nil {

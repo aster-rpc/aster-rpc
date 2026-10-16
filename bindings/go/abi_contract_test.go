@@ -49,6 +49,7 @@ func TestABI_StructSizes(t *testing.T) {
 		"aster_network_config_t":       96,  // ABI 7.3
 		"aster_metrics_config_t":       16,  // ABI 7.4
 		"aster_blob_transfer_stats_t":  168, // ABI 7.4
+		"aster_dispatch_identity_t":    64,  // ABI 7.5
 	}
 	got := cStructSizes()
 	for name, w := range want {
@@ -70,6 +71,18 @@ func TestABI_StructSizes(t *testing.T) {
 		if off != wantOff[name] {
 			t.Errorf("offsetof(aster_dispatch_event_t, %s) = %d, want %d", name, off, wantOff[name])
 		}
+	}
+	wantIdent := map[string]uintptr{
+		"struct_size": 0, "flags": 4, "peer_ptr": 8, "peer_len": 16, "principal_ptr": 24,
+		"principal_len": 32, "actor_ptr": 40, "actor_len": 48, "buffer": 56,
+	}
+	for name, off := range dispatchIdentityOffsets() {
+		if off != wantIdent[name] {
+			t.Errorf("offsetof(aster_dispatch_identity_t, %s) = %d, want %d", name, off, wantIdent[name])
+		}
+	}
+	if dispatchFlagHasPrincipal != 0x1000 || dispatchIdentityPrincipal != 1 || dispatchIdentityActor != 2 {
+		t.Error("ABI 7.5 dispatch identity flags drifted from the header")
 	}
 }
 
@@ -180,7 +193,7 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 		t.Error("topology snapshot event drifted from header")
 	}
 	// ABI 7.0 swapped the hook failure mode values; 7.1 added the audit acknowledgement log.
-	if major, minor, _ := Version(); major != 7 || ABIVersionMajor != 7 || minor < ABIMinorRequired || ABIMinorRequired != 4 {
+	if major, minor, _ := Version(); major != 7 || ABIVersionMajor != 7 || minor < ABIMinorRequired || ABIMinorRequired != 5 {
 		t.Errorf("library ABI %d.%d, binding needs 7.%d+ (major %d)", major, minor, ABIMinorRequired, ABIVersionMajor)
 	}
 	if ASTER_EVENT_ENROLLMENT_RESULT != 127 || AdmissionErrorNotAdmitted != 1 || AdmissionErrorDenied != 2 ||

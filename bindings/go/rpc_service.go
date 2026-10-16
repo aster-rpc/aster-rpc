@@ -89,8 +89,13 @@ type CallInfo struct {
 	Service string
 	Method  string
 	Pattern MethodPattern
-	// PeerID is the caller's node id (64 hex).
+	// PeerID is the transport's caller id: the node id (64 hex) over Iroh,
+	// the remote socket address over HTTP / WebTransport.
 	PeerID string
+	// Principal is the caller id the server's Authenticator resolved
+	// (RPCAuthResponse.Principal), else PeerID. Sessions and interceptors
+	// key on it. (ABI 7.5; a gateway's on-behalf-of actor is reserved.)
+	Principal string
 	// ConnectionID identifies the peer connection: key per-connection state
 	// on it (ServerOptions.OnConnectionClosed reports its end).
 	ConnectionID uint64
@@ -124,8 +129,10 @@ func CallInfoFromContext(ctx context.Context) (*CallInfo, bool) {
 // SessionInfo is passed to a session-scoped service's factory.
 type SessionInfo struct {
 	Service string
-	// PeerID is the caller's node id (64 hex).
-	PeerID       string
+	// PeerID is the transport's caller id (see CallInfo.PeerID).
+	PeerID string
+	// Principal is the Authenticator's principal, else PeerID.
+	Principal    string
 	ConnectionID uint64
 	// SessionID is the client's wire session id.
 	SessionID int32

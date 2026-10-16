@@ -7,26 +7,27 @@ The module path is `sdk.getaster.now/go` (Go 1.25+). This guide uses
 discovery and public release tags; the module path alone is not yet a working
 public installation source. See [publication setup](../../deploy/go-vanity/README.md).
 **Target:** Go 1.25+ (Fory Go 1.7.6 requires it)
-**ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, **C ABI 7.x, 7.4 minimum** (`aster_*` symbols)
+**ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, **C ABI 7.x, 7.5 minimum** (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Preview status (C ABI 7.4 minimum)
+## Preview status (C ABI 7.5 minimum)
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
 TypeScript, Java and .NET. Aster 0.3 is a preview release.
 
 **Native library requirement (for consumers such as Kasm):** this module needs
-`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 7.4 or a later 7.x**.
+`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 7.5 or a later 7.x**.
 It refuses anything else three ways:
 
 - at compile time, `runtime.go` fails with `#error` when the `aster_ffi.h` on
   `CGO_CFLAGS` is not major 7;
 - at run time, `CheckABI` (called by `NewRuntime` and before any config is
   filled) returns an error wrapping `ErrABIMismatch` when the loaded library's major is not
-  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (4; 7.1 added the audit
+  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (5; 7.1 added the audit
   outbox acknowledgement log, 7.2 `aster_server_drain`, 7.3 the cluster
   network settings `aster_config_set_network`, 7.4 the transfer metrics and
-  `aster_config_set_metrics`);
+  `aster_config_set_metrics`, 7.5 the handler call identity
+  `aster_dispatch_identity`);
 - the library itself refuses `aster_runtime_new` from another major and, since
   6.0, will not fill an `aster_config_t` until `aster_abi_accept` has
   succeeded for its major, so a 5.x-built caller cannot have its 280-byte
@@ -199,6 +200,11 @@ the 7.0 header and library together.
   `ErrVerificationFailed`, ... (status codes) and `ErrRpcNotFound`,
   `ErrRpcUnimplemented`, ... (RPC codes); `errors.As` to `*RpcError` /
   `*IrohError`. Native failures carry `aster_last_error_message`.
+- **Handler call identity (ABI 7.5):** `CallInfo.PeerID` is the transport
+  peer (node id over Iroh, remote address over HTTP / WebTransport) and
+  `CallInfo.Principal` the `RPCAuthenticator`'s principal, else `PeerID`
+  (`SessionInfo` carries both too). Interceptors see the principal as
+  `CallContext.Peer`.
 - **Transfer metrics (ABI 7.4):** `Blobs.TransferStats()` (node-wide
   `BlobTransferStats`: fetched / served payload, zstd payload, wire and plain
   bytes, fallbacks, transfers by encoding and result, decode errors);

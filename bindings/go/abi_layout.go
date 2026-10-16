@@ -49,6 +49,8 @@ func cStructSizes() map[string]uintptr {
 		// ABI 7.4
 		"aster_metrics_config_t":      unsafe.Sizeof(C.aster_metrics_config_t{}),
 		"aster_blob_transfer_stats_t": unsafe.Sizeof(C.aster_blob_transfer_stats_t{}),
+		// ABI 7.5
+		"aster_dispatch_identity_t": unsafe.Sizeof(C.aster_dispatch_identity_t{}),
 	}
 }
 
@@ -225,6 +227,19 @@ func dispatchEventOffsets() map[string]uintptr {
 		"deadline_unix_ms":  unsafe.Offsetof(e.deadline_unix_ms),
 		"session_id":        unsafe.Offsetof(e.session_id), "request_ptr": unsafe.Offsetof(e.request_ptr),
 		"peer_ptr": unsafe.Offsetof(e.peer_ptr), "buffer": unsafe.Offsetof(e.buffer),
+	}
+}
+
+// dispatchIdentityOffsets are the aster_dispatch_identity_t field offsets
+// (ABI 7.5, pinned in ffi/src/layout.rs).
+func dispatchIdentityOffsets() map[string]uintptr {
+	var e C.aster_dispatch_identity_t
+	return map[string]uintptr{
+		"struct_size": unsafe.Offsetof(e.struct_size), "flags": unsafe.Offsetof(e.flags),
+		"peer_ptr": unsafe.Offsetof(e.peer_ptr), "peer_len": unsafe.Offsetof(e.peer_len),
+		"principal_ptr": unsafe.Offsetof(e.principal_ptr), "principal_len": unsafe.Offsetof(e.principal_len),
+		"actor_ptr": unsafe.Offsetof(e.actor_ptr), "actor_len": unsafe.Offsetof(e.actor_len),
+		"buffer": unsafe.Offsetof(e.buffer),
 	}
 }
 

@@ -475,7 +475,8 @@ type inbound struct {
 	sessionID  int32
 	deadline   time.Time
 	request    []byte
-	peer       string
+	peer       string // transport peer id
+	principal  string // Authenticator principal, else peer
 	session    *sessionRecord
 	ctx        context.Context // cancelled by the call's CANCELLED event
 	cancel     context.CancelFunc
@@ -493,17 +494,36 @@ func (s *AsterServer) onCall(ev *C.aster_dispatch_event_t) {
 	if ev.request_len > 0 {
 		in.request = C.GoBytes(unsafe.Pointer(ev.request_ptr), C.int(ev.request_len))
 	}
-	peer := cString(ev.peer_ptr, ev.peer_len)
+	// peer_ptr is the principal: the Authenticator's when HAS_PRINCIPAL is
+	// set (the transport peer then comes from aster_dispatch_identity), else
+	// the transport peer itself.
+	principal := cString(ev.peer_ptr, ev.peer_len)
+	hasPrincipal := in.flags&dispatchFlagHasPrincipal != 0
 	// HTTP/WT calls have connection ID zero and resolve a principal per call.
-	// Only authenticated Iroh peers can share a connection identity cache.
-	if in.flags&dispatchFlagIrohAuthenticated != 0 {
-		if cached, ok := s.peers[in.connID]; ok {
-			peer = cached
-		} else {
+	// Only authenticated Iroh peers share a per-connection transport id cache.
+	iroh := in.flags&dispatchFlagIrohAuthenticated != 0
+	peer, cached := "", false
+	if iroh {
+		peer, cached = s.peers[in.connID]
+	}
+	if !cached {
+		peer = principal
+		known := !hasPrincipal
+		if hasPrincipal {
+			// The call may already be over (NOT_FOUND): fall back to the
+			// principal for this call only, uncached.
+			if p, ok := s.ds.transportPeer(in.callID); ok {
+				peer, known = p, true
+			}
+		}
+		if iroh && known {
 			s.peers[in.connID] = peer
 		}
 	}
-	in.peer = peer
+	if !hasPrincipal {
+		principal = peer
+	}
+	in.peer, in.principal = peer, principal
 	s.ds.releaseBuffer(ev.buffer)
 	if d := int64(ev.deadline_unix_ms); d > 0 {
 		in.deadline = time.UnixMilli(d)
@@ -522,7 +542,7 @@ func (s *AsterServer) onCall(ev *C.aster_dispatch_event_t) {
 		rec := s.sessions[key]
 		if rec == nil {
 			rec = &sessionRecord{factory: in.svc.newSession, info: SessionInfo{
-				Service: in.svc.Name, PeerID: peer, ConnectionID: in.connID, SessionID: in.sessionID,
+				Service: in.svc.Name, PeerID: peer, Principal: principal, ConnectionID: in.connID, SessionID: in.sessionID,
 			}}
 			s.sessions[key] = rec
 		}
@@ -570,7 +590,7 @@ func (s *AsterServer) serve(in inbound) {
 	}
 	info := &CallInfo{
 		Service: in.svc.Name, Method: in.method.Name, Pattern: in.method.Pattern,
-		PeerID: in.peer, ConnectionID: in.connID, SessionID: in.sessionID, CallID: in.callID,
+		PeerID: in.peer, Principal: in.principal, ConnectionID: in.connID, SessionID: in.sessionID, CallID: in.callID,
 		Deadline: in.deadline, IrohAuthenticated: in.flags&dispatchFlagIrohAuthenticated != 0,
 	}
 	if in.flags&dispatchFlagHasMetadata != 0 {
@@ -629,7 +649,7 @@ func (s *AsterServer) intercept(info *CallInfo, m *Method, call *serverCall) err
 	}
 	cc := &CallContext{
 		Service: info.Service, Method: info.Method, CallID: strconv.FormatUint(info.CallID, 10),
-		Peer: info.PeerID, Metadata: md, Attributes: attrs, IsStreaming: m.Pattern != PatternUnary,
+		Peer: info.Principal, Metadata: md, Attributes: attrs, IsStreaming: m.Pattern != PatternUnary,
 		Pattern: m.Pattern.String(), Idempotent: m.Idempotent,
 	}
 	if info.SessionID != 0 {

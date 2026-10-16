@@ -591,9 +591,11 @@ func Version() (major, minor, patch uint32) {
 // settings beside aster_config_t (aster_config_set_network: BindAddrV6,
 // AdvertiseAddrs, RelayCACerts, Discovery); 7.4 the transfer metrics
 // (Blobs.TransferStats, fetch report v2, topology QuicTraffic / BlobTransfer)
-// and the [metrics] peer labels (aster_config_set_metrics). This binding needs
-// native ABI 7.4 or a later 7.x.
-const ABIMinorRequired = uint32(4)
+// and the [metrics] peer labels (aster_config_set_metrics); 7.5 the handler
+// call identity (aster_dispatch_identity: CallInfo.PeerID is the transport
+// peer, CallInfo.Principal the Authenticator's principal). This binding needs
+// native ABI 7.5 or a later 7.x.
+const ABIMinorRequired = uint32(5)
 
 var (
 	abiOnce sync.Once
