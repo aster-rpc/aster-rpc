@@ -65,7 +65,7 @@ use iroh::endpoint::{
 use iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use iroh::{EndpointAddr, EndpointId, RelayMap, RelayUrl, SecretKey, TransportAddr};
 use iroh_blobs::api::downloader::{
-    DownloadOptions, DownloadProgressItem, Downloader, SplitStrategy,
+    AttemptStats, DownloadOptions, DownloadProgressItem, Downloader, SplitStrategy,
 };
 use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::format::collection::Collection;
@@ -463,6 +463,15 @@ pub struct CoreProviderOutcome {
     /// Says nothing about whether the provider has the content: those
     /// attempts still count in `failures` / `completed_requests` as usual.
     pub plain_fallbacks: u32,
+    /// Payload bytes this provider's attempts decoded, failed and unfinished
+    /// attempts included (see [`CoreFetchReport::bytes_transferred`]). Summed
+    /// over all providers, this is the report's `bytes_transferred`.
+    pub bytes_transferred: u64,
+    /// Compressed bytes received from this provider over zstd, before
+    /// decompression: what crossed the network for its zstd attempts. `None`
+    /// when every attempt against it was plain, or none got connected. When
+    /// some attempts were plain and some zstd, this covers only the zstd ones.
+    pub wire_bytes: Option<u64>,
 }
 
 /// Records a multi-provider fetch as it runs, so its report can still be read
@@ -512,79 +521,141 @@ pub struct CoreFetchReport {
     /// byte once — but this is a transfer metric, not a content size: a range
     /// that was decoded and then failed to be stored is counted again when it
     /// is re-fetched.
+    ///
+    /// The sum of [`CoreProviderOutcome::bytes_transferred`]. In a
+    /// [`CoreFetchTracker`] report taken after cancellation it includes what
+    /// unfinished attempts had received.
     pub bytes_transferred: u64,
+}
+
+/// What one provider did, as [`FetchAccumulator`] counts it.
+#[derive(Default)]
+struct ProviderTally {
+    attempts: u32,
+    failures: u32,
+    completed_requests: u32,
+    plain_fallbacks: u32,
+    /// Payload of this provider's finished attempts.
+    bytes: u64,
+    /// zstd wire bytes of its finished attempts; `None` while none was zstd.
+    wire_bytes: Option<u64>,
+}
+
+/// An attempt that has started and not yet ended.
+struct ActiveAttempt {
+    provider: EndpointId,
+    /// The attempt's live counters, until its `BytesTransferred` settles them.
+    live: Option<AttemptStats>,
+}
+
+fn add_wire(sum: &mut Option<u64>, wire: Option<u64>) {
+    if let Some(wire) = wire {
+        *sum.get_or_insert(0) += wire;
+    }
 }
 
 /// Folds a download's progress stream into a [`CoreFetchReport`].
 ///
-/// Provider attribution is by request: `PartComplete` carries no provider id,
-/// so it is credited to whichever provider that request last announced with
-/// `TryProvider`. Requests are keyed by value (`GetRequest` is `Eq + Hash`),
-/// not by allocation identity.
+/// Each attempt is keyed by its request: `TryProvider` and `BytesTransferred`
+/// name the provider, `PartComplete` does not, so it is credited to whichever
+/// provider that request last announced. Requests are keyed by value
+/// (`GetRequest` is `Eq + Hash`), not by allocation identity.
+///
+/// Bytes come from each attempt's `BytesTransferred`. Until it arrives, the
+/// attempt's live counters (handed out with its `TryProvider`) stand in, so a
+/// report taken after the fetch was cancelled still counts what an unfinished
+/// attempt received.
 #[derive(Default)]
 struct FetchAccumulator {
     order: Vec<EndpointId>,
-    outcomes: HashMap<EndpointId, (u32, u32, u32)>,
-    active: HashMap<Arc<iroh_blobs::protocol::GetRequest>, EndpointId>,
-    plain_fallbacks: HashMap<EndpointId, u32>,
-    bytes: u64,
+    outcomes: HashMap<EndpointId, ProviderTally>,
+    active: HashMap<Arc<iroh_blobs::protocol::GetRequest>, ActiveAttempt>,
     errors: Vec<String>,
     part_failed: bool,
 }
 
 impl FetchAccumulator {
-    fn entry(&mut self, id: EndpointId) -> &mut (u32, u32, u32) {
+    fn entry(&mut self, id: EndpointId) -> &mut ProviderTally {
         self.outcomes.entry(id).or_insert_with(|| {
             self.order.push(id);
-            (0, 0, 0)
+            ProviderTally::default()
         })
     }
 
     fn observe(&mut self, item: DownloadProgressItem) {
         match item {
-            DownloadProgressItem::TryProvider { id, request } => {
-                self.entry(id).0 += 1;
-                self.active.insert(request, id);
+            DownloadProgressItem::TryProvider { id, request, stats } => {
+                self.entry(id).attempts += 1;
+                self.active.insert(
+                    request,
+                    ActiveAttempt {
+                        provider: id,
+                        live: Some(stats),
+                    },
+                );
             }
             DownloadProgressItem::ProviderFailed { id, request } => {
-                self.entry(id).1 += 1;
+                self.entry(id).failures += 1;
                 self.active.remove(&request);
             }
             DownloadProgressItem::PartComplete { request } => {
-                if let Some(id) = self.active.remove(&request) {
-                    self.entry(id).2 += 1;
+                if let Some(attempt) = self.active.remove(&request) {
+                    self.entry(attempt.provider).completed_requests += 1;
                 }
             }
-            DownloadProgressItem::BytesTransferred(n) => self.bytes += n,
+            DownloadProgressItem::BytesTransferred {
+                id,
+                request,
+                bytes,
+                wire_bytes,
+            } => {
+                if let Some(attempt) = self.active.get_mut(&request) {
+                    attempt.live = None;
+                }
+                let tally = self.entry(id);
+                tally.bytes += bytes;
+                add_wire(&mut tally.wire_bytes, wire_bytes);
+            }
             DownloadProgressItem::Error(err) => self.errors.push(err.to_string()),
             DownloadProgressItem::DownloadError => self.part_failed = true,
             DownloadProgressItem::Progress(_) => {}
             DownloadProgressItem::PlainFallback { id, .. } => {
-                self.entry(id);
-                *self.plain_fallbacks.entry(id).or_default() += 1;
+                self.entry(id).plain_fallbacks += 1;
             }
         }
     }
 
     fn snapshot(&self) -> CoreFetchReport {
-        let providers = self
+        let providers: Vec<CoreProviderOutcome> = self
             .order
             .iter()
             .map(|id| {
-                let (attempts, failures, completed_requests) = self.outcomes[id];
+                let tally = &self.outcomes[id];
+                let mut bytes = tally.bytes;
+                let mut wire_bytes = tally.wire_bytes;
+                let mut in_flight = 0;
+                for attempt in self.active.values().filter(|a| a.provider == *id) {
+                    in_flight += 1;
+                    if let Some(live) = &attempt.live {
+                        bytes += live.payload_bytes();
+                        add_wire(&mut wire_bytes, live.wire_bytes());
+                    }
+                }
                 CoreProviderOutcome {
                     node_id: id.to_string(),
-                    attempts,
-                    failures,
-                    completed_requests,
-                    in_flight: self.active.values().filter(|a| *a == id).count() as u32,
-                    plain_fallbacks: self.plain_fallbacks.get(id).copied().unwrap_or(0),
+                    attempts: tally.attempts,
+                    failures: tally.failures,
+                    completed_requests: tally.completed_requests,
+                    in_flight,
+                    plain_fallbacks: tally.plain_fallbacks,
+                    bytes_transferred: bytes,
+                    wire_bytes,
                 }
             })
             .collect();
         CoreFetchReport {
+            bytes_transferred: providers.iter().map(|p| p.bytes_transferred).sum(),
             providers,
-            bytes_transferred: self.bytes,
         }
     }
 

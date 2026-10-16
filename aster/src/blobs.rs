@@ -136,6 +136,8 @@ pub struct ProviderOutcome {
     completed_requests: u32,
     in_flight: u32,
     plain_fallbacks: u32,
+    bytes_transferred: u64,
+    wire_bytes: Option<u64>,
 }
 
 impl ProviderOutcome {
@@ -171,6 +173,24 @@ impl ProviderOutcome {
     pub fn plain_fallbacks(&self) -> u32 {
         self.plain_fallbacks
     }
+    /// Payload bytes this provider carried during the fetch: what its
+    /// attempts decoded, failed ones included, as
+    /// [`FetchReport::bytes_transferred`] counts them. Summed over all
+    /// providers, this is the report's `bytes_transferred`.
+    ///
+    /// In a [`FetchTracker`] report taken after the fetch was cancelled, it
+    /// includes what the attempt in flight had received so far.
+    pub fn bytes_transferred(&self) -> u64 {
+        self.bytes_transferred
+    }
+    /// Compressed bytes received from this provider over zstd: what crossed
+    /// the network for the payload it carried. `None` when every attempt
+    /// against it went over plain transport, where wire and payload are the
+    /// same bytes. If it served some attempts plain and some over zstd, this
+    /// covers only the zstd ones.
+    pub fn wire_bytes(&self) -> Option<u64> {
+        self.wire_bytes
+    }
 }
 
 impl From<CoreProviderOutcome> for ProviderOutcome {
@@ -182,6 +202,8 @@ impl From<CoreProviderOutcome> for ProviderOutcome {
             completed_requests: o.completed_requests,
             in_flight: o.in_flight,
             plain_fallbacks: o.plain_fallbacks,
+            bytes_transferred: o.bytes_transferred,
+            wire_bytes: o.wire_bytes,
         }
     }
 }
@@ -253,6 +275,10 @@ impl FetchReport {
     /// what is already stored, so ordinary failover counts each byte once —
     /// but this is a transfer metric, not a content size: a range that was
     /// decoded and then failed to be stored is re-fetched and counted again.
+    ///
+    /// The sum of [`ProviderOutcome::bytes_transferred`] over
+    /// [`Self::providers`]; after cancellation, it includes what the attempts
+    /// in flight had received.
     pub fn bytes_transferred(&self) -> u64 {
         self.bytes_transferred
     }

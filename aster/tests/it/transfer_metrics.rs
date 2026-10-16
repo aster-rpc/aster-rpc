@@ -92,7 +92,7 @@ async fn view_until(
     found.unwrap_or_else(|_| panic!("timed out waiting for {what}: {last:#?}"))
 }
 
-async fn fetch(consumer: &Node, provider: &Node, hash: &aster::Hash) {
+async fn fetch(consumer: &Node, provider: &Node, hash: &aster::Hash) -> aster::FetchReport {
     timeout(
         WAIT,
         consumer.blobs().download_hash_to_store_from(
@@ -104,7 +104,7 @@ async fn fetch(consumer: &Node, provider: &Node, hash: &aster::Hash) {
     )
     .await
     .expect("fetch in time")
-    .expect("fetch");
+    .expect("fetch")
 }
 
 /// Portal's acceptance: A fetches a compressible blob from B over zstd, then
@@ -125,8 +125,8 @@ async fn blob_bytes_by_peer_and_encoding() {
         BlobTransportCompression::PreferZstd
     );
 
-    fetch(&a, &b, &text_hash).await;
-    fetch(&a, &c, &noise_hash).await;
+    let from_b_report = fetch(&a, &b, &text_hash).await;
+    let from_c_report = fetch(&a, &c, &noise_hash).await;
     assert_eq!(a.blobs().read_to_bytes(&text_hash).await.unwrap(), text);
     assert_eq!(a.blobs().read_to_bytes(&noise_hash).await.unwrap(), noise);
 
@@ -143,6 +143,30 @@ async fn blob_bytes_by_peer_and_encoding() {
         "compressed blob traffic {zstd_rx} B for {SIZE} B payload"
     );
     assert_eq!(from_b.quic_traffic.blobs.quic_bytes_received, 0);
+    // Compressed bytes fetched from B, attributed to B.
+    let fetched_wire = from_b.blob_transfer.fetched_wire_bytes;
+    assert!(
+        fetched_wire > 0 && fetched_wire < SIZE / 2,
+        "fetched {fetched_wire} wire bytes for {SIZE} B payload"
+    );
+    assert!(from_b.blob_transfer.fetched_plain_bytes > SIZE);
+    assert!(fetched_wire <= zstd_rx);
+
+    // Each fetch's report names its provider with its payload, and the zstd
+    // one its compressed bytes (the same figure as the per-peer one).
+    let [b_outcome] = from_b_report.providers() else {
+        panic!("one provider expected: {from_b_report:?}");
+    };
+    assert_eq!(b_outcome.node_id(), &b.id());
+    assert_eq!(b_outcome.bytes_transferred(), SIZE);
+    assert_eq!(b_outcome.wire_bytes(), Some(fetched_wire));
+    assert_eq!(from_b_report.bytes_transferred(), SIZE);
+    let [c_outcome] = from_c_report.providers() else {
+        panic!("one provider expected: {from_c_report:?}");
+    };
+    assert_eq!(c_outcome.node_id(), &c.id());
+    assert_eq!(c_outcome.bytes_transferred(), SIZE);
+    assert_eq!(c_outcome.wire_bytes(), None);
 
     // A's view of C: plain payload, no zstd, QUIC bytes at least the payload.
     let from_c = view_until(&a, &c.id(), "A's view of C", |v| {
@@ -151,6 +175,8 @@ async fn blob_bytes_by_peer_and_encoding() {
     .await;
     assert_eq!(from_c.blob_transfer.fetched_zstd_payload_bytes, 0);
     assert_eq!(from_c.blob_transfer.plain_fallbacks, 1);
+    assert_eq!(from_c.blob_transfer.fetched_wire_bytes, 0);
+    assert_eq!(from_c.blob_transfer.fetched_plain_bytes, 0);
     assert!(from_c.quic_traffic.blobs.quic_bytes_received >= SIZE);
     assert_eq!(from_c.quic_traffic.blobs_zstd, Default::default());
 
@@ -164,6 +190,11 @@ async fn blob_bytes_by_peer_and_encoding() {
     assert_eq!(
         to_a.blob_transfer.served_wire_bytes,
         a_stats.fetched_wire_bytes
+    );
+    assert_eq!(to_a.blob_transfer.served_wire_bytes, fetched_wire);
+    assert_eq!(
+        to_a.blob_transfer.served_plain_bytes,
+        from_b.blob_transfer.fetched_plain_bytes
     );
     assert_eq!(
         to_a.blob_transfer.served_plain_bytes,

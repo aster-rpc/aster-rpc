@@ -21,7 +21,8 @@
 # connections of its previous process. iroh-util 0.6.3 and iroh-blobs 0.103.9
 # retire a pooled blob connection whose provider stopped acknowledging (a restart
 # on a new port) and retry on a fresh one, instead of waiting out QUIC's idle
-# timeout.
+# timeout. iroh-blobs 0.103.10 attributes each downloader attempt's payload and
+# compressed bytes to its provider, live while the attempt runs.
 #
 # Regenerate every upgrade cycle. See docs/iroh-patches.md for the patch ledger
 # and the full upgrade procedure.
@@ -65,12 +66,12 @@ registry_bridge_crates = ["iroh-mdns-address-lookup", "iroh-tickets"]
 [forks.iroh-blobs]
 repo = "https://forge.emrul.dev/Aster/iroh-blobs.git"
 upstream_base = "v0.103.0"
-tag = "aster-iroh-blobs-v0.103.9"
-commit = "094bdd2f17b6b73d47393af840675e93a0f5e0f2"
+tag = "aster-iroh-blobs-v0.103.10"
+commit = "bcd00bb2a888f3d6990ac32d9fab1d8e2d9d73f4"
 branch = "upgrade/iroh-blobs-v0.103"
 crates = ["iroh-blobs"]
 registry_crates = ["iroh-blobs"]
-crate_version = "0.103.9"
+crate_version = "0.103.10"
 
 [forks.iroh-docs]
 repo = "https://forge.emrul.dev/Aster/iroh-docs.git"
@@ -211,7 +212,7 @@ portmapper = "0.19.3"                # iroh 1.3.0 (net-tools 0030e57fc70981895bb
 version_specs = """
 salvo       = "=1.0.4"
 iroh        = "=1.3.2"
-iroh-blobs  = "0.103.9"
+iroh-blobs  = "0.103.10"
 iroh-docs   = "0.101.5"
 iroh-gossip = "0.101.1"
 iroh-tickets = "=1.0.0"
@@ -224,7 +225,7 @@ patch_crates_io = """
 iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
-iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "094bdd2f17b6b73d47393af840675e93a0f5e0f2" }
+iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "bcd00bb2a888f3d6990ac32d9fab1d8e2d9d73f4" }
 iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
 noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }

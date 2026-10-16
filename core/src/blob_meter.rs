@@ -1,22 +1,21 @@
 //! Blob transfer accounting: every blob transfer this node fetches or serves,
 //! plain or zstd, node-wide and per peer.
 //!
-//! Three sources feed it, none of which needs a change to iroh-blobs:
+//! Three sources feed it:
 //!
 //! - **Fetch payload** comes from the downloader's progress stream. Each
-//!   provider attempt reports `TryProvider`, an optional `PlainFallback`, one
-//!   `BytesTransferred` (payload decoded by that attempt) and then
-//!   `PartComplete` or `ProviderFailed`. The downloader emits one attempt's
-//!   items contiguously, also when it splits a HashSeq into concurrent child
-//!   requests (it drains each child's channel in turn), so `BytesTransferred`
-//!   belongs to the provider of the latest `TryProvider`.
+//!   provider attempt reports `TryProvider` (with its live `AttemptStats`), an
+//!   optional `PlainFallback`, one `BytesTransferred` naming its provider and
+//!   request, and then `PartComplete` or `ProviderFailed`. Attempts are keyed
+//!   by request, so concurrent split children are attributed exactly.
 //! - **Serve payload** comes from provider events on both blob handlers:
 //!   `ClientConnected` maps the connection to its peer, and each request's
 //!   `TransferCompleted` / `TransferAborted` carries its payload bytes.
-//! - **zstd wire bytes** come from the transforms' counters. The fetching side
-//!   shares one transform across the downloaders, so its wire bytes are
-//!   node-wide only. The serving side gets one transform per connection, so
-//!   its wire bytes are also known per peer.
+//! - **zstd wire bytes** come from the transforms' counters. Node-wide, the
+//!   fetching side's shared transform counts every stream. Per peer, each
+//!   fetch attempt tallies its own streams (`BytesTransferred::wire_bytes` and
+//!   the attempt's `AttemptStats`), and the serving side gets one transform per
+//!   connection.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,7 +23,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use iroh::endpoint::Connection;
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::EndpointId;
-use iroh_blobs::api::downloader::DownloadProgressItem;
+use iroh_blobs::api::downloader::{AttemptStats, DownloadProgressItem};
 use iroh_blobs::api::Store as BlobStore;
 use iroh_blobs::provider::events::{
     ConnectMode, EventMask, EventSender, ProviderMessage, RequestMode, RequestUpdate,
@@ -133,15 +132,19 @@ pub struct CoreBlobTransferStats {
 /// Blob transfer counters for one peer, since this node started and across
 /// reconnects. Monotonic.
 ///
-/// The zstd wire bytes of a fetch are not attributed to a provider: the
-/// fetching side shares one zstd transform across all providers. The peer's
-/// QUIC bytes on the `blobs-zstd` protocol are the closest per-peer figure.
+/// Fetch figures are counted when each attempt ends, so an attempt of a fetch
+/// that was cancelled mid-transfer is not included.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CorePeerBlobStats {
     /// Payload bytes fetched from this peer, plain and zstd.
     pub fetched_payload_bytes: u64,
     /// The part of `fetched_payload_bytes` that came over zstd.
     pub fetched_zstd_payload_bytes: u64,
+    /// Compressed bytes received from this peer while fetching over zstd.
+    pub fetched_wire_bytes: u64,
+    /// Protocol bytes those decompressed to (zstd payload plus a small
+    /// protocol overhead).
+    pub fetched_plain_bytes: u64,
     /// Payload bytes served to this peer, plain and zstd.
     pub served_payload_bytes: u64,
     /// The part of `served_payload_bytes` that went out over zstd.
@@ -176,6 +179,8 @@ struct PeerState {
     fetched: [u64; 2],
     served: [u64; 2],
     plain_fallbacks: u64,
+    /// zstd counters of finished fetch attempts against this peer.
+    fetch_zstd: ZstdStatsSnapshot,
     /// zstd serve counters of this peer's connections that have finished.
     serve_zstd_closed: ZstdStatsSnapshot,
 }
@@ -217,18 +222,34 @@ impl MeterState {
     }
 }
 
-/// Which provider (and encoding) the fetch's current attempt is using.
+/// A fetch attempt that has started and not yet ended.
+struct FetchAttempt {
+    provider: EndpointId,
+    encoding: CoreBlobEncoding,
+    stats: AttemptStats,
+}
+
+/// The attempts of one fetch that have started and not yet ended, by request.
 pub(crate) struct FetchAttribution {
     /// The downloader offers zstd first.
     zstd: bool,
-    current: Option<(EndpointId, CoreBlobEncoding)>,
+    active: HashMap<Arc<iroh_blobs::protocol::GetRequest>, FetchAttempt>,
 }
 
 impl FetchAttribution {
     pub(crate) fn new(mode: CoreBlobCompression) -> Self {
         Self {
             zstd: mode != CoreBlobCompression::Off,
-            current: None,
+            active: HashMap::new(),
+        }
+    }
+
+    /// The encoding an attempt that is not (or no longer) tracked used.
+    fn default_encoding(&self) -> CoreBlobEncoding {
+        if self.zstd {
+            CoreBlobEncoding::Zstd
+        } else {
+            CoreBlobEncoding::Plain
         }
     }
 }
@@ -258,42 +279,63 @@ impl BlobMeter {
     /// Fold one item of a download's progress stream into the counters.
     pub(crate) fn observe_fetch(&self, attr: &mut FetchAttribution, item: &DownloadProgressItem) {
         match item {
-            DownloadProgressItem::TryProvider { id, .. } => {
-                let encoding = if attr.zstd {
-                    CoreBlobEncoding::Zstd
-                } else {
-                    CoreBlobEncoding::Plain
+            DownloadProgressItem::TryProvider { id, request, stats } => {
+                let attempt = FetchAttempt {
+                    provider: *id,
+                    encoding: attr.default_encoding(),
+                    stats: stats.clone(),
                 };
-                attr.current = Some((*id, encoding));
+                attr.active.insert(request.clone(), attempt);
             }
             DownloadProgressItem::PlainFallback { id, .. } => {
-                if let Some((current, encoding)) = &mut attr.current {
-                    if current == id {
-                        *encoding = CoreBlobEncoding::Plain;
+                // It names no request; it follows the `TryProvider` of the
+                // attempt it qualifies, and a provider that refuses zstd
+                // refuses it on every concurrent attempt too.
+                for attempt in attr.active.values_mut() {
+                    if attempt.provider == *id {
+                        attempt.encoding = CoreBlobEncoding::Plain;
                     }
                 }
                 let mut s = self.lock();
                 s.plain_fallbacks += 1;
                 s.peer(*id).plain_fallbacks += 1;
             }
-            DownloadProgressItem::BytesTransferred(n) => {
-                let Some((id, encoding)) = attr.current else {
-                    return;
+            DownloadProgressItem::BytesTransferred {
+                id,
+                request,
+                bytes,
+                wire_bytes,
+            } => {
+                // Wire bytes are reported exactly when the attempt ran over
+                // the zstd transform.
+                let encoding = if wire_bytes.is_some() {
+                    CoreBlobEncoding::Zstd
+                } else {
+                    CoreBlobEncoding::Plain
                 };
+                // The attempt has ended, so its tally is final.
+                let tally = attr
+                    .active
+                    .get(request)
+                    .and_then(|a| a.stats.transform_tally());
                 let mut s = self.lock();
-                s.fetched[slot(encoding)] += n;
-                s.peer(id).fetched[slot(encoding)] += n;
-            }
-            DownloadProgressItem::PartComplete { .. } => {
-                if let Some((_, encoding)) = attr.current.take() {
-                    self.lock().fetch_transfers.bump(encoding, true);
+                s.fetched[slot(encoding)] += bytes;
+                let peer = s.peer(*id);
+                peer.fetched[slot(encoding)] += bytes;
+                if let Some(tally) = tally {
+                    peer.fetch_zstd.wire_bytes_read += tally.wire_bytes_read;
+                    peer.fetch_zstd.plain_bytes_read += tally.plain_bytes_read;
                 }
             }
-            DownloadProgressItem::ProviderFailed { id, .. } => {
-                let encoding = match attr.current.take() {
-                    Some((current, encoding)) if current == *id => encoding,
-                    _ if attr.zstd => CoreBlobEncoding::Zstd,
-                    _ => CoreBlobEncoding::Plain,
+            DownloadProgressItem::PartComplete { request } => {
+                if let Some(attempt) = attr.active.remove(request) {
+                    self.lock().fetch_transfers.bump(attempt.encoding, true);
+                }
+            }
+            DownloadProgressItem::ProviderFailed { id, request } => {
+                let encoding = match attr.active.remove(request) {
+                    Some(attempt) if attempt.provider == *id => attempt.encoding,
+                    _ => attr.default_encoding(),
                 };
                 self.lock().fetch_transfers.bump(encoding, false);
             }
@@ -468,6 +510,8 @@ impl BlobMeter {
         CorePeerBlobStats {
             fetched_payload_bytes: p.fetched[plain] + p.fetched[zstd],
             fetched_zstd_payload_bytes: p.fetched[zstd],
+            fetched_wire_bytes: p.fetch_zstd.wire_bytes_read,
+            fetched_plain_bytes: p.fetch_zstd.plain_bytes_read,
             served_payload_bytes: p.served[plain] + p.served[zstd],
             served_zstd_payload_bytes: p.served[zstd],
             served_wire_bytes: serve.wire_bytes_written,

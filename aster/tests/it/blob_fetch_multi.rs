@@ -625,9 +625,9 @@ async fn interrupted_download_resumes_verified_partial_content() -> anyhow::Resu
     Ok(())
 }
 
-/// A blobs provider that serves one chunk group of `payload` and then stops
-/// sending, with its connection still alive: it never answers a throttle
-/// request and keeps each one, so the transfer sits open.
+/// A blobs provider that serves the first chunk groups of `payload` and then
+/// stops sending, with its connection still alive: it holds every throttle
+/// request past the allowed ones, so the transfer sits open.
 struct StallingProvider {
     id: NodeId,
     router: aster::native::iroh::protocol::Router,
@@ -635,7 +635,13 @@ struct StallingProvider {
 }
 
 impl StallingProvider {
+    /// Serves one chunk group, then stalls.
     async fn start(payload: &[u8], consumer: &Node) -> anyhow::Result<Self> {
+        Self::start_allowing(payload, consumer, 0).await
+    }
+
+    /// Serves `allow` + 1 chunk groups, then stalls.
+    async fn start_allowing(payload: &[u8], consumer: &Node, allow: usize) -> anyhow::Result<Self> {
         use aster::native::{
             iroh::{address_lookup::memory::MemoryLookup, endpoint::presets, protocol::Router},
             iroh_blobs::{
@@ -667,9 +673,15 @@ impl StallingProvider {
             .spawn();
         let gate = tokio::spawn(async move {
             let mut held = Vec::new();
+            let mut allowed = 0;
             while let Some(message) = messages.recv().await {
                 if let ProviderMessage::Throttle(message) = message {
-                    held.push(message);
+                    if allowed < allow {
+                        allowed += 1;
+                        message.tx.send(Ok(())).await.ok();
+                    } else {
+                        held.push(message);
+                    }
                 }
             }
         });
@@ -772,8 +784,83 @@ async fn tracker_reports_the_provider_a_cancelled_fetch_was_waiting_on() -> anyh
     assert_eq!(ids(report.in_flight()), vec![stalled.id.to_string()]);
     assert!(report.failed().next().is_none());
     assert!(report.served().next().is_none());
+    // The bytes the unfinished attempt received are in the report: the
+    // provider served one chunk group before stalling.
+    let stalled_outcome = &report.providers()[0];
+    assert!(
+        stalled_outcome.bytes_transferred() > 0
+            && stalled_outcome.bytes_transferred() < payload.len() as u64,
+        "{report:?}"
+    );
+    assert_eq!(
+        stalled_outcome.bytes_transferred(),
+        report.bytes_transferred()
+    );
+    // A plain-only provider: no compressed bytes.
+    assert_eq!(stalled_outcome.wire_bytes(), None);
 
     stalled.shutdown().await?;
+    holder.shutdown().await;
+    consumer.shutdown().await;
+    Ok(())
+}
+
+/// Portal's M3 acceptance: a failover fetch whose first provider dies after
+/// delivering part of the blob credits bytes to both providers, and they add
+/// up to the report's total.
+#[tokio::test]
+async fn failover_credits_bytes_to_a_provider_that_died_mid_transfer() -> anyhow::Result<()> {
+    let payload = stall_payload();
+    let holder = start_node().await;
+    let hash = holder.blobs().add_bytes(payload.clone()).await?;
+    let consumer = start_node().await;
+    connect(&consumer, &holder);
+    let dying = StallingProvider::start_allowing(&payload, &consumer, 3).await?;
+    let dying_id = dying.id.clone();
+
+    let blobs = consumer.blobs().with_provider_idle_timeout(None);
+    let from = [dying_id.clone(), holder.id()];
+    let fetch = blobs.download_hash_from(&hash, &from, BlobFormat::Raw, FetchStrategy::Whole);
+    // Kill the first provider once part of the blob's content is stored.
+    let native_hash: aster::native::iroh_blobs::Hash = hash.as_str().parse()?;
+    let kill = async {
+        let store = consumer.blobs().native_store();
+        let content = aster::native::iroh_blobs::HashAndFormat::raw(native_hash);
+        while store.remote().local(content).await?.local_bytes() == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        dying.shutdown().await
+    };
+    let (fetched, killed) = timeout(FETCH_TIMEOUT, async { tokio::join!(fetch, kill) })
+        .await
+        .expect("the fetch did not fail over from the dead provider");
+    killed?;
+    let (got, report) = fetched?;
+
+    assert_eq!(got, payload);
+    assert_eq!(
+        ids(report.attempted()),
+        vec![dying_id.to_string(), holder.id().to_string()]
+    );
+    assert_eq!(ids(report.failed()), vec![dying_id.to_string()]);
+    assert_eq!(ids(report.served()), vec![holder.id().to_string()]);
+    let [from_dying, from_holder] = report.providers() else {
+        panic!("two providers expected: {report:?}");
+    };
+    assert!(from_dying.bytes_transferred() > 0, "{report:?}");
+    assert!(from_holder.bytes_transferred() > 0, "{report:?}");
+    assert_eq!(
+        from_dying.bytes_transferred() + from_holder.bytes_transferred(),
+        report.bytes_transferred()
+    );
+    assert_eq!(report.bytes_transferred(), payload.len() as u64);
+    // The dead provider served plain; the holder over zstd.
+    assert_eq!(from_dying.wire_bytes(), None);
+    assert!(
+        from_holder.wire_bytes().is_some_and(|w| w > 0),
+        "{report:?}"
+    );
+
     holder.shutdown().await;
     consumer.shutdown().await;
     Ok(())
