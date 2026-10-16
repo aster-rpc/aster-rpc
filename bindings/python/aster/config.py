@@ -44,6 +44,26 @@ TOML example (``aster.toml``)::
 
     [identity]
     file = "~/.aster/.aster-identity"   # credential file (peers, enrollment)
+    accept_on_behalf_of = true          # gateway identity (see below)
+
+    [[identity.trusted_issuers]]        # see TrustedIssuer
+    iss = "https://accounts.example.com"
+    audiences = ["notes"]
+
+    [remote_config]                     # aster.ops.NodeConfig
+    lock = ["identity"]
+
+Gateway identity (``docs/_internal/web_gateway/gateway-identity.md``): with
+``identity_accept_on_behalf_of`` an :class:`aster.AsterServer` accepts calls
+an edge holding ``aster.gateway`` makes on behalf of a user, verifying the
+``aster-on-behalf-of`` token (edge-minted, or from a
+``identity_trusted_issuers`` provider) before Gate 3. ``identity_publisher``
+(``[identity.publisher]``) runs the issuer-key publisher on the node that
+fetches provider keys; ``remote_config_enabled`` / ``remote_config_lock``
+govern ``aster.ops.NodeConfig``. ``setting_sources`` records where each
+overridable ``[identity]`` setting came from (filled by the loaders; a value
+changed with :meth:`AsterConfig.replace` drops its entry, so NodeConfig
+reports it as set in code).
 
 Enrollment: a configuration that sets an ``[enrollment]`` audience, fleet
 namespace or issuer delegation, or a credential (``enrollment_credential_file``
@@ -95,9 +115,19 @@ _ENV_OVERRIDES = {
 
 
 def _env_var(name: str) -> str | None:
-    if name == "alpns":
+    if name in ("alpns", "setting_sources"):
         return None
     return _ENV_OVERRIDES.get(name, f"ASTER_{name.upper()}")
+
+
+# The ``setting_sources`` key of each overridable ``[identity]`` field.
+_IDENTITY_SETTING_KEYS = {
+    "identity_accept_on_behalf_of": "identity.accept_on_behalf_of",
+    "identity_trusted_issuers": "identity.trusted_issuers",
+    "identity_edge_token_max_lifetime_secs": "identity.edge_token_max_lifetime_secs",
+    "identity_clock_leeway_secs": "identity.clock_leeway_secs",
+    "identity_max_key_set_age_secs": "identity.max_key_set_age_secs",
+}
 
 
 def _toml_section(name: str) -> str:
@@ -114,8 +144,14 @@ def _toml_section(name: str) -> str:
         return "[storage]"
     if name.startswith("log_"):
         return "[logging]"
-    if name == "identity_file":
+    if name == "identity_publisher":
+        return "[identity.publisher]"
+    if name == "identity_trusted_issuers":
+        return "[[identity.trusted_issuers]]"
+    if name.startswith("identity_"):
         return "[identity]"
+    if name.startswith("remote_config_"):
+        return "[remote_config]"
     if name.startswith("health_"):
         return "[health]"
     if name.startswith("metrics_"):
@@ -274,6 +310,91 @@ class EnrollmentConfig:
         roles["tags"] = {k: tuple(v) for k, v in roles["tags"].items()}
         d["roles"] = RoleMappingConfig(**roles)
         return cls(**d)
+
+
+@dataclass(frozen=True)
+class TrustedIssuer:
+    """An identity provider whose tokens a server accepts in
+    ``aster-on-behalf-of`` (``[[identity.trusted_issuers]]``; Rust
+    ``aster::TrustedIssuer``). Its keys come from the fleet namespace,
+    published by a node holding ``aster.identity-publisher``; this says whom
+    to trust and how to map roles. Needs Enrollment."""
+
+    iss: str
+    """The exact ``iss`` claim."""
+    audiences: tuple[str, ...]
+    """Accepted ``aud`` values. Required."""
+    roles_claim: str | None = None
+    """The claim roles are read from (an array, or space-separated text)."""
+    role_map: Mapping[str, str] = dc_field(default_factory=dict)
+    """Claim value -> Aster role; unmapped values grant nothing."""
+    max_token_lifetime_secs: int = 900
+    """Longest ``exp - iat`` accepted."""
+
+    def __post_init__(self) -> None:
+        aud = self.audiences
+        object.__setattr__(self, "audiences", (aud,) if isinstance(aud, str) else tuple(aud))
+        object.__setattr__(self, "role_map", dict(self.role_map or {}))
+
+    def _to_native(self) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "iss": self.iss,
+            "audiences": list(self.audiences),
+            "max_token_lifetime_secs": self.max_token_lifetime_secs,
+        }
+        if self.roles_claim is not None:
+            out["roles_claim"] = self.roles_claim
+        if self.role_map:
+            out["role_map"] = dict(self.role_map)
+        return out
+
+
+@dataclass(frozen=True)
+class IdentityPublisherConfig:
+    """``[identity.publisher]`` (Rust ``aster::IdentityPublisherConfig``): on
+    the node that publishes issuer keys, normally the gateway. It fetches each
+    issuer's JWK set over validated HTTPS and writes it into the fleet
+    namespace. Needs Enrollment, a credential granting
+    ``aster.identity-publisher`` and the root's sealed write grant."""
+
+    issuers: tuple[str, ...]
+    """The issuers (``iss``) to publish keys for."""
+    jwks_url: Mapping[str, str] = dc_field(default_factory=dict)
+    """Issuer -> the HTTPS URL of its JWK set."""
+    refresh_secs: int = 3600
+    """Scheduled refresh interval (60..=86400)."""
+    min_refresh_secs: int = 60
+    """Shortest gap between two unknown-kid refreshes of one issuer."""
+    ca_certs: tuple[str, ...] = ()
+    """Extra PEM trust anchors for the providers' TLS."""
+    ca_only: bool = False
+    """Trust only ``ca_certs``."""
+
+    def __post_init__(self) -> None:
+        iss = self.issuers
+        object.__setattr__(self, "issuers", (iss,) if isinstance(iss, str) else tuple(iss))
+        object.__setattr__(self, "jwks_url", dict(self.jwks_url or {}))
+        object.__setattr__(self, "ca_certs", tuple(os.fspath(p) for p in self.ca_certs or ()))
+
+    def _to_native(self) -> dict[str, Any]:
+        return {
+            "issuers": list(self.issuers),
+            "jwks_url": dict(self.jwks_url),
+            "refresh_secs": self.refresh_secs,
+            "min_refresh_secs": self.min_refresh_secs,
+            "ca_certs": list(self.ca_certs),
+            "ca_only": self.ca_only,
+        }
+
+
+def _trusted_issuer(value: Any) -> TrustedIssuer:
+    if isinstance(value, TrustedIssuer):
+        return value
+    if isinstance(value, Mapping):
+        return TrustedIssuer(**value)
+    raise TypeError(
+        f"identity_trusted_issuers: expected TrustedIssuer or dict, got {type(value).__name__}"
+    )
 
 
 def _role_list(value: Any) -> list[str]:
@@ -450,6 +571,38 @@ class AsterConfig:
     enrollment: EnrollmentConfig = dc_field(default_factory=EnrollmentConfig)
     """The ``[enrollment]`` section; also accepts a dict of its fields."""
 
+    # -- Gateway identity ([identity], [identity.publisher]) --------------------
+    identity_accept_on_behalf_of: bool = False
+    """Accept calls an edge holding ``aster.gateway`` makes on behalf of a
+    user (``ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF``, ``[identity]
+    accept_on_behalf_of``). Off: the ``aster-on-behalf-of`` entry is refused."""
+    identity_trusted_issuers: tuple[TrustedIssuer, ...] = ()
+    """External identity providers (``[[identity.trusted_issuers]]``,
+    ``ASTER_IDENTITY_TRUSTED_ISSUERS`` as a JSON array); dicts accepted."""
+    identity_edge_token_max_lifetime_secs: int = 300
+    """Longest edge-minted token, 1..=300."""
+    identity_clock_leeway_secs: int = 60
+    """Leeway on ``iat`` / ``nbf``, 0..=300."""
+    identity_max_key_set_age_secs: int = 172_800
+    """Oldest issuer key set verified with, 60..=2592000."""
+    identity_publisher: IdentityPublisherConfig | None = None
+    """``[identity.publisher]`` (``ASTER_IDENTITY_PUBLISHER`` as JSON); a
+    dict is accepted."""
+
+    # -- aster.ops.NodeConfig ([remote_config]) ---------------------------------
+    remote_config_enabled: bool = True
+    """Serve ``aster.ops.NodeConfig`` behind ``aster.config-admin``
+    (``ASTER_REMOTE_CONFIG_ENABLED``)."""
+    remote_config_lock: tuple[str, ...] = ()
+    """Sections remote overrides may not change, e.g. ``("identity",)``
+    (``ASTER_REMOTE_CONFIG_LOCK``)."""
+    setting_sources: Mapping[str, str] = dc_field(
+        default_factory=dict, repr=False, compare=False
+    )
+    """Where each overridable setting came from (``identity.<field>`` ->
+    ``file`` / ``env`` / ...), filled by the loaders and reported by
+    NodeConfig ``get``; :meth:`replace` drops a changed field's entry."""
+
     # -- Internal -------------------------------------------------------------
     _sources: Mapping[str, str] = dc_field(
         default_factory=dict, init=False, repr=False, compare=False
@@ -489,6 +642,26 @@ class AsterConfig:
                 f"enrollment: expected EnrollmentConfig or dict, got {type(enrollment).__name__}"
             )
         raw["enrollment"] = enrollment._to_native()
+        issuers = raw["identity_trusted_issuers"] or ()
+        if isinstance(issuers, (TrustedIssuer, Mapping)):
+            issuers = (issuers,)
+        raw["identity_trusted_issuers"] = [_trusted_issuer(i)._to_native() for i in issuers]
+        publisher = raw["identity_publisher"]
+        if isinstance(publisher, Mapping):
+            publisher = IdentityPublisherConfig(**publisher)
+        if isinstance(publisher, IdentityPublisherConfig):
+            raw["identity_publisher"] = publisher._to_native()
+        elif publisher is not None:
+            raise TypeError(
+                "identity_publisher: expected IdentityPublisherConfig or dict, "
+                f"got {type(publisher).__name__}"
+            )
+        raw["remote_config_lock"] = (
+            [raw["remote_config_lock"]]
+            if isinstance(raw["remote_config_lock"], str)
+            else list(raw["remote_config_lock"] or ())
+        )
+        raw["setting_sources"] = dict(raw["setting_sources"] or {})
         native = NativeAsterConfig(**raw)
         self._adopt(native)
 
@@ -502,6 +675,12 @@ class AsterConfig:
                 value = tuple(value)
             elif name == "enrollment":
                 value = EnrollmentConfig._from_native(value)
+            elif name == "identity_trusted_issuers":
+                value = tuple(TrustedIssuer(**i) for i in value)
+            elif name == "identity_publisher" and value is not None:
+                value = IdentityPublisherConfig(**value)
+            elif name == "remote_config_lock":
+                value = tuple(value)
             object.__setattr__(self, name, value)
         object.__setattr__(self, "_native_cfg", native)
 
@@ -528,7 +707,7 @@ class AsterConfig:
         sources = {
             name: _env_var(name) or "env"
             for name, value in native.to_dict().items()
-            if value != base[name]
+            if value != base[name] and name != "setting_sources"
         }
         return cls._from_native(native, sources)
 
@@ -545,6 +724,8 @@ class AsterConfig:
         file_only = NativeAsterConfig.file_only(path).to_dict()
         sources: dict[str, str] = {}
         for name, value in native.to_dict().items():
+            if name == "setting_sources":
+                continue
             if value != file_only[name]:
                 sources[name] = _env_var(name) or "env"
             elif value != base[name]:
@@ -552,7 +733,18 @@ class AsterConfig:
         return cls._from_native(native, sources)
 
     def replace(self, **changes: Any) -> "AsterConfig":
-        """A copy with ``changes`` applied (validated); provenance is kept."""
+        """A copy with ``changes`` applied (validated); provenance is kept.
+        A changed overridable ``[identity]`` field loses its
+        ``setting_sources`` entry: it is now set in code."""
+        dropped = [
+            key for name, key in _IDENTITY_SETTING_KEYS.items()
+            if name in changes and key in self.setting_sources
+        ]
+        if dropped and "setting_sources" not in changes:
+            changes = dict(changes)
+            changes["setting_sources"] = {
+                k: v for k, v in self.setting_sources.items() if k not in dropped
+            }
         new = dataclasses.replace(self, **changes)
         sources = dict(self._sources)
         for name in changes:
@@ -654,6 +846,21 @@ class AsterConfig:
                 ("replicas", ", ".join(self.enrollment.replicas) or "<none>"),
                 ("issuer_delegation_file", self.enrollment.issuer_delegation_file or "<not set>"),
                 ("renew_from", self.enrollment.renew_from or "<not set>"),
+            ],
+            "identity": [
+                ("identity_accept_on_behalf_of", self.identity_accept_on_behalf_of),
+                (
+                    "identity_trusted_issuers",
+                    ", ".join(i.iss for i in self.identity_trusted_issuers) or "<none>",
+                ),
+                (
+                    "identity_publisher",
+                    ", ".join(self.identity_publisher.issuers)
+                    if self.identity_publisher is not None
+                    else "<off>",
+                ),
+                ("remote_config_enabled", self.remote_config_enabled),
+                ("remote_config_lock", ", ".join(self.remote_config_lock) or "<none>"),
             ],
             "connect": [
                 ("endpoint_addr", self.endpoint_addr or "<not set>"),

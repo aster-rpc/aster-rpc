@@ -24,8 +24,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use aster::{
-    AsterConfig, DiscoveryMode, EnrollmentConfig, EnrollmentLimits, HookFailureMode, RelayMode,
-    RoleMappingConfig,
+    AsterConfig, ConfigSource, DiscoveryMode, EnrollmentConfig, EnrollmentLimits, HookFailureMode,
+    RelayMode, RoleMappingConfig,
 };
 
 use crate::error::aster_err_to_py;
@@ -90,6 +90,15 @@ pub(crate) const FIELDS: &[&str] = &[
     "identity_file",
     "alpns",
     "enrollment",
+    "identity_accept_on_behalf_of",
+    "identity_trusted_issuers",
+    "identity_edge_token_max_lifetime_secs",
+    "identity_clock_leeway_secs",
+    "identity_max_key_set_age_secs",
+    "identity_publisher",
+    "remote_config_enabled",
+    "remote_config_lock",
+    "setting_sources",
 ];
 
 /// A resolved `aster::AsterConfig` (see module docs). Immutable.
@@ -143,6 +152,49 @@ fn str_list(v: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect())
+}
+
+/// A JSON-shaped Python value (`None`, a JSON string, or lists / dicts of
+/// plain values) as `serde_json::Value`; `None` for `None` or an empty string.
+fn from_json_value(v: &Bound<'_, PyAny>) -> PyResult<Option<serde_json::Value>> {
+    if v.is_none() {
+        return Ok(None);
+    }
+    let text: String = if let Ok(text) = v.extract::<String>() {
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        text
+    } else {
+        v.py()
+            .import("json")?
+            .call_method1("dumps", (v,))?
+            .extract()?
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| PyValueError::new_err(format!("expected JSON: {e}")))
+}
+
+/// A serializable value as plain Python values (`json.loads`).
+fn to_json_py<'py>(py: Python<'py>, value: &impl serde::Serialize) -> PyResult<Bound<'py, PyAny>> {
+    let text = serde_json::to_string(value).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    py.import("json")?.call_method1("loads", (text,))
+}
+
+fn parse_source(source: &str) -> PyResult<ConfigSource> {
+    Ok(match source {
+        "default" => ConfigSource::Default,
+        "file" => ConfigSource::File,
+        "env" => ConfigSource::Env,
+        "code" => ConfigSource::Code,
+        "override" => ConfigSource::Override,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "unknown source {other:?} (expected default, file, env, code or override)"
+            )))
+        }
+    })
 }
 
 fn strict_bool(name: &str, v: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -406,6 +458,39 @@ fn apply_field(c: &mut AsterConfig, key: &str, v: &Bound<'_, PyAny>) -> PyResult
                 opt::<usize>(v)?.unwrap_or(aster::DEFAULT_METRICS_PEER_LABEL_CAP)
         }
         "identity_file" => c.identity_file = opt_path(v)?,
+        "identity_accept_on_behalf_of" => c.identity_accept_on_behalf_of = strict_bool(key, v)?,
+        "identity_trusted_issuers" => {
+            c.identity_trusted_issuers = match from_json_value(v)? {
+                None => Vec::new(),
+                Some(value) => serde_json::from_value(value)
+                    .map_err(|e| PyValueError::new_err(format!("expected trusted issuers: {e}")))?,
+            }
+        }
+        "identity_edge_token_max_lifetime_secs" => {
+            c.identity_edge_token_max_lifetime_secs = v.extract()?
+        }
+        "identity_clock_leeway_secs" => c.identity_clock_leeway_secs = v.extract()?,
+        "identity_max_key_set_age_secs" => c.identity_max_key_set_age_secs = v.extract()?,
+        "identity_publisher" => {
+            c.identity_publisher = match from_json_value(v)? {
+                None => None,
+                Some(value) => Some(serde_json::from_value(value).map_err(|e| {
+                    PyValueError::new_err(format!("expected [identity.publisher] fields: {e}"))
+                })?),
+            }
+        }
+        "remote_config_enabled" => c.remote_config_enabled = strict_bool(key, v)?,
+        "remote_config_lock" => c.remote_config_lock = str_list(v)?,
+        "setting_sources" => {
+            c.setting_sources.clear();
+            if !v.is_none() {
+                for (name, source) in v.cast::<PyDict>()?.iter() {
+                    let name: String = name.extract()?;
+                    let source: String = source.extract()?;
+                    c.setting_sources.insert(name, parse_source(&source)?);
+                }
+            }
+        }
         "alpns" => {
             let mut out: Vec<Vec<u8>> = Vec::new();
             if !v.is_none() {
@@ -859,6 +944,35 @@ impl NativeAsterConfig {
         }
         d.set_item("alpns", alpns)?;
         d.set_item("enrollment", enrollment_to_py(py, &c.enrollment)?)?;
+        d.set_item(
+            "identity_accept_on_behalf_of",
+            c.identity_accept_on_behalf_of,
+        )?;
+        d.set_item(
+            "identity_trusted_issuers",
+            to_json_py(py, &c.identity_trusted_issuers)?,
+        )?;
+        d.set_item(
+            "identity_edge_token_max_lifetime_secs",
+            c.identity_edge_token_max_lifetime_secs,
+        )?;
+        d.set_item("identity_clock_leeway_secs", c.identity_clock_leeway_secs)?;
+        d.set_item(
+            "identity_max_key_set_age_secs",
+            c.identity_max_key_set_age_secs,
+        )?;
+        let publisher = match &c.identity_publisher {
+            Some(publisher) => to_json_py(py, publisher)?,
+            None => py.None().into_bound(py),
+        };
+        d.set_item("identity_publisher", publisher)?;
+        d.set_item("remote_config_enabled", c.remote_config_enabled)?;
+        d.set_item("remote_config_lock", c.remote_config_lock.clone())?;
+        let sources = PyDict::new(py);
+        for (name, source) in &c.setting_sources {
+            sources.set_item(name, source.as_str())?;
+        }
+        d.set_item("setting_sources", sources)?;
         Ok(d)
     }
 

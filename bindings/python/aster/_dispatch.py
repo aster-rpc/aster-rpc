@@ -84,6 +84,7 @@ class ServerCallContext(CallContext):
         call: ServerCall,
         method: "_Method",
         gate: Any,
+        dispatcher: "Dispatcher | None" = None,
     ) -> None:
         d = self.__dict__
         d["service"] = method.service.name
@@ -103,6 +104,64 @@ class ServerCallContext(CallContext):
         d["attempt"] = 1
         d["_call"] = call
         d["_gate"] = gate
+        d["_dispatcher"] = dispatcher
+
+    # -- gateway identity (Rust `CallContext::actor` / `auth_methods` /
+    # `on_behalf_of` / `node_properties`), read on first access ---------------
+
+    @property  # type: ignore[override]
+    def on_behalf_of(self) -> Any:
+        """The verified user of a call an edge forwarded on its behalf
+        (``aster.identity.ForwardedIdentity``: issuer, subject, jti,
+        expiry); ``None`` for a call made by the peer as itself."""
+        return self._lazy("_obo", lambda: self.__dict__["_call"].on_behalf_of)
+
+    @on_behalf_of.setter
+    def on_behalf_of(self, value: Any) -> None:
+        self.__dict__["_obo"] = value
+
+    @property  # type: ignore[override]
+    def actor(self) -> str | None:
+        """The edge that forwarded this call on behalf of ``principal`` (its
+        node id, also ``peer``); ``None`` for a call made by the peer as
+        itself."""
+        def make() -> str | None:
+            obo = self.on_behalf_of
+            return None if obo is None else obo.actor
+        return self._lazy("_actor", make)
+
+    @actor.setter
+    def actor(self, value: str | None) -> None:
+        self.__dict__["_actor"] = value
+
+    @property  # type: ignore[override]
+    def auth_methods(self) -> tuple[str, ...]:
+        """How the user signed in (the token's ``amr``: ``webauthn``,
+        ``pwd``, ``apikey``), for a forwarded call; empty otherwise."""
+        def make() -> tuple[str, ...]:
+            obo = self.on_behalf_of
+            return () if obo is None else tuple(obo.auth_methods)
+        return self._lazy("_amr", make)
+
+    @auth_methods.setter
+    def auth_methods(self, value: tuple[str, ...]) -> None:
+        self.__dict__["_amr"] = tuple(value)
+
+    @property  # type: ignore[override]
+    def node_properties(self) -> Any:
+        """This node's ``aster.ops.NodeConfig`` properties
+        (``aster.identity.NodeProperties``); empty when never set or off."""
+        def make() -> Any:
+            dispatcher = self.__dict__["_dispatcher"]
+            if dispatcher is None:
+                from aster.identity import EMPTY_NODE_PROPERTIES
+                return EMPTY_NODE_PROPERTIES
+            return dispatcher._node_properties()
+        return self._lazy("_node_props", make)
+
+    @node_properties.setter
+    def node_properties(self, value: Any) -> None:
+        self.__dict__["_node_props"] = value
 
     @property  # type: ignore[override]
     def peer(self) -> str | None:
@@ -290,6 +349,9 @@ class Dispatcher:
         node_info: tuple[str, list[str], list[str]] | None = ("", [], []),
         builtin_topology: bool = False,
         topology_requires: Any = None,
+        identity: Any = None,
+        accept_on_behalf_of: bool | None = None,
+        audit_outbox: Any = None,
     ) -> None:
         base = list(interceptors or [])
         self._services = [_Service(s, base) for s in services]
@@ -326,6 +388,10 @@ class Dispatcher:
         self._session_conn: dict[int, int] = {}
         self._server: DispatchServer | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._identity = identity
+        self._accept_on_behalf_of = accept_on_behalf_of
+        self._audit_outbox = audit_outbox
+        self._props: Any = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -352,12 +418,37 @@ class Dispatcher:
             handler_timeout=self._handler_timeout,
             builtin_topology=self._builtin_topology,
             topology_requires=json.dumps(_requirement_json(self._topology_requires)),
+            identity=self._identity,
+            accept_on_behalf_of=self._accept_on_behalf_of,
+            audit_outbox=self._audit_outbox,
         )
         return self._server
 
     @property
     def server(self) -> DispatchServer | None:
         return self._server
+
+    def _node_properties(self) -> Any:
+        """The server's NodeConfig properties, re-read only when the
+        generation in force changes."""
+        from aster.identity import EMPTY_NODE_PROPERTIES, NodeProperties
+
+        server = self._server
+        if server is None:
+            return EMPTY_NODE_PROPERTIES
+        generation = server.node_config_generation
+        cached = self._props
+        if cached is not None and cached.generation == generation:
+            return cached
+        props = NodeProperties._from_native(server.node_properties())
+        self._props = props
+        return props
+
+    async def attach_identity(self) -> None:
+        """With Enrollment, once its policy is attached: start the
+        issuer-key publisher and watcher (see ``DispatchServer``)."""
+        if self._server is not None:
+            await self._server.attach_identity()
 
     @property
     def in_flight(self) -> int:
@@ -572,7 +663,7 @@ class Dispatcher:
             except Exception as e:  # noqa: BLE001
                 self._fail(call, _INVALID_ARGUMENT, f"request does not decode: {e}")
                 return
-            ctx = ServerCallContext(call, m, self._gate)
+            ctx = ServerCallContext(call, m, self._gate, self)
             self._ctxs[call.call_id] = ctx
             interceptors = svc.interceptors
             if interceptors:
@@ -601,7 +692,7 @@ class Dispatcher:
 
     async def _server_stream(self, call: ServerCall, m: _Method) -> None:
         svc = m.service
-        ctx = ServerCallContext(call, m, self._gate)
+        ctx = ServerCallContext(call, m, self._gate, self)
         self._ctxs[call.call_id] = ctx
         interceptors = svc.interceptors
         token = None
@@ -640,7 +731,7 @@ class Dispatcher:
 
     async def _client_stream(self, call: ServerCall, m: _Method) -> None:
         svc = m.service
-        ctx = ServerCallContext(call, m, self._gate)
+        ctx = ServerCallContext(call, m, self._gate, self)
         self._ctxs[call.call_id] = ctx
         interceptors = svc.interceptors
         token = None
@@ -669,7 +760,7 @@ class Dispatcher:
 
     async def _bidi_stream(self, call: ServerCall, m: _Method) -> None:
         svc = m.service
-        ctx = ServerCallContext(call, m, self._gate)
+        ctx = ServerCallContext(call, m, self._gate, self)
         self._ctxs[call.call_id] = ctx
         interceptors = svc.interceptors
         token = None

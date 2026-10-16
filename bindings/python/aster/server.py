@@ -97,6 +97,9 @@ class Server:
         handler_timeout: float | None = None,
         builtin_topology: bool = False,
         topology_requires: Any = None,
+        identity: Any = None,
+        accept_on_behalf_of: bool | None = None,
+        audit_outbox: Any = None,
     ) -> None:
         """Initialize the server.
 
@@ -134,6 +137,13 @@ class Server:
                 baseline RPC. Requires monitoring on the node; default False.
             topology_requires: Native Gate-3 role, ``any_of`` or ``all_of``
                 requirement for that baseline service.
+            identity: The node's :class:`aster.AsterConfig`: its
+                ``[identity]`` / ``[remote_config]`` are wired in Rust as the
+                Rust ``AsterServer`` does (on-behalf-of verification,
+                ``aster.ops.NodeConfig``). ``None`` wires none of it.
+            accept_on_behalf_of: Overrides ``[identity] accept_on_behalf_of``.
+            audit_outbox: An :class:`aster.AuditOutbox` recording every
+                NodeConfig ``set`` / ``clear``.
         """
         self._endpoint = endpoint
         self._owns_endpoint = owns_endpoint
@@ -145,6 +155,9 @@ class Server:
         self._handler_timeout_s = handler_timeout
         self._builtin_topology = builtin_topology
         self._topology_requires = topology_requires
+        self._identity = identity
+        self._accept_on_behalf_of = accept_on_behalf_of
+        self._audit_outbox = audit_outbox
         self._dispatcher: Any = None
         # Deadlines are enforced by the Rust dispatcher (design sec. 2.4), so
         # there is no server-side deadline interceptor by default.
@@ -250,6 +263,11 @@ class Server:
             handler_timeout=self._handler_timeout_s,
             builtin_topology=self._builtin_topology,
             topology_requires=self._topology_requires,
+            identity=self._identity,
+            accept_on_behalf_of=self._accept_on_behalf_of,
+            audit_outbox=(
+                self._audit_outbox._native if self._audit_outbox is not None else None
+            ),
         )
         dispatcher.start(self._node)
         self._dispatcher = dispatcher

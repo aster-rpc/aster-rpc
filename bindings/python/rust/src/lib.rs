@@ -47,6 +47,7 @@ mod expose;
 mod gossip;
 mod grants;
 mod http;
+mod identity;
 mod ids;
 mod keys;
 mod lease;
@@ -126,6 +127,7 @@ fn _aster(m: &Bound<'_, PyModule>) -> PyResult<()> {
     provisioning::register(m)?;
     raw_webtransport::register(m)?;
     rpc::register(py, m)?;
+    identity::register(py, m)?;
     upcall::register(py, m)?;
     observability::register(py, m)?;
     expose::register(py, m)?;

@@ -22,17 +22,20 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyLookupError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use aster::binding_support::enrollment::{
     plan as validate, serve_inbound_enrollment, Installed, Overrides, Plan, Side,
 };
+use aster::binding_support::identity::client_publisher_plan;
 use aster::enrollment::{
     AdmissionClaims, Registration, RenewalHandle, TypedAttribute, ENROLLMENT_ALPN,
 };
+use aster::rpc::jwks_publisher::{IssuerKeyPublisher, PublisherHandle};
+use aster::IdentityPublisherConfig;
 
 use crate::config::NativeAsterConfig;
 use crate::error::aster_err_to_py;
@@ -76,6 +79,57 @@ fn claims(
 pub struct EnrollmentPlan {
     plan: Arc<Plan>,
     config: aster::AsterConfig,
+    /// A client's `[identity.publisher]` and its key-set age bound.
+    publisher: Option<(IdentityPublisherConfig, u64)>,
+}
+
+/// The issuer-key publisher an Enrollment's node runs: a client's own
+/// (delivering to the servers it enrolled with, restarted on each new one),
+/// or a server's (from `DispatchServer.attach_identity`).
+#[derive(Default)]
+struct PublisherSlot {
+    config: Option<(IdentityPublisherConfig, u64)>,
+    owned: Option<(IssuerKeyPublisher, Vec<aster::NodeId>)>,
+    server: Option<PublisherHandle>,
+}
+
+impl PublisherSlot {
+    fn handle(&self) -> Option<PublisherHandle> {
+        self.server
+            .clone()
+            .or_else(|| self.owned.as_ref().map(|(p, _)| p.handle()))
+    }
+
+    /// A client enrolled with `server`: (re)start the publisher so it also
+    /// delivers there. No-op without `[identity.publisher]`.
+    fn enrolled(
+        &mut self,
+        node: &aster::Node,
+        enrollment: &aster::enrollment::Enrollment,
+        server: aster::NodeId,
+    ) -> aster::Result<()> {
+        let Some((config, max_age)) = &self.config else {
+            return Ok(());
+        };
+        let mut deliver_to = self
+            .owned
+            .as_ref()
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        if deliver_to.contains(&server) {
+            return Ok(());
+        }
+        deliver_to.push(server);
+        let publisher = IssuerKeyPublisher::start(
+            node,
+            enrollment.clone(),
+            config,
+            *max_age,
+            deliver_to.clone(),
+        )?;
+        self.owned = Some((publisher, deliver_to));
+        Ok(())
+    }
 }
 
 #[pymethods]
@@ -97,10 +151,21 @@ impl EnrollmentPlan {
             }
         };
         let mut config = extract_config(Some(config))?;
+        let is_client = matches!(side, Side::Client);
         let plan = validate(&mut config, side, Overrides::default()).map_err(aster_err_to_py)?;
+        // A client's `[identity.publisher]` needs Enrollment, as the Rust
+        // `AsterClient` checks (a server's is checked at `DispatchServer.start`).
+        let publisher = if is_client {
+            client_publisher_plan(&config, plan.is_some())
+                .map_err(aster_err_to_py)?
+                .map(|p| (p, config.identity_max_key_set_age_secs))
+        } else {
+            None
+        };
         Ok(plan.map(|plan| Self {
             plan: Arc::new(plan),
             config,
+            publisher,
         }))
     }
 
@@ -122,8 +187,13 @@ impl EnrollmentPlan {
         Ok(Enrollment {
             plan: self.plan.clone(),
             installed: Arc::new(installed),
+            node: node.inner.clone(),
             renewal: Mutex::new(None),
             inbound: Mutex::new(None),
+            publisher: Arc::new(Mutex::new(PublisherSlot {
+                config: self.publisher.clone(),
+                ..PublisherSlot::default()
+            })),
         })
     }
 }
@@ -133,11 +203,40 @@ impl EnrollmentPlan {
 pub struct Enrollment {
     plan: Arc<Plan>,
     installed: Arc<Installed>,
+    node: aster::Node,
     renewal: Mutex<Option<RenewalHandle>>,
     inbound: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    publisher: Arc<Mutex<PublisherSlot>>,
 }
 
 impl Enrollment {
+    /// The installed enrollment and its plan, for the server's identity
+    /// wiring (`aster::binding_support::identity`).
+    pub(crate) fn parts(&self) -> (Arc<Installed>, Arc<Plan>) {
+        (self.installed.clone(), self.plan.clone())
+    }
+
+    /// A server's `[identity.publisher]`, once its identity is attached.
+    pub(crate) fn set_server_publisher(&self, handle: Option<PublisherHandle>) {
+        self.publisher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .server = handle;
+    }
+
+    fn publisher_handle(&self) -> PyResult<PublisherHandle> {
+        self.publisher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .handle()
+            .ok_or_else(|| {
+                PyLookupError::new_err(
+                    "this node runs no issuer-key publisher ([identity.publisher] is not \
+                     configured)",
+                )
+            })
+    }
+
     /// Server: wire the role source, the issuer and `ENROLLMENT_ALPN` into
     /// the RPC server.
     pub(crate) fn serve_on(
@@ -205,9 +304,83 @@ impl Enrollment {
                 .map_err(aster_err_to_py)?;
             plan.enroll_with_server(&installed.enrollment, &server)
                 .await
-                .map(|_| ())
+                .map_err(aster_err_to_py)?;
+            // `[identity.publisher]`: deliver issuer keys to this server too.
+            slf.get()
+                .publisher
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .enrolled(&node, &installed.enrollment, server.node_id)
                 .map_err(aster_err_to_py)
         })
+    }
+
+    /// Mint a short-lived token for user `sub` with `roles`, signed in by
+    /// `amr` (at least one, e.g. `AMR_WEBAUTHN`), valid for `ttl` seconds
+    /// (1..=300), signed with this node's key (Rust
+    /// `AsterClient::user_token_issuer` + `Issuer::mint_user_token`). The
+    /// roles must be within the issuer delegation
+    /// (`aster.identity.issuable_roles`) in the credential held now; anything
+    /// else raises `ValueError`. Attach it with
+    /// `CallOptions(on_behalf_of=token)`; the node needs `aster.gateway`.
+    #[pyo3(signature = (sub, roles, amr, ttl))]
+    fn mint_user_token(
+        &self,
+        sub: &str,
+        roles: Vec<String>,
+        amr: Vec<String>,
+        ttl: f64,
+    ) -> PyResult<String> {
+        if !(ttl.is_finite() && ttl >= 1.0) {
+            return Err(PyValueError::new_err(format!(
+                "ttl must be at least 1 second, got {ttl}"
+            )));
+        }
+        let issuer =
+            aster::rpc::identity::Issuer::from_enrollment(&self.node, &self.installed.enrollment)
+                .map_err(aster_err_to_py)?;
+        issuer
+            .mint_user_token(sub, roles, amr, Duration::from_secs_f64(ttl.floor()))
+            .map_err(aster_err_to_py)
+    }
+
+    /// Whether this node runs an issuer-key publisher (`[identity.publisher]`).
+    #[getter]
+    fn has_publisher(&self) -> bool {
+        self.publisher_handle().is_ok()
+    }
+
+    /// Tell the issuer-key publisher that a token of `iss` carried key id
+    /// `kid`: an unknown kid refreshes `iss` at once (at most every
+    /// `min_refresh_secs`). Rust `PublisherHandle::notice_kid`. Raises
+    /// `LookupError` when the node runs no publisher.
+    fn notice_kid(&self, iss: &str, kid: &str) -> PyResult<()> {
+        self.publisher_handle()?.notice_kid(iss, kid);
+        Ok(())
+    }
+
+    /// `notice_kid` with the `iss` and `kid` of a compact JWT (unverified; a
+    /// token that does not parse is ignored). Rust
+    /// `PublisherHandle::notice_token`.
+    fn notice_token(&self, token: &str) -> PyResult<()> {
+        self.publisher_handle()?.notice_token(token);
+        Ok(())
+    }
+
+    /// What the publisher last published, per issuer: `{iss: {"kids",
+    /// "fetched_at", "publications", "attempts", "last_error"}}`.
+    fn publisher_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let out = PyDict::new(py);
+        for (iss, s) in self.publisher_handle()?.status() {
+            let entry = PyDict::new(py);
+            entry.set_item("kids", s.kids)?;
+            entry.set_item("fetched_at", s.fetched_at)?;
+            entry.set_item("publications", s.publications)?;
+            entry.set_item("attempts", s.attempts)?;
+            entry.set_item("last_error", s.last_error.as_ref().map(ToString::to_string))?;
+            out.set_item(iss, entry)?;
+        }
+        Ok(out)
     }
 
     /// Start renewing this node's credential when configured: from
@@ -299,9 +472,14 @@ impl Enrollment {
             .map_err(|e| PyValueError::new_err(format!("issue_for: {e}")))
     }
 
-    /// Stop renewal and inbound handling. Idempotent.
+    /// Stop renewal, the publisher and inbound handling. Idempotent.
     fn close(&self) {
         self.renewal.lock().unwrap().take();
+        {
+            let mut publisher = self.publisher.lock().unwrap_or_else(|e| e.into_inner());
+            publisher.owned = None;
+            publisher.server = None;
+        }
         if let Some(task) = self.inbound.lock().unwrap().take() {
             task.abort();
         }
@@ -339,7 +517,8 @@ fn role_attributes(roles: Option<String>) -> Option<HashMap<String, String>> {
 /// <audience> [--attributes roles.json] [--scope ..] [--tag ..]` writes: a
 /// root-issued credential chain.
 #[pyfunction]
-#[pyo3(name = "_enrollment_test_credential", signature = (root_seed, subject, audience, *, roles=None, scopes=Vec::new(), tags=Vec::new(), lifetime_secs=3600))]
+#[pyo3(name = "_enrollment_test_credential", signature = (root_seed, subject, audience, *, roles=None, scopes=Vec::new(), tags=Vec::new(), lifetime_secs=3600, attributes=None))]
+#[allow(clippy::too_many_arguments)]
 fn test_credential(
     root_seed: &[u8],
     subject: &str,
@@ -348,13 +527,18 @@ fn test_credential(
     scopes: Vec<String>,
     tags: Vec<String>,
     lifetime_secs: u64,
+    attributes: Option<HashMap<String, String>>,
 ) -> PyResult<String> {
     let mut request = aster::enrollment::EnrollmentIssueRequest::new(
         hex32(subject, "subject")?,
         audience,
         now() + lifetime_secs,
     );
-    request.claims = claims(role_attributes(roles), scopes, tags);
+    // Extra string claim attributes (e.g. `aster.identity.issuable_roles`).
+    let mut claim_attributes = role_attributes(roles).unwrap_or_default();
+    claim_attributes.extend(attributes.unwrap_or_default());
+    let claim_attributes = (!claim_attributes.is_empty()).then_some(claim_attributes);
+    request.claims = claims(claim_attributes, scopes, tags);
     aster::enrollment::issue_credential(&root_key(root_seed)?, &request, now())
         .map(|issued| issued.into_chain())
         .map_err(|e| PyValueError::new_err(format!("issue_credential: {e}")))
@@ -407,6 +591,7 @@ fn test_delegation(
 pub struct EnrollmentTestRoot {
     node: aster::Node,
     fleet: aster::Doc,
+    fleet_secret: [u8; 32],
     enrollment: aster::enrollment::Enrollment,
     seed: [u8; 32],
     audience: String,
@@ -447,6 +632,7 @@ impl EnrollmentTestRoot {
             Vec::new(),
             Vec::new(),
             3600,
+            None,
         )?;
         future_into_py(py, async move {
             let err = |e: &dyn std::fmt::Display| PyRuntimeError::new_err(e.to_string());
@@ -472,7 +658,13 @@ impl EnrollmentTestRoot {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let fleet = node.docs().create().await.map_err(aster_err_to_py)?;
+            let mut fleet_secret = [0u8; 32];
+            getrandom::fill(&mut fleet_secret).map_err(|e| err(&e))?;
+            let fleet = node
+                .docs()
+                .open_or_import_write_namespace(aster::NamespaceSecret::from_bytes(fleet_secret))
+                .await
+                .map_err(aster_err_to_py)?;
             let namespace = hex32(
                 &fleet.id().map_err(aster_err_to_py)?.to_string(),
                 "namespace",
@@ -515,6 +707,7 @@ impl EnrollmentTestRoot {
             Ok(EnrollmentTestRoot {
                 node,
                 fleet,
+                fleet_secret,
                 enrollment,
                 seed,
                 audience,
@@ -608,6 +801,53 @@ impl EnrollmentTestRoot {
                 .await
                 .map_err(aster_err_to_py)?;
             this.fleet
+                .sync_with_timeout(
+                    std::slice::from_ref(&server.node_id),
+                    Duration::from_secs(15),
+                )
+                .await
+                .map_err(aster_err_to_py)
+        })
+    }
+
+    /// What `[identity.publisher]` on `publisher` (an `aster.Node` enrolled
+    /// with a credential granting `aster.identity-publisher`, passed as
+    /// `credential`) writes after fetching `jwks_json` for issuer `iss`: the
+    /// key-set record in the fleet namespace (opened with the root's write
+    /// grant), authored by `publisher`, then synchronized to `server` (an
+    /// `aster.NodeAddr`).
+    fn publish_issuer_keys<'py>(
+        slf: Py<Self>,
+        py: Python<'py>,
+        publisher: PyRef<'_, Node>,
+        credential: String,
+        iss: String,
+        jwks_json: String,
+        server: PyRef<'_, NodeAddr>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use aster::rpc::issuer_keys::{publish_issuer_keys, IssuerKeyPublication};
+        let publisher = publisher.inner.clone();
+        let server = to_aster_addr(&server);
+        future_into_py(py, async move {
+            let secret = slf.get().fleet_secret;
+            let fleet = publisher
+                .docs()
+                .open_or_import_write_namespace(aster::NamespaceSecret::from_bytes(secret))
+                .await
+                .map_err(aster_err_to_py)?;
+            let publication = IssuerKeyPublication {
+                source_url: format!("{iss}/jwks"),
+                iss,
+                jwks_json,
+                fetched_at: now(),
+            };
+            publish_issuer_keys(&publisher, &fleet, Some(&credential), &publication)
+                .await
+                .map_err(aster_err_to_py)?;
+            publisher
+                .add_node_addr(server.clone())
+                .map_err(aster_err_to_py)?;
+            fleet
                 .sync_with_timeout(
                     std::slice::from_ref(&server.node_id),
                     Duration::from_secs(15),

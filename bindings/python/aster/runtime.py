@@ -66,7 +66,7 @@ from .registry.models import ServiceSummary
 from .rpc_types import RpcScope, SerializationMode
 from .server import Server
 from .http import HTTPListener
-from ._aster import ENROLLMENT_ALPN, DrainReport, EnrollmentPlan
+from ._aster import ENROLLMENT_ALPN, DispatchServer, DrainReport, EnrollmentPlan
 
 __all__ = ["AsterServer", "AsterClient", "AdmissionDeniedError", "RPC_ALPN"]
 
@@ -181,6 +181,8 @@ class AsterServer:
         handler_timeout: float | None = None,
         builtin_topology: bool = False,
         topology_requires: Any = None,
+        accept_on_behalf_of: bool | None = None,
+        audit_outbox: Any = None,
     ) -> None:
         """Create an Aster RPC server.
 
@@ -218,6 +220,13 @@ class AsterServer:
                 RPC service. Requires ``config.enable_monitoring=True``.
             topology_requires: Native role/``any_of``/``all_of`` Gate-3 requirement
                 for the opt-in topology baseline service.
+            accept_on_behalf_of: Overrides ``config.identity_accept_on_behalf_of``
+                (gateway identity: calls an edge holding ``aster.gateway``
+                makes on behalf of a user; see :mod:`aster.identity`).
+                ``[identity]`` and ``[remote_config]`` (``aster.ops.NodeConfig``,
+                served behind ``aster.config-admin``) come from ``config``.
+            audit_outbox: An :class:`aster.AuditOutbox` recording every
+                ``aster.ops.NodeConfig`` ``set`` / ``clear``.
 
         Example::
 
@@ -267,6 +276,8 @@ class AsterServer:
         self._handler_timeout = handler_timeout
         self._builtin_topology = builtin_topology
         self._topology_requires = topology_requires
+        self._accept_on_behalf_of = accept_on_behalf_of
+        self._audit_outbox = audit_outbox
 
         # Populated by start()
         self._started: bool = False
@@ -317,6 +328,9 @@ class AsterServer:
         # Enrollment from `[enrollment]`: validated in full (in Rust) before
         # the node starts, so a misconfiguration fails here, closed.
         plan = EnrollmentPlan.from_config(node_config, side="server")
+        # `[identity]` / `[remote_config]` validated as a whole too (trusted
+        # issuers and the publisher need Enrollment).
+        DispatchServer.check_identity(node_config, plan is not None)
         if plan is not None:
             if self._gate is not None:
                 raise ValueError(
@@ -470,6 +484,9 @@ class AsterServer:
             handler_timeout=self._handler_timeout,
             builtin_topology=self._builtin_topology,
             topology_requires=self._topology_requires,
+            identity=node_config,
+            accept_on_behalf_of=self._accept_on_behalf_of,
+            audit_outbox=self._audit_outbox,
         )
         if self._max_sessions_per_connection is not None:
             server_kwargs["max_sessions_per_connection"] = self._max_sessions_per_connection
@@ -482,6 +499,9 @@ class AsterServer:
             self._server.start()
             try:
                 await self._enrollment.attach_policy(self._node)
+                # Then the issuer-key publisher (to the policy replicas) and
+                # the issuer-key watcher, as the Rust AsterServer orders it.
+                await self._server._dispatcher.attach_identity()
             except BaseException:
                 self._server._dispatcher.close()
                 self._enrollment.close()
@@ -1234,6 +1254,20 @@ class AsterServer:
         ``issue_for(subject, attributes=...)`` when the server runs a
         delegated issuer."""
         return self._enrollment
+
+    def node_properties(self) -> Any:
+        """This server's ``aster.ops.NodeConfig`` properties now
+        (:class:`aster.identity.NodeProperties`; Rust
+        ``AsterServer::node_config().properties()``). Empty before the
+        server serves, when never set, or with ``remote_config_enabled``
+        off."""
+        from .identity import EMPTY_NODE_PROPERTIES
+
+        self._require_started()
+        dispatcher = self._server._dispatcher if self._server is not None else None
+        if dispatcher is None:
+            return EMPTY_NODE_PROPERTIES
+        return dispatcher._node_properties()
 
     def _dispatch_server(self) -> Any:
         self._require_started()
@@ -2038,6 +2072,7 @@ class AsterClient:
 
         rpc_addr_key = self._rpc_key_for(info.name, info.version, channel)
         conn = await self._rpc_conn_for(rpc_addr_key)
+        interceptors = self._identity_interceptors() + list(interceptors or [])
 
         # Session-scoped services route via a ClientSession allocated on
         # the fly. Every call threads the same monotonic sessionId into
@@ -2119,6 +2154,44 @@ class AsterClient:
         """The ``aster.Enrollment`` installed from ``[enrollment]``, or
         ``None`` when enrollment is off (``credential``, ``is_renewing``)."""
         return self._enrollment
+
+    def _identity_interceptors(self) -> list[Any]:
+        """With ``[identity.publisher]``: hand each call's on-behalf-of token
+        to the publisher (a provider's new key is published at once)."""
+        if self._enrollment is None or not self._enrollment.has_publisher:
+            return []
+        from .identity import _PublisherNotice
+
+        return [_PublisherNotice(self._enrollment)]
+
+    def mint_user_token(
+        self, sub: str, roles: list[str], amr: list[str], ttl: float
+    ) -> str:
+        """Mint a short-lived token for user ``sub`` with ``roles``, signed in
+        by ``amr`` (at least one, e.g. ``aster.identity.AMR_WEBAUTHN``),
+        valid for ``ttl`` seconds (at most 300), signed with this node's key
+        (Rust ``AsterClient::user_token_issuer`` +
+        ``Issuer::mint_user_token``). The roles must be within the issuer
+        delegation (``aster.identity.issuable_roles``) in the credential held
+        now; anything else raises ``ValueError``. Attach it with
+        ``CallOptions(on_behalf_of=token)``; this node needs
+        ``aster.gateway``. Raises ``RuntimeError`` without enrollment."""
+        if self._enrollment is None:
+            raise RuntimeError(
+                "mint_user_token needs enrollment: the token's roles are bounded by "
+                "the delegation in this node's credential"
+            )
+        return self._enrollment.mint_user_token(sub, list(roles), list(amr), float(ttl))
+
+    async def node_config(self) -> Any:
+        """An :class:`aster.identity.NodeConfigClient` for the server this
+        client connected to (``aster.ops.NodeConfig``; needs
+        ``aster.config-admin``)."""
+        if not self._connected:
+            raise RuntimeError("AsterClient not connected; call connect() first")
+        from .identity import NodeConfigClient
+
+        return NodeConfigClient(await self._rpc_conn_for(self._server_key))
 
     @property
     def is_renewing(self) -> bool:

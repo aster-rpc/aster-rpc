@@ -17,7 +17,7 @@ crate-type = ["cdylib"]
 # + expose (socket targets with a Python authorize hook by upcall, R6)
 # + otel + health (observability O6: the built-in RPC metrics and spans, the
 # ops listener, all over the Rust pipeline in `aster-otel`).
-aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "binding-support", "coordination-client", "expose", "otel", "health", "audit-outbox", "enrollment"] }
+aster = { path = "../../../aster", version = "=0.3.0", features = ["rpc", "binding-support", "coordination-client", "expose", "otel", "health", "audit-outbox", "enrollment", "identity-publisher"] }
 # Transport core, still driven directly for the reactor ring, client-call
 # pool, tunnels and bare endpoints (reached from `aster` handles through
 # `aster::binding_support`).

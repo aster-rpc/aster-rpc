@@ -54,6 +54,9 @@ class ClientTimeoutError(ClientError):
 
 # ── Per-call options ─────────────────────────────────────────────────────────
 
+# Rust `aster::rpc::identity::ON_BEHALF_OF_METADATA`.
+_ON_BEHALF_OF = "aster-on-behalf-of"
+
 
 @dataclass(frozen=True)
 class CallOptions:
@@ -71,16 +74,33 @@ class CallOptions:
         metadata: Key/value headers sent with the call (merged over the
             client's; the call's value wins for a shared key).
         serialization_mode: Overrides the negotiated serialization mode.
+        on_behalf_of: A user's token (a provider's, forwarded unchanged, or
+            one from :meth:`aster.AsterClient.mint_user_token`): the call is
+            made on that user's behalf, in the ``aster-on-behalf-of``
+            metadata entry (replacing an earlier one; Rust
+            ``CallOptions::on_behalf_of``). The server must accept it
+            (``identity_accept_on_behalf_of``) and this node must hold
+            ``aster.gateway``.
     """
 
     timeout: float | None = None
     metadata: Mapping[str, str] | None = None
     serialization_mode: SerializationMode | None = None
+    on_behalf_of: str | None = None
 
     def __post_init__(self) -> None:
         t = self.timeout
         if t is not None and (isinstance(t, bool) or not math.isfinite(float(t)) or t < 0):
             raise ValueError(f"timeout must be a finite number of seconds >= 0, got {t!r}")
+        if self.on_behalf_of is not None:
+            # The token travels as one metadata entry, replacing any other
+            # spelling of it.
+            md = {
+                k: v for k, v in (self.metadata or {}).items()
+                if k.lower() != _ON_BEHALF_OF
+            }
+            md[_ON_BEHALF_OF] = self.on_behalf_of
+            object.__setattr__(self, "metadata", md)
 
     def merged(self, over: "CallOptions | None") -> "CallOptions":
         """These options with ``over``'s set values on top (metadata merged)."""
@@ -88,7 +108,10 @@ class CallOptions:
             return self
         metadata: Mapping[str, str] | None = self.metadata
         if over.metadata:
-            metadata = {**(self.metadata or {}), **over.metadata}
+            base = self.metadata or {}
+            if over.on_behalf_of is not None:
+                base = {k: v for k, v in base.items() if k.lower() != _ON_BEHALF_OF}
+            metadata = {**base, **over.metadata}
         return CallOptions(
             timeout=over.timeout if over.timeout is not None else self.timeout,
             metadata=metadata,

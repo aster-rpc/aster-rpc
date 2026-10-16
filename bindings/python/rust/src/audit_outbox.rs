@@ -29,8 +29,15 @@ fn invalid(_: impl std::fmt::Display) -> PyErr {
 }
 
 #[pyclass(name = "NativeAuditOutbox", module = "aster._aster")]
-struct NativeAuditOutbox {
+pub(crate) struct NativeAuditOutbox {
     inner: AuditOutbox,
+}
+
+impl NativeAuditOutbox {
+    /// A handle on the same outbox (for `DispatchServer.start(audit_outbox=)`).
+    pub(crate) fn handle(&self) -> AuditOutbox {
+        self.inner.clone()
+    }
 }
 
 #[pymethods]

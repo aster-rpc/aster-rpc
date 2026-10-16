@@ -153,7 +153,14 @@ except ImportError as e:
 # Former name of DownloadPolicy.
 DocDownloadPolicy = DownloadPolicy
 
-from .config import AsterConfig, EnrollmentConfig, EnrollmentLimits, RoleMappingConfig
+from .config import (
+    AsterConfig, EnrollmentConfig, EnrollmentLimits, IdentityPublisherConfig,
+    RoleMappingConfig, TrustedIssuer,
+)
+from . import identity
+from .identity import (
+    ForwardedIdentity, IdentityOverride, NodeConfigClient, NodeProperties, bearer_token,
+)
 from .provisioning import (
     ProvisioningError, GenesisVoter, GenesisSpec, JoinPermitSpec,
     VerifiedGenesis, VerifiedJoinPermit, canonical_genesis, canonical_join_permit,
@@ -628,6 +635,14 @@ __all__ = [
     "EnrollmentConfig",
     "EnrollmentLimits",
     "RoleMappingConfig",
+    "TrustedIssuer",
+    "IdentityPublisherConfig",
+    "identity",
+    "ForwardedIdentity",
+    "IdentityOverride",
+    "NodeConfigClient",
+    "NodeProperties",
+    "bearer_token",
     "AsterServer",
     "AsterClient",
     "ClientSession",

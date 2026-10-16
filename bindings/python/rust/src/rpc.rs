@@ -32,6 +32,7 @@ use aster::binding_support::dispatch::{
     CallHandle, CancelReason, DispatchEvent, InboundTrace, PeerAttributes, RingConsumer, RingSink,
     SubmitError,
 };
+use aster::binding_support::identity::{PendingIdentity, ServerIdentity};
 use aster::binding_support::CoreConnection;
 use aster::rpc::baseline::{Attr, NodeIdentity, NodeInfo, NodeInfoClient, NodeInfoServer};
 use aster::rpc::{
@@ -147,6 +148,9 @@ pub struct DispatchServer {
     table: aster::binding_support::dispatch::CallTable,
     dispatcher: Mutex<Option<aster::rpc::Dispatcher>>,
     http: Arc<crate::http::HttpChildren>,
+    /// Gateway identity and `aster.ops.NodeConfig` once attached.
+    identity: Arc<Mutex<Option<ServerIdentity>>>,
+    pending_identity: Mutex<Option<PendingServerIdentity>>,
 }
 
 #[pymethods]
@@ -164,23 +168,53 @@ impl DispatchServer {
     ///   served, and a configured delegated issuer serves renewals.
     /// - `handler_timeout`: cap on any handler, seconds (`None` = the Rust
     ///   default, 300 s; `<= 0` = no cap).
+    /// - `identity`: the node's `aster.AsterConfig`; its `[identity]` and
+    ///   `[remote_config]` are validated and wired as the Rust `AsterServer`
+    ///   does (on-behalf-of verification, the issuer-key cache, and
+    ///   `aster.ops.NodeConfig` behind `aster.config-admin`). `None` (the
+    ///   low-level path) wires none of it. With `enrollment`, call
+    ///   `attach_identity` once its policy is attached.
+    /// - `accept_on_behalf_of`: overrides `[identity] accept_on_behalf_of`.
+    /// - `audit_outbox`: records every NodeConfig `set` / `clear`.
     #[staticmethod]
-    #[pyo3(signature = (node, services, *, node_info=Some((String::new(), Vec::new(), Vec::new())), node_attributes=Vec::new(), gate=None, gate_attributes=false, enrollment=None, max_sessions_per_connection=None, handler_timeout=None, ring_capacity=256, builtin_topology=false, topology_requires=None))]
+    #[pyo3(signature = (node, services, *, node_info=Some((String::new(), Vec::new(), Vec::new())), node_attributes=Vec::new(), gate=None, gate_attributes=false, enrollment=None, max_sessions_per_connection=None, handler_timeout=None, ring_capacity=256, builtin_topology=false, topology_requires=None, identity=None, accept_on_behalf_of=None, audit_outbox=None))]
     #[allow(clippy::too_many_arguments)]
     fn start(
+        py: Python<'_>,
         node: PyRef<'_, crate::node::Node>,
         services: Vec<String>,
         node_info: Option<(String, Vec<String>, Vec<String>)>,
         node_attributes: Vec<(String, String)>,
         gate: Option<PyRef<'_, GatePolicy>>,
         gate_attributes: bool,
-        enrollment: Option<PyRef<'_, crate::enrollment::Enrollment>>,
+        enrollment: Option<Bound<'_, crate::enrollment::Enrollment>>,
         max_sessions_per_connection: Option<usize>,
         handler_timeout: Option<f64>,
         ring_capacity: usize,
         builtin_topology: bool,
         topology_requires: Option<&str>,
+        identity: Option<Bound<'_, PyAny>>,
+        accept_on_behalf_of: Option<bool>,
+        audit_outbox: Option<PyRef<'_, crate::audit_outbox::NativeAuditOutbox>>,
     ) -> PyResult<Self> {
+        // `[identity]` / `[remote_config]`, validated as a whole before
+        // anything is served (`aster::binding_support::identity::plan`).
+        let identity_plan = match &identity {
+            None => None,
+            Some(config) => {
+                let config = crate::node::extract_config(Some(config))?;
+                let mut plan =
+                    aster::binding_support::identity::plan(&config, enrollment.is_some())
+                        .map_err(aster_err_to_py)?;
+                if let Some(accept) = accept_on_behalf_of {
+                    plan.set_accept_on_behalf_of(accept);
+                }
+                if let Some(outbox) = &audit_outbox {
+                    plan.audit_outbox(outbox.handle());
+                }
+                Some(plan)
+            }
+        };
         if builtin_topology && !node.inner.topology().has_monitoring() {
             return Err(PyValueError::new_err(
                 "builtin topology requires monitoring",
@@ -203,6 +237,21 @@ impl DispatchServer {
         let (sink, consumer) = RingSink::new_on(rt.handle(), ring_capacity.max(2));
         let attributes = AttributeStore::new();
         let mut server = Server::new(&node.inner).attributes(attributes.clone());
+        // Gateway identity and `aster.ops.NodeConfig` before anything else
+        // is registered (a stored record applies before the first call), as
+        // `AsterServer` orders it.
+        let enrollment_parts = enrollment.as_ref().map(|e| e.get().parts());
+        let mut pending_identity = None;
+        if let Some(plan) = identity_plan {
+            let parts = enrollment_parts
+                .as_ref()
+                .map(|(installed, plan)| (&installed.enrollment, &**plan));
+            let (with_identity, pending) =
+                block_on_runtime(py, plan.apply(server, &node.inner, parts))
+                    .map_err(aster_err_to_py)?;
+            server = with_identity;
+            pending_identity = Some(pending);
+        }
         if builtin_topology {
             server = server.with_builtin_topology(&node.inner, requirement);
         }
@@ -224,7 +273,7 @@ impl DispatchServer {
                     "enrollment owns Gate 0: pass either gate or enrollment, not both",
                 ));
             }
-            server = enrollment.serve_on(server, &attributes);
+            server = enrollment.get().serve_on(server, &attributes);
         }
         if gate_attributes {
             if let Some(gate) = &gate {
@@ -249,6 +298,28 @@ impl DispatchServer {
         let table = server.call_table();
         let dispatcher = server.dispatcher();
         let handle = server.serve();
+        // Without Enrollment there is nothing to wait for: attach now (no
+        // publisher, no watcher). With it, `attach_identity` runs once the
+        // policy is attached.
+        let mut attached = None;
+        let mut pending = None;
+        if let Some(identity) = pending_identity {
+            match &enrollment {
+                None => {
+                    attached = Some(
+                        block_on_runtime(py, identity.attach(&node.inner, None))
+                            .map_err(aster_err_to_py)?,
+                    );
+                }
+                Some(enrollment) => {
+                    pending = Some(PendingServerIdentity {
+                        pending: identity,
+                        node: node.inner.clone(),
+                        enrollment: Some(enrollment.clone().unbind()),
+                    });
+                }
+            }
+        }
         Ok(DispatchServer {
             consumer: Arc::new(tokio::sync::Mutex::new(consumer)),
             handle: Mutex::new(Some(handle)),
@@ -256,6 +327,8 @@ impl DispatchServer {
             table,
             dispatcher: Mutex::new(Some(dispatcher)),
             http: Arc::new(crate::http::HttpChildren::default()),
+            identity: Arc::new(Mutex::new(attached)),
+            pending_identity: Mutex::new(pending),
         })
     }
 
@@ -461,7 +534,116 @@ impl DispatchServer {
         if let Some(handle) = self.handle.lock().unwrap().take() {
             handle.abort();
         }
+        self.pending_identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
+
+    /// Validate `config`'s `[identity]` and `[remote_config]` for a server
+    /// (`enrolled`: whether it runs Enrollment), as `start` will: raises
+    /// `ValueError` naming the problem. Lets `AsterServer.start` fail before
+    /// it starts anything.
+    #[staticmethod]
+    fn check_identity(config: &Bound<'_, PyAny>, enrolled: bool) -> PyResult<()> {
+        let config = crate::node::extract_config(Some(config))?;
+        aster::binding_support::identity::plan(&config, enrolled)
+            .map(|_| ())
+            .map_err(aster_err_to_py)
+    }
+
+    /// With Enrollment, once its policy is attached: start the issuer-key
+    /// publisher (`[identity.publisher]`, delivering to the policy replicas)
+    /// and the issuer-key watcher on the fleet namespace, as the Rust
+    /// `AsterServer` does after serving. A no-op otherwise (a server without
+    /// Enrollment attaches at `start`).
+    fn attach_identity<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pending = self
+            .pending_identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let slot = self.identity.clone();
+        future_into_py(py, async move {
+            let Some(pending) = pending else {
+                return Ok(());
+            };
+            let parts = pending.enrollment.as_ref().map(|e| e.get().parts());
+            let identity = pending
+                .pending
+                .attach(
+                    &pending.node,
+                    parts
+                        .as_ref()
+                        .map(|(installed, plan)| (&installed.enrollment, &**plan)),
+                )
+                .await
+                .map_err(aster_err_to_py)?;
+            if let Some(enrollment) = &pending.enrollment {
+                enrollment.get().set_server_publisher(identity.publisher());
+            }
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(identity);
+            Ok(())
+        })
+    }
+
+    /// This node's `aster.ops.NodeConfig` properties now (Rust
+    /// `CallContext::node_properties`): `{"generation", "name", "tags",
+    /// "attributes"}`. Empty (generation 0) when NodeConfig is off or never
+    /// set. They describe the node and never authorise.
+    fn node_properties<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let guard = self.identity.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(identity) => crate::identity::properties_to_py(
+                py,
+                identity.generation(),
+                &identity.node_properties(),
+            ),
+            None => crate::identity::properties_to_py(py, 0, &Default::default()),
+        }
+    }
+
+    /// The NodeConfig generation in force (`0`: never changed, or off): a
+    /// cache key for `node_properties`.
+    #[getter]
+    fn node_config_generation(&self) -> u64 {
+        self.identity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map_or(0, ServerIdentity::generation)
+    }
+}
+
+/// The identity wiring between `DispatchServer.start` and
+/// `attach_identity` (an enrolled server attaches once its policy is held).
+struct PendingServerIdentity {
+    pending: PendingIdentity,
+    node: aster::Node,
+    enrollment: Option<Py<crate::enrollment::Enrollment>>,
+}
+
+/// Run `fut` to completion on the shared runtime from the Python thread,
+/// with the GIL released (on a scoped thread, so an entered runtime context
+/// does not make `block_on` panic).
+fn block_on_runtime<F>(py: Python<'_>, fut: F) -> F::Output
+where
+    F: Future + Send,
+    F::Output: Send,
+{
+    let rt = pyo3_async_runtimes::tokio::get_runtime();
+    py.detach(|| {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| rt.block_on(fut))
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    })
 }
 
 impl Drop for DispatchServer {
@@ -797,6 +979,22 @@ impl ServerCall {
         self.connection.as_ref().map(CoreConnection::remote_id)
     }
 
+    /// For a call an edge forwarded on behalf of a user: that edge's node id
+    /// (the transport peer); `peer` is then the user's principal (`iss|sub`).
+    /// `None` for a call made by the peer as itself.
+    #[getter]
+    fn actor(&self) -> Option<String> {
+        self.handle.actor().map(str::to_string)
+    }
+
+    /// The verified on-behalf-of identity, for a forwarded call.
+    #[getter]
+    fn on_behalf_of(&self) -> Option<crate::identity::ForwardedIdentity> {
+        self.handle
+            .on_behalf_of()
+            .map(|f| crate::identity::ForwardedIdentity(Arc::new(f.clone())))
+    }
+
     /// Whether the peer cancelled, the stream failed, or the deadline passed.
     #[getter]
     fn cancelled(&self) -> bool {
@@ -894,7 +1092,7 @@ impl<'py> IntoPyObject<'py> for BytesList {
 /// transport has always raised: `RpcError` (by status code) for RPC
 /// failures, `ConnectionLostError` for broken streams and connections,
 /// `TransportError` for misuse.
-fn client_err(e: aster::Error) -> PyErr {
+pub(crate) fn client_err(e: aster::Error) -> PyErr {
     Python::attach(|py| {
         let made = match e {
             aster::Error::Rpc {

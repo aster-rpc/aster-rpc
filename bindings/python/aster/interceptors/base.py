@@ -74,6 +74,10 @@ class CallContext:
     rtt_micros: int | None = None
     iroh_authenticated: bool = False
     principal: str | None = None
+    actor: str | None = None
+    auth_methods: tuple[str, ...] = ()
+    on_behalf_of: Any = None  # aster.identity.ForwardedIdentity | None
+    node_properties: Any = None  # aster.identity.NodeProperties | None
     _cancel: Any = field(default=None, init=False, repr=False, compare=False)
 
     _current: ClassVar[contextvars.ContextVar["CallContext | None"]] = (
@@ -98,6 +102,28 @@ class CallContext:
         Iroh QUIC remote node id, proven by the handshake) or ``"other"`` (a
         hint, never an authority)."""
         return "iroh_authenticated" if self.iroh_authenticated else "other"
+
+    def require_auth_method(self, method: str) -> None:
+        """Raise ``PermissionDeniedError`` unless the user signed in with
+        ``method`` (one of :attr:`auth_methods`, e.g.
+        ``aster.identity.AMR_WEBAUTHN``). A call made by the peer as itself
+        carries no sign-in method and is refused too (Rust
+        ``CallContext::require_auth_method``). ``requires=`` checks roles
+        only; call this in the handler for methods that need a stronger
+        sign-in."""
+        if method in self.auth_methods:
+            return
+        from aster.status import PermissionDeniedError
+
+        raise PermissionDeniedError(f"this method needs a sign-in with {method}")
+
+    def node_attribute(self, key: str) -> Any:
+        """One of the serving node's ``aster.ops.NodeConfig`` attributes
+        (``bool`` / ``int`` / ``float`` / ``str``), or ``None`` (Rust
+        ``CallContext::node_attribute``). They describe the node and never
+        authorise: Gate 3 does not read them."""
+        props = self.node_properties
+        return None if props is None else props.attributes.get(key)
 
     def _cancel_event(self) -> asyncio.Event:
         ev = self.__dict__.get("_cancel")
