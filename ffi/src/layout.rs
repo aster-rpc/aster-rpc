@@ -13,14 +13,15 @@
 use crate::audit_outbox::aster_audit_outbox_error_t;
 use core::mem::{align_of, offset_of, size_of};
 
+use crate::config_metrics::aster_metrics_config_t;
 use crate::config_network::aster_network_config_t;
 use crate::coordination::{
     aster_coordination_client_options_t, aster_coordination_error_t,
     aster_coordination_mutation_op_t, aster_coordination_read_op_t,
 };
 use crate::data::{
-    aster_blob_format_t, aster_blob_status_t, aster_fetch_strategy_t, aster_local_access_t,
-    aster_path_info_t, aster_path_list_t, aster_retire_outcome_t,
+    aster_blob_format_t, aster_blob_status_t, aster_blob_transfer_stats_t, aster_fetch_strategy_t,
+    aster_local_access_t, aster_path_info_t, aster_path_list_t, aster_retire_outcome_t,
 };
 use crate::envelope::{aster_call_header_t, aster_rpc_status_t, aster_stream_header_t};
 use crate::expose::{
@@ -308,6 +309,40 @@ mod lp64 {
         reserved = 60,
         discovery_dns_origin = 64,
         discovery_pkarr_relays = 80,
+    });
+
+    // ABI 7.4: [metrics] settings beside aster_config_t (config_metrics.rs).
+    assert_layout!(aster_metrics_config_t, size = 16, align = 4, {
+        struct_size = 0,
+        peer_labels = 4,
+        peer_label_cap = 8,
+        reserved = 12,
+    });
+
+    // ABI 7.4: node-wide blob transfer counters (data.rs).
+    assert_layout!(aster_blob_transfer_stats_t, size = 168, align = 8, {
+        struct_size = 0,
+        reserved = 4,
+        fetched_payload_bytes = 8,
+        fetched_zstd_payload_bytes = 16,
+        fetched_wire_bytes = 24,
+        fetched_plain_bytes = 32,
+        served_payload_bytes = 40,
+        served_zstd_payload_bytes = 48,
+        served_wire_bytes = 56,
+        served_plain_bytes = 64,
+        plain_fallbacks = 72,
+        plain_serves = 80,
+        fetch_plain_ok = 88,
+        fetch_plain_failed = 96,
+        fetch_zstd_ok = 104,
+        fetch_zstd_failed = 112,
+        serve_plain_ok = 120,
+        serve_plain_failed = 128,
+        serve_zstd_ok = 136,
+        serve_zstd_failed = 144,
+        fetch_decode_errors = 152,
+        serve_decode_errors = 160,
     });
 
     // ABI 3.3: connection paths (data.rs).

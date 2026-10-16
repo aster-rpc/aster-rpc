@@ -52,16 +52,41 @@ pub(crate) struct HealthEntry {
 pub(crate) static HEALTHS: once_cell::sync::Lazy<HandleRegistry<HealthEntry>> =
     once_cell::sync::Lazy::new(HandleRegistry::new);
 
-/// The health config of each node `aster_node_start` started, from its
-/// `AsterConfig` (`ASTER_HEALTH_*`, `[health]`); `None` = disabled there.
-static NODE_CONFIGS: Mutex<Option<HashMap<u64, Option<HealthConfig>>>> = Mutex::new(None);
+/// What each node `aster_node_start` started said about its ops listener,
+/// from its `AsterConfig`.
+#[derive(Clone)]
+struct NodeOps {
+    /// `ASTER_HEALTH_*`, `[health]`; `None` = disabled there.
+    health: Option<HealthConfig>,
+    /// `[metrics] peer_labels` / `peer_label_cap` (ABI 7.4): applied to an
+    /// explicit `aster_health_config_t` too.
+    peer_label_cap: Option<usize>,
+}
 
-pub(crate) fn remember_node_config(node: aster_node_t, cfg: Option<HealthConfig>) {
+static NODE_CONFIGS: Mutex<Option<HashMap<u64, NodeOps>>> = Mutex::new(None);
+
+/// The per-peer label cap a config asks for, `None` when peer labels are off.
+pub(crate) fn peer_label_cap(cfg: &aster::AsterConfig) -> Option<usize> {
+    cfg.metrics_peer_labels
+        .then_some(cfg.metrics_peer_label_cap)
+}
+
+pub(crate) fn remember_node_config(
+    node: aster_node_t,
+    health: Option<HealthConfig>,
+    peer_label_cap: Option<usize>,
+) {
     NODE_CONFIGS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get_or_insert_with(HashMap::new)
-        .insert(node, cfg);
+        .insert(
+            node,
+            NodeOps {
+                health,
+                peer_label_cap,
+            },
+        );
 }
 
 pub(crate) fn forget_node_config(node: aster_node_t) {
@@ -74,14 +99,17 @@ pub(crate) fn forget_node_config(node: aster_node_t) {
     }
 }
 
-fn node_config(node: aster_node_t) -> Option<HealthConfig> {
+fn node_ops(node: aster_node_t) -> Option<NodeOps> {
     NODE_CONFIGS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()?
         .get(&node)
         .cloned()
-        .flatten()
+}
+
+fn node_config(node: aster_node_t) -> Option<HealthConfig> {
+    node_ops(node)?.health
 }
 
 fn fail(s: aster_status_t, msg: impl ToString) -> i32 {
@@ -114,7 +142,8 @@ fn state_of(h: aster_health_t) -> Result<HealthState, i32> {
 /// Start an ops listener for `node` (a node from `aster_node_start`). `cfg`
 /// NULL = the node's `AsterConfig` (`ASTER_HEALTH_PORT` / `_HOST` /
 /// `_ENABLED`, `[health]`); `INVALID_ARGUMENT` when that config has health
-/// disabled. Joins the running observability pipeline, or starts one from
+/// disabled. Either way the node's `[metrics]` peer labels (ABI 7.4,
+/// `aster_config_set_metrics`) apply to `aster.peer.bytes`. Joins the running observability pipeline, or starts one from
 /// the environment, with the Prometheus pull reader. The state starts healthy
 /// and not ready: attach it to a server (`aster_server_attach_health`) or set
 /// it with `aster_health_set_ready`. Blocks until bound; refused on a tokio
@@ -173,7 +202,12 @@ pub unsafe extern "C" fn aster_health_start(
                     Err(_) => return invalid("host is not UTF-8"),
                 }
             };
-            HealthConfig::new(host, c.port)
+            let config = HealthConfig::new(host, c.port);
+            // ABI 7.4: the node's `[metrics]` peer labels apply here too.
+            match node_ops(node).and_then(|ops| ops.peer_label_cap) {
+                Some(cap) => config.with_peer_labels(cap),
+                None => config,
+            }
         }
     };
     let node = aster::Node::from_core_node((*core).clone());

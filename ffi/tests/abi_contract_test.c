@@ -222,6 +222,40 @@ OFF(aster_network_config_t, discovery_pkarr_relays, 80);
 _Static_assert(sizeof(aster_discovery_t) == 4, "enum size");
 _Static_assert(ASTER_DISCOVERY_DEFAULT == 0 && ASTER_DISCOVERY_NONE == 1 && ASTER_DISCOVERY_LOCAL == 2 && ASTER_DISCOVERY_CUSTOM == 3, "discovery values");
 
+/* ABI 7.4: [metrics] settings beside aster_config_t (config_metrics.rs). */
+LAYOUT(aster_metrics_config_t, 16);
+OFF(aster_metrics_config_t, struct_size, 0);
+OFF(aster_metrics_config_t, peer_labels, 4);
+OFF(aster_metrics_config_t, peer_label_cap, 8);
+OFF(aster_metrics_config_t, reserved, 12);
+_Static_assert(ASTER_METRICS_PEER_LABEL_CAP_DEFAULT == 64, "default peer label cap");
+
+/* ABI 7.4: node-wide blob transfer counters and fetch report v2 (data.rs). */
+LAYOUT(aster_blob_transfer_stats_t, 168);
+OFF(aster_blob_transfer_stats_t, struct_size, 0);
+OFF(aster_blob_transfer_stats_t, reserved, 4);
+OFF(aster_blob_transfer_stats_t, fetched_payload_bytes, 8);
+OFF(aster_blob_transfer_stats_t, fetched_zstd_payload_bytes, 16);
+OFF(aster_blob_transfer_stats_t, fetched_wire_bytes, 24);
+OFF(aster_blob_transfer_stats_t, fetched_plain_bytes, 32);
+OFF(aster_blob_transfer_stats_t, served_payload_bytes, 40);
+OFF(aster_blob_transfer_stats_t, served_zstd_payload_bytes, 48);
+OFF(aster_blob_transfer_stats_t, served_wire_bytes, 56);
+OFF(aster_blob_transfer_stats_t, served_plain_bytes, 64);
+OFF(aster_blob_transfer_stats_t, plain_fallbacks, 72);
+OFF(aster_blob_transfer_stats_t, plain_serves, 80);
+OFF(aster_blob_transfer_stats_t, fetch_plain_ok, 88);
+OFF(aster_blob_transfer_stats_t, fetch_plain_failed, 96);
+OFF(aster_blob_transfer_stats_t, fetch_zstd_ok, 104);
+OFF(aster_blob_transfer_stats_t, fetch_zstd_failed, 112);
+OFF(aster_blob_transfer_stats_t, serve_plain_ok, 120);
+OFF(aster_blob_transfer_stats_t, serve_plain_failed, 128);
+OFF(aster_blob_transfer_stats_t, serve_zstd_ok, 136);
+OFF(aster_blob_transfer_stats_t, serve_zstd_failed, 144);
+OFF(aster_blob_transfer_stats_t, fetch_decode_errors, 152);
+OFF(aster_blob_transfer_stats_t, serve_decode_errors, 160);
+_Static_assert(ASTER_FETCH_REPORT_V2 == 2 && ASTER_FETCH_REPORT_VERSION_2 == 2 && ASTER_FETCH_PROVIDER_RECORD_V2_SIZE == 72 && ASTER_FETCH_PROVIDER_HAS_WIRE_BYTES == 1, "fetch report v2");
+
 /* ABI 3.3: connection paths (data.rs). */
 _Static_assert(sizeof(aster_blob_format_t) == 4, "enum size");
 _Static_assert(sizeof(aster_fetch_strategy_t) == 4, "enum size");
@@ -487,7 +521,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 3); /* 7.3: cluster network settings; 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 4); /* 7.4: transfer metrics, [metrics] peer labels; 7.3: cluster network settings; 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
     {
         /* A 5.x caller (280-byte aster_config_t, no 6.x handshake) is refused
          * cleanly and nothing is written past, or into, its struct. This runs
@@ -836,6 +870,39 @@ static void test_config(void) {
     CHECK(aster_config_set_network(&n, &net) == ASTER_STATUS_INVALID_ARGUMENT);
     CHECK(aster_config_release(&n) == ASTER_STATUS_OK);
     CHECK(n.storage == NULL);
+
+    /* 7.4: [metrics] settings ride in storage too, beside the network ones. */
+    aster_config_t mc;
+    CHECK(aster_config_init(&mc) == ASTER_STATUS_OK);
+    aster_metrics_config_t m;
+    memset(&m, 0, sizeof m);
+    m.struct_size = sizeof m;
+    CHECK(aster_config_metrics(&mc, &m) == ASTER_STATUS_OK);
+    CHECK(m.peer_labels == 0 && m.peer_label_cap == ASTER_METRICS_PEER_LABEL_CAP_DEFAULT);
+    CHECK(mc.storage == NULL);
+    m.peer_labels = 1;
+    m.peer_label_cap = 3;
+    CHECK(aster_config_set_metrics(&mc, &m) == ASTER_STATUS_OK);
+    CHECK(mc.storage != NULL);
+    net.struct_size = sizeof net;
+    CHECK(aster_config_set_network(&mc, &net) == ASTER_STATUS_OK); /* shares the storage */
+    aster_metrics_config_t mb;
+    memset(&mb, 0, sizeof mb);
+    mb.struct_size = sizeof mb;
+    CHECK(aster_config_metrics(&mc, &mb) == ASTER_STATUS_OK);
+    CHECK(mb.peer_labels == 1 && mb.peer_label_cap == 3);
+    m.peer_labels = 2;
+    CHECK(aster_config_set_metrics(&mc, &m) == ASTER_STATUS_INVALID_ARGUMENT);
+    m.peer_labels = 0;
+    m.struct_size = 8;
+    CHECK(aster_config_set_metrics(&mc, &m) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_config_release(&mc) == ASTER_STATUS_OK);
+    CHECK(mc.storage == NULL);
+
+    aster_blob_transfer_stats_t bs;
+    memset(&bs, 0, sizeof bs);
+    bs.struct_size = 8;
+    CHECK(aster_blobs_transfer_stats(0, 0, &bs) == ASTER_STATUS_INVALID_ARGUMENT);
 }
 
 static int wait_event(aster_runtime_t rt, aster_operation_t op, aster_event_t *out) {
@@ -1598,6 +1665,15 @@ static void test_health(void) {
     CHECK(aster_health_stop(rt, h) == ASTER_STATUS_OK);
     CHECK(aster_health_stop(rt, h) == ASTER_STATUS_NOT_FOUND);
     CHECK(aster_health_set_ready(h, true) == ASTER_STATUS_NOT_FOUND);
+    {
+        /* 7.4: node-wide blob transfer counters (a fresh node: all zero). */
+        aster_blob_transfer_stats_t bs;
+        memset(&bs, 0xff, sizeof bs);
+        bs.struct_size = sizeof bs;
+        CHECK(aster_blobs_transfer_stats(rt, node, &bs) == ASTER_STATUS_OK);
+        CHECK(bs.struct_size == sizeof bs && bs.fetched_payload_bytes == 0 && bs.serve_decode_errors == 0);
+        CHECK(aster_blobs_transfer_stats(rt, node + 1000, &bs) == ASTER_STATUS_NOT_FOUND);
+    }
     CHECK(aster_node_free(rt, node) == ASTER_STATUS_OK);
     CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }

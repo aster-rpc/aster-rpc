@@ -51,6 +51,7 @@ use aster::{
 };
 use aster_transport_core::{CoreAfterHandshakeDecision, CoreHookReceiver, CoreNode};
 
+use crate::config_metrics::MetricsSettings;
 use crate::config_network::{NetworkSettings, StoredNetwork};
 use crate::{
     aster_bytes_list_t, aster_bytes_t, aster_event_kind_t, aster_hook_decision_t,
@@ -280,6 +281,10 @@ pub(crate) unsafe fn lower_config(c: &aster_config_t) -> Result<AsterConfig, Str
         if let Some(network) = &storage.network {
             network.settings.apply(&mut cfg);
         }
+        // ABI 7.4: `[metrics]` settings, likewise.
+        if let Some(metrics) = &storage.metrics {
+            metrics.apply(&mut cfg);
+        }
     }
     cfg.blob_zstd_level = match c.blob_zstd_level {
         ASTER_BLOB_ZSTD_LEVEL_DEFAULT => AsterConfig::default().blob_zstd_level,
@@ -481,6 +486,8 @@ pub(crate) struct ConfigStorage {
     health: Option<StoredHealthConfig>,
     /// ABI 7.3 cluster network settings (`aster_config_set_network`).
     pub(crate) network: Option<Box<StoredNetwork>>,
+    /// ABI 7.4 `[metrics]` settings (`aster_config_set_metrics`).
+    pub(crate) metrics: Option<MetricsSettings>,
 }
 
 struct StoredHealthConfig {
@@ -548,6 +555,10 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
     let network = NetworkSettings::from_config(cfg);
     if !network.is_default() {
         st.network = Some(StoredNetwork::new(network));
+    }
+    let metrics = MetricsSettings::from_config(cfg);
+    if !metrics.is_default() {
+        st.metrics = Some(metrics);
     }
     let (relay_mode, urls) = match &cfg.relay_mode {
         RelayMode::Default => (aster_relay_mode_t::ASTER_RELAY_MODE_DEFAULT, Vec::new()),
@@ -668,7 +679,12 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
             aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_DISABLED
         } as u32,
     };
-    if !st.bufs.is_empty() || !st.lists.is_empty() || st.health.is_some() || st.network.is_some() {
+    if !st.bufs.is_empty()
+        || !st.lists.is_empty()
+        || st.health.is_some()
+        || st.network.is_some()
+        || st.metrics.is_some()
+    {
         out.storage = Box::into_raw(Box::new(st)) as *mut c_void;
     }
 }
@@ -1233,6 +1249,7 @@ pub unsafe extern "C" fn aster_node_start(
         let hooks = cfg.enable_hooks;
         // `aster_health_start` with a NULL config serves this.
         let health = cfg.health_config();
+        let peer_labels = crate::health::peer_label_cap(&cfg);
         match aster::Node::start(cfg).await {
             Ok(node) => {
                 let core: CoreNode = node.core_node().clone();
@@ -1242,7 +1259,7 @@ pub unsafe extern "C" fn aster_node_start(
                     None
                 };
                 let handle = bridge2.nodes.insert(core);
-                crate::health::remember_node_config(handle, health);
+                crate::health::remember_node_config(handle, health, peer_labels);
                 let slot = receiver
                     .as_ref()
                     .map(|_| Arc::new(RwLock::new(SlotState { gate: gate_entry })));
@@ -1718,6 +1735,10 @@ port = 18081
 host = "0.0.0.0"
 enabled = true
 
+[metrics]
+peer_labels = true
+peer_label_cap = 7
+
 [identity]
 file = "/etc/aster/.aster-identity"
 "#,
@@ -1746,6 +1767,10 @@ file = "/etc/aster/.aster-identity"
         assert_eq!(cfg.health_port, 18081);
         assert_eq!(cfg.health_host, "0.0.0.0");
         assert_eq!(cfg.health_enabled, Some(true));
+        // ABI 7.4: [metrics] survives the trip through aster_config_t.
+        assert!(cfg.metrics_peer_labels);
+        assert_eq!(cfg.metrics_peer_label_cap, 7);
+        assert_eq!(cfg.health_config().unwrap().peer_label_cap, Some(7));
         assert_eq!(
             cfg.secret_key_file,
             Some(PathBuf::from("/var/lib/aster-test/node.key"))

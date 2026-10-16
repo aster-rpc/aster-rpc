@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 7
 
-#define ASTER_ABI_VERSION_MINOR 3
+#define ASTER_ABI_VERSION_MINOR 4
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -49,6 +49,11 @@
  * Raw input whitespace/escaping also counts; native envelope validation remains authoritative.
  */
 #define ASTER_AUDIT_OUTBOX_EVENT_JSON_OVERHEAD 1024
+
+/**
+ * The default `peer_label_cap` (64).
+ */
+#define ASTER_METRICS_PEER_LABEL_CAP_DEFAULT 64
 
 /**
  * `aster_coordination_client_options_t.flags`: open the read-only client
@@ -156,6 +161,35 @@
  * Size of one provider record in a fetch report.
  */
 #define ASTER_FETCH_PROVIDER_RECORD_SIZE 44
+
+/**
+ * `flags` bit of the fetches that report (`aster_blobs_download_hash_from`,
+ * the custody download): write fetch report v2 (ABI 7.4, see
+ * `ASTER_FETCH_REPORT_VERSION_2`) instead of v1. Ignored by
+ * `aster_blobs_download_hash`, which has no report.
+ */
+#define ASTER_FETCH_REPORT_V2 2
+
+/**
+ * Version byte of fetch report v2 (ABI 7.4): the v1 header, then provider
+ * records of `ASTER_FETCH_PROVIDER_RECORD_V2_SIZE` bytes, all little-endian:
+ * 32-byte raw node id, u32 attempts, u32 failures, u32 completed_requests,
+ * u32 in_flight, u32 plain_fallbacks, u32 record flags
+ * (`ASTER_FETCH_PROVIDER_HAS_WIRE_BYTES`), u64 bytes_transferred, u64
+ * wire_bytes.
+ */
+#define ASTER_FETCH_REPORT_VERSION_2 2
+
+/**
+ * Size of one provider record in a fetch report v2.
+ */
+#define ASTER_FETCH_PROVIDER_RECORD_V2_SIZE 72
+
+/**
+ * Fetch report v2 record flag: `wire_bytes` is set (some attempt against
+ * the provider went over zstd).
+ */
+#define ASTER_FETCH_PROVIDER_HAS_WIRE_BYTES 1
 
 /**
  * Size of an authority fingerprint (BLAKE3).
@@ -1874,6 +1908,29 @@ typedef struct aster_config_t {
 } aster_config_t;
 
 /**
+ * `[metrics]` settings of a node config (ABI 7.4), next to `aster_config_t`;
+ * see `aster_config_set_metrics`. 16 bytes. A zeroed struct with
+ * `struct_size` set is "nothing configured" (peer labels off, default cap).
+ */
+typedef struct aster_metrics_config_t {
+  /**
+   * `sizeof(aster_metrics_config_t)`, set by the caller.
+   */
+  uint32_t struct_size;
+  /**
+   * 1 = label `aster.peer.bytes` per peer (`aster.peer`) instead of by
+   * locality level; 0 = off (the default).
+   */
+  uint32_t peer_labels;
+  /**
+   * How many peers get their own `aster.peer` series (later peers count
+   * under `_OTHER`); 0 = the default (`ASTER_METRICS_PEER_LABEL_CAP_DEFAULT`).
+   */
+  uint32_t peer_label_cap;
+  uint32_t reserved;
+} aster_metrics_config_t;
+
+/**
  * Cluster network settings of a node config (ABI 7.3), next to
  * `aster_config_t`; see `aster_config_set_network`. Strings are UTF-8, not
  * NUL-terminated; empty = `{NULL, 0}`. A zeroed struct with `struct_size`
@@ -1976,6 +2033,80 @@ typedef uint64_t aster_coordination_placement_manager_t;
  * Runtime-local owned temporary custody scope. Free with aster_blob_custody_free.
  */
 typedef uint64_t aster_blob_custody_t;
+
+/**
+ * Node-wide blob transfer counters since the node started
+ * (`aster::BlobTransferStats`; `aster_blobs_transfer_stats`, ABI 7.4).
+ * Monotonic. Payload is blob content as decoded, whatever the encoding:
+ * compression coverage is `*_zstd_payload_bytes / *_payload_bytes`, its
+ * saving `*_plain_bytes - *_wire_bytes`. 168 bytes.
+ */
+typedef struct aster_blob_transfer_stats_t {
+  /**
+   * `sizeof(aster_blob_transfer_stats_t)`, set by the caller.
+   */
+  uint32_t struct_size;
+  uint32_t reserved;
+  /**
+   * Payload bytes fetched, plain and zstd.
+   */
+  uint64_t fetched_payload_bytes;
+  /**
+   * The part of `fetched_payload_bytes` that came over zstd.
+   */
+  uint64_t fetched_zstd_payload_bytes;
+  /**
+   * Compressed bytes received while fetching over zstd.
+   */
+  uint64_t fetched_wire_bytes;
+  /**
+   * Protocol bytes those decompressed to.
+   */
+  uint64_t fetched_plain_bytes;
+  /**
+   * Payload bytes served, plain and zstd.
+   */
+  uint64_t served_payload_bytes;
+  /**
+   * The part of `served_payload_bytes` that went out over zstd.
+   */
+  uint64_t served_zstd_payload_bytes;
+  /**
+   * Compressed bytes sent while serving over zstd.
+   */
+  uint64_t served_wire_bytes;
+  /**
+   * Protocol bytes those were compressed from.
+   */
+  uint64_t served_plain_bytes;
+  /**
+   * Fetch attempts that fell back to plain (the provider has no zstd).
+   */
+  uint64_t plain_fallbacks;
+  /**
+   * Requests served over plain transport.
+   */
+  uint64_t plain_serves;
+  /**
+   * Fetch attempts by encoding and result.
+   */
+  uint64_t fetch_plain_ok;
+  uint64_t fetch_plain_failed;
+  uint64_t fetch_zstd_ok;
+  uint64_t fetch_zstd_failed;
+  /**
+   * Served requests by encoding and result.
+   */
+  uint64_t serve_plain_ok;
+  uint64_t serve_plain_failed;
+  uint64_t serve_zstd_ok;
+  uint64_t serve_zstd_failed;
+  /**
+   * Fetched / served zstd streams that failed on malformed zstd data.
+   */
+  uint64_t fetch_decode_errors;
+  uint64_t serve_decode_errors;
+} aster_blob_transfer_stats_t;
 
 /**
  * One network path of a connection (`aster::PathInfo`). Strings point into
@@ -4209,6 +4340,33 @@ int32_t aster_call_discard(aster_runtime_t runtime, aster_call_t call);
 int32_t aster_call_buffer_release(aster_runtime_t runtime, aster_buffer_t buffer);
 
 /**
+ * Set (or, with `metrics` NULL, clear) the `[metrics]` settings of `config`
+ * (ABI 7.4). They are validated and copied into the config's library-owned
+ * `storage`, which this allocates for a caller-built config: release such a
+ * config with `aster_config_release` once it has been passed to
+ * `aster_node_start` (or is no longer needed).
+ *
+ * `metrics->struct_size` must equal `sizeof(aster_metrics_config_t)`;
+ * `peer_labels` is 0 or 1; `reserved` is 0.
+ *
+ * # Safety
+ * `config` points to a valid `aster_config_t`; `metrics` is NULL or valid.
+ */
+int32_t aster_config_set_metrics(struct aster_config_t *config,
+                                 const struct aster_metrics_config_t *metrics);
+
+/**
+ * Read the `[metrics]` settings of `config` (ABI 7.4) into `*out`. A config
+ * without any reads as peer labels off with the default cap. The caller sets
+ * `out->struct_size` to `sizeof(aster_metrics_config_t)` before the call.
+ *
+ * # Safety
+ * `config` points to a valid `aster_config_t`; `out` is writable.
+ */
+int32_t aster_config_metrics(const struct aster_config_t *config,
+                             struct aster_metrics_config_t *out);
+
+/**
  * Set (or, with `network` NULL, clear) the cluster network settings of
  * `config` (ABI 7.3). The settings are validated and copied into the
  * config's library-owned `storage`, which this allocates for a caller-built
@@ -4666,13 +4824,14 @@ int32_t aster_blob_custody_download_hash_from(aster_runtime_t runtime,
  * (relay, discovery, or an address added with `aster_add_node_addr`).
  *
  * `format`: `aster_blob_format_t`; `strategy`: `aster_fetch_strategy_t`
- * (`SPLIT_CHILDREN` requires `HASH_SEQ`); `flags`: 0 or
- * `ASTER_FETCH_TO_STORE`. Bad arguments return
+ * (`SPLIT_CHILDREN` requires `HASH_SEQ`); `flags`: `ASTER_FETCH_TO_STORE`
+ * and/or `ASTER_FETCH_REPORT_V2` (ABI 7.4), or 0. Bad arguments return
  * `ASTER_STATUS_INVALID_ARGUMENT` before anything starts.
  *
  * Emits `ASTER_EVENT_BLOB_FETCHED` (`handle` = node, `flags` = provider
- * count); payload = fetch report v1 then, without `ASTER_FETCH_TO_STORE`, the
- * blob bytes. A failed fetch emits `ASTER_EVENT_ERROR`.
+ * count); payload = fetch report v1 (v2 with `ASTER_FETCH_REPORT_V2`) then,
+ * without `ASTER_FETCH_TO_STORE`, the blob bytes. A failed fetch emits
+ * `ASTER_EVENT_ERROR`.
  */
 int32_t aster_blobs_download_hash_from(aster_runtime_t runtime,
                                        aster_node_t node,
@@ -4685,9 +4844,23 @@ int32_t aster_blobs_download_hash_from(aster_runtime_t runtime,
                                        aster_operation_t *out_operation);
 
 /**
+ * The node's blob transfer counters since it started
+ * (`aster::Blobs::transfer_stats`, ABI 7.4): every fetch and serve, plain
+ * and zstd. Synchronous. The caller sets `out->struct_size` to
+ * `sizeof(aster_blob_transfer_stats_t)`; the library fills the rest.
+ *
+ * # Safety
+ * `out` is writable.
+ */
+int32_t aster_blobs_transfer_stats(aster_runtime_t runtime,
+                                   aster_node_t node,
+                                   struct aster_blob_transfer_stats_t *out);
+
+/**
  * Download a blob by hash from one provider (`aster::Blobs::download_hash` /
  * `download_hash_to_store`). `format`: `aster_blob_format_t`; `flags`: 0 or
- * `ASTER_FETCH_TO_STORE`.
+ * `ASTER_FETCH_TO_STORE` (`ASTER_FETCH_REPORT_V2` is accepted and ignored:
+ * there is no report).
  *
  * Emits `ASTER_EVENT_BLOB_DOWNLOADED` (`handle` = node) with the blob bytes
  * as payload (empty with `ASTER_FETCH_TO_STORE`).
@@ -5936,7 +6109,8 @@ int32_t aster_grant_outcome_release(struct aster_grant_outcome_t *outcome);
  * Start an ops listener for `node` (a node from `aster_node_start`). `cfg`
  * NULL = the node's `AsterConfig` (`ASTER_HEALTH_PORT` / `_HOST` /
  * `_ENABLED`, `[health]`); `INVALID_ARGUMENT` when that config has health
- * disabled. Joins the running observability pipeline, or starts one from
+ * disabled. Either way the node's `[metrics]` peer labels (ABI 7.4,
+ * `aster_config_set_metrics`) apply to `aster.peer.bytes`. Joins the running observability pipeline, or starts one from
  * the environment, with the Prometheus pull reader. The state starts healthy
  * and not ready: attach it to a server (`aster_server_attach_health`) or set
  * it with `aster_health_set_ready`. Blocks until bound; refused on a tokio
@@ -7551,6 +7725,13 @@ int32_t aster_topology_has_monitoring(aster_runtime_t runtime, aster_node_t node
  * Output is owned UTF-8 JSON; free with aster_string_release. Level is 0..4,
  * confidence_ppm is native integer confidence; nullable RTT/jitter stay null.
  * remote_addr is local-only and never added to the baseline Topology RPC.
+ * ABI 7.4 adds `quic_traffic` (an object keyed by protocol family `blobs`,
+ * `blobs-zstd`, `docs`, `gossip`, `rpc`, `other`, each
+ * `{quic_bytes_sent, quic_bytes_received}`) and `blob_transfer`
+ * (`fetched_payload_bytes`, `fetched_zstd_payload_bytes`,
+ * `fetched_wire_bytes`, `fetched_plain_bytes`, `served_payload_bytes`,
+ * `served_zstd_payload_bytes`, `served_wire_bytes`, `served_plain_bytes`,
+ * `plain_fallbacks`), all cumulative integers.
  * # Safety
  * out must be writable for one byte span.
  */

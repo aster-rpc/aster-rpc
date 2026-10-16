@@ -5,7 +5,10 @@ use crate::data::{
 };
 use crate::upcall::{admitted_for, aster_topology_admitted_t};
 use crate::*;
-use aster::topology::{ClusterView, PeerView, SeparationVerdict, Topology, TopologySwarmOptions};
+use aster::topology::{
+    ClusterView, PeerBlobStats, PeerView, QuicTraffic, SeparationVerdict, Topology,
+    TopologySwarmOptions,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -49,6 +52,41 @@ fn peer_json(peer: PeerView) -> Value {
         "congestion_events": peer.congestion_events, "samples": peer.samples,
         "confidence_ppm": peer.confidence_ppm, "last_measured_unix_ms": peer.last_measured_unix_ms,
         "cluster_held_since_unix_ms": peer.cluster_held_since_unix_ms, "is_connected": peer.is_connected,
+        "quic_traffic": quic_traffic_json(&peer.quic_traffic),
+        "blob_transfer": blob_transfer_json(&peer.blob_transfer),
+    })
+}
+/// ABI 7.4: QUIC bytes per protocol family (`blobs`, `blobs-zstd`, `docs`,
+/// `gossip`, `rpc`, `other`), each `{"quic_bytes_sent", "quic_bytes_received"}`,
+/// cumulative since the node started and across reconnects.
+fn quic_traffic_json(traffic: &QuicTraffic) -> Value {
+    Value::Object(
+        traffic
+            .iter()
+            .map(|(family, bytes)| {
+                (
+                    family.as_str().to_string(),
+                    json!({
+                        "quic_bytes_sent": bytes.quic_bytes_sent,
+                        "quic_bytes_received": bytes.quic_bytes_received,
+                    }),
+                )
+            })
+            .collect(),
+    )
+}
+/// ABI 7.4: exact blob payload (and zstd wire) bytes exchanged with the peer.
+fn blob_transfer_json(b: &PeerBlobStats) -> Value {
+    json!({
+        "fetched_payload_bytes": b.fetched_payload_bytes,
+        "fetched_zstd_payload_bytes": b.fetched_zstd_payload_bytes,
+        "fetched_wire_bytes": b.fetched_wire_bytes,
+        "fetched_plain_bytes": b.fetched_plain_bytes,
+        "served_payload_bytes": b.served_payload_bytes,
+        "served_zstd_payload_bytes": b.served_zstd_payload_bytes,
+        "served_wire_bytes": b.served_wire_bytes,
+        "served_plain_bytes": b.served_plain_bytes,
+        "plain_fallbacks": b.plain_fallbacks,
     })
 }
 fn cluster_json(cluster: &ClusterView) -> Value {
@@ -116,6 +154,13 @@ pub unsafe extern "C" fn aster_topology_has_monitoring(
 /// Output is owned UTF-8 JSON; free with aster_string_release. Level is 0..4,
 /// confidence_ppm is native integer confidence; nullable RTT/jitter stay null.
 /// remote_addr is local-only and never added to the baseline Topology RPC.
+/// ABI 7.4 adds `quic_traffic` (an object keyed by protocol family `blobs`,
+/// `blobs-zstd`, `docs`, `gossip`, `rpc`, `other`, each
+/// `{quic_bytes_sent, quic_bytes_received}`) and `blob_transfer`
+/// (`fetched_payload_bytes`, `fetched_zstd_payload_bytes`,
+/// `fetched_wire_bytes`, `fetched_plain_bytes`, `served_payload_bytes`,
+/// `served_zstd_payload_bytes`, `served_wire_bytes`, `served_plain_bytes`,
+/// `plain_fallbacks`), all cumulative integers.
 /// # Safety
 /// out must be writable for one byte span.
 #[no_mangle]
@@ -465,11 +510,41 @@ mod tests {
             level_source: aster::topology::LevelSource::Measured,
             declared_region: None,
             declared_zone: None,
-            quic_traffic: Default::default(),
-            blob_transfer: Default::default(),
+            quic_traffic: aster::topology::QuicTraffic {
+                rpc: aster::topology::QuicBytes {
+                    quic_bytes_sent: 12,
+                    quic_bytes_received: u64::MAX,
+                },
+                ..Default::default()
+            },
+            blob_transfer: aster::topology::PeerBlobStats {
+                fetched_wire_bytes: 21,
+                served_payload_bytes: 22,
+                plain_fallbacks: 23,
+                ..Default::default()
+            },
         };
         let value = peer_json(peer);
-        assert_eq!(value.as_object().unwrap().len(), 17);
+        assert_eq!(value.as_object().unwrap().len(), 19);
+        let traffic = value["quic_traffic"].as_object().unwrap();
+        assert_eq!(
+            traffic.keys().map(String::as_str).collect::<Vec<_>>().len(),
+            6
+        );
+        for family in ["blobs", "blobs-zstd", "docs", "gossip", "rpc", "other"] {
+            assert!(traffic.contains_key(family), "{family}");
+        }
+        assert_eq!(traffic["rpc"]["quic_bytes_sent"], 12);
+        assert_eq!(
+            traffic["rpc"]["quic_bytes_received"].as_u64(),
+            Some(u64::MAX)
+        );
+        assert_eq!(traffic["blobs-zstd"]["quic_bytes_sent"], 0);
+        let blobs = value["blob_transfer"].as_object().unwrap();
+        assert_eq!(blobs.len(), 9);
+        assert_eq!(blobs["fetched_wire_bytes"], 21);
+        assert_eq!(blobs["served_payload_bytes"], 22);
+        assert_eq!(blobs["plain_fallbacks"], 23);
         assert_eq!(value["level"], 1);
         assert!(
             value["rtt_us"].is_null()

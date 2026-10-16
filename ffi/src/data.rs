@@ -35,6 +35,26 @@
 //! 32-byte raw node id, then `attempts`, `failures`, `completed_requests`
 //! (u32 each). Without `ASTER_FETCH_TO_STORE`, the blob bytes follow the
 //! report directly (offset `16 + 44 × N` to the end of the payload).
+//!
+//! **Fetch report v2** (ABI 7.4; `ASTER_FETCH_REPORT_VERSION_2` = 2), written
+//! instead of v1 when the fetch's `flags` include `ASTER_FETCH_REPORT_V2`:
+//! the same 16-byte header (version byte 2), then `N` records of
+//! `ASTER_FETCH_PROVIDER_RECORD_V2_SIZE` = 72 bytes:
+//!
+//! | Offset | Size | Field |
+//! |---|---|---|
+//! | 0 | 32 | raw node id |
+//! | 32 | 4 | attempts (u32) |
+//! | 36 | 4 | failures (u32) |
+//! | 40 | 4 | completed_requests (u32) |
+//! | 44 | 4 | in_flight (u32) |
+//! | 48 | 4 | plain_fallbacks (u32) |
+//! | 52 | 4 | record flags (u32): `ASTER_FETCH_PROVIDER_HAS_WIRE_BYTES` |
+//! | 56 | 8 | bytes_transferred (u64): payload from this provider |
+//! | 64 | 8 | wire_bytes (u64): compressed bytes received over zstd; 0 with the flag clear when every attempt was plain |
+//!
+//! The header's bytes transferred is the sum of the records'. The blob bytes
+//! follow the last record, as in v1.
 
 use std::ffi::c_void;
 use std::future::Future;
@@ -120,6 +140,23 @@ pub const ASTER_FETCH_REPORT_VERSION: u8 = 1;
 pub const ASTER_FETCH_REPORT_HEADER_SIZE: usize = 16;
 /// Size of one provider record in a fetch report.
 pub const ASTER_FETCH_PROVIDER_RECORD_SIZE: usize = 44;
+/// `flags` bit of the fetches that report (`aster_blobs_download_hash_from`,
+/// the custody download): write fetch report v2 (ABI 7.4, see
+/// `ASTER_FETCH_REPORT_VERSION_2`) instead of v1. Ignored by
+/// `aster_blobs_download_hash`, which has no report.
+pub const ASTER_FETCH_REPORT_V2: u32 = 2;
+/// Version byte of fetch report v2 (ABI 7.4): the v1 header, then provider
+/// records of `ASTER_FETCH_PROVIDER_RECORD_V2_SIZE` bytes, all little-endian:
+/// 32-byte raw node id, u32 attempts, u32 failures, u32 completed_requests,
+/// u32 in_flight, u32 plain_fallbacks, u32 record flags
+/// (`ASTER_FETCH_PROVIDER_HAS_WIRE_BYTES`), u64 bytes_transferred, u64
+/// wire_bytes.
+pub const ASTER_FETCH_REPORT_VERSION_2: u8 = 2;
+/// Size of one provider record in a fetch report v2.
+pub const ASTER_FETCH_PROVIDER_RECORD_V2_SIZE: usize = 72;
+/// Fetch report v2 record flag: `wire_bytes` is set (some attempt against
+/// the provider went over zstd).
+pub const ASTER_FETCH_PROVIDER_HAS_WIRE_BYTES: u32 = 1;
 /// Size of an authority fingerprint (BLAKE3).
 pub const ASTER_AUTHORITY_FINGERPRINT_SIZE: usize = 32;
 
@@ -163,6 +200,81 @@ pub struct aster_path_list_t {
     pub len: usize,
     /// Library-owned backing store; NULL when nothing was allocated.
     pub storage: *mut c_void,
+}
+
+/// Node-wide blob transfer counters since the node started
+/// (`aster::BlobTransferStats`; `aster_blobs_transfer_stats`, ABI 7.4).
+/// Monotonic. Payload is blob content as decoded, whatever the encoding:
+/// compression coverage is `*_zstd_payload_bytes / *_payload_bytes`, its
+/// saving `*_plain_bytes - *_wire_bytes`. 168 bytes.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct aster_blob_transfer_stats_t {
+    /// `sizeof(aster_blob_transfer_stats_t)`, set by the caller.
+    pub struct_size: u32,
+    pub reserved: u32,
+    /// Payload bytes fetched, plain and zstd.
+    pub fetched_payload_bytes: u64,
+    /// The part of `fetched_payload_bytes` that came over zstd.
+    pub fetched_zstd_payload_bytes: u64,
+    /// Compressed bytes received while fetching over zstd.
+    pub fetched_wire_bytes: u64,
+    /// Protocol bytes those decompressed to.
+    pub fetched_plain_bytes: u64,
+    /// Payload bytes served, plain and zstd.
+    pub served_payload_bytes: u64,
+    /// The part of `served_payload_bytes` that went out over zstd.
+    pub served_zstd_payload_bytes: u64,
+    /// Compressed bytes sent while serving over zstd.
+    pub served_wire_bytes: u64,
+    /// Protocol bytes those were compressed from.
+    pub served_plain_bytes: u64,
+    /// Fetch attempts that fell back to plain (the provider has no zstd).
+    pub plain_fallbacks: u64,
+    /// Requests served over plain transport.
+    pub plain_serves: u64,
+    /// Fetch attempts by encoding and result.
+    pub fetch_plain_ok: u64,
+    pub fetch_plain_failed: u64,
+    pub fetch_zstd_ok: u64,
+    pub fetch_zstd_failed: u64,
+    /// Served requests by encoding and result.
+    pub serve_plain_ok: u64,
+    pub serve_plain_failed: u64,
+    pub serve_zstd_ok: u64,
+    pub serve_zstd_failed: u64,
+    /// Fetched / served zstd streams that failed on malformed zstd data.
+    pub fetch_decode_errors: u64,
+    pub serve_decode_errors: u64,
+}
+
+impl From<aster::BlobTransferStats> for aster_blob_transfer_stats_t {
+    fn from(s: aster::BlobTransferStats) -> Self {
+        aster_blob_transfer_stats_t {
+            struct_size: std::mem::size_of::<Self>() as u32,
+            reserved: 0,
+            fetched_payload_bytes: s.fetched_payload_bytes,
+            fetched_zstd_payload_bytes: s.fetched_zstd_payload_bytes,
+            fetched_wire_bytes: s.fetched_wire_bytes,
+            fetched_plain_bytes: s.fetched_plain_bytes,
+            served_payload_bytes: s.served_payload_bytes,
+            served_zstd_payload_bytes: s.served_zstd_payload_bytes,
+            served_wire_bytes: s.served_wire_bytes,
+            served_plain_bytes: s.served_plain_bytes,
+            plain_fallbacks: s.plain_fallbacks,
+            plain_serves: s.plain_serves,
+            fetch_plain_ok: s.fetch_transfers.plain_ok,
+            fetch_plain_failed: s.fetch_transfers.plain_failed,
+            fetch_zstd_ok: s.fetch_transfers.zstd_ok,
+            fetch_zstd_failed: s.fetch_transfers.zstd_failed,
+            serve_plain_ok: s.serve_transfers.plain_ok,
+            serve_plain_failed: s.serve_transfers.plain_failed,
+            serve_zstd_ok: s.serve_transfers.zstd_ok,
+            serve_zstd_failed: s.serve_transfers.zstd_failed,
+            fetch_decode_errors: s.fetch_decode_errors,
+            serve_decode_errors: s.serve_decode_errors,
+        }
+    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -269,11 +381,23 @@ pub(crate) fn fetch_strategy(v: u32) -> Result<FetchStrategy, i32> {
     }
 }
 
-pub(crate) fn fetch_flags(v: u32) -> Result<bool, i32> {
-    if v & !ASTER_FETCH_TO_STORE != 0 {
+/// Decoded `flags` of a blob download.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FetchFlags {
+    /// `ASTER_FETCH_TO_STORE`.
+    pub(crate) to_store: bool,
+    /// `ASTER_FETCH_REPORT_V2`.
+    pub(crate) report_v2: bool,
+}
+
+pub(crate) fn fetch_flags(v: u32) -> Result<FetchFlags, i32> {
+    if v & !(ASTER_FETCH_TO_STORE | ASTER_FETCH_REPORT_V2) != 0 {
         return Err(invalid(format!("unknown fetch flags {v:#x}")));
     }
-    Ok(v & ASTER_FETCH_TO_STORE != 0)
+    Ok(FetchFlags {
+        to_store: v & ASTER_FETCH_TO_STORE != 0,
+        report_v2: v & ASTER_FETCH_REPORT_V2 != 0,
+    })
 }
 
 fn local_access_code(a: LocalAccess) -> u32 {
@@ -300,6 +424,55 @@ fn node_facade(bridge: &BridgeRuntime, node: aster_node_t) -> Result<aster::Node
         Some(core) => Ok(aster::Node::from_core_node(core.as_ref().clone())),
         None => Err(not_found(format!("unknown node handle {node}"))),
     }
+}
+
+/// Encode a fetch report, v2 when `flags.report_v2` (else v1; see the module
+/// docs), followed by `data`.
+pub(crate) fn encode_fetch_report_for(
+    report: &FetchReport,
+    data: &[u8],
+    flags: FetchFlags,
+) -> Vec<u8> {
+    if flags.report_v2 {
+        encode_fetch_report_v2(report, data)
+    } else {
+        encode_fetch_report(report, data)
+    }
+}
+
+/// Encode a fetch report v2 (ABI 7.4, see the module docs) followed by `data`.
+pub fn encode_fetch_report_v2(report: &FetchReport, data: &[u8]) -> Vec<u8> {
+    let providers = report.providers();
+    let mut out = Vec::with_capacity(
+        ASTER_FETCH_REPORT_HEADER_SIZE
+            + ASTER_FETCH_PROVIDER_RECORD_V2_SIZE * providers.len()
+            + data.len(),
+    );
+    out.push(ASTER_FETCH_REPORT_VERSION_2);
+    out.extend_from_slice(&[0, 0, 0]);
+    out.extend_from_slice(&(providers.len() as u32).to_le_bytes());
+    out.extend_from_slice(&report.bytes_transferred().to_le_bytes());
+    for p in providers {
+        let mut id = [0u8; 32];
+        // Ids come from iroh endpoint ids, so they are always 32-byte hex.
+        let _ = hex::decode_to_slice(p.node_id().as_str(), &mut id);
+        out.extend_from_slice(&id);
+        out.extend_from_slice(&p.attempts().to_le_bytes());
+        out.extend_from_slice(&p.failures().to_le_bytes());
+        out.extend_from_slice(&p.completed_requests().to_le_bytes());
+        out.extend_from_slice(&p.in_flight().to_le_bytes());
+        out.extend_from_slice(&p.plain_fallbacks().to_le_bytes());
+        let flags = if p.wire_bytes().is_some() {
+            ASTER_FETCH_PROVIDER_HAS_WIRE_BYTES
+        } else {
+            0
+        };
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&p.bytes_transferred().to_le_bytes());
+        out.extend_from_slice(&p.wire_bytes().unwrap_or(0).to_le_bytes());
+    }
+    out.extend_from_slice(data);
+    out
 }
 
 /// Encode a fetch report (v1, see the module docs) followed by `data`.
@@ -580,13 +753,14 @@ fn err(e: impl std::fmt::Display) -> String {
 /// (relay, discovery, or an address added with `aster_add_node_addr`).
 ///
 /// `format`: `aster_blob_format_t`; `strategy`: `aster_fetch_strategy_t`
-/// (`SPLIT_CHILDREN` requires `HASH_SEQ`); `flags`: 0 or
-/// `ASTER_FETCH_TO_STORE`. Bad arguments return
+/// (`SPLIT_CHILDREN` requires `HASH_SEQ`); `flags`: `ASTER_FETCH_TO_STORE`
+/// and/or `ASTER_FETCH_REPORT_V2` (ABI 7.4), or 0. Bad arguments return
 /// `ASTER_STATUS_INVALID_ARGUMENT` before anything starts.
 ///
 /// Emits `ASTER_EVENT_BLOB_FETCHED` (`handle` = node, `flags` = provider
-/// count); payload = fetch report v1 then, without `ASTER_FETCH_TO_STORE`, the
-/// blob bytes. A failed fetch emits `ASTER_EVENT_ERROR`.
+/// count); payload = fetch report v1 (v2 with `ASTER_FETCH_REPORT_V2`) then,
+/// without `ASTER_FETCH_TO_STORE`, the blob bytes. A failed fetch emits
+/// `ASTER_EVENT_ERROR`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn aster_blobs_download_hash_from(
@@ -613,11 +787,11 @@ pub unsafe extern "C" fn aster_blobs_download_hash_from(
     if strategy == FetchStrategy::SplitChildren && format != BlobFormat::HashSeq {
         return invalid("ASTER_FETCH_STRATEGY_SPLIT_CHILDREN needs ASTER_BLOB_FORMAT_HASH_SEQ");
     }
-    let to_store = try_status!(fetch_flags(flags));
+    let flags = try_status!(fetch_flags(flags));
     let bridge = try_status!(bridge_for(runtime));
     let blobs = try_status!(node_facade(&bridge, node)).blobs();
     spawn_op(&bridge, user_data, out_operation, async move {
-        let (data, report) = if to_store {
+        let (data, report) = if flags.to_store {
             let r = blobs
                 .download_hash_to_store_from(&hash, &from, format, strategy)
                 .await
@@ -631,13 +805,43 @@ pub unsafe extern "C" fn aster_blobs_download_hash_from(
         };
         Ok(Done::ok(aster_event_kind_t::ASTER_EVENT_BLOB_FETCHED, node)
             .flags(report.providers().len() as u32)
-            .data(encode_fetch_report(&report, &data)))
+            .data(encode_fetch_report_for(&report, &data, flags)))
     })
+}
+
+/// The node's blob transfer counters since it started
+/// (`aster::Blobs::transfer_stats`, ABI 7.4): every fetch and serve, plain
+/// and zstd. Synchronous. The caller sets `out->struct_size` to
+/// `sizeof(aster_blob_transfer_stats_t)`; the library fills the rest.
+///
+/// # Safety
+/// `out` is writable.
+#[no_mangle]
+pub unsafe extern "C" fn aster_blobs_transfer_stats(
+    runtime: aster_runtime_t,
+    node: aster_node_t,
+    out: *mut aster_blob_transfer_stats_t,
+) -> i32 {
+    if out.is_null() {
+        return invalid("aster_blobs_transfer_stats: out is NULL");
+    }
+    let size = out.cast::<u32>().read_unaligned();
+    let expected = std::mem::size_of::<aster_blob_transfer_stats_t>() as u32;
+    if size != expected {
+        return invalid(format!(
+            "aster_blobs_transfer_stats: out->struct_size is {size}, expected {expected}"
+        ));
+    }
+    let bridge = try_status!(bridge_for(runtime));
+    let blobs = try_status!(node_facade(&bridge, node)).blobs();
+    *out = blobs.transfer_stats().into();
+    OK
 }
 
 /// Download a blob by hash from one provider (`aster::Blobs::download_hash` /
 /// `download_hash_to_store`). `format`: `aster_blob_format_t`; `flags`: 0 or
-/// `ASTER_FETCH_TO_STORE`.
+/// `ASTER_FETCH_TO_STORE` (`ASTER_FETCH_REPORT_V2` is accepted and ignored:
+/// there is no report).
 ///
 /// Emits `ASTER_EVENT_BLOB_DOWNLOADED` (`handle` = node) with the blob bytes
 /// as payload (empty with `ASTER_FETCH_TO_STORE`).
@@ -659,7 +863,7 @@ pub unsafe extern "C" fn aster_blobs_download_hash(
     let hash = Hash::from_hex(try_status!(in_hex32(&hash_hex, "hash")));
     let from = try_status!(in_node_id(&provider, "provider"));
     let format = try_status!(blob_format(format));
-    let to_store = try_status!(fetch_flags(flags));
+    let to_store = try_status!(fetch_flags(flags)).to_store;
     let bridge = try_status!(bridge_for(runtime));
     let blobs = try_status!(node_facade(&bridge, node)).blobs();
     spawn_op(&bridge, user_data, out_operation, async move {
@@ -1454,6 +1658,96 @@ mod tests {
     }
 
     #[test]
+    fn fetch_report_v2_encoding_is_stable() {
+        let provider =
+            |id: &str, bytes: u64, wire: Option<u64>| aster_transport_core::CoreProviderOutcome {
+                node_id: id.repeat(32),
+                attempts: 3,
+                failures: 2,
+                completed_requests: 1,
+                plain_fallbacks: 4,
+                in_flight: 5,
+                bytes_transferred: bytes,
+                wire_bytes: wire,
+            };
+        let report = FetchReport::from(aster_transport_core::CoreFetchReport {
+            providers: vec![
+                provider("0a", 0x0102_0304_0506_0708, Some(0x10)),
+                provider("0b", 1, None),
+            ],
+            bytes_transferred: 0x0102_0304_0506_0709,
+        });
+        let enc = encode_fetch_report_v2(&report, b"xyz");
+        let mut want = vec![2u8, 0, 0, 0, 2, 0, 0, 0, 9, 7, 6, 5, 4, 3, 2, 1];
+        want.extend_from_slice(&[0x0a; 32]);
+        want.extend_from_slice(&[3, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0]);
+        want.extend_from_slice(&[1, 0, 0, 0]);
+        want.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1, 0x10, 0, 0, 0, 0, 0, 0, 0]);
+        want.extend_from_slice(&[0x0b; 32]);
+        want.extend_from_slice(&[3, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0]);
+        want.extend_from_slice(&[0, 0, 0, 0]);
+        want.extend_from_slice(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        want.extend_from_slice(b"xyz");
+        assert_eq!(enc, want);
+        assert_eq!(
+            enc.len(),
+            ASTER_FETCH_REPORT_HEADER_SIZE + 2 * ASTER_FETCH_PROVIDER_RECORD_V2_SIZE + 3
+        );
+        let v1 = FetchFlags {
+            to_store: false,
+            report_v2: false,
+        };
+        assert_eq!(
+            encode_fetch_report_for(&report, b"", v1),
+            encode_fetch_report(&report, b"")
+        );
+    }
+
+    #[test]
+    fn blob_transfer_stats_copy_every_counter() {
+        let counts = |a, b, c, d| aster::BlobTransferCounts {
+            plain_ok: a,
+            plain_failed: b,
+            zstd_ok: c,
+            zstd_failed: d,
+        };
+        let s = aster::BlobTransferStats {
+            fetched_payload_bytes: 1,
+            fetched_zstd_payload_bytes: 2,
+            fetched_wire_bytes: 3,
+            fetched_plain_bytes: 4,
+            served_payload_bytes: 5,
+            served_zstd_payload_bytes: 6,
+            served_wire_bytes: 7,
+            served_plain_bytes: 8,
+            plain_fallbacks: 9,
+            plain_serves: 10,
+            fetch_transfers: counts(11, 12, 13, 14),
+            serve_transfers: counts(15, 16, 17, 18),
+            fetch_decode_errors: 19,
+            serve_decode_errors: 20,
+        };
+        let c: aster_blob_transfer_stats_t = s.into();
+        assert_eq!(c.struct_size, 168);
+        // Every u64 after the 8-byte prefix, in declaration order, is 1..=20.
+        let words: &[u64; 21] = unsafe { &*(&c as *const _ as *const [u64; 21]) };
+        assert_eq!(&words[1..], &(1..=20).collect::<Vec<u64>>()[..]);
+
+        let mut out = aster_blob_transfer_stats_t {
+            struct_size: 8,
+            ..Default::default()
+        };
+        assert_eq!(
+            unsafe { aster_blobs_transfer_stats(0, 0, &mut out) },
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32
+        );
+        assert_eq!(
+            unsafe { aster_blobs_transfer_stats(0, 0, std::ptr::null_mut()) },
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT as i32
+        );
+    }
+
+    #[test]
     fn hex_and_enum_validation() {
         let good = "AB".repeat(32);
         let b = aster_bytes_t {
@@ -1468,8 +1762,11 @@ mod tests {
         assert!(unsafe { in_hex32(&short, "x") }.is_err());
         assert!(blob_format(2).is_err());
         assert!(fetch_strategy(7).is_err());
-        assert!(fetch_flags(2).is_err());
-        assert!(fetch_flags(ASTER_FETCH_TO_STORE).unwrap());
+        assert!(fetch_flags(4).is_err());
+        assert!(fetch_flags(ASTER_FETCH_TO_STORE).unwrap().to_store);
+        let both = fetch_flags(ASTER_FETCH_TO_STORE | ASTER_FETCH_REPORT_V2).unwrap();
+        assert!(both.to_store && both.report_v2);
+        assert!(!fetch_flags(0).unwrap().report_v2);
     }
 
     #[test]

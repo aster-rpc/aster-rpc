@@ -1,4 +1,21 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.3)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.4)
+
+## New in 7.4 (transfer metrics; additive)
+
+The transfer metrics Rust gained in 0.3 (Portal M1-M4), for the bindings
+that reach Rust through this ABI. Nothing existing changes shape: fetch
+report v1 stays the default and the topology JSON only gains keys.
+
+| Item | Role |
+|---|---|
+| `aster_blobs_transfer_stats(rt, node, out)` / `aster_blob_transfer_stats_t` (168 bytes) | Node-wide blob counters (`aster::Blobs::transfer_stats`): fetched / served payload, zstd payload, zstd wire and plain bytes, plain fallbacks and serves, transfers by encoding and result, zstd decode errors. Synchronous; the caller sets `out->struct_size`. |
+| `ASTER_FETCH_REPORT_V2` (fetch `flags` bit 2) | `aster_blobs_download_hash_from` and the custody download write fetch report v2 (`ASTER_FETCH_REPORT_VERSION_2` = 2): the v1 header, then 72-byte records (`ASTER_FETCH_PROVIDER_RECORD_V2_SIZE`) adding `in_flight`, `plain_fallbacks`, record flags (`ASTER_FETCH_PROVIDER_HAS_WIRE_BYTES`), `bytes_transferred` and `wire_bytes` per provider (`aster::ProviderOutcome`). Layout in `ffi/src/data.rs`. |
+| `aster_topology_peers` / `aster_topology_peer` JSON | Each peer gains `quic_traffic` (object keyed `blobs`, `blobs-zstd`, `docs`, `gossip`, `rpc`, `other`, each `{quic_bytes_sent, quic_bytes_received}`) and `blob_transfer` (`fetched_payload_bytes`, `fetched_zstd_payload_bytes`, `fetched_wire_bytes`, `fetched_plain_bytes`, `served_payload_bytes`, `served_zstd_payload_bytes`, `served_wire_bytes`, `served_plain_bytes`, `plain_fallbacks`) (`aster::topology::PeerView`). |
+| `aster_metrics_config_t` (16 bytes), `aster_config_set_metrics`, `aster_config_metrics` | `[metrics] peer_labels` / `peer_label_cap` beside `aster_config_t`, in its `storage`, as 7.3 does for the network settings. `peer_label_cap` 0 = `ASTER_METRICS_PEER_LABEL_CAP_DEFAULT` (64). `aster_config_from_env` / `_from_toml` read `ASTER_METRICS_PEER_LABELS` / `ASTER_METRICS_PEER_LABEL_CAP` and `[metrics]`; the node's ops listener applies them, with or without an explicit `aster_health_config_t`. |
+
+Go requires 7.4 (`ABIMinorRequired = 4`; `Blobs.TransferStats`,
+`FetchReport` v2 fields, `TopologyPeerView.QuicTraffic` / `BlobTransfer`,
+`AsterConfig.MetricsPeerLabels` / `MetricsPeerLabelCap`).
 
 ## New in 7.3 (cluster network settings; additive)
 

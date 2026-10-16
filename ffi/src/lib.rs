@@ -28,6 +28,7 @@ mod audit_test_common;
 #[cfg(test)]
 extern crate self as aster_transport_ffi;
 pub mod call;
+pub mod config_metrics;
 pub mod config_network;
 pub mod coordination;
 pub mod coordination_codec;
@@ -212,8 +213,16 @@ pub mod upcall;
 //   `aster_config_network`; `config_network.rs`): IPv6 bind pin, advertised
 //   addresses, relay CA trust, discovery. `aster_config_t` is unchanged. See
 //   `ffi/RENAME_MAP.md` "7.3".
+// - 7.4.0 (additive): transfer metrics. `aster_blobs_transfer_stats` /
+//   `aster_blob_transfer_stats_t` (node-wide blob transfer counters);
+//   `ASTER_FETCH_REPORT_V2` (fetch flag) selects fetch report v2 with
+//   per-provider `in_flight`, `plain_fallbacks`, `bytes_transferred` and
+//   `wire_bytes`; topology peer JSON gains `quic_traffic` and
+//   `blob_transfer`; `[metrics]` peer labels beside `aster_config_t`
+//   (`aster_metrics_config_t`, `aster_config_set_metrics`,
+//   `aster_config_metrics`; `config_metrics.rs`). See `ffi/RENAME_MAP.md` "7.4".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 3;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 4;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

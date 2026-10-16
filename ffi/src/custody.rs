@@ -3,8 +3,8 @@
 //! Operation cancellation is cooperative and callers must collect the terminal
 //! event: a named-tag commit already in progress reports its actual result.
 use crate::data::{
-    bridge_for, encode_fetch_report, fetch_flags, fetch_strategy, in_hex32, in_node_list, in_slice,
-    in_string, invalid,
+    bridge_for, encode_fetch_report_for, fetch_flags, fetch_strategy, in_hex32, in_node_list,
+    in_slice, in_string, invalid,
 };
 use crate::*;
 use aster_transport_core::{
@@ -553,7 +553,7 @@ pub unsafe extern "C" fn aster_blob_custody_download_hash_from(
     if strategy == aster::FetchStrategy::SplitChildren && format != "hash_seq" {
         return invalid("split children requires HashSeq format");
     }
-    let to_store = attempt!(fetch_flags(flags));
+    let flags = attempt!(fetch_flags(flags));
     let providers = providers
         .into_iter()
         .map(|v| v.as_str().to_string())
@@ -582,7 +582,7 @@ pub unsafe extern "C" fn aster_blob_custody_download_hash_from(
                     )
                     .await?
                     .into();
-                let bytes = if to_store {
+                let bytes = if flags.to_store {
                     Vec::new()
                 } else {
                     lease.read_cancellable(hash, Some(_cancel)).await?
@@ -590,7 +590,7 @@ pub unsafe extern "C" fn aster_blob_custody_download_hash_from(
                 Ok(ResultData {
                     kind: aster_event_kind_t::ASTER_EVENT_BLOB_FETCHED,
                     flags: report.providers().len() as u32,
-                    bytes: encode_fetch_report(&report, &bytes),
+                    bytes: encode_fetch_report_for(&report, &bytes, flags),
                 })
             },
         )

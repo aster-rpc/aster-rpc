@@ -565,6 +565,7 @@ pub unsafe extern "C" fn aster_node_start_enrolled(
             return;
         }
         let health = cfg.health_config();
+        let peer_labels = crate::health::peer_label_cap(&cfg);
         let node = match aster::Node::start_with_alpns(
             cfg,
             vec![aster::enrollment::ENROLLMENT_ALPN.to_vec()],
@@ -592,7 +593,7 @@ pub unsafe extern "C" fn aster_node_start_enrolled(
             .then(|| serve_inbound_enrollment(&node, &installed.enrollment));
         let revocations = tokio::sync::Mutex::new(installed.enrollment.revocations());
         let handle = bridge2.nodes.insert(node.core_node().clone());
-        crate::health::remember_node_config(handle, health);
+        crate::health::remember_node_config(handle, health, peer_labels);
         let id = bridge2.enrollments.insert(EnrollmentState {
             enrollment: installed.enrollment,
             issuer: installed.issuer,
