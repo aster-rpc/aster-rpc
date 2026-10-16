@@ -394,24 +394,30 @@ async fn only_an_enrolled_config_admin_may_change_it() {
             Some(StatusCode::PermissionDenied)
         );
 
-        // An edge cannot forward a user's admin role either: the token's
-        // roles are what the edge may issue, and changes refuse forwarded
-        // calls outright.
+        // An edge cannot forward a user's admin role either: framework roles
+        // are never issuable, and changes refuse forwarded calls outright.
         let edge = connect(
             &root,
             &server,
             EDGE,
-            credential(EDGE, Some(GATEWAY_ROLE), Some(CONFIG_ADMIN_ROLE)),
+            credential(
+                EDGE,
+                Some(GATEWAY_ROLE),
+                Some(&format!("data.read,{CONFIG_ADMIN_ROLE}")),
+            ),
         )
         .await;
-        let token = Issuer::from_enrollment(edge.node(), edge.enrollment().unwrap())
-            .unwrap()
+        let issuer = Issuer::from_enrollment(edge.node(), edge.enrollment().unwrap()).unwrap();
+        assert!(issuer
             .mint_user_token(
                 "mallory",
                 [CONFIG_ADMIN_ROLE],
                 ["pwd"],
                 Duration::from_secs(60),
             )
+            .is_err());
+        let token = issuer
+            .mint_user_token("mallory", ["data.read"], ["pwd"], Duration::from_secs(60))
             .unwrap();
         let forwarded =
             NodeConfigClient::new(edge.rpc()).with_options(options().on_behalf_of(&token));
@@ -432,35 +438,50 @@ async fn only_an_enrolled_config_admin_may_change_it() {
 }
 
 #[tokio::test]
-async fn a_forwarded_admin_role_cannot_change_it_even_when_the_entry_is_accepted() {
+async fn a_forwarded_call_cannot_change_it_even_from_an_admin_edge_when_the_entry_is_accepted() {
     tokio::time::timeout(Duration::from_secs(120), async {
         let root = Root::start().await;
         let files = tempfile::tempdir().unwrap();
         let server = start_server(&root, 2, files.path(), |b| b.accept_on_behalf_of(true)).await;
+        // The edge is itself an admin, and its delegation even lists the
+        // admin role: a framework role is still never issuable.
         let edge = connect(
             &root,
             &server,
             EDGE,
-            credential(EDGE, Some(GATEWAY_ROLE), Some(CONFIG_ADMIN_ROLE)),
+            credential(
+                EDGE,
+                Some(&format!("{GATEWAY_ROLE},{CONFIG_ADMIN_ROLE}")),
+                Some(&format!("data.read,{CONFIG_ADMIN_ROLE}")),
+            ),
         )
         .await;
-        let token = Issuer::from_enrollment(edge.node(), edge.enrollment().unwrap())
-            .unwrap()
+        let issuer = Issuer::from_enrollment(edge.node(), edge.enrollment().unwrap()).unwrap();
+        assert!(!issuer.issuable_roles().contains(CONFIG_ADMIN_ROLE));
+        assert!(issuer
             .mint_user_token(
                 "mallory",
                 [CONFIG_ADMIN_ROLE],
                 ["pwd"],
                 Duration::from_secs(60),
             )
+            .is_err());
+        let token = issuer
+            .mint_user_token("mallory", ["data.read"], ["pwd"], Duration::from_secs(60))
             .unwrap();
         let forwarded =
             NodeConfigClient::new(edge.rpc()).with_options(options().on_behalf_of(&token));
-        // Gate 3 passes on the token's role; the change is still refused.
-        assert!(forwarded.get().await.is_ok());
+        // Gate 3 checks the token's roles, not the edge's.
+        assert_eq!(
+            code(forwarded.get().await),
+            Some(StatusCode::PermissionDenied)
+        );
         assert_eq!(
             code(forwarded.set(accept(false)).await),
             Some(StatusCode::PermissionDenied)
         );
+        // As itself, the edge is an admin.
+        assert!(admin_api(&edge).get().await.is_ok());
         assert_eq!(server.node_config().unwrap().generation(), 0);
         edge.close().await;
         server.shutdown().await;

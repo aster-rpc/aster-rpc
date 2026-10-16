@@ -333,10 +333,7 @@ impl IdentitySettings {
                         at("role_map")
                     ));
                 }
-                if role
-                    .get(..6)
-                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("aster."))
-                {
+                if is_framework_role(role) {
                     return Err(format!(
                         "{}: {role:?}: roles starting \"aster.\" are the framework's and are \
                          never granted by an identity provider",
@@ -436,13 +433,24 @@ pub(crate) struct OnBehalfOfPolicy {
     pub(crate) keys: Option<Arc<super::issuer_keys::IssuerKeys>>,
 }
 
+/// Whether `role` is a framework role (`aster.` prefix, ASCII case ignored),
+/// which only a node's own credential grants. The token verifier applies the
+/// same rule (`aster_transport_core::delegation::on_behalf_of`).
+fn is_framework_role(role: &str) -> bool {
+    role.get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("aster."))
+}
+
 /// Parse an [`ISSUABLE_ROLES_ATTRIBUTE`] value: comma-separated, trimmed,
-/// empty entries dropped.
+/// empty entries dropped. Framework roles (`aster.` prefix) are dropped too:
+/// as with `role_map`, they are never granted to a user, so a delegation
+/// listing one cannot make it issuable (the token verifier refuses them
+/// regardless).
 pub fn parse_issuable_roles(value: &str) -> BTreeSet<String> {
     value
         .split(',')
         .map(str::trim)
-        .filter(|role| !role.is_empty())
+        .filter(|role| !role.is_empty() && !is_framework_role(role))
         .map(str::to_string)
         .collect()
 }
@@ -1084,6 +1092,11 @@ mod tests {
         assert_eq!(
             parse_issuable_roles(" a, b ,,a"),
             ["a".to_string(), "b".to_string()].into()
+        );
+        assert_eq!(
+            parse_issuable_roles("aster.gateway,data.read, ASTER.config-admin"),
+            ["data.read".to_string()].into(),
+            "framework roles are never issuable"
         );
     }
 }

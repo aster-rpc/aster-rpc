@@ -633,6 +633,68 @@ async fn a_session_opened_for_one_user_refuses_every_other_principal() {
     .expect("test timed out");
 }
 
+/// GI-4: framework (`aster.`) roles are never issuable, as with `role_map`:
+/// not minted, and refused on verification even when the delegation lists one.
+#[tokio::test]
+async fn framework_roles_are_never_issuable() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let server = start_server(&root, 12, true, files.path()).await;
+        let edge = connect(
+            &root,
+            &server,
+            5,
+            credential(
+                5,
+                Some(GATEWAY_ROLE),
+                Some(&format!("data.read,{GATEWAY_ROLE},Aster.Config-Admin")),
+            ),
+        )
+        .await;
+        let issuer = Issuer::from_enrollment(edge.node(), edge.enrollment().unwrap()).unwrap();
+        assert_eq!(
+            issuer.issuable_roles(),
+            BTreeSet::from(["data.read".to_string()])
+        );
+        for role in [GATEWAY_ROLE, "Aster.Config-Admin"] {
+            assert!(
+                issuer
+                    .mint_user_token("alice", [role], ["pwd"], Duration::from_secs(60))
+                    .is_err(),
+                "{role}"
+            );
+            assert!(
+                Issuer::new(key(5), [role])
+                    .mint_user_token("alice", [role], ["pwd"], Duration::from_secs(60))
+                    .is_err(),
+                "{role}, fixed issuer"
+            );
+        }
+        // A token the edge signed itself, claiming a role its delegation lists.
+        let t = now();
+        for role in [GATEWAY_ROLE, "Aster.Config-Admin"] {
+            let mut payload = claims(5, t, t + 60);
+            payload["roles"] = serde_json::json!([role]);
+            assert_eq!(
+                code(api(&edge, Some(&forge(5, payload))).whoami().await),
+                Some(StatusCode::PermissionDenied),
+                "{role}"
+            );
+        }
+        // An ordinary role still works.
+        api(&edge, Some(&forge(5, claims(5, t, t + 60))))
+            .read(Num { n: 1 })
+            .await
+            .unwrap();
+        edge.close().await;
+        server.shutdown().await;
+        root.node.shutdown().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
 #[tokio::test]
 async fn a_server_that_does_not_accept_on_behalf_of_refuses_the_entry() {
     tokio::time::timeout(Duration::from_secs(60), async {

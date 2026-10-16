@@ -92,7 +92,8 @@ pub enum EdgeTokenError {
     Expired,
     /// `exp <= iat`, `nbf >= exp`, or `exp - iat` above the limit.
     Lifetime,
-    /// A role outside the edge's issuable set.
+    /// A role outside the edge's issuable set, or a framework (`aster.`)
+    /// role, which no delegation can make issuable.
     RoleNotIssuable,
     /// Minting could not sign or draw randomness.
     Issuance,
@@ -170,6 +171,15 @@ pub struct VerifiedEdgeToken {
     pub not_before: Option<u64>,
     pub expires_at: u64,
     pub jti: String,
+}
+
+/// Whether `role` is one of the framework's (`aster.` prefix, ASCII case
+/// ignored). Those are granted only by a node's own credential: never by an
+/// identity provider's `role_map`, and never through an issuer delegation, so
+/// an edge-minted token carrying one is refused however the delegation reads.
+pub fn is_framework_role(role: &str) -> bool {
+    role.get(..6)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("aster."))
 }
 
 /// A role as Gate 3 compares it: non-empty, bounded, no control character,
@@ -270,7 +280,10 @@ pub fn verify_edge_token(
         .verify(peer)
         .map_err(|_| EdgeTokenError::Signature)?;
     check_times(payload.iat, payload.nbf, payload.exp, limits)?;
-    if !roles.iter().all(|role| issuable.contains(*role)) {
+    if !roles
+        .iter()
+        .all(|role| issuable.contains(*role) && !is_framework_role(role))
+    {
         return Err(EdgeTokenError::RoleNotIssuable);
     }
     Ok(VerifiedEdgeToken {
@@ -390,6 +403,15 @@ mod tests {
             mint(&request(&["data.admin"])),
             Err(EdgeTokenError::RoleNotIssuable)
         );
+        // A framework role, even one the delegation lists.
+        let framework = roles(&["data.read", "aster.gateway", "Aster.Config-Admin"]);
+        for role in ["aster.gateway", "Aster.Config-Admin"] {
+            assert_eq!(
+                mint_edge_token(&[7; 32], &request(&[role]), &framework, &limits),
+                Err(EdgeTokenError::RoleNotIssuable),
+                "{role}"
+            );
+        }
         let mut long = request(&["data.read"]);
         long.expires_at = NOW + MAX_EDGE_TOKEN_LIFETIME_SECONDS + 1;
         assert_eq!(mint(&long), Err(EdgeTokenError::Lifetime));
@@ -485,6 +507,17 @@ mod tests {
             verify(
                 &with(&|p| p["roles"] = serde_json::json!(["data.admin"])),
                 7
+            ),
+            Err(EdgeTokenError::RoleNotIssuable)
+        );
+        // A framework role is refused even when the delegation lists it.
+        let framework = roles(&["data.read", "aster.gateway"]);
+        assert_eq!(
+            verify_edge_token(
+                &with(&|p| p["roles"] = serde_json::json!(["aster.gateway"])),
+                &key(7),
+                &framework,
+                &limits
             ),
             Err(EdgeTokenError::RoleNotIssuable)
         );
