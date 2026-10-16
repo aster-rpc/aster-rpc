@@ -465,6 +465,8 @@ mod tests {
             level_source: aster::topology::LevelSource::Measured,
             declared_region: None,
             declared_zone: None,
+            quic_traffic: Default::default(),
+            blob_transfer: Default::default(),
         };
         let value = peer_json(peer);
         assert_eq!(value.as_object().unwrap().len(), 17);
