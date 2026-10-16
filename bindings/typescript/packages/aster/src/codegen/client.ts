@@ -12,8 +12,11 @@
  *   index.ts
  * ```
  *
- * Ported from the Python CLI's generator; output is byte-identical except
- * for the timestamp and number formatting of float defaults.
+ * Ported from the Python CLI's generator; output matched it byte for byte
+ * (except the timestamp and float default formatting) until per-call
+ * options: every generated method now takes a trailing `callOptions?:
+ * CallOptions`, and clients have `withOptions(options)` (Rust's
+ * `XClient::with_options`).
  */
 
 import * as fs from 'node:fs';
@@ -300,6 +303,32 @@ function typeClass(rec: TypeRecord, known: Set<string>): string {
 
 const isSession = (m: Manifest) => m.scoped === 'session' || m.scoped === 'stream';
 
+/** `withOptions` plus the per-call merge every method uses (shared by both client kinds). */
+function optionsMembers(cls: string, ctorArgs: string): string[] {
+  return [
+    '',
+    '  /**',
+    '   * A copy of this client whose calls (every method, every pattern) carry',
+    '   * `options`: deadline, metadata, session id, serialization mode, signal.',
+    '   * Replaces options set by an earlier `withOptions`; a call\'s own',
+    '   * `callOptions` merge over these (metadata key by key).',
+    '   */',
+    `  withOptions(options: CallOptions): ${cls} {`,
+    `    return new ${cls}(${ctorArgs}, options);`,
+    '  }',
+    '',
+    '  private callOptions(callOptions?: CallOptions): CallOptions {',
+    '    const out: CallOptions = { ...this.options };',
+    '    for (const [k, v] of Object.entries(callOptions ?? {})) {',
+    '      if (v !== undefined) (out as Record<string, unknown>)[k] = v;',
+    '    }',
+    '    out.metadata = { ...this.options?.metadata, ...callOptions?.metadata };',
+    `    out.version = ${cls}.serviceVersion;`,
+    '    return out;',
+    '  }',
+  ];
+}
+
 function fromConnectionPreamble(svc: string, cls: string): string[] {
   return [
     `  static async fromConnection(client: AsterClientWrapper): Promise<${cls}> {`,
@@ -318,7 +347,10 @@ function sharedClient(svc: string, version: unknown, cid: string, methods: Manif
     `  static readonly serviceVersion = ${version};`,
     `  static readonly contractId = "${cid}";`,
     '',
-    '  private constructor(private readonly transport: AsterTransport) {}',
+    '  private constructor(',
+    '    private readonly transport: AsterTransport,',
+    '    private readonly options?: CallOptions,',
+    '  ) {}',
     '',
     '  /**',
     `   * Resolve ${svc} on a connected AsterClient and return a`,
@@ -338,6 +370,7 @@ function sharedClient(svc: string, version: unknown, cid: string, methods: Manif
     '  async close(): Promise<void> {',
     '    await this.transport.close();',
     '  }',
+    ...optionsMembers(cls, 'this.transport'),
   ];
   for (const m of methods) {
     const name: string = m.name;
@@ -347,29 +380,32 @@ function sharedClient(svc: string, version: unknown, cid: string, methods: Manif
     const inline = m.request_style === 'inline';
     const params: Field[] = m.inline_params || [];
     const sig = params.map((p) => `${p.name ?? 'arg'}: ${fieldType(p, known)[0]}`).join(', ');
+    const optArg = 'callOptions?: CallOptions';
+    const withOpt = (a: string) => (a ? `${a}, ${optArg}` : optArg);
+    const opts = 'this.callOptions(callOptions)';
     const ctor = params.length
       ? `new ${req}({${params.map((p) => p.name ?? 'arg').join(', ')}})`
       : `new ${req}()`;
     lines.push('');
     if (pattern === 'unary') {
       const [args, arg] = inline ? [sig, ctor] : [`request: ${req}`, 'request'];
-      lines.push(`  async ${name}(${args}): Promise<${resp}> {`);
-      lines.push(`    return (await this.transport.unary("${svc}", "${name}", ${arg})) as ${resp};`);
+      lines.push(`  async ${name}(${withOpt(args)}): Promise<${resp}> {`);
+      lines.push(`    return (await this.transport.unary("${svc}", "${name}", ${arg}, ${opts})) as ${resp};`);
       lines.push('  }');
     } else if (pattern === 'server_stream') {
       const [args, arg] = inline ? [sig, ctor] : [`request: ${req}`, 'request'];
-      lines.push(`  async *${name}(${args}): AsyncGenerator<${resp}> {`);
-      lines.push(`    for await (const item of this.transport.serverStream("${svc}", "${name}", ${arg})) {`);
+      lines.push(`  async *${name}(${withOpt(args)}): AsyncGenerator<${resp}> {`);
+      lines.push(`    for await (const item of this.transport.serverStream("${svc}", "${name}", ${arg}, ${opts})) {`);
       lines.push(`      yield item as ${resp};`);
       lines.push('    }');
       lines.push('  }');
     } else if (pattern === 'client_stream') {
-      lines.push(`  async ${name}(requests: AsyncIterable<${req}>): Promise<${resp}> {`);
-      lines.push(`    return (await this.transport.clientStream("${svc}", "${name}", requests)) as ${resp};`);
+      lines.push(`  async ${name}(requests: AsyncIterable<${req}>, ${optArg}): Promise<${resp}> {`);
+      lines.push(`    return (await this.transport.clientStream("${svc}", "${name}", requests, ${opts})) as ${resp};`);
       lines.push('  }');
     } else if (pattern === 'bidi_stream') {
-      lines.push(`  ${name}(): BidiChannel {`);
-      lines.push(`    return this.transport.bidiStream("${svc}", "${name}");`);
+      lines.push(`  ${name}(${optArg}): BidiChannel {`);
+      lines.push(`    return this.transport.bidiStream("${svc}", "${name}", ${opts});`);
       lines.push('  }');
     } else {
       lines.push(`  // unknown pattern: ${pattern}`);
@@ -390,7 +426,10 @@ function sessionClient(svc: string, version: unknown, cid: string, methods: Mani
     '  // SessionProxyClient is dynamically typed (JS Proxy with method-name',
     '  // interception); we wrap it with typed signatures below.',
     '  // eslint-disable-next-line @typescript-eslint/no-explicit-any',
-    '  private constructor(private readonly inner: any) {}',
+    '  private constructor(',
+    '    private readonly inner: any,',
+    '    private readonly options?: CallOptions,',
+    '  ) {}',
     '',
     '  /**',
     `   * Open a session-scoped ${svc} client. The first method`,
@@ -406,6 +445,7 @@ function sessionClient(svc: string, version: unknown, cid: string, methods: Mani
     '  async close(): Promise<void> {',
     '    await this.inner.close();',
     '  }',
+    ...optionsMembers(cls, 'this.inner'),
   ];
   for (const m of methods) {
     const name: string = m.name;
@@ -414,12 +454,12 @@ function sessionClient(svc: string, version: unknown, cid: string, methods: Mani
     const resp = known.has(m.response_type ?? '') ? m.response_type : 'unknown';
     lines.push('');
     if (pattern === 'unary') {
-      lines.push(`  async ${name}(request: ${req}): Promise<${resp}> {`);
-      lines.push(`    return (await this.inner.${name}(request)) as ${resp};`);
+      lines.push(`  async ${name}(request: ${req}, callOptions?: CallOptions): Promise<${resp}> {`);
+      lines.push(`    return (await this.inner.${name}(request, this.callOptions(callOptions))) as ${resp};`);
       lines.push('  }');
     } else {
       lines.push(`  // session-scoped ${pattern} is not yet supported by SessionProxyClient`);
-      lines.push(`  async ${name}(_request: ${req}): Promise<${resp}> {`);
+      lines.push(`  async ${name}(_request: ${req}, _callOptions?: CallOptions): Promise<${resp}> {`);
       lines.push(
         `    throw new Error("${svc}.${name}: session-scoped ${pattern} methods are not yet supported by the TypeScript runtime");`,
       );
@@ -536,6 +576,7 @@ export function generateTypescriptClients(manifestList: Manifest[], opts: Genera
         parts.push('type BidiChannel');
       }
     }
+    parts.push('type CallOptions');
     body += `import { ${parts.join(', ')} } from "@aster-rpc/aster";\n`;
 
     const byFile = new Map<string, Set<string>>();

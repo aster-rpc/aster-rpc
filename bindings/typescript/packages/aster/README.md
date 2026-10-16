@@ -221,6 +221,31 @@ the AST directly. You can delete them from new code. They still
 work (and still trigger the runtime manifest path) if you haven't
 run the scanner yet.
 
+## Per-call options: deadline and metadata
+
+Every client method takes an optional `CallOptions` as its last
+argument: `deadlineSecs` (fractions allowed; the client enforces it and
+the handler sees it as `ctx.deadline` / `ctx.remainingSeconds`),
+`metadata` (the handler reads `ctx.metadata`), `sessionId`,
+`serializationMode` and `signal`. This works for typed clients
+(`client.client(Svc)`), generated clients (`aster-gen client`) and the
+dynamic `ProxyClient`, in all four patterns. A bidi method takes only
+the options. `withOptions` returns a copy whose calls all carry them
+(Rust's `with_options`); a call's own options merge over those, with
+metadata merged key by key:
+
+```ts
+const svc = await client.client(MissionControl);
+await svc.getStatus(new StatusRequest({ agentId: 'edge-7' }), { deadlineSecs: 2 });
+
+const call = svc.withOptions({ deadlineSecs: budget, metadata: { 'x-user': user } });
+await call.getStatus(req);
+const ch = call.runCommand();                    // bidi: the options only
+
+const mc = await client.proxy('MissionControl');
+for await (const e of mc.tailLogs.stream({ level: 'info' }, { deadlineSecs: 30 })) { /* … */ }
+```
+
 ## Enrollment: who may connect, and their roles
 
 `AsterServer` and `AsterClientWrapper` admit peers with Enrollment, driven

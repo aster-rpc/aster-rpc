@@ -14,8 +14,8 @@ import { resolve as resolvePath } from 'node:path';
 
 import { ServiceRegistry } from './service.js';
 import { LocalTransport } from './transport/local.js';
-import { createClient, type AsterClient as ClientProxy } from './client.js';
-import type { AsterTransport } from './transport/base.js';
+import { createClient, mergeCallOptions, type AsterClient as ClientProxy } from './client.js';
+import type { AsterTransport, CallOptions } from './transport/base.js';
 import { AsterConfig, loadIdentity, mergeConfig, toNativeConfig } from './config.js';
 import { Node } from './node.js';
 import { createLogger, type AsterLogger } from './logging.js';
@@ -1585,13 +1585,14 @@ export class AsterClientWrapper {
  * Dynamic proxy client -- invokes RPC methods without local type definitions.
  *
  * Created via `AsterClientWrapper.proxy("ServiceName")`. Supports all four
- * RPC patterns:
+ * RPC patterns, each taking optional {@link CallOptions} (deadline,
+ * metadata, signal, ...) last:
  *
  * ```ts
  * const mc = client.proxy("MissionControl");
  *
  * // Unary
- * const status = await mc.getStatus({ agent_id: "edge-7" });
+ * const status = await mc.getStatus({ agent_id: "edge-7" }, { deadlineSecs: 5 });
  *
  * // Client streaming — pass an async iterable
  * const result = await mc.ingestMetrics(asyncGenerator());
@@ -1600,10 +1601,13 @@ export class AsterClientWrapper {
  * for await (const entry of mc.tailLogs.stream({ level: "info" })) { ... }
  *
  * // Bidi streaming — use .bidi()
- * const ch = mc.runCommand.bidi();
+ * const ch = mc.runCommand.bidi({ metadata: { "x-trace": "t1" } });
  * await ch.open();
  * await ch.send({ command: "ls" });
  * for await (const r of ch) { ... }
+ *
+ * // Options on every call of a copy
+ * const timed = mc.withOptions({ deadlineSecs: 2 });
  * ```
  *
  * @group Server and Client
@@ -1618,6 +1622,7 @@ export class ProxyClient {
     // `AsterClientWrapper.proxy()` from manifest-synthesised types.
     private readonly _hintTypes?: Map<string, new (init?: any) => any>,
     private readonly _version: number = 1,
+    private readonly _options?: CallOptions,
   ) {
     return new Proxy(this, {
       get(target, prop: string) {
@@ -1636,9 +1641,18 @@ export class ProxyClient {
           return undefined;
         }
         const hintType = target._hintTypes?.get(prop);
-        return _proxyMethod(target.serviceName, prop, target.transport, hintType, target._version);
+        return _proxyMethod(target.serviceName, prop, target.transport, hintType, target._version, target._options);
       },
     });
+  }
+
+  /**
+   * A copy of this proxy whose calls (every method, every pattern) carry
+   * `options`. Replaces options set by an earlier `withOptions`; a call's own
+   * options merge over these (metadata key by key).
+   */
+  withOptions(options: CallOptions): ProxyClient {
+    return new ProxyClient(this.serviceName, this.transport, this._hintTypes, this._version, options);
   }
 }
 
@@ -1649,15 +1663,22 @@ function _proxyMethod(
   transport: AsterTransport,
   hintType?: new (init?: any) => any,
   version = 1,
+  defaults?: CallOptions,
 ) {
+  const optsFor = (call?: CallOptions, withHint = true): CallOptions => {
+    const o = mergeCallOptions(defaults, call);
+    o.version = version;
+    if (withHint) o.hintType = hintType;
+    return o;
+  };
   // The callable: detects async iterables for client streaming, else unary
-  const fn = async (payload?: unknown) => {
+  const fn = async (payload?: unknown, opts?: CallOptions) => {
     // Detect client streaming: payload is an async iterable (but not a plain object)
     if (payload != null && typeof payload === 'object' && Symbol.asyncIterator in payload) {
       const wrapped = hintType
         ? _wrapAsyncIterable(payload as AsyncIterable<unknown>, hintType)
         : (payload as AsyncIterable<unknown>);
-      return transport.clientStream(serviceName, methodName, wrapped, { version });
+      return transport.clientStream(serviceName, methodName, wrapped, optsFor(opts, false));
     }
     // Default: unary. If the user accidentally calls a server-streaming
     // method via `await proxy.method(...)`, the underlying transport will
@@ -1665,7 +1686,7 @@ function _proxyMethod(
     // frames". Catch that and re-raise with an actionable hint pointing
     // at `proxy.method.stream(...)` / `.bidi()`.
     try {
-      return await transport.unary(serviceName, methodName, payload ?? {}, { hintType, version });
+      return await transport.unary(serviceName, methodName, payload ?? {}, optsFor(opts));
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('multiple response frames')) {
@@ -1683,16 +1704,16 @@ function _proxyMethod(
   };
 
   // .stream() — server streaming
-  fn.stream = (payload?: unknown): AsyncIterable<unknown> => {
-    return transport.serverStream(serviceName, methodName, payload ?? {}, { hintType, version });
+  fn.stream = (payload?: unknown, opts?: CallOptions): AsyncIterable<unknown> => {
+    return transport.serverStream(serviceName, methodName, payload ?? {}, optsFor(opts));
   };
 
   // .bidi() — bidirectional streaming. Returns a lazy wrapper so callers
   // can do `const ch = m.bidi(); await ch.open(); await ch.send(...)` —
   // mirrors Python's _ProxyBidiChannel behaviour. Opening eagerly here
   // would force every call site to handle the connect failure synchronously.
-  fn.bidi = (): ProxyBidiChannel => {
-    return new ProxyBidiChannel(serviceName, methodName, transport, hintType, version);
+  fn.bidi = (opts?: CallOptions): ProxyBidiChannel => {
+    return new ProxyBidiChannel(serviceName, methodName, transport, hintType, version, optsFor(opts, false));
   };
 
   return fn;
@@ -1724,11 +1745,16 @@ export class ProxyBidiChannel {
     private readonly transport: AsterTransport,
     private readonly _hintType?: new (init?: any) => any,
     private readonly _version: number = 1,
+    private readonly _options?: CallOptions,
   ) {}
+
+  private _openOptions(): CallOptions {
+    return { ...this._options, version: this._version };
+  }
 
   async open(): Promise<void> {
     if (this._channel) return;
-    this._channel = this.transport.bidiStream(this.serviceName, this.methodName, { version: this._version });
+    this._channel = this.transport.bidiStream(this.serviceName, this.methodName, this._openOptions());
   }
 
   async send(payload: unknown): Promise<void> {
@@ -1749,7 +1775,7 @@ export class ProxyBidiChannel {
     if (!this._channel) {
       // Open on the fly so `for await` after `await ch.send()` (which
       // already opened) and `for await` without an explicit open both work.
-      this._channel = this.transport.bidiStream(this.serviceName, this.methodName, { version: this._version });
+      this._channel = this.transport.bidiStream(this.serviceName, this.methodName, this._openOptions());
     }
     return this._channel[Symbol.asyncIterator]();
   }
@@ -1820,32 +1846,33 @@ class SessionProxyClient {
   private _sessionMethod(methodName: string) {
     const self = this;
     const hintType = self._hintTypes?.get(methodName);
-    const fn = async (payload?: unknown): Promise<unknown> => {
-      return self._callUnary(methodName, payload ?? {}, hintType);
+    // Per-call options, minus `sessionId`: the session pins it.
+    const optsFor = (opts?: CallOptions, withHint = true): CallOptions => {
+      const o = mergeCallOptions(undefined, opts);
+      delete o.sessionId;
+      o.version = self._version;
+      if (withHint) o.hintType = hintType;
+      return o;
     };
-    fn.stream = (payload?: unknown): AsyncIterable<unknown> => {
-      return self._sessionTransport.serverStream(
-        self.serviceName,
-        methodName,
-        payload ?? {},
-        { hintType, version: self._version },
+    const fn = async (payload?: unknown, opts?: CallOptions): Promise<unknown> => {
+      self._ensureOpen();
+      return self._sessionTransport.unary(self.serviceName, methodName, payload ?? {}, optsFor(opts));
+    };
+    fn.stream = (payload?: unknown, opts?: CallOptions): AsyncIterable<unknown> => {
+      return self._sessionTransport.serverStream(self.serviceName, methodName, payload ?? {}, optsFor(opts));
+    };
+    fn.bidi = (opts?: CallOptions): ProxyBidiChannel => {
+      return new ProxyBidiChannel(
+        self.serviceName, methodName, self._sessionTransport, hintType, self._version, optsFor(opts, false),
       );
-    };
-    fn.bidi = (): ProxyBidiChannel => {
-      return new ProxyBidiChannel(self.serviceName, methodName, self._sessionTransport, hintType, self._version);
     };
     return fn;
   }
 
-  private async _callUnary(
-    method: string,
-    request: unknown,
-    hintType?: new (init?: any) => any,
-  ): Promise<unknown> {
+  private _ensureOpen(): void {
     if (this._closed) {
       throw new RpcError(StatusCode.FAILED_PRECONDITION, 'SessionProxyClient is closed');
     }
-    return await this._sessionTransport.unary(this.serviceName, method, request, { hintType, version: this._version });
   }
 
   /**

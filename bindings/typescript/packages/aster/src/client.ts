@@ -41,7 +41,7 @@ export class ServiceClient<T extends object> {
 
 /** Options for creating a client. */
 export interface ClientOptions {
-  /** Default timeout in seconds for all calls. */
+  /** Default timeout in seconds for all calls (fractions allowed). A call's own `deadlineSecs` wins. */
   timeout?: number;
   /** Default metadata for all calls. */
   metadata?: Record<string, string>;
@@ -57,7 +57,8 @@ export interface ClientOptions {
  * Type helper: extracts the client interface from a service class.
  *
  * For each @Rpc method `foo(req: A): Promise<B>`, the client has
- * `foo(req: A, opts?: CallOptions): Promise<B>`.
+ * `foo(req: A, opts?: CallOptions): Promise<B>`. A bidi method takes only
+ * the options: `chat(opts?)`.
  */
 export type AsterClient<T> = {
   [K in keyof T as T[K] extends (...args: any[]) => any ? K : never]:
@@ -67,7 +68,43 @@ export type AsterClient<T> = {
 } & {
   /** Close the underlying transport. */
   close(): Promise<void>;
+  /**
+   * A copy of this client whose calls (every method, every pattern) carry
+   * `options`: deadline, metadata, session id, serialization mode, signal.
+   * Replaces options set by an earlier `withOptions`; a call's own options
+   * merge over these (metadata key by key). Cheap, so build one per request.
+   */
+  withOptions(options: CallOptions): AsterClient<T>;
 };
+
+/**
+ * Per-call options over client-wide ones: `call` fields win, metadata merges
+ * key by key (`call`'s values win). Used by every client kind (typed proxy,
+ * generated clients, `ProxyClient`).
+ */
+export function mergeCallOptions(base?: CallOptions, call?: CallOptions): CallOptions {
+  if (!call) return { ...base, metadata: base?.metadata ? { ...base.metadata } : undefined };
+  const out: CallOptions = { ...base };
+  for (const [k, v] of Object.entries(call)) {
+    if (v !== undefined) (out as Record<string, unknown>)[k] = v;
+  }
+  out.metadata = base?.metadata || call.metadata ? { ...base?.metadata, ...call.metadata } : undefined;
+  return out;
+}
+
+/**
+ * The options argument of a typed or proxy client call, if any: `args[optsIndex]`
+ * when it is a plain options object (not a request stream, not a class
+ * instance such as a request message).
+ */
+export function callOptionsArg(args: readonly unknown[], optsIndex: number): CallOptions | undefined {
+  const v = args[optsIndex];
+  if (v == null || typeof v !== 'object' || Array.isArray(v)) return undefined;
+  if (Symbol.asyncIterator in v || Symbol.iterator in v) return undefined;
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) return undefined;
+  return v as CallOptions;
+}
 
 /**
  * Create a typed client from a @Service-decorated class.
@@ -102,7 +139,7 @@ export async function timeSleep(seconds: number): Promise<void> {
  */
 export function timeouts(timeoutS: number, metadata?: Record<string, string>): CallOptions {
   return {
-    deadlineSecs: Math.max(1, Math.round(timeoutS)),
+    deadlineSecs: timeoutS,
     metadata,
   };
 }
@@ -120,11 +157,25 @@ export function createClient<T extends new (...args: any[]) => any>(
   }
 
   const chain = new ClientChain(options?.interceptors ?? []);
+  return typedProxy(serviceInfo, transport, chain, options, undefined);
+}
 
-  return new Proxy({} as AsterClient<InstanceType<T>>, {
+function typedProxy<S>(
+  serviceInfo: NonNullable<ReturnType<typeof getServiceInfo>>,
+  transport: AsterTransport,
+  chain: ClientChain,
+  options: ClientOptions | undefined,
+  defaults: CallOptions | undefined,
+): AsterClient<S> {
+  return new Proxy({} as AsterClient<S>, {
     get(_target, prop: string | symbol) {
       if (prop === 'close') {
         return () => transport.close();
+      }
+      // Promise resolution sniffs `.then`; this is not a thenable.
+      if (prop === 'then') return undefined;
+      if (prop === 'withOptions' && !serviceInfo.methods.has('withOptions')) {
+        return (opts: CallOptions) => typedProxy<S>(serviceInfo, transport, chain, options, opts);
       }
 
       if (typeof prop !== 'string') return undefined;
@@ -133,23 +184,21 @@ export function createClient<T extends new (...args: any[]) => any>(
       if (!methodInfo) return undefined;
 
       return (...args: unknown[]) => {
-        // Last arg might be CallOptions
-        let request = args[0];
-        let callOpts: CallOptions | undefined;
-        if (args.length > 1 && typeof args[args.length - 1] === 'object') {
-          callOpts = args[args.length - 1] as CallOptions;
-        }
+        // A bidi call takes no request: its options come first. Every other
+        // pattern takes the request (or request stream), then the options.
+        const request = args[0];
+        const callOpts = methodInfo.pattern === RpcPattern.BIDI_STREAM
+          ? callOptionsArg(args, 0) ?? callOptionsArg(args, 1)
+          : callOptionsArg(args, 1);
 
-        const opts: CallOptions = {
+        const clientWide: CallOptions = {
           version: serviceInfo.version,
-          ...callOpts,
-          metadata: { ...options?.metadata, ...callOpts?.metadata },
-          hintType: methodInfo.requestType,
+          metadata: options?.metadata,
+          ...(options?.timeout ? { deadlineSecs: options.timeout } : {}),
         };
-
-        if (options?.timeout && !opts.deadlineSecs) {
-          opts.deadlineSecs = Math.max(1, Math.round(options.timeout));
-        }
+        const opts = mergeCallOptions(mergeCallOptions(clientWide, defaults), callOpts);
+        opts.metadata ??= {};
+        opts.hintType = methodInfo.requestType;
 
         if (!chain.empty) {
           const m: ClientMethod = {
