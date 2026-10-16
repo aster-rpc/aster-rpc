@@ -21,13 +21,17 @@ import org.apache.fory.type.Types;
  *
  * <p>Fory registers its built-in xlang types through a private {@code registerType(int, Class,
  * Serializer)}; there is no public way to give a class a built-in type id, so this calls it
- * reflectively (pinned to {@link ForyCodec#FORY_VERSION}).
+ * reflectively. That private method's meaning is only known for {@link ForyCodec#FORY_VERSION}, so
+ * {@link #install} refuses any other loaded Fory: a release that kept the signature but changed
+ * what registering a class under a built-in id does would otherwise pass Java to Java and fail only
+ * at a cross-binding peer.
  */
 public final class ContractScalars {
   private ContractScalars() {}
 
   /** Bind {@link UUID} and {@link Ulid} to Fory BINARY in {@code fory} (idempotent). */
   public static void install(Fory fory) {
+    checkForyVersion(Fory.class.getPackage().getImplementationVersion());
     TypeResolver resolver = fory.getTypeResolver();
     try {
       Method register =
@@ -40,6 +44,25 @@ public final class ContractScalars {
     } catch (ReflectiveOperationException e) {
       throw new IllegalStateException(
           "cannot bind uuid / ulid to Fory BINARY (Fory " + ForyCodec.FORY_VERSION + ")", e);
+    }
+  }
+
+  /**
+   * Refuse a loaded Fory other than {@link ForyCodec#FORY_VERSION}: {@link #install} depends on a
+   * private Fory method whose behaviour is checked only for that release.
+   *
+   * @param loaded the loaded fory-core's {@code Implementation-Version}, or null when its jar has
+   *     no manifest version (a repackaged jar), which is refused too
+   */
+  static void checkForyVersion(String loaded) {
+    if (!ForyCodec.FORY_VERSION.equals(loaded)) {
+      throw new IllegalStateException(
+          "Aster binds uuid / ulid to Fory BINARY through a private Fory "
+              + ForyCodec.FORY_VERSION
+              + " method, but the loaded fory-core is "
+              + (loaded == null ? "of unknown version (no Implementation-Version)" : loaded)
+              + ": depend on org.apache.fory:fory-core:"
+              + ForyCodec.FORY_VERSION);
     }
   }
 
