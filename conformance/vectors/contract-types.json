@@ -282,6 +282,66 @@
         "name": "Chain",
         "package": "types.v1"
       },
+      "types.v1.DiamondA": {
+        "expected_canonical_type_def_hex": "002274797065732e7631224469616d6f6e6441020c02066201022005f05d335c36755f0c25c0770d6223f14ebe0fbaec3d2c704856c34c3c4d54e40201000000020001000406630202004674797065732e76312e4469616d6f6e64430100000002000100000c000c",
+        "expected_type_hash": "159ee8bbb3f1257a2c7eb8a4d832d65675950bad7d42b3a3dab1dc73996fc885",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "b",
+            "optional": true,
+            "self_ref_name": "",
+            "type_kind": 1,
+            "type_primitive": "",
+            "type_ref": "05f05d335c36755f0c25c0770d6223f14ebe0fbaec3d2c704856c34c3c4d54e4"
+          },
+          {
+            "container": 0,
+            "name": "c",
+            "optional": true,
+            "self_ref_name": "types.v1.DiamondC",
+            "type_kind": 2,
+            "type_primitive": "",
+            "type_ref": ""
+          }
+        ],
+        "name": "DiamondA",
+        "package": "types.v1"
+      },
+      "types.v1.DiamondB": {
+        "expected_canonical_type_def_hex": "002274797065732e7631224469616d6f6e6442010c020663010220c69fe1232bd1d8191deff84185db46b5c7639c7233926c4826d7d6cdbdb1f20e020100000002000100000c000c",
+        "expected_type_hash": "05f05d335c36755f0c25c0770d6223f14ebe0fbaec3d2c704856c34c3c4d54e4",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "c",
+            "optional": true,
+            "self_ref_name": "",
+            "type_kind": 1,
+            "type_primitive": "",
+            "type_ref": "c69fe1232bd1d8191deff84185db46b5c7639c7233926c4826d7d6cdbdb1f20e"
+          }
+        ],
+        "name": "DiamondB",
+        "package": "types.v1"
+      },
+      "types.v1.DiamondC": {
+        "expected_canonical_type_def_hex": "002274797065732e7631224469616d6f6e6443010c0206610202004674797065732e76312e4469616d6f6e64410000010002000100000c000c",
+        "expected_type_hash": "c69fe1232bd1d8191deff84185db46b5c7639c7233926c4826d7d6cdbdb1f20e",
+        "fields_in_declaration_order": [
+          {
+            "container": 1,
+            "name": "a",
+            "optional": false,
+            "self_ref_name": "types.v1.DiamondA",
+            "type_kind": 2,
+            "type_primitive": "",
+            "type_ref": ""
+          }
+        ],
+        "name": "DiamondC",
+        "package": "types.v1"
+      },
       "types.v1.Forest": {
         "expected_canonical_type_def_hex": "002274797065732e76311a466f72657374010c02167472656573010220d3bc5d8fd700dc5632646382938153a2f273ec686cb0aff6d5705fdf51791ca4020000010002000100000c000c",
         "expected_type_hash": "4352f4f460d7120668ce2c39cfba21cdf4383357d7440aa61a31a5f3cc7f52a2",

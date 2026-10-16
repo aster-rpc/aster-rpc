@@ -77,6 +77,23 @@ export class Priced {
   amount: Decimal = new Decimal(0n);
 }
 
+// The spec's B.4 diamond: A -> C is a back-edge though C is hashed first.
+@WireType('types.v1/DiamondA')
+export class DiamondA {
+  b: DiamondB | null = null;
+  c: DiamondC | null = null;
+}
+
+@WireType('types.v1/DiamondB')
+export class DiamondB {
+  c: DiamondC | null = null;
+}
+
+@WireType('types.v1/DiamondC')
+export class DiamondC {
+  a: DiamondA[] = [];
+}
+
 // A cycle whose spanning tree depends on codepoint (not UTF-16) order:
 // Ａ (U+FF21) and 𝔸 (U+1D538). Contract identity only, as in Rust.
 @WireType('types.v1/Ord')

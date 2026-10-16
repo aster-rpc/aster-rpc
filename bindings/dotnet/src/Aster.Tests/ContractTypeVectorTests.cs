@@ -100,6 +100,20 @@ public sealed class CtWide
 [ForyStruct, WireType("types.v1/\U0001D538")]
 public sealed class CtMath { public CtWide? Wide { get; set; } }
 
+// The spec's B.4 diamond: A -> C is a back-edge though C is hashed first.
+[ForyStruct, WireType("types.v1/DiamondA")]
+public sealed class CtDiamondA
+{
+    public CtDiamondB? B { get; set; }
+    public CtDiamondC? C { get; set; }
+}
+
+[ForyStruct, WireType("types.v1/DiamondB")]
+public sealed class CtDiamondB { public CtDiamondC? C { get; set; } }
+
+[ForyStruct, WireType("types.v1/DiamondC")]
+public sealed class CtDiamondC { public List<CtDiamondA> A { get; set; } = new(); }
+
 /// <summary>
 /// conformance/vectors/contract-types.json: the .NET contract types (timestamp, date, decimal,
 /// decimal(p,s), uuid, ulid) and recursive types (SELF_REF) give Rust's TypeDef bytes, type hashes
@@ -122,6 +136,9 @@ public class ContractTypeVectorTests
         ["types.v1.Forest"] = typeof(CtForest),
         ["types.v1.Identified"] = typeof(CtIdentified),
         ["types.v1.Priced"] = typeof(CtPriced),
+        ["types.v1.DiamondA"] = typeof(CtDiamondA),
+        ["types.v1.DiamondB"] = typeof(CtDiamondB),
+        ["types.v1.DiamondC"] = typeof(CtDiamondC),
         ["types.v1.Ord"] = typeof(CtOrd),
         ["types.v1.\uFF21"] = typeof(CtWide),
         ["types.v1.\U0001D538"] = typeof(CtMath),

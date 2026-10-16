@@ -109,6 +109,29 @@ struct CpMath {
     wide: Option<Box<CpWide>>,
 }
 
+/// The spec's B.4 diamond: A -> B, A -> C, B -> C, C -> A. The DFS from A
+/// reaches C through B, so C is hashed before A, yet A -> C is still a
+/// back-edge: a binding must check the back-edge before looking up the
+/// (already known) hash. Contract identity only.
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/DiamondA")]
+struct DiamondA {
+    b: Option<Box<DiamondB>>,
+    c: Option<Box<DiamondC>>,
+}
+
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/DiamondB")]
+struct DiamondB {
+    c: Option<Box<DiamondC>>,
+}
+
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/DiamondC")]
+struct DiamondC {
+    a: Vec<DiamondA>,
+}
+
 /// A non-recursive holder of a recursive type: an ordinary `REF` to it.
 #[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
 #[aster(wire = "types.v1/Forest")]
@@ -304,6 +327,20 @@ fn spanning_tree_orders_names_by_codepoint_not_utf16() {
     let math = CpMath::aster_type_def();
     assert_eq!(field(&math, "wide").type_kind, TypeKind::SelfRef);
     assert_eq!(field(&math, "wide").self_ref_name, "types.v1.\u{FF21}");
+}
+
+#[test]
+fn diamond_back_edge_to_an_already_hashed_type_is_a_self_ref() {
+    let a = DiamondA::aster_type_def();
+    assert_eq!(field(&a, "b").type_ref, DiamondB::aster_type_hash_hex());
+    let c = field(&a, "c");
+    assert_eq!(c.type_kind, TypeKind::SelfRef);
+    assert_eq!(c.self_ref_name, "types.v1.DiamondC");
+    let b = DiamondB::aster_type_def();
+    assert_eq!(field(&b, "c").type_ref, DiamondC::aster_type_hash_hex());
+    let c = DiamondC::aster_type_def();
+    assert_eq!(field(&c, "a").type_kind, TypeKind::SelfRef);
+    assert_eq!(field(&c, "a").self_ref_name, "types.v1.DiamondA");
 }
 
 #[test]
@@ -686,6 +723,9 @@ fn actual() -> Value {
             "types.v1.Ord": type_entry::<CpOrd>(),
             "types.v1.\u{FF21}": type_entry::<CpWide>(),
             "types.v1.\u{1D538}": type_entry::<CpMath>(),
+            "types.v1.DiamondA": type_entry::<DiamondA>(),
+            "types.v1.DiamondB": type_entry::<DiamondB>(),
+            "types.v1.DiamondC": type_entry::<DiamondC>(),
         },
         "service": "Types v1, xlang, SHARED; unary methods echo_temporal(Temporal)->Temporal, plant(TreeNode)->Forest, author(Book)->Author, cycle(Alpha)->Gamma",
         "expected_contract_id": contract_id(&service()),

@@ -387,6 +387,26 @@ class CpMath:
     wide: Optional[CpWide] = None
 
 
+# The spec's B.4 diamond: A -> C is a back-edge though C is hashed first.
+@wire_type("types.v1/DiamondA")
+@dataclass
+class DiamondA:
+    b: Optional[DiamondB] = None
+    c: Optional[DiamondC] = None
+
+
+@wire_type("types.v1/DiamondB")
+@dataclass
+class DiamondB:
+    c: Optional[DiamondC] = None
+
+
+@wire_type("types.v1/DiamondC")
+@dataclass
+class DiamondC:
+    a: list[DiamondA] = field(default_factory=list)
+
+
 _ZERO_UUID = uuid.UUID(int=0)
 _ZERO_ULID = ULID(bytes(16))
 Money = aster_decimal(18, 4)
@@ -424,6 +444,9 @@ _TYPE_CLASSES = [
     Forest,
     Identified,
     Priced,
+    DiamondA,
+    DiamondB,
+    DiamondC,
 ]
 # Contract identity only: pyfory 1.7.5 cannot register a type named like
 # `𝔸` (its meta-string encoder lower-cases an uppercase first letter and

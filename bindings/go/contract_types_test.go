@@ -120,11 +120,30 @@ type ctMath struct{ Wide *ctWide }
 
 func (ctMath) AsterWireType() string { return "types.v1/\U0001d538" }
 
+// The spec's B.4 diamond: A -> C is a back-edge though C is hashed first.
+type ctDiamondA struct {
+	B *ctDiamondB
+	C *ctDiamondC
+}
+
+func (ctDiamondA) AsterWireType() string { return "types.v1/DiamondA" }
+
+type ctDiamondB struct{ C *ctDiamondC }
+
+func (ctDiamondB) AsterWireType() string { return "types.v1/DiamondB" }
+
+type ctDiamondC struct {
+	A []ctDiamondA `fory:"type=list(element=_(nullable=false))"`
+}
+
+func (ctDiamondC) AsterWireType() string { return "types.v1/DiamondC" }
+
 var ctTypes = map[string]any{
 	"types.v1.Temporal": ctTemporal{}, "types.v1.TreeNode": ctTreeNode{}, "types.v1.Chain": ctChain{},
 	"types.v1.Author": ctAuthor{}, "types.v1.Book": ctBook{}, "types.v1.Alpha": ctAlpha{},
 	"types.v1.Beta": ctBeta{}, "types.v1.Gamma": ctGamma{}, "types.v1.Forest": ctForest{},
 	"types.v1.Identified": ctIdentified{}, "types.v1.Priced": ctPriced{},
+	"types.v1.DiamondA": ctDiamondA{}, "types.v1.DiamondB": ctDiamondB{}, "types.v1.DiamondC": ctDiamondC{},
 	"types.v1.Ord": ctOrd{}, "types.v1.\uff21": ctWide{}, "types.v1.\U0001d538": ctMath{},
 }
 

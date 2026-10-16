@@ -159,6 +159,23 @@ final class ContractTypesVectorTest {
     public @Nullable CpWide wide;
   }
 
+  // The spec's B.4 diamond: A -> C is a back-edge though C is hashed first.
+  @WireType("types.v1/DiamondA")
+  public static final class DiamondA {
+    public @Nullable DiamondB b;
+    public @Nullable DiamondC c;
+  }
+
+  @WireType("types.v1/DiamondB")
+  public static final class DiamondB {
+    public @Nullable DiamondC c;
+  }
+
+  @WireType("types.v1/DiamondC")
+  public static final class DiamondC {
+    public List<DiamondA> a = new ArrayList<>();
+  }
+
   static final List<Class<?>> TYPES =
       List.of(
           Temporal.class,
@@ -172,6 +189,9 @@ final class ContractTypesVectorTest {
           Forest.class,
           Identified.class,
           Priced.class,
+          DiamondA.class,
+          DiamondB.class,
+          DiamondC.class,
           CpOrd.class,
           CpWide.class,
           CpMath.class);
