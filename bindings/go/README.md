@@ -10,21 +10,21 @@ public installation source. See [publication setup](../../deploy/go-vanity/READM
 **ABI contract:** Rust FFI via CGO, header `ffi/aster_ffi.h`, **C ABI 7.x, 7.1 minimum** (`aster_*` symbols)
 **Native library:** `libaster_transport_ffi.dylib` / `.so` / `.dll`
 
-## Preview status (C ABI 7.1 minimum)
+## Preview status (C ABI 7.2 minimum)
 
 Go participates in the six-language `tests/interop/` matrix with Rust, Python,
 TypeScript, Java and .NET. Aster 0.3 is a preview release.
 
 **Native library requirement (for consumers such as Kasm):** this module needs
-`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 7.1 or a later 7.x**.
+`libaster_transport_ffi` and its `aster_ffi.h` at **C ABI 7.2 or a later 7.x**.
 It refuses anything else three ways:
 
 - at compile time, `runtime.go` fails with `#error` when the `aster_ffi.h` on
   `CGO_CFLAGS` is not major 7;
 - at run time, `CheckABI` (called by `NewRuntime` and before any config is
   filled) returns an error wrapping `ErrABIMismatch` when the loaded library's major is not
-  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (1; 7.1 added the audit
-  outbox acknowledgement log);
+  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (2; 7.1 added the audit
+  outbox acknowledgement log, 7.2 `aster_server_drain`);
 - the library itself refuses `aster_runtime_new` from another major and, since
   6.0, will not fill an `aster_config_t` until `aster_abi_accept` has
   succeeded for its major, so a 5.x-built caller cannot have its 280-byte
@@ -295,6 +295,28 @@ Known gaps:
 - `hostile_race_test.go` / `TestSoak_Short` have no peer and only check "no
   crash"; `TestSoak_Runs` (30 min) is skipped unless `ASTER_GO_SOAK=1`.
 
+## Draining a server (ABI 7.2)
+
+`Drain` takes a replica out of rotation (rolling restart, scale-in), then
+closes it as `Close` does:
+
+```go
+report, err := srv.Drain(ctx, 30*time.Second)
+log.Printf("completed %d, cancelled %d, refused %d calls; closed %d connections",
+	report.CallsCompleted, report.CallsCancelled, report.CallsRefused, report.ConnectionsClosed)
+```
+
+The health listener (if any) reports not ready first. New connections are
+closed after the handshake with QUIC application close code `DrainCloseCode`
+(503); new calls answer `UNAVAILABLE` with the detail `aster.draining`, except
+calls on a session that already exists. Each connection is closed once it has
+no call in flight and no live session (after four round trips of quiet, so the
+last response is acknowledged), and at the grace deadline the rest are closed,
+which cancels their handlers' contexts. `ctx`'s deadline or cancellation cuts
+the grace short. On the client, `IsDraining(err)` recognises both the refusal
+and a call cut off by the drain close; `RetryInterceptor` does not retry it on
+the same connection: reconnect to another replica.
+
 ## Authenticated HTTPS and WebTransport
 
 ABI 4.11 adds `AsterServer.StartHTTP` over the server's registered RPC services.
@@ -455,6 +477,7 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `observability.go`, `metrics.go`, `tracing.go`, `health.go` | ABI 4.6 pipeline init / shutdown and the log poller; metric instruments; spans; `HealthServer` |
 | `abi_trace.go` | `aster_trace_context_*` wrappers (test support: pin the Go codec to the library) |
 | `rpc_server.go` | `AsterServer` — dispatch events → typed handlers, sessions, cancellation, RpcStatus |
+| `drain.go` | `AsterServer.Drain` (ABI 7.2), `DrainReport`, `DrainCloseCode` |
 | `rpc_client.go` | `AsterClient`, `RpcConnection`, `Call*` functions, `BidiCall` (`aster_rpc_*`) |
 | `ucv1.go`, `upcall_types.go` | UCv1 upcall payload codec and kind / status tables (plain Go, no cgo) |
 | `upcall.go` | ABI 4.1 `Upcalls`: poll goroutine, per-kind policy, typed serving, owned-operation helper |

@@ -1003,6 +1003,63 @@ assert!(fetched.verified);
 # }
 ```
 
+### 4.10 Draining a server, and sizing a router
+
+`AsterServer::drain(grace)` takes a replica out of rotation for a rolling
+restart or a scale-in, then shuts it down:
+
+```rust
+# async fn stop(srv: aster::rpc::AsterServer) {
+let report = srv.drain(std::time::Duration::from_secs(30)).await;
+tracing::info!(?report, "drained");
+# }
+```
+
+1. The health listener, if enabled, answers `/readyz` with 503 first.
+2. New connections are closed right after the handshake with QUIC application
+   close code 503 (`aster::rpc::DRAIN_CLOSE_CODE`); new calls on existing
+   connections answer `UNAVAILABLE` with the detail `aster.draining = true`.
+   Calls on a session that already exists still run.
+3. Each connection is closed with the drain code once it has had no call in
+   flight and no live session for four round trips (100 ms to 2 s), so its
+   last response is acknowledged before the close.
+4. Calls of every pattern run until `grace`; then every remaining connection is
+   closed, which cancels the handlers still running.
+
+The `DrainReport` counts calls in flight, completed, cancelled at the deadline
+and refused, and connections closed and refused. On a client,
+`Error::is_draining()` is true for both a refused call and a call whose
+connection the drain closed (`RpcConnection::is_drained()` tells the
+connection apart), and `RetryPolicy` does not retry it: reconnect to another
+replica. The server publishes no endpoint leases itself; if your application
+publishes them, renew yours with the `draining` health status before draining.
+A lower-level `Server` drains through `ServerHandle::drain(grace)`, which leaves
+the node up.
+
+**Sizing.** On loopback (macOS, Apple M3 Max) an idle `aster/1` connection
+cost the server about **100-115 KiB of RSS** and about **1.5 % of one core per
+1,000 connections** for keep-alives, from 500 to 2,000 connections
+(`docs/_internal/investigations/2026-10-16-idle-connection-cost.md`; rerun
+`aster/examples/idle_connections.rs` on your target). Plan on ~130 MiB per
+1,000 idle peers before handler state, and measure on real paths: loss,
+relays and multipath add state that loopback does not.
+
+These `transport_*` knobs (§2.2) bound what a connection can cost under load;
+they do not shrink an idle one, because windows are flow-control credit, not
+preallocated buffers:
+
+| Knob | Default | Bounds |
+|---|---|---|
+| `transport_stream_receive_window` | 1.25 MB | data buffered per incoming stream |
+| `transport_receive_window` | unlimited | data buffered per connection across streams |
+| `transport_send_window` | 10 MB | unacknowledged data queued per connection |
+| `transport_max_concurrent_bidi_streams` / `_uni_streams` | 100 / 100 | concurrent streams a peer may open |
+| `transport_keep_alive_interval_ms` | 5,000 | idle CPU and packets (keep it below the 30 s idle timeout and NAT timeouts) |
+
+For a router with mostly idle peers, set a connection `receive_window` (for
+example 256 KiB) and a smaller `send_window` so a slow or stalled peer cannot
+make the server buffer megabytes, and cap the streams a peer may open.
+
 ---
 
 ## 5. Logging
