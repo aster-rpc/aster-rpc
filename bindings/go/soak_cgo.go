@@ -13,6 +13,7 @@ import "C"
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -68,99 +69,51 @@ func (m *soakMetrics) snapshot() (submitted, completed, cancelled, errored, maxP
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-// soakPollForEvent polls for a specific event kind within a timeout.
-// Returns true if the event was observed, false on timeout.
-func soakPollForEvent(runtime *Runtime, kind uint32, timeoutMs int) bool {
-	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
-	for time.Now().Before(deadline) {
-		var events [4]C.aster_event_t
-		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 4, 100)
-		for i := 0; i < int(n); i++ {
-			if uint32(events[i].kind) == kind {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// soakDrainAllEvents drains all pending events from the runtime.
-func soakDrainAllEvents(runtime *Runtime) {
-	for {
-		var events [16]C.aster_event_t
-		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 16, 0)
-		if int(n) == 0 {
-			break
-		}
-	}
-}
-
-// runSoakCycleOnRuntime performs one iteration of the churn pattern on an existing runtime.
-// Pattern: create node → submit accept → optionally cancel → drain → close node.
+// runSoakCycleOnRuntime performs one iteration of the churn pattern on an
+// existing runtime. Pattern: start a loopback node on runtime → submit accept →
+// cancel it (after a short delay ~25% of the time) → close the node. A cancelled
+// operation still completes in Rust; the runtime drops that completion, and the
+// caller checks the runtime's backlog drains (soakRuntimeBacklog).
 //
-// Without a peer, accepts don't complete — this exercises the node lifecycle
-// and validates that create/close cycles don't leak resources. The CQ remains
-// bounded because each cycle is short-lived.
-//
-// Returns true on cycle completion (even if no op completed), false on error.
-func runSoakCycleOnRuntime(runtime *Runtime, metrics *soakMetrics) bool {
-	soakDrainAllEvents(runtime)
-
-	ctx := context.Background()
-
-	// Create an in-memory node.
-	node, err := MemoryWithAlpns(ctx, []string{"aster"})
+// cfg must be loopback-only (relay disabled, 127.0.0.1:0): with the default
+// relay every node start waits for the public n0 relay. Without a peer, accepts
+// don't complete — this exercises the node lifecycle and validates that
+// create/close cycles don't leak operations. Any failure is returned.
+func runSoakCycleOnRuntime(ctx context.Context, runtime *Runtime, cfg AsterConfig, metrics *soakMetrics) error {
+	node, err := startNodeOn(ctx, runtime, cfg, NodeOptions{}, -1)
 	if err != nil {
-		return false
+		return fmt.Errorf("start node: %w", err)
 	}
+	// The runtime belongs to the caller; Close must not release it.
+	node.ownsRuntime = false
 
-	// Wait for node creation event (with a short timeout).
-	if !soakPollForEvent(runtime, uint32(ASTER_EVENT_NODE_CREATED), 2000) {
+	acceptOp, err := submitAccept(runtime, node)
+	if err != nil {
 		node.Close()
-		return false
-	}
-
-	// Submit an accept operation on the node.
-	var acceptOp C.aster_operation_t
-	r := C.aster_node_accept_aster(
-		C.uint64_t(runtime.handle),
-		C.uint64_t(node.handle),
-		0,
-		&acceptOp,
-	)
-	if r != 0 {
-		node.Close()
-		return false
+		return fmt.Errorf("aster_node_accept_aster: %w", err)
 	}
 	metrics.recordSubmit()
 
-	// Randomly cancel ~25% of accepts to exercise cancellation paths.
-	if time.Now().UnixNano()&0x3F < 25 {
+	if time.Now().UnixNano()&0x3F < 16 {
 		time.Sleep(5 * time.Millisecond)
-		runtime.Cancel(uint64(acceptOp))
-		metrics.opsCancelled.Add(1)
 	}
-
-	// Drain accept events.
-	for {
-		var events [8]C.aster_event_t
-		n := C.aster_poll_events(C.uint64_t(runtime.handle), &events[0], 8, 100)
-		if int(n) == 0 {
-			break
-		}
-		for i := 0; i < int(n); i++ {
-			ev := events[i]
-			if uint64(ev.operation) == uint64(acceptOp) {
-				if ev.status == 0 {
-					metrics.recordComplete()
-				} else {
-					metrics.recordError()
-				}
-			}
-		}
+	if err := runtime.Cancel(acceptOp); err != nil {
+		node.Close()
+		return fmt.Errorf("cancel accept %d: %w", acceptOp, err)
 	}
-
-	node.Close()
+	metrics.opsCancelled.Add(1)
+	metrics.currentPending.Add(-1)
+	if err := node.Close(); err != nil {
+		return fmt.Errorf("close node: %w", err)
+	}
 	metrics.recordCycle()
-	return true
+	return nil
+}
+
+// soakRuntimeBacklog reports the completions runtime still holds for nobody
+// (arrived before Register, or cancelled and not yet completed).
+func soakRuntimeBacklog(runtime *Runtime) (pending, abandoned int) {
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return len(runtime.pending), len(runtime.abandoned)
 }

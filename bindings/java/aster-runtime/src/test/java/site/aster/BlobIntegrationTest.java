@@ -14,6 +14,7 @@ import org.junit.jupiter.api.io.TempDir;
 import site.aster.blobs.BlobId;
 import site.aster.blobs.BlobStatus;
 import site.aster.blobs.IrohBlobs;
+import site.aster.config.AsterConfig;
 import site.aster.node.IrohNode;
 
 /**
@@ -24,6 +25,11 @@ import site.aster.node.IrohNode;
 public class BlobIntegrationTest {
 
   private static final String ALPN = "test-alpn";
+
+  /** Loopback-only: no relay (a default-relay start waits for the public n0 relay). */
+  private static final AsterConfig LOOPBACK =
+      AsterConfig.builder().relayMode("disabled").bindAddr("127.0.0.1:0").build();
+
   private static final Duration TIMEOUT = Duration.ofSeconds(10);
 
   @Test
@@ -31,7 +37,8 @@ public class BlobIntegrationTest {
       throws ExecutionException, InterruptedException, TimeoutException {
     // Create an in-memory node
     IrohNode node1 =
-        IrohNode.memoryWithAlpns(java.util.List.of(ALPN.getBytes())).get(10, TimeUnit.SECONDS);
+        IrohNode.start(LOOPBACK, java.util.List.of(ALPN.getBytes()), null)
+            .get(10, TimeUnit.SECONDS);
 
     try {
       IrohBlobs blobs = node1.blobs();
@@ -55,7 +62,8 @@ public class BlobIntegrationTest {
   @Test
   public void testAddPathImportsFile(@TempDir Path tmp) throws Exception {
     IrohNode node =
-        IrohNode.memoryWithAlpns(java.util.List.of(ALPN.getBytes())).get(10, TimeUnit.SECONDS);
+        IrohNode.start(LOOPBACK, java.util.List.of(ALPN.getBytes()), null)
+            .get(10, TimeUnit.SECONDS);
     try {
       IrohBlobs blobs = node.blobs();
 
@@ -76,7 +84,8 @@ public class BlobIntegrationTest {
   @Test
   public void testAddPathWithNamedTagImportsFile(@TempDir Path tmp) throws Exception {
     IrohNode node =
-        IrohNode.memoryWithAlpns(java.util.List.of(ALPN.getBytes())).get(10, TimeUnit.SECONDS);
+        IrohNode.start(LOOPBACK, java.util.List.of(ALPN.getBytes()), null)
+            .get(10, TimeUnit.SECONDS);
     try {
       IrohBlobs blobs = node.blobs();
 

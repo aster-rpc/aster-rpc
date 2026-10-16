@@ -99,7 +99,7 @@ public class RuntimeTests
         var runtime = new Runtime();
 
         // Create an endpoint and start accepting
-        var config = new EndpointConfigBuilder().Alpn("test").EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config("test");
         var endpoint = await Endpoint.CreateAsync(runtime, config);
 
         // Start accept but immediately cancel
@@ -172,7 +172,7 @@ public class RuntimeTests
         {
             tasks[i] = Task.Run(async () =>
             {
-                var cfg = new EndpointConfigBuilder().Alpn($"test{i}").EnableDiscovery(false);
+                var cfg = LoopbackEndpoints.Config($"test{i}");
                 var ep = await Endpoint.CreateAsync(runtime, cfg);
                 ep.Dispose();
             });

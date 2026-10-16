@@ -9,7 +9,8 @@ namespace Aster.Tests;
 /// Endpoint Integration Tests (5b.6)
 ///
 /// Tests real endpoint lifecycle: create, connect, accept, close.
-/// These use the real native library — no mocking.
+/// These use the real native library — no mocking. Endpoints are loopback-only
+/// (<see cref="LoopbackEndpoints"/>): no relay, no n0 discovery, dialled by address.
 /// </summary>
 public class EndpointTests : IDisposable
 {
@@ -26,8 +27,8 @@ public class EndpointTests : IDisposable
         _runtimeA = new Runtime();
         _runtimeB = new Runtime();
 
-        var configA = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
-        var configB = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var configA = LoopbackEndpoints.Config(ALPN);
+        var configB = LoopbackEndpoints.Config(ALPN);
 
         var epA = await Endpoint.CreateAsync(_runtimeA, configA);
         var epB = await Endpoint.CreateAsync(_runtimeB, configB);
@@ -38,12 +39,10 @@ public class EndpointTests : IDisposable
     private async Task<(Connection connA, Connection connB)> CreateConnectedPair(
         CancellationTokenSource cts)
     {
-        var (epA, epB, epAId) = await CreateEndpoints(cts);
+        var (epA, epB, _) = await CreateEndpoints(cts);
 
-        var acceptTask = epA.AcceptAsync();
-        await Task.Delay(50);
-
-        var connB = await epB.ConnectAsync(epAId, ALPN, cts.Token);
+        var acceptTask = epA.AcceptAsync(cts.Token);
+        var connB = await LoopbackEndpoints.ConnectAsync(epB, epA, ALPN, cts.Token);
         var connA = await acceptTask;
 
         return (connA, connB);
@@ -55,11 +54,11 @@ public class EndpointTests : IDisposable
         _runtimeB?.Dispose();
     }
 
-    [Fact]
+    [Fact(Timeout = 60_000)]
     public async Task Create_NodeId_IsConsistent()
     {
         using var runtime = new Runtime();
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var endpoint = await Endpoint.CreateAsync(runtime, config);
 
         string nodeId1 = endpoint.NodeId();
@@ -72,14 +71,14 @@ public class EndpointTests : IDisposable
         endpoint.Dispose();
     }
 
-    [Fact]
+    [Fact(Timeout = 60_000)]
     public async Task Create_TwoEndpoints_HaveUniqueNodeIds()
     {
         using var runtimeA = new Runtime();
         using var runtimeB = new Runtime();
 
-        var configA = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
-        var configB = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var configA = LoopbackEndpoints.Config(ALPN);
+        var configB = LoopbackEndpoints.Config(ALPN);
 
         var epA = await Endpoint.CreateAsync(runtimeA, configA);
         var epB = await Endpoint.CreateAsync(runtimeB, configB);
@@ -93,18 +92,17 @@ public class EndpointTests : IDisposable
         epB.Dispose();
     }
 
-    [Fact]
+    [Fact(Timeout = 60_000)]
     public async Task Connect_Accept_Completes()
     {
         using var cts = new CancellationTokenSource((int)Timeout.TotalMilliseconds);
-        var (epA, epB, epAId) = await CreateEndpoints(cts);
+        var (epA, epB, _) = await CreateEndpoints(cts);
 
         // A accepts in background
-        var acceptTask = epA.AcceptAsync();
-        await Task.Delay(50);
+        var acceptTask = epA.AcceptAsync(cts.Token);
 
-        // B connects to A
-        var connB = await epB.ConnectAsync(epAId, ALPN, cts.Token);
+        // B connects to A by address
+        var connB = await LoopbackEndpoints.ConnectAsync(epB, epA, ALPN, cts.Token);
 
         // Wait for A
         var connA = await acceptTask;
@@ -119,11 +117,11 @@ public class EndpointTests : IDisposable
         epB.Dispose();
     }
 
-    [Fact]
+    [Fact(Timeout = 60_000)]
     public async Task Accept_Cancel_BeforeConnect_ReturnsCanceled()
     {
         using var runtime = new Runtime();
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var ep = await Endpoint.CreateAsync(runtime, config);
 
         using var cts = new CancellationTokenSource();
@@ -144,11 +142,11 @@ public class EndpointTests : IDisposable
         ep.Dispose();
     }
 
-    [Fact]
+    [Fact(Timeout = 60_000)]
     public async Task Close_Endpoint_WhilePendingAccept_IsClean()
     {
         using var runtime = new Runtime();
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var ep = await Endpoint.CreateAsync(runtime, config);
 
         // Start accept without timeout
@@ -169,11 +167,11 @@ public class EndpointTests : IDisposable
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 60_000)]
     public async Task NodeId_IsValidHexString()
     {
         using var runtime = new Runtime();
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var ep = await Endpoint.CreateAsync(runtime, config);
 
         string nodeId = ep.NodeId();
@@ -190,32 +188,28 @@ public class EndpointTests : IDisposable
         ep.Dispose();
     }
 
-    [Fact]
+    [Fact(Timeout = 60_000)]
     public async Task TwoConnections_Independent()
     {
         using var runtimeA = new Runtime();
         using var runtimeB = new Runtime();
         using var runtimeC = new Runtime();
 
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
 
         var epA = await Endpoint.CreateAsync(runtimeA, config);
         var epB = await Endpoint.CreateAsync(runtimeB, config);
         var epC = await Endpoint.CreateAsync(runtimeC, config);
 
-        string epAId = epA.NodeId();
-
         // B connects to A
-        var acceptTask1 = epA.AcceptAsync();
-        await Task.Delay(50);
         using var cts = new CancellationTokenSource((int)Timeout.TotalMilliseconds);
-        var connB = await epB.ConnectAsync(epAId, ALPN, cts.Token);
+        var acceptTask1 = epA.AcceptAsync(cts.Token);
+        var connB = await LoopbackEndpoints.ConnectAsync(epB, epA, ALPN, cts.Token);
         var connA1 = await acceptTask1;
 
         // C connects to A
-        var acceptTask2 = epA.AcceptAsync();
-        await Task.Delay(50);
-        var connC = await epC.ConnectAsync(epAId, ALPN, cts.Token);
+        var acceptTask2 = epA.AcceptAsync(cts.Token);
+        var connC = await LoopbackEndpoints.ConnectAsync(epC, epA, ALPN, cts.Token);
         var connA2 = await acceptTask2;
 
         // Both connections should be independent

@@ -77,7 +77,7 @@ public class ConformanceTests
         long startTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         using var runtime = new Runtime();
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var endpoint = await Endpoint.CreateAsync(runtime, config);
 
         string nodeId = endpoint.NodeId();
@@ -130,11 +130,10 @@ public class ConformanceTests
         using var runtimeA = new Runtime();
         using var runtimeB = new Runtime();
 
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var epA = await Endpoint.CreateAsync(runtimeA, config);
         var epB = await Endpoint.CreateAsync(runtimeB, config);
 
-        string epAId = epA.NodeId();
 
         recordedEvents.Add(new RecordedEvent
         {
@@ -160,7 +159,7 @@ public class ConformanceTests
 
         // B connects
         using var cts = new CancellationTokenSource((int)Timeout.TotalMilliseconds);
-        var connB = await epB.ConnectAsync(epAId, ALPN, cts.Token);
+        var connB = await LoopbackEndpoints.ConnectAsync(epB, epA, ALPN, cts.Token);
 
         recordedEvents.Add(new RecordedEvent
         {
@@ -219,7 +218,7 @@ public class ConformanceTests
         long startTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
         using var runtime = new Runtime();
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var endpoint = await Endpoint.CreateAsync(runtime, config);
 
         // Start accept
@@ -307,24 +306,21 @@ public class ConformanceTests
         using var runtimeB = new Runtime();
         using var runtimeC = new Runtime();
 
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var epA = await Endpoint.CreateAsync(runtimeA, config);
         var epB = await Endpoint.CreateAsync(runtimeB, config);
         var epC = await Endpoint.CreateAsync(runtimeC, config);
 
-        string epAId = epA.NodeId();
 
         // First connection B -> A
         var acceptTask1 = epA.AcceptAsync();
-        await Task.Delay(50);
         using var cts = new CancellationTokenSource((int)Timeout.TotalMilliseconds);
-        var connB = await epB.ConnectAsync(epAId, ALPN, cts.Token);
+        var connB = await LoopbackEndpoints.ConnectAsync(epB, epA, ALPN, cts.Token);
         var connA1 = await acceptTask1;
 
         // Second connection C -> A
         var acceptTask2 = epA.AcceptAsync();
-        await Task.Delay(50);
-        var connC = await epC.ConnectAsync(epAId, ALPN, cts.Token);
+        var connC = await LoopbackEndpoints.ConnectAsync(epC, epA, ALPN, cts.Token);
         var connA2 = await acceptTask2;
 
         // Both connections accepted on A must have independent handles. (connB
@@ -350,16 +346,14 @@ public class ConformanceTests
         using var runtimeA = new Runtime();
         using var runtimeB = new Runtime();
 
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var epA = await Endpoint.CreateAsync(runtimeA, config);
         var epB = await Endpoint.CreateAsync(runtimeB, config);
 
-        string epAId = epA.NodeId();
 
         var acceptTask = epA.AcceptAsync();
-        await Task.Delay(50);
         using var cts = new CancellationTokenSource((int)Timeout.TotalMilliseconds);
-        var connB = await epB.ConnectAsync(epAId, ALPN, cts.Token);
+        var connB = await LoopbackEndpoints.ConnectAsync(epB, epA, ALPN, cts.Token);
         var connA = await acceptTask;
 
         // Open a stream

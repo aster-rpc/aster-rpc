@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed: `EndpointConfigBuilder.EnableDiscovery(false)` turns off all address lookup
+
+It used to turn off only local mDNS, leaving the n0 pkarr/DNS lookups on; it
+now also selects `DiscoveryMode.None`, so peers are dialled by full address.
+`EndpointConfigBuilder.BindAddr(string)` and `Endpoint.NodeAddr()` are new, so
+an endpoint can bind loopback and hand its address to
+`ConnectWithAddrAsync`.
+
 ### Added: gateway identity (C ABI 7.7 required)
 
 `Native.RequiredAbiMinor` is now 7; a 7.0 – 7.6 library is refused. Gateway

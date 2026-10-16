@@ -26,17 +26,15 @@ public class DatagramTests : IDisposable
         _runtimeA = new Runtime();
         _runtimeB = new Runtime();
 
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
 
         var epA = await Endpoint.CreateAsync(_runtimeA, config);
         var epB = await Endpoint.CreateAsync(_runtimeB, config);
 
-        string epAId = epA.NodeId();
 
         var acceptTask = epA.AcceptAsync();
-        await Task.Delay(50);
 
-        var connB = await epB.ConnectAsync(epAId, ALPN, cts.Token);
+        var connB = await LoopbackEndpoints.ConnectAsync(epB, epA, ALPN, cts.Token);
         var connA = await acceptTask;
 
         return (connA, connB);

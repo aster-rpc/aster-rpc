@@ -56,7 +56,7 @@ func TestHostile_APISurfaceStress(t *testing.T) {
 			}
 			defer runtime.Close()
 
-			node, err := MemoryWithAlpns(ctx, []string{"aster"})
+			node, err := loopbackMemoryNode(ctx, []string{"aster"})
 			if err != nil {
 				errCh <- err
 				return
@@ -96,11 +96,11 @@ func TestHostile_AcceptSubmitThenClose(t *testing.T) {
 	}
 	defer runtime.Close()
 
-	node, err := MemoryWithAlpns(ctx, []string{"aster"})
+	node, err := loopbackMemoryNode(ctx, []string{"aster"})
 	if err != nil {
 		t.Fatalf("MemoryWithAlpns: %v", err)
 	}
-	// MemoryWithAlpns creates the node on its own runtime; ops must be
+	// loopbackMemoryNode creates the node on its own runtime; ops must be
 	// submitted against that runtime or they return NOT_FOUND.
 	runtime = node.runtime
 
@@ -160,7 +160,7 @@ func TestHostile_CancelOpAndCompletionRacing(t *testing.T) {
 	}
 	defer runtime.Close()
 
-	node, err := MemoryWithAlpns(ctx, []string{"aster"})
+	node, err := loopbackMemoryNode(ctx, []string{"aster"})
 	if err != nil {
 		t.Fatalf("MemoryWithAlpns: %v", err)
 	}
@@ -246,11 +246,11 @@ func TestHostile_HandleCloseAfterSubmit(t *testing.T) {
 		t.Fatalf("NewRuntime: %v", err)
 	}
 
-	node, err := MemoryWithAlpns(ctx, []string{"aster"})
+	node, err := loopbackMemoryNode(ctx, []string{"aster"})
 	if err != nil {
 		t.Fatalf("MemoryWithAlpns: %v", err)
 	}
-	// MemoryWithAlpns creates the node on its own runtime; ops must be
+	// loopbackMemoryNode creates the node on its own runtime; ops must be
 	// submitted against that runtime or they return NOT_FOUND.
 	runtime = node.runtime
 
@@ -293,11 +293,11 @@ func TestHostile_ManyOutstandingOnCQ(t *testing.T) {
 	}
 	defer runtime.Close()
 
-	node, err := MemoryWithAlpns(ctx, []string{"aster"})
+	node, err := loopbackMemoryNode(ctx, []string{"aster"})
 	if err != nil {
 		t.Fatalf("MemoryWithAlpns: %v", err)
 	}
-	// MemoryWithAlpns creates the node on its own runtime; ops must be
+	// loopbackMemoryNode creates the node on its own runtime; ops must be
 	// submitted against that runtime or they return NOT_FOUND.
 	runtime = node.runtime
 	defer node.Close()
@@ -367,7 +367,7 @@ func TestHostile_ManyConnectionsShareCQ(t *testing.T) {
 
 	// Create multiple nodes.
 	for i := 0; i < nodeCount; i++ {
-		node, err := MemoryWithAlpns(ctx, []string{"aster"})
+		node, err := loopbackMemoryNode(ctx, []string{"aster"})
 		if err != nil {
 			t.Fatalf("MemoryWithAlpns[%d]: %v", i, err)
 		}
@@ -446,7 +446,7 @@ func TestHostile_ConcurrentCreateClose(t *testing.T) {
 			}
 
 			// Create node
-			node, err := MemoryWithAlpns(ctx, []string{"aster"})
+			node, err := loopbackMemoryNode(ctx, []string{"aster"})
 			if err != nil {
 				runtime.Close()
 				errCh <- err
@@ -477,4 +477,24 @@ func TestHostile_ConcurrentCreateClose(t *testing.T) {
 	if errorCount > 0 {
 		t.Errorf("%d errors during concurrent create/close", errorCount)
 	}
+}
+
+// loopbackMemoryNode is MemoryWithAlpns on a loopback-only config (relay
+// disabled, 127.0.0.1:0): with the default relay every node start waits for
+// the public n0 relay. Like MemoryWithAlpns, the node runs on its own runtime,
+// which its Close leaves running.
+func loopbackMemoryNode(ctx context.Context, alpns []string) (*Node, error) {
+	rt, err := NewRuntime(ctx, DefaultRuntimeConfig())
+	if err != nil {
+		return nil, err
+	}
+	cfg := testCfg()
+	cfg.ALPNs = alpns
+	node, err := startNodeOn(ctx, rt, cfg, NodeOptions{}, -1)
+	if err != nil {
+		rt.Close()
+		return nil, err
+	}
+	node.ownsRuntime = false
+	return node, nil
 }

@@ -266,7 +266,7 @@ public class NodeTests
         // ABI 4.0 removed bare endpoints: Endpoint.CreateAsync starts a node, so the node
         // functions accept its handle and report the same id.
         using var runtime = new Runtime();
-        var ep = await Endpoint.CreateAsync(runtime, new EndpointConfigBuilder().Alpn("ep-node").EnableDiscovery(false));
+        var ep = await Endpoint.CreateAsync(runtime, LoopbackEndpoints.Config("ep-node"));
         IntPtr buf = System.Runtime.InteropServices.Marshal.AllocHGlobal(65);
         try
         {
@@ -285,6 +285,13 @@ public class NodeTests
         Assert.Equal(new[] { "a", "b" }, cfg.Alpns);
         Assert.Equal("disabled", cfg.RelayMode);
         Assert.False(cfg.LocalDiscovery);
-        Assert.Null(new EndpointConfigBuilder().ToAsterConfig().RelayMode);
+        // EnableDiscovery(false) turns off the n0 lookups too, not only mDNS.
+        Assert.Equal(DiscoveryMode.None, cfg.Discovery);
+        Assert.Null(cfg.BindAddr);
+        Assert.Equal("127.0.0.1:0", new EndpointConfigBuilder().BindAddr("127.0.0.1:0").ToAsterConfig().BindAddr);
+        var defaults = new EndpointConfigBuilder().ToAsterConfig();
+        Assert.Null(defaults.RelayMode);
+        Assert.Equal(DiscoveryMode.Default, defaults.Discovery);
+        Assert.True(defaults.LocalDiscovery);
     }
 }

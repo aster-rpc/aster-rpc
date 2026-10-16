@@ -7,8 +7,7 @@ the repository build or an explicit build property:
 
 ```sh
 dotnet test src/Aster.Tests/Aster.Tests.csproj \
-  -p:NativeLibraryPath=/absolute/path/to/native/library/directory \
-  --filter 'FullyQualifiedName!~SoakTests'
+  -p:NativeLibraryPath=/absolute/path/to/native/library/directory
 ```
 
 This is a checkout build instruction; it does not establish public NuGet or

@@ -13,7 +13,9 @@ namespace Aster.Tests;
 /// - Memory growth over time
 /// - CQ backlog accumulation
 ///
-/// These run as regular unit tests but can be extended to run for hours.
+/// These run as regular unit tests but can be extended to run for hours. Endpoints are
+/// loopback-only (<see cref="LoopbackEndpoints"/>): no relay, no n0 discovery, dialled by address,
+/// so an iteration costs milliseconds and a failure fails the test instead of hiding in a timeout.
 /// </summary>
 public class SoakTests
 {
@@ -26,7 +28,7 @@ public class SoakTests
         catch (IrohException ex) when (ex.Status == Status.NotFound || ex.Status == Status.AlreadyClosed) { }
     }
 
-    [Fact]
+    [Fact(Timeout = 300_000)]
     public async Task Soak_ConnectAccept_100Iterations()
     {
         // Run 100 iterations of connect/accept to detect any cumulative issues
@@ -35,45 +37,34 @@ public class SoakTests
             using var runtimeA = new Runtime();
             using var runtimeB = new Runtime();
 
-            var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+            var config = LoopbackEndpoints.Config(ALPN);
             var epA = await Endpoint.CreateAsync(runtimeA, config);
             var epB = await Endpoint.CreateAsync(runtimeB, config);
 
-            string epAId = epA.NodeId();
+            using var cts = new CancellationTokenSource(ShortTimeout);
+            var acceptTask = epA.AcceptAsync(cts.Token);
+            var connB = await LoopbackEndpoints.ConnectAsync(epB, epA, ALPN, cts.Token);
+            var connA = await acceptTask;
 
-            var acceptTask = epA.AcceptAsync();
-            await Task.Delay(20);
+            Assert.NotNull(connA);
+            Assert.NotNull(connB);
 
-            using var cts = new CancellationTokenSource((int)ShortTimeout.TotalMilliseconds);
-            try
-            {
-                var connB = await epB.ConnectAsync(epAId, ALPN, cts.Token);
-                var connA = await acceptTask;
-
-                Assert.NotNull(connA);
-                Assert.NotNull(connB);
-
-                connB.Close();
-                connA.Close();
-            }
-            catch (Exception)
-            {
-                // On iteration failure, still cleanup
-            }
+            connB.Close();
+            connA.Close();
 
             epA.Dispose();
             epB.Dispose();
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 300_000)]
     public async Task Soak_EndpointCreateDestroy_200Iterations()
     {
         // Rapid create/destroy to detect handle/resource leaks
         for (int i = 0; i < 200; i++)
         {
             using var runtime = new Runtime();
-            var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+            var config = LoopbackEndpoints.Config(ALPN);
             var endpoint = await Endpoint.CreateAsync(runtime, config);
 
             // Verify it's functional
@@ -84,11 +75,11 @@ public class SoakTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 300_000)]
     public async Task Soak_NodeIdRetrieval_1000Iterations()
     {
         using var runtime = new Runtime();
-        var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+        var config = LoopbackEndpoints.Config(ALPN);
         var endpoint = await Endpoint.CreateAsync(runtime, config);
 
         // Repeated node ID retrieval
@@ -101,7 +92,7 @@ public class SoakTests
         endpoint.Dispose();
     }
 
-    [Fact]
+    [Fact(Timeout = 300_000)]
     public async Task Soak_ConnectionCloseRace_50Iterations()
     {
         // Test close while operations are pending
@@ -110,36 +101,26 @@ public class SoakTests
             using var runtimeA = new Runtime();
             using var runtimeB = new Runtime();
 
-            var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+            var config = LoopbackEndpoints.Config(ALPN);
             var epA = await Endpoint.CreateAsync(runtimeA, config);
             var epB = await Endpoint.CreateAsync(runtimeB, config);
 
-            string epAId = epA.NodeId();
+            using var cts = new CancellationTokenSource(ShortTimeout);
+            var acceptTask = epA.AcceptAsync(cts.Token);
+            var connB = await LoopbackEndpoints.ConnectAsync(epB, epA, ALPN, cts.Token);
+            var connA = await acceptTask;
 
-            var acceptTask = epA.AcceptAsync();
-            await Task.Delay(20);
-
-            using var cts = new CancellationTokenSource((int)ShortTimeout.TotalMilliseconds);
-            try
-            {
-                var connB = await epB.ConnectAsync(epAId, ALPN, cts.Token);
-                var connA = await acceptTask;
-
-                // Immediately close - race with any pending operations
-                connB.Close();
-                connA.Close();
-            }
-            catch (Exception)
-            {
-                // Expected on close race
-            }
+            // Immediately close both sides - races the peer's close; a peer that already
+            // closed reports NotFound / AlreadyClosed, anything else fails the test.
+            CloseConnection(connB);
+            CloseConnection(connA);
 
             epA.Dispose();
             epB.Dispose();
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 300_000)]
     public async Task Soak_MultipleRuntimes_50Iterations()
     {
         // Create multiple runtimes to ensure no cross-contamination
@@ -149,7 +130,7 @@ public class SoakTests
             using var runtime2 = new Runtime();
             using var runtime3 = new Runtime();
 
-            var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+            var config = LoopbackEndpoints.Config(ALPN);
             var ep1 = await Endpoint.CreateAsync(runtime1, config);
             var ep2 = await Endpoint.CreateAsync(runtime2, config);
             var ep3 = await Endpoint.CreateAsync(runtime3, config);
@@ -168,41 +149,33 @@ public class SoakTests
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 300_000)]
     public async Task Soak_Cancellation_100Iterations()
     {
         // Test cancellation patterns
         for (int i = 0; i < 100; i++)
         {
             using var runtime = new Runtime();
-            var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+            var config = LoopbackEndpoints.Config(ALPN);
             var endpoint = await Endpoint.CreateAsync(runtime, config);
 
             using var cts = new CancellationTokenSource();
             cts.Cancel();
 
-            try
-            {
-                var acceptTask = endpoint.AcceptAsync(cts.Token);
-                await acceptTask;
-            }
-            catch (OperationCanceledException)
-            {
-                // Expected
-            }
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => endpoint.AcceptAsync(cts.Token));
 
             endpoint.Dispose();
         }
     }
 
-    [Fact]
+    [Fact(Timeout = 300_000)]
     public async Task Soak_DoubleDispose_100Iterations()
     {
         // Ensure double dispose is handled gracefully
         for (int i = 0; i < 100; i++)
         {
             using var runtime = new Runtime();
-            var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+            var config = LoopbackEndpoints.Config(ALPN);
             var endpoint = await Endpoint.CreateAsync(runtime, config);
 
             endpoint.Dispose();
@@ -214,7 +187,7 @@ public class SoakTests
         runtime2.Dispose(); // Idempotent
     }
 
-    [Fact]
+    [Fact(Timeout = 300_000)]
     public async Task Soak_ConcurrentEndpointCreation_20Iterations()
     {
         // Create endpoints concurrently
@@ -227,7 +200,7 @@ public class SoakTests
             {
                 int idx = j;
                 runtimes[idx] = new Runtime();
-                var config = new EndpointConfigBuilder().Alpn(ALPN).EnableDiscovery(false);
+                var config = LoopbackEndpoints.Config(ALPN);
                 tasks[idx] = Endpoint.CreateAsync(runtimes[idx], config);
             }
 

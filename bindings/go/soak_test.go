@@ -54,7 +54,7 @@ func TestSoak_Runs(t *testing.T) {
 	deadline := time.Now().Add(duration)
 
 	t.Logf("Starting soak test for %s (%d seconds)", duration, durationSecs)
-	t.Logf("Churn pattern: node_create → accept → cancel(~25%%) → drain → node_close")
+	t.Logf("Churn pattern: loopback node_start → accept → cancel(~25%%) or node_close → terminal event")
 	t.Logf("Assertions: final_pending == 0, max_pending < 100")
 	t.Logf("")
 
@@ -71,8 +71,11 @@ func TestSoak_Runs(t *testing.T) {
 	printInterval := 100
 	start := time.Now()
 
+	nodeCfg := soakNodeConfig()
 	for time.Now().Before(deadline) {
-		_ = runSoakCycleOnRuntime(runtime, metrics)
+		if err := runSoakCycleOnRuntime(ctx, runtime, nodeCfg, metrics); err != nil {
+			t.Fatalf("cycle %d: %v", cycleCount, err)
+		}
 		cycleCount++
 
 		elapsed := time.Since(start)
@@ -117,6 +120,7 @@ func TestSoak_Runs(t *testing.T) {
 	} else {
 		t.Logf("PASS: max pending ops = %d (< 100)", maxPend)
 	}
+	assertSoakBacklogDrains(t, runtime)
 
 	t.Logf("Soak test complete")
 }
@@ -138,8 +142,11 @@ func TestSoak_Short(t *testing.T) {
 	deadline := time.Now().Add(time.Duration(durationSecs) * time.Second)
 	cycleCount := 0
 
+	nodeCfg := soakNodeConfig()
 	for time.Now().Before(deadline) {
-		_ = runSoakCycleOnRuntime(runtime, metrics)
+		if err := runSoakCycleOnRuntime(ctx, runtime, nodeCfg, metrics); err != nil {
+			t.Fatalf("cycle %d: %v", cycleCount, err)
+		}
 		cycleCount++
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -148,10 +155,39 @@ func TestSoak_Short(t *testing.T) {
 	t.Logf("Cycles: %d, submitted: %d, completed: %d, errored: %d, max_pending: %d, current_pending: %d",
 		cycleCount, sub, comp, errCount, maxPend, currPend)
 
+	if cycleCount == 0 || sub != int64(cycleCount) {
+		t.Errorf("cycles=%d submitted=%d: every cycle must submit an accept", cycleCount, sub)
+	}
 	if currPend != 0 {
 		t.Errorf("final pending ops = %d (expected 0)", currPend)
 	}
 	if maxPend >= 100 {
 		t.Errorf("max pending ops = %d (expected < 100)", maxPend)
+	}
+	assertSoakBacklogDrains(t, runtime)
+}
+
+// soakNodeConfig is a loopback-only node config (relay disabled, 127.0.0.1:0):
+// with the default relay every node start waits for the public n0 relay.
+func soakNodeConfig() AsterConfig {
+	cfg := testCfg()
+	cfg.ALPNs = []string{"aster"}
+	return cfg
+}
+
+// assertSoakBacklogDrains checks the runtime ends with no undelivered or
+// abandoned completions (cancelled accepts complete within a short bound).
+func assertSoakBacklogDrains(t *testing.T, runtime *Runtime) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		pending, abandoned := soakRuntimeBacklog(runtime)
+		if pending == 0 && abandoned == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("runtime backlog after soak: pending=%d abandoned=%d", pending, abandoned)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

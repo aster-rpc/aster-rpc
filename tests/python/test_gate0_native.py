@@ -33,6 +33,12 @@ OTHER = "cd" * 32
 APP_ALPN = b"test/gate0/1"
 
 
+def _loopback(**kw) -> AsterConfig:
+    """Loopback-only node config: with the default relay a node start waits
+    for the public n0 relay."""
+    return AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0", **kw)
+
+
 # -- GatePolicy / PeerAdmissionStore (no network) ----------------------------
 
 
@@ -166,7 +172,7 @@ async def _accept_one(node):
 async def test_gate_denies_then_admits_then_revokes():
     gate = GatePolicy()
     gate.set_reject(4031, b"go away")
-    node = await Node.start(AsterConfig(), alpns=[APP_ALPN], gate=gate)
+    node = await Node.start(_loopback(), alpns=[APP_ALPN], gate=gate)
     ep = await _client()
     try:
         assert node.has_hooks()
@@ -206,7 +212,7 @@ async def test_gate_denies_then_admits_then_revokes():
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
 async def test_open_dev_gate_lets_unknown_peer_in():
-    node = await Node.start(alpns=[APP_ALPN], gate=GatePolicy.open_dev())
+    node = await Node.start(_loopback(), alpns=[APP_ALPN], gate=GatePolicy.open_dev())
     ep = await _client()
     try:
         await ep.connect_node_addr(node.node_addr_info(), APP_ALPN)
@@ -229,8 +235,8 @@ async def test_gate_decides_this_nodes_own_dials():
     from aster import net_client
 
     gate = GatePolicy()
-    node = await Node.start(AsterConfig(), alpns=[APP_ALPN], gate=gate)
-    peer = await Node.start(AsterConfig())
+    node = await Node.start(_loopback(), alpns=[APP_ALPN], gate=gate)
+    peer = await Node.start(_loopback())
     node.add_node_addr(peer)
     try:
         with pytest.raises(Exception) as rejected:
@@ -255,7 +261,7 @@ async def test_gate_decides_this_nodes_own_dials():
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
 async def test_admission_iterator_reject_code_reason_and_accept():
-    node = await Node.start(AsterConfig(enable_hooks=True), alpns=[APP_ALPN])
+    node = await Node.start(_loopback(enable_hooks=True), alpns=[APP_ALPN])
     ep = await _client()
     admission = node.admission()
     with pytest.raises(RuntimeError):
@@ -298,7 +304,7 @@ async def test_admission_iterator_reject_code_reason_and_accept():
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
 async def test_admission_iterator_ends_when_node_closes():
-    node = await Node.start(AsterConfig(enable_hooks=True))
+    node = await Node.start(_loopback(enable_hooks=True))
     admission = node.admission()
     await node.shutdown()
     assert await asyncio.wait_for(admission.recv(), timeout=10) is None
@@ -309,8 +315,8 @@ async def test_admission_iterator_ends_when_node_closes():
 @pytest.mark.asyncio
 @pytest.mark.timeout(30)
 async def test_admission_outbound_yields_connect_requests():
-    server = await Node.start(AsterConfig(enable_hooks=True), alpns=[APP_ALPN])
-    client = await Node.start(AsterConfig(enable_hooks=True), alpns=[APP_ALPN])
+    server = await Node.start(_loopback(enable_hooks=True), alpns=[APP_ALPN])
+    client = await Node.start(_loopback(enable_hooks=True), alpns=[APP_ALPN])
     server_adm = server.admission()
     client_adm = client.admission(outbound=True)
     client.add_node_addr(server)
@@ -340,7 +346,7 @@ async def test_admission_outbound_yields_connect_requests():
 
 @pytest.mark.asyncio
 async def test_admission_needs_hooks():
-    node = await Node.start()
+    node = await Node.start(_loopback())
     try:
         assert not node.has_hooks()
         assert node.gate is None

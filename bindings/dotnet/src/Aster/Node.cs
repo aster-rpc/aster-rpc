@@ -141,12 +141,15 @@ public sealed class Node : IDisposable, IAsyncDisposable
     }
 
     /// <summary>This node's address: id, relay URL and direct addresses.</summary>
-    public NodeAddrInfo NodeAddr()
+    public NodeAddrInfo NodeAddr() => ReadNodeAddr(_runtime, _handle.Value);
+
+    /// <summary><c>aster_node_addr_info</c> for <paramref name="node"/> (a node or endpoint handle).</summary>
+    internal static NodeAddrInfo ReadNodeAddr(Runtime runtime, ulong node)
     {
         IntPtr buf = Marshal.AllocHGlobal(8192);
         try
         {
-            Native.Check(Native.aster_node_addr_info(_runtime.Handle, _handle.Value, buf, (UIntPtr)8192, out NodeAddr addr),
+            Native.Check(Native.aster_node_addr_info(runtime.Handle, node, buf, (UIntPtr)8192, out NodeAddr addr),
                 "aster_node_addr_info");
             return new NodeAddrInfo(
                 addr.endpoint_id.ToUtf8String(),

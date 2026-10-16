@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import org.junit.jupiter.api.Test;
+import site.aster.config.AsterConfig;
 import site.aster.node.IrohNode;
 
 /**
@@ -18,11 +19,15 @@ final class NodeEndpointTest {
 
   private static final String ALPN = "aster-test/raw";
 
+  /** Loopback-only: no relay (a default-relay start waits for the public n0 relay). */
+  private static final AsterConfig LOOPBACK =
+      AsterConfig.builder().relayMode("disabled").bindAddr("127.0.0.1:0").build();
+
   @Test
   void nodeBackedEndpointsConnectAndAccept() throws Exception {
     List<byte[]> alpns = List.of(ALPN.getBytes(StandardCharsets.UTF_8));
-    IrohNode a = IrohNode.memoryWithAlpns(alpns).get(20, TimeUnit.SECONDS);
-    IrohNode b = IrohNode.memoryWithAlpns(alpns).get(20, TimeUnit.SECONDS);
+    IrohNode a = IrohNode.start(LOOPBACK, alpns, null).get(20, TimeUnit.SECONDS);
+    IrohNode b = IrohNode.start(LOOPBACK, alpns, null).get(20, TimeUnit.SECONDS);
     IrohEndpoint epA = IrohEndpoint.ofNode(a.runtime(), a.nodeHandle());
     IrohEndpoint epB = IrohEndpoint.ofNode(b.runtime(), b.nodeHandle());
     try {
@@ -45,7 +50,7 @@ final class NodeEndpointTest {
   @Test
   void explicitEndpointCloseReportsClosedState() throws Exception {
     IrohNode node =
-        IrohNode.memoryWithAlpns(List.of(ALPN.getBytes(StandardCharsets.UTF_8)))
+        IrohNode.start(LOOPBACK, List.of(ALPN.getBytes(StandardCharsets.UTF_8)), null)
             .get(20, TimeUnit.SECONDS);
     IrohEndpoint endpoint = IrohEndpoint.ofNode(node.runtime(), node.nodeHandle());
     var closing = endpoint.closeAsync();

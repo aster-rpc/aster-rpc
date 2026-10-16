@@ -67,6 +67,12 @@ public sealed class Endpoint : IDisposable
         finally { Marshal.FreeHGlobal(buf); }
     }
 
+    /// <summary>
+    /// This endpoint's address: id, relay URL and direct addresses (<c>aster_node_addr_info</c>). Direct
+    /// addresses can appear shortly after start; pass the result to <see cref="ConnectWithAddrAsync"/>.
+    /// </summary>
+    public NodeAddrInfo NodeAddr() => Node.ReadNodeAddr(_runtime, _handle.Value);
+
     /// <summary>Closes this endpoint (and its node) asynchronously.</summary>
     public async Task CloseAsync(CancellationToken cancellationToken = default)
     {
