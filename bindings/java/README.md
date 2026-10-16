@@ -76,6 +76,93 @@ Both cross the C ABI in `aster_config_t` (C ABI 6.0).
 AsterConfig cfg = AsterConfig.builder().blobZstdLevel(0).reuseLastPort(false).build();
 ```
 
+## Cluster network and metrics settings
+
+C ABI 7.3 / 7.4 settings beside the node config, from `AsterConfig`, the
+environment or `aster.toml`, resolved by the Rust config as in every binding:
+
+| Builder | Env | TOML |
+| --- | --- | --- |
+| `bindAddrV6(String)` | `ASTER_BIND_ADDR_V6` | `[network] bind_addr_v6` |
+| `advertiseAddrs(List)` | `ASTER_ADVERTISE_ADDRS` | `[network] advertise_addrs` |
+| `relayCaCerts(List)` / `relayCaOnly(boolean)` | `ASTER_RELAY_CA_CERTS` / `ASTER_RELAY_CA_ONLY` | `[network] relay_ca_certs` / `relay_ca_only` |
+| `discovery(String)`: `default`, `none`, `local`, `custom` | `ASTER_DISCOVERY` | `[network] discovery` |
+| `discoveryDnsOrigin(String)` / `discoveryPkarrRelays(List)` | `ASTER_DISCOVERY_DNS_ORIGIN` / `ASTER_DISCOVERY_PKARR_RELAYS` | `[network] discovery_dns_origin` / `discovery_pkarr_relays` |
+| `metricsPeerLabels(boolean)` / `metricsPeerLabelCap(int)` | `ASTER_METRICS_PEER_LABELS` / `ASTER_METRICS_PEER_LABEL_CAP` | `[metrics] peer_labels` / `peer_label_cap` |
+
+Setting DNS / pkarr servers alone selects `custom` discovery. Rust validates
+the settings when the config is lowered (an `IrohException`), and again when
+the node starts (addresses, CA files).
+
+## Graceful drain
+
+`AsterServer.drain(Duration grace)` (C ABI 7.2) takes a server out of
+rotation, then closes it: an attached ops listener reports not ready, new
+connections are closed with `DrainReport.DRAIN_CLOSE_CODE` (503) and new calls
+answer `UNAVAILABLE` with the `aster.draining` detail (`RpcError.isDraining()`;
+calls on an existing session still run), idle connections are closed, and the
+calls still running at `grace` are cancelled (their `CallContext` reports
+cancelled). It blocks and returns a `DrainReport` (calls in flight /
+completed / cancelled / refused, connections closed / refused, elapsed,
+whether the deadline was reached). A second `drain` with a shorter grace cuts
+a running one short; `isDraining()` reports a started drain.
+
+## Handler context
+
+`CallContext` (C ABI 7.5) separates `peer()`, the transport caller id (the
+64-hex endpoint id over Iroh, the remote address over HTTP / WebTransport),
+from `principal()`, the `Authenticator`'s principal (else the peer). It also
+carries `callId()` (the caller's wire call id, as Rust's `call_id()`),
+`dispatchCallId()`, `metadata()` / `metadataValue(key)`, `attributes()` /
+`attribute(key)` (the set Gate 3 checked), `irohAuthenticated()` (the
+provenance), `deadlineInstant()` / `remaining()` (the effective deadline),
+`isCancelled()` and `cancelled()`, a future that completes when the peer
+cancels, the deadline passes or the connection goes. The server binds it as
+`CallContext.current()` (a `ScopedValue`) around every handler, all four
+patterns; threads a handler starts itself do not inherit it. There is no
+Kotlin coroutine context element yet (handlers are not `suspend`).
+
+## Transfer metrics and the audit acknowledgement log
+
+`IrohBlobs.transferStats()` returns the node-wide `BlobTransferStats` (C ABI
+7.4). The reporting fetches (`downloadHashFromAsync`, custody downloads) ask
+for fetch report v2, so `FetchReport.ProviderOutcome` carries `inFlight`,
+`plainFallbacks`, `bytesTransferred` and `wireBytes` (`null` when no attempt
+went over zstd), and `FetchReport.inFlight()` / `plainOnly()` list providers.
+`Topology.PeerView` carries `quicTraffic()` (bytes per protocol family:
+`blobs`, `blobs-zstd`, `docs`, `gossip`, `rpc`, `other`) and `blobTransfer()`.
+
+`AuditOutbox.acknowledgements(after, limit)` reads the acknowledgement log
+(C ABI 7.1) from an exclusive cursor; `waitAcknowledgements` waits up to an
+hour for the next entry, and `watchAcknowledgements(after, consumer)` streams
+them until its `Watch` is closed. `Config.withAcknowledgementLog(maxEntries,
+maxAgeMs)` bounds the log (defaults 100,000 entries and 7 days).
+
+## Contract types
+
+| Java | Contract type | Wire |
+| --- | --- | --- |
+| `java.time.Instant` | `timestamp` | Fory TIMESTAMP, truncated to microseconds |
+| `java.time.LocalDate` | `date` | Fory DATE |
+| `java.math.BigDecimal` | `decimal` | Fory DECIMAL, the value's own scale |
+| `BigDecimal` with `@FixedDecimal(precision = p, scale = s)` | `decimal(p,s)` | Fory DECIMAL at scale `s` |
+| `java.util.UUID` | `uuid` | 16-byte BINARY, RFC 9562 byte order |
+| `site.aster.codec.Ulid` | `ulid` | 16-byte BINARY; `toString()` is Crockford base32 |
+
+Recursive types are `SELF_REF`, as in Rust and Python. `ForyCodec` zero-pads a
+`@FixedDecimal` value to its scale and refuses one that would need rounding or
+has too many digits, on encode and on decode, without modifying the caller's
+object; it refuses a `uuid` / `ulid` of any length but 16. Declare an optional
+field with Fory's type-use `@org.apache.fory.annotation.Nullable` (Fory does
+not serialize `Optional` in xlang mode); contract identity reads it as
+optional. Java contract identity uses the declared field name, so give
+multi-word fields their wire (snake_case) name when the contract must match
+another binding's. `ContractTypesVectorTest` pins all of this to
+`conformance/vectors/contract-types.json`. Fory Java writes collection
+elements as nullable and ASCII strings as LATIN1, so payloads holding a list
+or a string are not byte-identical to Rust's (they decode both ways); the
+scalar encodings are.
+
 ## Authenticated HTTPS and WebTransport listeners
 
 `AsterServer.startHttp(upcalls, config)` exposes the server's registered services

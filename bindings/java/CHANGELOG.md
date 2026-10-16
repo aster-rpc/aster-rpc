@@ -5,6 +5,37 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Changed: native C ABI 7.5; handler peer and principal
+
+The native library must be C ABI **7.5** or a later 7.x
+(`REQUIRED_ABI_MINOR = 5`). `CallContext.peer()` is now the transport peer
+(the remote address over HTTP / WebTransport) and the new `principal()` the
+`Authenticator`'s principal; before, `peer()` was the principal. Code that
+keyed on `peer()` for HTTP callers should use `principal()`. `callId()` is the
+caller's wire call id instead of a random UUID. `CallContext.current()` is a
+`ScopedValue` the server binds around every handler.
+
+### Added
+
+- `AuditOutbox.acknowledgements` / `waitAcknowledgements` /
+  `watchAcknowledgements` and the log bounds on `AuditOutbox.Config` (ABI 7.1).
+- `AsterServer.drain(Duration)` returning `DrainReport`, `isDraining()`, and
+  `RpcError.isDraining()` (ABI 7.2).
+- Cluster network settings (`bindAddrV6`, `advertiseAddrs`, `relayCaCerts`,
+  `relayCaOnly`, `discovery`, `discoveryDnsOrigin`, `discoveryPkarrRelays`)
+  and `[metrics]` peer labels on `AsterConfig`, from env and TOML (ABI 7.3 /
+  7.4).
+- `IrohBlobs.transferStats()`, fetch report v2 per-provider counters,
+  `PeerView.quicTraffic()` / `blobTransfer()` (ABI 7.4).
+- `CallContext.principal()`, `dispatchCallId()`, `wireCallId()`,
+  `metadataValue`, `attribute`, `deadlineInstant()`, `remaining()`,
+  `cancelled()`, `currentOrNull()` (ABI 7.5).
+- Contract types: `Instant` (`timestamp`), `LocalDate` (`date`),
+  `BigDecimal` (`decimal`), `@FixedDecimal` (`decimal(p,s)`), `UUID`
+  (`uuid`) and `Ulid` (`ulid`), matching Rust's contract ids and scalar wire
+  bytes (`conformance/vectors/contract-types.json`).
+
+
 ### Changed (breaking): native C ABI 7.0, zero means fail closed
 
 The native library must be C ABI **7.0** or a later 7.x
