@@ -45,7 +45,7 @@ KNOBS = [
     ("enable_monitoring", True, "1", "enable_monitoring = true"),
     ("enable_hooks", True, "yes", "enable_hooks = true"),
     ("hook_timeout_ms", 1234, "1234", "hook_timeout_ms = 1234"),
-    ("hook_failure_mode", "fail_closed", "fail_closed", 'hook_failure_mode = "fail_closed"'),
+    ("hook_failure_mode", "fail_open", "fail_open", 'hook_failure_mode = "fail_open"'),
     ("clear_ip_transports", True, "true", "clear_ip_transports = true"),
     ("clear_relay_transports", True, "true", "clear_relay_transports = true"),
     ("portmapper_config", "disabled", "disabled", 'portmapper_config = "disabled"'),
@@ -107,7 +107,7 @@ def test_defaults_match_rust_defaults():
     assert cfg.storage_path is None and not cfg.is_persistent
     assert cfg.secret_key is None and cfg.secret_key_file is None
     assert cfg.hook_timeout_ms == 5000
-    assert cfg.hook_failure_mode == "fail_open"
+    assert cfg.hook_failure_mode == "fail_closed"
     assert cfg.enrollment == EnrollmentConfig()
     assert not cfg.is_enrollment_enabled
     assert cfg.log_format == "text" and cfg.log_level == "info" and cfg.log_mask is True

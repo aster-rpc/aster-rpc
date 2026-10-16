@@ -276,6 +276,11 @@ pub enum aster_relay_mode_t {
 }
 
 /// Hook fallback behavior when callback processing is unavailable.
+///
+/// `aster_config_init` fills `ASTER_HOOK_FAILURE_FAIL_CLOSED` (the default);
+/// `ASTER_HOOK_FAILURE_FAIL_OPEN` is an explicit opt-in. Its value 0 predates
+/// that default, so a zero-filled `aster_config_t` that skips
+/// `aster_config_init` falls open.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum aster_hook_failure_mode_t {

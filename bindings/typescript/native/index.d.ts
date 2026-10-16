@@ -1761,7 +1761,10 @@ export interface AsterConfig {
   enableHooks?: boolean
   /** Hook decision timeout in ms (default 5000). `ASTER_HOOK_TIMEOUT_MS`. */
   hookTimeoutMs?: number | bigint
-  /** `"fail_open"` (default) or `"fail_closed"`. `ASTER_HOOK_FAILURE_MODE`. */
+  /**
+   * `"fail_closed"` (default) or the explicit opt-in `"fail_open"`.
+   * `ASTER_HOOK_FAILURE_MODE`.
+   */
   hookFailureMode?: string
   /** Relay-only: disable direct IP transports. `ASTER_CLEAR_IP_TRANSPORTS`. */
   clearIpTransports?: boolean

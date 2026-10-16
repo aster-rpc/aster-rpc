@@ -246,7 +246,8 @@ async for req in node.admission():      # HandshakeRequest per inbound peer
 
 `node.admission(outbound=True)` also yields a `ConnectRequest` for each of
 this node's own dials (otherwise they are allowed). A request left unanswered
-falls back to `hook_failure_mode` after `hook_timeout_ms`. The iterator ends
+falls back to `hook_failure_mode` after `hook_timeout_ms`: `"fail_closed"`
+(the default) rejects it, `"fail_open"` (explicit opt-in) accepts it. The iterator ends
 when the node closes.
 
 Or hand the decisions to an `AdmissionHandler` served over the upcall channel

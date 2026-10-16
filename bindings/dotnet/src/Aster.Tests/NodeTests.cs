@@ -52,7 +52,7 @@ public class NodeTests
             StoragePath = "/tmp/x",
             GcIntervalMs = 1234,
             HookTimeoutMs = 777,
-            HookFailureMode = HookFailureMode.FailClosed,
+            HookFailureMode = HookFailureMode.FailOpen,
             EnableHooks = true,
             Portmapper = Portmapper.Disabled,
             Transport = new TransportConfig { MaxConcurrentBidiStreams = 99, SendFairness = false, InitialMtu = 1300 },
@@ -64,10 +64,19 @@ public class NodeTests
         Assert.Equal("127.0.0.1:0", n.bind_addr.ToUtf8String());
         Assert.Equal(c.SecretKey, n.secret_key.ToArray());
         Assert.Equal(1234ul, n.gc_interval_ms);
-        Assert.Equal(1u, n.hook_failure_mode);
+        Assert.Equal(0u, n.hook_failure_mode);
         Assert.Equal(2u, n.portmapper);
         Assert.Equal(99ul, n.transport_max_concurrent_bidi_streams);
         Assert.Equal((1u << 0) | (1u << 7) | (1u << 10), n.transport_set);
+    }
+
+    [Fact]
+    public void Config_Admission_Fails_Closed_By_Default()
+    {
+        using var scope = new NativeScope();
+        var c = new AsterConfig();
+        Assert.Equal(HookFailureMode.FailClosed, c.HookFailureMode);
+        Assert.Equal((uint)HookFailureMode.FailClosed, c.ToNative(scope).hook_failure_mode);
     }
 
     [Fact]

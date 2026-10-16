@@ -30,6 +30,7 @@ async fn node_and_connection_reach_core_and_back() {
             .relay(RelayMode::Disabled)
             .alpn(b"bind/1".to_vec())
             .hooks(true)
+            .hook_failure_mode(aster::HookFailureMode::FailOpen)
             .build(),
     )
     .await
@@ -50,8 +51,8 @@ async fn node_and_connection_reach_core_and_back() {
     assert_eq!(rewrapped.id(), a.id());
 
     // Raw hook receiver round-trips through Admission. Dropped straight away:
-    // a closed hook channel falls back to the (fail-open) failure mode, so the
-    // connection below is not held for the hook timeout.
+    // a closed hook channel falls back to the explicit fail-open failure mode,
+    // so the connection below is admitted without a hook decision.
     let admission = a.take_admission().expect("hooks enabled");
     let rx = admission.into_core_receiver();
     drop(aster::Admission::from_core_receiver(rx));

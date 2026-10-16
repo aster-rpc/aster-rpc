@@ -28,7 +28,7 @@ def test_all_defaults():
     assert cfg.enable_monitoring is False
     assert cfg.enable_hooks is False
     assert cfg.hook_timeout_ms == 5000
-    assert cfg.hook_failure_mode == "fail_open"
+    assert cfg.hook_failure_mode == "fail_closed"
     assert cfg.bind_addr is None
     assert cfg.clear_ip_transports is False
     assert cfg.clear_relay_transports is False
@@ -88,8 +88,8 @@ def test_hook_timeout_ms():
 
 
 def test_hook_failure_mode():
-    cfg = EndpointConfig(alpns=[], hook_failure_mode="fail_closed")
-    assert cfg.hook_failure_mode == "fail_closed"
+    cfg = EndpointConfig(alpns=[], hook_failure_mode="fail_open")
+    assert cfg.hook_failure_mode == "fail_open"
 
 
 def test_hook_failure_mode_rejects_invalid_value():
@@ -138,7 +138,7 @@ def test_all_fields_together():
         enable_monitoring=True,
         enable_hooks=True,
         hook_timeout_ms=2000,
-        hook_failure_mode="fail_closed",
+        hook_failure_mode="fail_open",
         bind_addr="0.0.0.0:9000",
         clear_ip_transports=False,
         clear_relay_transports=False,
@@ -164,7 +164,7 @@ def test_all_fields_together():
     assert cfg.enable_monitoring is True
     assert cfg.enable_hooks is True
     assert cfg.hook_timeout_ms == 2000
-    assert cfg.hook_failure_mode == "fail_closed"
+    assert cfg.hook_failure_mode == "fail_open"
     assert cfg.bind_addr == "0.0.0.0:9000"
     assert cfg.clear_ip_transports is False
     assert cfg.clear_relay_transports is False
@@ -195,7 +195,7 @@ def test_field_mutation():
     cfg.relay_mode = "disabled"
     cfg.enable_monitoring = True
     cfg.hook_timeout_ms = 999
-    cfg.hook_failure_mode = "fail_closed"
+    cfg.hook_failure_mode = "fail_open"
     cfg.bind_addr = "127.0.0.1:0"
     cfg.portmapper_config = "disabled"
     cfg.proxy_url = "http://p:80"
@@ -211,7 +211,7 @@ def test_field_mutation():
     assert cfg.relay_mode == "disabled"
     assert cfg.enable_monitoring is True
     assert cfg.hook_timeout_ms == 999
-    assert cfg.hook_failure_mode == "fail_closed"
+    assert cfg.hook_failure_mode == "fail_open"
     assert cfg.bind_addr == "127.0.0.1:0"
     assert cfg.portmapper_config == "disabled"
     assert cfg.proxy_url == "http://p:80"

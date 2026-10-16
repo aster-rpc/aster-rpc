@@ -168,8 +168,8 @@ pub(crate) fn blob_zstd_level_from_py(v: &Bound<'_, PyAny>) -> PyResult<Option<u
 
 fn parse_hook_failure_mode(v: &str) -> PyResult<HookFailureMode> {
     match v.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "" | "fail_open" | "open" => Ok(HookFailureMode::FailOpen),
-        "fail_closed" | "closed" => Ok(HookFailureMode::FailClosed),
+        "" | "fail_closed" | "closed" => Ok(HookFailureMode::FailClosed),
+        "fail_open" | "open" => Ok(HookFailureMode::FailOpen),
         other => Err(PyValueError::new_err(format!(
             "hook_failure_mode: expected fail_open or fail_closed, got {other:?}"
         ))),
@@ -278,7 +278,7 @@ fn apply_field(c: &mut AsterConfig, key: &str, v: &Bound<'_, PyAny>) -> PyResult
         "hook_timeout_ms" => c.hook_timeout_ms = v.extract()?,
         "hook_failure_mode" => {
             c.hook_failure_mode = match opt::<String>(v)? {
-                None => HookFailureMode::FailOpen,
+                None => HookFailureMode::default(),
                 Some(s) => parse_hook_failure_mode(&s)?,
             }
         }

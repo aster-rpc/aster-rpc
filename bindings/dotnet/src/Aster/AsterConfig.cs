@@ -72,7 +72,12 @@ public sealed record AsterConfig
     public bool ProxyFromEnv { get; init; }
     /// <summary>Hook (admission) timeout; 0 = 5000 ms.</summary>
     public ulong HookTimeoutMs { get; init; }
-    public HookFailureMode HookFailureMode { get; init; } = HookFailureMode.FailOpen;
+    /// <summary>
+    /// What a stalled or missing admission loop does after <see cref="HookTimeoutMs"/>:
+    /// <see cref="HookFailureMode.FailClosed"/> (default) rejects, <see cref="HookFailureMode.FailOpen"/>
+    /// (explicit opt-in) accepts.
+    /// </summary>
+    public HookFailureMode HookFailureMode { get; init; } = HookFailureMode.FailClosed;
     /// <summary>Raise admission events (<see cref="Node.Admissions"/>) when no <see cref="Gate"/> is attached.</summary>
     public bool EnableHooks { get; init; }
     public bool EnableMonitoring { get; init; }

@@ -665,7 +665,7 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
 // ── config functions ────────────────────────────────────────────────────────
 
 /// Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
-/// in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
+/// in-memory, hooks off, hook timeout 5000 ms, fail-closed, no transport
 /// overrides, blob zstd level 3, port reuse on). Never allocates (`storage` is NULL).
 ///
 /// Since ABI 6.0 this and `aster_config_from_env` / `_from_toml` return
@@ -1346,7 +1346,7 @@ mod tests {
             .monitoring(true)
             .hooks(true)
             .hook_timeout_ms(750)
-            .hook_failure_mode(HookFailureMode::FailClosed)
+            .hook_failure_mode(HookFailureMode::FailOpen)
             .clear_ip_transports(true)
             .clear_relay_transports(true)
             .portmapper(false)
@@ -1594,7 +1594,7 @@ mod tests {
         std::env::set_var("ASTER_BIND_ADDR", "127.0.0.1:4567");
         std::env::set_var("ASTER_GC_INTERVAL_MS", "2500");
         std::env::set_var("ASTER_ENABLE_HOOKS", "true");
-        std::env::set_var("ASTER_HOOK_FAILURE_MODE", "fail_closed");
+        std::env::set_var("ASTER_HOOK_FAILURE_MODE", "fail_open");
         std::env::set_var("ASTER_PORTMAPPER_CONFIG", "disabled");
         std::env::set_var("ASTER_TRANSPORT_INITIAL_MTU", "1300");
         std::env::set_var("ASTER_SECRET_KEY", "07".repeat(32));
@@ -1616,7 +1616,7 @@ mod tests {
         assert_eq!(c.enable_hooks, 1);
         assert_eq!(
             c.hook_failure_mode,
-            aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_CLOSED as u32
+            aster_hook_failure_mode_t::ASTER_HOOK_FAILURE_FAIL_OPEN as u32
         );
         assert_eq!(
             c.portmapper,
@@ -1673,7 +1673,7 @@ local_discovery = true
 enable_monitoring = true
 enable_hooks = true
 hook_timeout_ms = 1234
-hook_failure_mode = "fail_closed"
+hook_failure_mode = "fail_open"
 clear_ip_transports = true
 portmapper_config = "enabled"
 proxy_url = "http://localhost:8080"
@@ -1722,7 +1722,7 @@ file = "/etc/aster/.aster-identity"
         );
         assert!(cfg.local_discovery && cfg.enable_monitoring && cfg.enable_hooks);
         assert_eq!(cfg.hook_timeout_ms, 1234);
-        assert_eq!(cfg.hook_failure_mode, HookFailureMode::FailClosed);
+        assert_eq!(cfg.hook_failure_mode, HookFailureMode::FailOpen);
         assert!(cfg.clear_ip_transports && !cfg.clear_relay_transports);
         assert_eq!(cfg.portmapper_config.as_deref(), Some("enabled"));
         assert_eq!(cfg.proxy_url.as_deref(), Some("http://localhost:8080"));

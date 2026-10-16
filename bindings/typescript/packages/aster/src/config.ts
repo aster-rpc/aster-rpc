@@ -137,7 +137,11 @@ export interface AsterConfig {
   enableHooks?: boolean;
   /** Hook decision timeout (ms, default 5000). `ASTER_HOOK_TIMEOUT_MS`. */
   hookTimeoutMs?: number | bigint;
-  /** `ASTER_HOOK_FAILURE_MODE`. */
+  /**
+   * What a stalled or missing admission loop does after `hookTimeoutMs`:
+   * `fail_closed` (default) rejects, `fail_open` (explicit opt-in) accepts.
+   * `ASTER_HOOK_FAILURE_MODE`.
+   */
   hookFailureMode?: HookFailureMode;
   /** Relay-only. `ASTER_CLEAR_IP_TRANSPORTS`. */
   clearIpTransports?: boolean;

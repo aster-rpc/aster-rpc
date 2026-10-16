@@ -353,7 +353,10 @@ class AsterConfig:
     enable_monitoring: bool = False
     enable_hooks: bool = False
     hook_timeout_ms: int = 5000
-    hook_failure_mode: str = "fail_open"
+    hook_failure_mode: str = "fail_closed"
+    """Admission hook fallback when the hook loop stalls past
+    ``hook_timeout_ms`` or is gone (``ASTER_HOOK_FAILURE_MODE``): ``"fail_closed"``
+    (default, reject) or the explicit opt-in ``"fail_open"`` (accept)."""
     clear_ip_transports: bool = False
     clear_relay_transports: bool = False
     portmapper_config: str | None = None

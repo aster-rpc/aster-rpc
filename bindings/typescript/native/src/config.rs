@@ -104,7 +104,8 @@ pub struct JsAsterConfig {
     pub enable_hooks: Option<bool>,
     /// Hook decision timeout in ms (default 5000). `ASTER_HOOK_TIMEOUT_MS`.
     pub hook_timeout_ms: Option<Either<f64, BigInt>>,
-    /// `"fail_open"` (default) or `"fail_closed"`. `ASTER_HOOK_FAILURE_MODE`.
+    /// `"fail_closed"` (default) or the explicit opt-in `"fail_open"`.
+    /// `ASTER_HOOK_FAILURE_MODE`.
     pub hook_failure_mode: Option<String>,
     /// Relay-only: disable direct IP transports. `ASTER_CLEAR_IP_TRANSPORTS`.
     pub clear_ip_transports: Option<bool>,

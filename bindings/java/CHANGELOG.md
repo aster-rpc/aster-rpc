@@ -5,6 +5,15 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Changed (breaking): admission fails closed by default
+
+`AsterConfig.hookFailureMode()` now defaults to `"fail_closed"`: with
+`enableHooks(true)`, a connection whose admission request is not answered
+within `hookTimeoutMs` (or whose admission loop is gone) is rejected with
+`403 "hook unavailable"` instead of accepted. Any value other than
+`"fail_open"` now fails closed; set `hookFailureMode("fail_open")` to keep the
+old behaviour.
+
 ### Added: blob compression level and port reuse in `AsterConfig`
 
 `AsterConfig.blobZstdLevel()` (`null` = level 3, `0` = off, 1..19) and

@@ -270,7 +270,9 @@ public enum RelayMode : uint
 /// <summary>Hook failure mode. Mirrors aster_hook_failure_mode_t.</summary>
 public enum HookFailureMode : uint
 {
+    /// <summary>Explicit opt-in: accept when the hook times out or is gone.</summary>
     FailOpen = 0,
+    /// <summary>Default: reject when the hook times out or is gone.</summary>
     FailClosed = 1,
 }
 

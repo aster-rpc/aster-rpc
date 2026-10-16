@@ -5,6 +5,14 @@ All notable changes to `@aster-rpc/aster` (and its native addon
 
 ## Unreleased
 
+### Changed (breaking): admission fails closed by default
+
+`AsterConfig.hookFailureMode` now defaults to `'fail_closed'`: with
+`enableHooks`, a connection whose admission request is not answered within
+`hookTimeoutMs` (or with no `admission()` iterator open) is rejected with
+`403 "hook unavailable"` instead of accepted. Set `hookFailureMode:
+'fail_open'` to keep the old behaviour.
+
 ### Added: `blobZstdLevel` and `reuseLastPort` in `AsterConfig`
 
 `AsterConfig.blobZstdLevel` sets the zstd level of blob transport (unset = 3,

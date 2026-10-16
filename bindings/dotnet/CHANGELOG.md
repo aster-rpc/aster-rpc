@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Changed (breaking): admission fails closed by default
+
+`AsterConfig.HookFailureMode` now defaults to `HookFailureMode.FailClosed`:
+with `EnableHooks`, a connection whose admission request is not answered
+within `HookTimeoutMs` (or whose `Admissions` loop is gone) is rejected with
+`403 "hook unavailable"` instead of accepted. Set `HookFailureMode.FailOpen`
+to keep the old behaviour.
+
 ### Added: `AsterConfig.BlobZstdLevel` and `ReuseLastPort` (native C ABI 6.0)
 
 Blob transport compression and port reuse on restart can now be set, and in

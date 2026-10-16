@@ -70,8 +70,9 @@ describe('Gate 0 in Rust (GatePolicy on a node)', () => {
     server.setGate(gate);
     expect((await dial(client, server, APP)).closed).toBe(true);
     server.setGate(null);
-    // No admission() iterator open: the hook failure mode (fail_open) applies.
-    expect((await dial(client, server, APP, 500)).closed).toBe(false);
+    // No admission() iterator open: the hook failure mode (fail_closed by
+    // default) applies.
+    expect(await dial(client, server, APP)).toMatchObject({ closed: true, code: 403, reason: 'hook unavailable' });
   });
 
   it('setGate / admission() need hooks', async () => {
@@ -112,9 +113,9 @@ describe('admission() as an AsyncIterable', () => {
     ]);
 
     // Iterator closed by `break`: later requests get the failure mode
-    // (fail_open) at once instead of waiting for the hook timeout.
+    // (fail_closed by default) at once instead of waiting for the hook timeout.
     const t0 = Date.now();
-    expect((await dial(client, server, APP, 500)).closed).toBe(false);
+    expect(await dial(client, server, APP)).toMatchObject({ closed: true, code: 403, reason: 'hook unavailable' });
     expect(Date.now() - t0).toBeLessThan(4000);
   });
 });

@@ -51,6 +51,11 @@ final class NodeConfigTest {
   }
 
   @Test
+  void admissionFailsClosedByDefault() {
+    assertEquals("fail_closed", AsterConfig.builder().build().hookFailureMode());
+  }
+
+  @Test
   void javaConfigRoundTripsThroughTheNativeStruct() {
     AsterConfig c =
         AsterConfig.builder()
@@ -65,7 +70,7 @@ final class NodeConfigTest {
             .enableMonitoring(true)
             .enableHooks(true)
             .hookTimeoutMs(750)
-            .hookFailureMode("fail_closed")
+            .hookFailureMode("fail_open")
             .clearIpTransports(true)
             .portmapper(false)
             .proxyUrl("socks5://p:1080")
@@ -90,7 +95,7 @@ final class NodeConfigTest {
     assertEquals("aster/1", new String(back.alpns().get(0), StandardCharsets.UTF_8));
     assertTrue(back.localDiscovery() && back.enableMonitoring() && back.enableHooks());
     assertEquals(750, back.hookTimeoutMs());
-    assertEquals("fail_closed", back.hookFailureMode());
+    assertEquals("fail_open", back.hookFailureMode());
     assertTrue(back.clearIpTransports());
     assertFalse(back.clearRelayTransports());
     assertEquals("disabled", back.portmapperConfig());
@@ -147,7 +152,7 @@ final class NodeConfigTest {
         relay_mode = "disabled"
         bind_addr = "127.0.0.1:0"
         secret_key = "%s"
-        hook_failure_mode = "fail_closed"
+        hook_failure_mode = "fail_open"
         transport_keep_alive_interval_ms = 2000
         """
             .formatted(
@@ -187,7 +192,7 @@ final class NodeConfigTest {
     assertEquals("disabled", c.relayMode());
     assertEquals("127.0.0.1:0", c.bindAddr());
     assertEquals(60000, c.gcIntervalMs());
-    assertEquals("fail_closed", c.hookFailureMode());
+    assertEquals("fail_open", c.hookFailureMode());
     assertEquals(2000L, c.transportKeepAliveIntervalMs());
     byte[] want = new byte[32];
     java.util.Arrays.fill(want, (byte) 7);

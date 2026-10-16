@@ -139,7 +139,8 @@ pub struct EndpointConfig {
     /// Timeout in ms for hook replies (default 5000)
     #[pyo3(get, set)]
     pub hook_timeout_ms: u64,
-    /// Post-handshake hook fallback mode: "fail_open" (default) or "fail_closed".
+    /// Post-handshake hook fallback mode: "fail_closed" (default) or the
+    /// explicit opt-in "fail_open".
     #[pyo3(get, set)]
     pub hook_failure_mode: String,
     /// Bind address e.g. `"0.0.0.0:9000"`, `"127.0.0.1:0"`, `"[::]:0"`
@@ -223,7 +224,7 @@ impl EndpointConfig {
         enable_monitoring=false,
         enable_hooks=false,
         hook_timeout_ms=5000,
-        hook_failure_mode="fail_open".to_string(),
+        hook_failure_mode="fail_closed".to_string(),
         bind_addr=None,
         clear_ip_transports=false,
         clear_relay_transports=false,

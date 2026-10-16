@@ -16,7 +16,7 @@ import (
 
 func TestConfig_DefaultsEnvTOML(t *testing.T) {
 	d := DefaultConfig()
-	if d.RelayMode != "default" || d.HookFailureMode != HookFailOpen || d.EnableHooks || d.IsEnrollmentEnabled() || d.LogLevel != "info" {
+	if d.RelayMode != "default" || d.HookFailureMode != HookFailClosed || d.EnableHooks || d.IsEnrollmentEnabled() || d.LogLevel != "info" {
 		t.Fatalf("defaults %+v", d)
 	}
 

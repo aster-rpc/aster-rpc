@@ -183,7 +183,8 @@ pub struct AsterConfig {
     /// Timeout in milliseconds for admission hook decisions.
     pub hook_timeout_ms: u64,
     /// Hook fallback behavior when the host callback is unavailable or times
-    /// out.
+    /// out. Defaults to [`HookFailureMode::FailClosed`] (reject); `fail_open`
+    /// is an explicit opt-in.
     pub hook_failure_mode: HookFailureMode,
     /// Disable direct IP transports.
     pub clear_ip_transports: bool,
@@ -974,7 +975,7 @@ impl Default for AsterConfig {
             enable_monitoring: false,
             enable_hooks: false,
             hook_timeout_ms: 5000,
-            hook_failure_mode: HookFailureMode::FailOpen,
+            hook_failure_mode: HookFailureMode::FailClosed,
             clear_ip_transports: false,
             clear_relay_transports: false,
             portmapper_config: None,
@@ -1156,9 +1157,10 @@ impl AsterConfigBuilder {
     /// Configure post-handshake hook fallback behavior for timeouts or closed
     /// hook channels.
     ///
-    /// The default is [`HookFailureMode::FailOpen`] for compatibility with
-    /// observability-only hooks. Protected admission flows should use
-    /// [`HookFailureMode::FailClosed`].
+    /// The default is [`HookFailureMode::FailClosed`]: a stalled or dropped
+    /// admission loop rejects the connection. [`HookFailureMode::FailOpen`] is
+    /// an explicit opt-in for observability-only hooks that must never block
+    /// a connection.
     pub fn hook_failure_mode(mut self, mode: HookFailureMode) -> Self {
         self.config.hook_failure_mode = mode;
         self
@@ -1957,7 +1959,7 @@ mod tests {
         env::set_var("ASTER_ENABLE_MONITORING", "true");
         env::set_var("ASTER_ENABLE_HOOKS", "true");
         env::set_var("ASTER_HOOK_TIMEOUT_MS", "1234");
-        env::set_var("ASTER_HOOK_FAILURE_MODE", "fail-closed");
+        env::set_var("ASTER_HOOK_FAILURE_MODE", "fail-open");
         env::set_var("ASTER_CLEAR_IP_TRANSPORTS", "true");
         env::set_var("ASTER_CLEAR_RELAY_TRANSPORTS", "false");
         env::set_var("ASTER_PORTMAPPER_CONFIG", "disabled");
@@ -2025,7 +2027,7 @@ mod tests {
         assert!(cfg.enable_monitoring);
         assert!(cfg.enable_hooks);
         assert_eq!(cfg.hook_timeout_ms, 1234);
-        assert_eq!(cfg.hook_failure_mode, HookFailureMode::FailClosed);
+        assert_eq!(cfg.hook_failure_mode, HookFailureMode::FailOpen);
         assert!(cfg.clear_ip_transports);
         assert!(!cfg.clear_relay_transports);
         assert_eq!(cfg.portmapper_config.as_deref(), Some("disabled"));
@@ -2402,7 +2404,7 @@ mod binding_knob_tests {
             .monitoring(true)
             .hooks(true)
             .hook_timeout_ms(750)
-            .hook_failure_mode(HookFailureMode::FailClosed)
+            .hook_failure_mode(HookFailureMode::FailOpen)
             .clear_ip_transports(true)
             .clear_relay_transports(true)
             .portmapper(false)
@@ -2442,7 +2444,7 @@ mod binding_knob_tests {
         assert!(core.enable_monitoring);
         assert!(core.enable_hooks);
         assert_eq!(core.hook_timeout_ms, 750);
-        assert_eq!(core.hook_failure_mode, HookFailureMode::FailClosed);
+        assert_eq!(core.hook_failure_mode, HookFailureMode::FailOpen);
         assert!(core.clear_ip_transports);
         assert!(core.clear_relay_transports);
         assert_eq!(core.portmapper_config.as_deref(), Some("disabled"));
@@ -2472,6 +2474,7 @@ mod binding_knob_tests {
         assert_eq!(core.data_dir, None);
         assert_eq!(core.hook_timeout_ms, expected.hook_timeout_ms);
         assert_eq!(core.hook_failure_mode, expected.hook_failure_mode);
+        assert_eq!(core.hook_failure_mode, HookFailureMode::FailClosed);
         assert_eq!(core.portmapper_config, expected.portmapper_config);
         assert!(!core.enable_discovery && !core.enable_hooks && !core.enable_monitoring);
         assert!(!core.clear_ip_transports && !core.clear_relay_transports);

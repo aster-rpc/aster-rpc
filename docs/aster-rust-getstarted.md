@@ -181,7 +181,7 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `monitoring(b)` | `ASTER_ENABLE_MONITORING` | `[network] enable_monitoring` | |
 | `hooks(b)` | `ASTER_ENABLE_HOOKS` | `[network] enable_hooks` | needed for `take_admission` |
 | `hook_timeout_ms(ms)` | `ASTER_HOOK_TIMEOUT_MS` | `[network] hook_timeout_ms` | default 5000 |
-| `hook_failure_mode(m)` | `ASTER_HOOK_FAILURE_MODE` | `[network] hook_failure_mode` | `fail_open` (default) / `fail_closed` |
+| `hook_failure_mode(m)` | `ASTER_HOOK_FAILURE_MODE` | `[network] hook_failure_mode` | `fail_closed` (default: a stalled or missing admission loop rejects) / `fail_open` (explicit opt-in: accepts) |
 | `clear_ip_transports(b)` | `ASTER_CLEAR_IP_TRANSPORTS` | `[network] clear_ip_transports` | relay-only |
 | `clear_relay_transports(b)` | `ASTER_CLEAR_RELAY_TRANSPORTS` | `[network] clear_relay_transports` | direct-only |
 | `portmapper(b)` | `ASTER_PORTMAPPER_CONFIG` | `[network] portmapper_config` | `enabled` / `disabled` |
@@ -450,7 +450,7 @@ connection before *any* protocol (RPC, blobs, docs, gossip) can be used.
 
 ```rust
 use std::collections::HashSet;
-use aster::{AsterConfig, AsterServer, HookFailureMode, NodeId, PublicKey, RelayMode};
+use aster::{AsterConfig, AsterServer, NodeId, PublicKey, RelayMode};
 
 # async fn serve(root_pubkey: PublicKey, also_allow: Vec<NodeId>) -> aster::Result<()> {
 // Node IDs allowed to reach this node at all. A node ID *is* an ed25519 public
@@ -463,8 +463,7 @@ for id in &also_allow {
 
 let config = AsterConfig::builder()
     .relay(RelayMode::Default)
-    .hooks(true)                                    // enable the admission hook
-    .hook_failure_mode(HookFailureMode::FailClosed) // REQUIRED — see the warning below
+    .hooks(true) // enable the admission hook; fails closed by default (see below)
     .build();
 
 let srv = AsterServer::builder()
@@ -492,12 +491,17 @@ srv.run().await;
 
 For a single allowed identity (e.g. *only* the root node), use a one-element set.
 
-> **You must set `HookFailureMode::FailClosed`.** The hook's default fallback is
-> **fail-open**: if your admission loop stalls past `hook_timeout_ms` (default
-> 5 s) or is dropped, the connection is *accepted*. `FailClosed` flips that to a
-> reject, so a stalled or missing loop denies rather than admits. Also make sure
-> the loop actually runs (`take_admission` returns the handle once) — without a
-> live loop draining `next_handshake`, every decision hits the fallback.
+> **Admission fails closed by default.** If your admission loop stalls past
+> `hook_timeout_ms` (default 5 s) or is dropped, the connection is *rejected*
+> (`403 "hook unavailable"`): the default `HookFailureMode::FailClosed` means a
+> stalled or missing loop denies rather than admits. Setting
+> `.hook_failure_mode(HookFailureMode::FailOpen)` (`fail_open`) opts into the
+> opposite: an unanswered decision *accepts* the connection, which suits only
+> observability hooks that must never block a peer. Either way, make sure the
+> loop actually runs (`take_admission` returns the handle once) — without a
+> live loop draining `next_handshake`, every decision hits the fallback. The
+> node's own outbound connections raise handshake requests on the same loop,
+> so answer those too.
 
 **Per-method instead of per-connection?** If you'd rather admit a broad set but
 restrict only some methods to specific identities, use Gate 3 (§4.6): map each
@@ -964,7 +968,9 @@ with `AsterConfigBuilder::hooks(true)`.
 - **Interceptors** apply to unary calls; streaming calls are not yet intercepted.
 - `Admission` exposes separate `next_handshake()` (inbound) and `next_connect()`
   (outbound) streams; with hooks enabled, unhandled outbound connect hooks wait
-  for the hook timeout before a default accept.
+  for the hook timeout before a default accept. `next_handshake()` also yields
+  the handshakes of this node's own outbound connections; left unanswered they
+  fail closed like inbound ones.
 
 ---
 

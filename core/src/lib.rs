@@ -124,9 +124,11 @@ pub struct CoreEndpointConfig {
     pub enable_hooks: bool,
     /// Timeout in ms for hook replies (default 5000)
     pub hook_timeout_ms: u64,
-    /// Post-handshake hook fallback when callback channel is closed or times out.
-    /// `before_connect` falls open unless a low-level adapter is constructed
-    /// with an explicit outbound failure mode.
+    /// Post-handshake (admission) hook fallback when the callback channel is
+    /// closed or times out. Defaults to [`trust::HookFailureMode::FailClosed`];
+    /// `FailOpen` is an explicit opt-in. Outbound `before_connect` falls open
+    /// unless a low-level adapter is constructed with an explicit outbound
+    /// failure mode.
     pub hook_failure_mode: trust::HookFailureMode,
     /// Bind address string e.g. "0.0.0.0:9000", "127.0.0.1:0", "`[::`]:0"
     pub bind_addr: Option<String>,
@@ -193,7 +195,7 @@ impl Default for CoreEndpointConfig {
             enable_monitoring: false,
             enable_hooks: false,
             hook_timeout_ms: 5000,
-            hook_failure_mode: trust::HookFailureMode::FailOpen,
+            hook_failure_mode: trust::HookFailureMode::default(),
             bind_addr: None,
             clear_ip_transports: false,
             clear_relay_transports: false,
@@ -1317,8 +1319,9 @@ impl CoreHooksAdapter {
     /// Create a new hooks adapter. Returns `(adapter, receiver)`.
     /// The adapter is installed on the endpoint builder.
     /// The receiver is consumed by the FFI layer to forward events.
+    /// Inbound `after_handshake` uses the default failure mode (fail closed).
     pub fn new(timeout_ms: u64) -> (Self, CoreHookReceiver) {
-        Self::new_with_failure_mode(timeout_ms, trust::HookFailureMode::FailOpen)
+        Self::new_with_failure_mode(timeout_ms, trust::HookFailureMode::default())
     }
 
     /// Create a new hooks adapter with explicit inbound fallback behavior.
@@ -5849,5 +5852,121 @@ mod relay_online_wait_tests {
         .expect("node with cleared relay transports hung waiting for a relay")
         .unwrap();
         node.close().await;
+    }
+}
+
+#[cfg(test)]
+mod hook_failure_mode_tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        reason = "test scaffolding: a failed unwrap/panic is the test failing"
+    )]
+
+    use super::*;
+
+    const ALPN: &[u8] = b"aster.test.hooks/1";
+    const BUDGET: Duration = Duration::from_secs(10);
+
+    fn local_config(enable_hooks: bool) -> CoreEndpointConfig {
+        CoreEndpointConfig {
+            relay_mode: Some("disabled".into()),
+            alpns: vec![ALPN.to_vec()],
+            bind_addr: Some("127.0.0.1:0".into()),
+            enable_hooks,
+            hook_timeout_ms: 200,
+            ..Default::default()
+        }
+    }
+
+    /// Connect a hookless client to `server` and report how the connection
+    /// ended: `None` if it stays open, `Some(code)` if it was closed (`code` is
+    /// the application close code, if any).
+    async fn dial(server: &Arc<CoreNetClient>) -> Option<Option<u64>> {
+        let acceptor = {
+            let server = Arc::clone(server);
+            tokio::spawn(async move { server.accept().await })
+        };
+        let client = CoreNetClient::create_with_config(local_config(false))
+            .await
+            .unwrap();
+        let outcome = match client
+            .connect_node_addr(server.endpoint_addr_info(), ALPN.to_vec())
+            .await
+        {
+            Err(_) => Some(None),
+            Ok(conn) => tokio::time::timeout(Duration::from_secs(2), conn.closed())
+                .await
+                .ok()
+                .map(|info| info.code),
+        };
+        acceptor.abort();
+        client.close().await;
+        outcome
+    }
+
+    #[test]
+    fn default_failure_mode_is_fail_closed() {
+        assert_eq!(
+            trust::HookFailureMode::default(),
+            trust::HookFailureMode::FailClosed
+        );
+        assert_eq!(
+            CoreEndpointConfig::default().hook_failure_mode,
+            trust::HookFailureMode::FailClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn default_rejects_when_hook_receiver_is_dropped() {
+        tokio::time::timeout(BUDGET, async {
+            let server = Arc::new(
+                CoreNetClient::create_with_config(local_config(true))
+                    .await
+                    .unwrap(),
+            );
+            drop(server.take_hook_receiver().expect("hooks enabled"));
+            assert_eq!(dial(&server).await, Some(Some(403)));
+            server.close().await;
+        })
+        .await
+        .expect("test hung");
+    }
+
+    #[tokio::test]
+    async fn default_rejects_when_hook_times_out() {
+        tokio::time::timeout(BUDGET, async {
+            let server = Arc::new(
+                CoreNetClient::create_with_config(local_config(true))
+                    .await
+                    .unwrap(),
+            );
+            // Hold the receiver but never answer: the hook times out.
+            let _stalled = server.take_hook_receiver().expect("hooks enabled");
+            assert_eq!(dial(&server).await, Some(Some(403)));
+            server.close().await;
+        })
+        .await
+        .expect("test hung");
+    }
+
+    #[tokio::test]
+    async fn explicit_fail_open_accepts_when_hook_receiver_is_dropped() {
+        tokio::time::timeout(BUDGET, async {
+            let server = Arc::new(
+                CoreNetClient::create_with_config(CoreEndpointConfig {
+                    hook_failure_mode: trust::HookFailureMode::FailOpen,
+                    ..local_config(true)
+                })
+                .await
+                .unwrap(),
+            );
+            drop(server.take_hook_receiver().expect("hooks enabled"));
+            assert_eq!(dial(&server).await, None);
+            server.close().await;
+        })
+        .await
+        .expect("test hung");
     }
 }

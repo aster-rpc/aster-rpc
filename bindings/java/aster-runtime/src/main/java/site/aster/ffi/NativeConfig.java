@@ -136,8 +136,9 @@ public final class NativeConfig {
     putStr(seg, IDENTITY_FILE, c.identityFile(), arena);
     putStr(seg, PROXY_URL, c.proxyUrl(), arena);
     seg.set(ValueLayout.JAVA_LONG, HOOK_TIMEOUT_MS, Math.max(0, c.hookTimeoutMs()));
+    // Fail closed unless fail_open is asked for explicitly.
     seg.set(
-        ValueLayout.JAVA_INT, HOOK_FAILURE_MODE, "fail_closed".equals(c.hookFailureMode()) ? 1 : 0);
+        ValueLayout.JAVA_INT, HOOK_FAILURE_MODE, "fail_open".equals(c.hookFailureMode()) ? 0 : 1);
     seg.set(ValueLayout.JAVA_INT, ENABLE_HOOKS, c.enableHooks() ? 1 : 0);
     seg.set(ValueLayout.JAVA_INT, ENABLE_MONITORING, c.enableMonitoring() ? 1 : 0);
     seg.set(ValueLayout.JAVA_INT, LOCAL_DISCOVERY, c.localDiscovery() ? 1 : 0);

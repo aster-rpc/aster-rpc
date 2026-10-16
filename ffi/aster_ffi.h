@@ -621,6 +621,11 @@ typedef enum aster_relay_mode_t {
 
 /**
  * Hook fallback behavior when callback processing is unavailable.
+ *
+ * `aster_config_init` fills `ASTER_HOOK_FAILURE_FAIL_CLOSED` (the default);
+ * `ASTER_HOOK_FAILURE_FAIL_OPEN` is an explicit opt-in. Its value 0 predates
+ * that default, so a zero-filled `aster_config_t` that skips
+ * `aster_config_init` falls open.
  */
 typedef enum aster_hook_failure_mode_t {
   ASTER_HOOK_FAILURE_FAIL_OPEN = 0,
@@ -5871,7 +5876,7 @@ int32_t aster_http_listener_stop(aster_runtime_t runtime,
 
 /**
  * Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
- * in-memory, hooks off, hook timeout 5000 ms, fail-open, no transport
+ * in-memory, hooks off, hook timeout 5000 ms, fail-closed, no transport
  * overrides, blob zstd level 3, port reuse on). Never allocates (`storage` is NULL).
  *
  * Since ABI 6.0 this and `aster_config_from_env` / `_from_toml` return

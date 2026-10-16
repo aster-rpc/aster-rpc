@@ -33,12 +33,18 @@ pub enum TrustMode {
 
 /// What the core hook adapter should do if the host callback is unavailable or
 /// does not answer before the configured timeout.
+///
+/// Admission fails closed by default: a stalled or dropped admission loop
+/// rejects the connection rather than letting it through.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HookFailureMode {
-    /// Preserve historical behavior: let the connection through.
-    #[default]
+    /// Explicit opt-in (`fail_open`): let the connection through when the host
+    /// callback is unavailable or times out. Only for hosts that treat the
+    /// hook as advisory, never for one that relies on it for admission.
     FailOpen,
-    /// Protected behavior: reject the connection.
+    /// Default (`fail_closed`): reject the connection when the host callback
+    /// is unavailable or times out.
+    #[default]
     FailClosed,
 }
 

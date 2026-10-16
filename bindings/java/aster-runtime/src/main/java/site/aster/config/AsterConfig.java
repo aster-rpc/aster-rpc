@@ -66,7 +66,7 @@ public final class AsterConfig {
   private String relayMode;
   private List<String> relayUrls = List.of();
   private long gcIntervalMs;
-  private String hookFailureMode = "fail_open";
+  private String hookFailureMode = "fail_closed";
   private List<byte[]> alpns = List.of();
   private Long transportMaxConcurrentBidiStreams;
   private Long transportMaxConcurrentUniStreams;
@@ -239,7 +239,10 @@ public final class AsterConfig {
     return gcIntervalMs;
   }
 
-  /** {@code "fail_open"} (default) or {@code "fail_closed"}. */
+  /**
+   * {@code "fail_closed"} (default: a stalled or missing admission loop rejects) or the explicit
+   * opt-in {@code "fail_open"} (accepts).
+   */
   public String hookFailureMode() {
     return hookFailureMode;
   }
@@ -492,7 +495,10 @@ public final class AsterConfig {
       return this;
     }
 
-    /** {@code "fail_open"} or {@code "fail_closed"}: what a hook timeout means. */
+    /**
+     * {@code "fail_closed"} (default) or {@code "fail_open"}: what a hook timeout means. Any value
+     * other than {@code "fail_open"} fails closed.
+     */
     public Builder hookFailureMode(String mode) {
       c.hookFailureMode = mode;
       return this;

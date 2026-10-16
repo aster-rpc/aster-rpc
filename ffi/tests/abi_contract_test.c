@@ -745,7 +745,7 @@ static void test_config(void) {
     CHECK(c.storage == NULL);
     CHECK(c.relay_mode == ASTER_RELAY_MODE_DEFAULT);
     CHECK(c.hook_timeout_ms == 5000);
-    CHECK(c.hook_failure_mode == ASTER_HOOK_FAILURE_FAIL_OPEN);
+    CHECK(c.hook_failure_mode == ASTER_HOOK_FAILURE_FAIL_CLOSED);
     CHECK(c.transport_set == 0 && c.bind_addr.ptr == NULL && c.alpns.len == 0);
     CHECK(c.blob_zstd_level == 3);
     CHECK(c.reuse_last_port == ASTER_REUSE_LAST_PORT_ENABLED);

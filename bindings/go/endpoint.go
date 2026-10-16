@@ -51,9 +51,9 @@ type EndpointConfig struct {
 	ProxyURL             string
 	ProxyFromEnv         bool
 	DataDir              string // -> AsterConfig.StoragePath ("" = in memory)
-	HookFailureMode      uint32
-	BlobZstdLevel        *int  // -> AsterConfig.BlobZstdLevel (nil = 3, 0 = off)
-	ReuseLastPort        *bool // -> AsterConfig.ReuseLastPort (nil = on)
+	HookFailureMode      uint32 // HookFailClosed (DefaultEndpointConfig) or HookFailOpen (the zero value)
+	BlobZstdLevel        *int   // -> AsterConfig.BlobZstdLevel (nil = 3, 0 = off)
+	ReuseLastPort        *bool  // -> AsterConfig.ReuseLastPort (nil = on)
 }
 
 // DefaultEndpointConfig returns a sensible default endpoint configuration.
@@ -62,6 +62,7 @@ func DefaultEndpointConfig() EndpointConfig {
 		RelayMode:       RelayModeDefault,
 		EnableDiscovery: true,
 		EnableHooks:     false,
+		HookFailureMode: HookFailClosed,
 	}
 }
 

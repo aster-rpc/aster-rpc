@@ -72,7 +72,7 @@ describe('AsterConfig.fromEnv', () => {
     });
     expect(c.relayMode).toBe('default');
     expect(c.hookTimeoutMs).toBe(5000);
-    expect(c.hookFailureMode).toBe('fail_open');
+    expect(c.hookFailureMode).toBe('fail_closed');
     expect(c.gcIntervalMs).toBe(0);
     expect(c.enableHooks).toBe(false);
     expect(c.healthPort).toBe(0);
@@ -154,7 +154,7 @@ gc_interval_ms = 60000
 relay_mode = "disabled"
 bind_addr = "127.0.0.1:0"
 hook_timeout_ms = 10000
-hook_failure_mode = "fail_closed"
+hook_failure_mode = "fail_open"
 secret_key_file = "${join(dir, 'node.key')}"
 transport_stream_receive_window = 4294967296
 transport_initial_mtu = 1400
@@ -194,7 +194,7 @@ host = "0.0.0.0"
     expect(c.relayMode).toBe('disabled');
     expect(c.bindAddr).toBe('127.0.0.1:0');
     expect(c.hookTimeoutMs).toBe(10000);
-    expect(c.hookFailureMode).toBe('fail_closed');
+    expect(c.hookFailureMode).toBe('fail_open');
     expect(c.secretKeyFile).toBe(join(dir, 'node.key'));
     expect(c.transportStreamReceiveWindow).toBe(4294967296);
     expect(c.transportInitialMtu).toBe(1400);
@@ -236,7 +236,7 @@ describe('AsterConfig round trip', () => {
       enableMonitoring: true,
       enableHooks: true,
       hookTimeoutMs: 1234,
-      hookFailureMode: 'fail_closed',
+      hookFailureMode: 'fail_open',
       clearIpTransports: true,
       clearRelayTransports: false,
       portmapper: true,
