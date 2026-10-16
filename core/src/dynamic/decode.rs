@@ -16,6 +16,7 @@ use fory_core::util::murmurhash3_x64_128;
 
 use super::coerce::MAX_DEPTH;
 use super::encode::XLANG_FLAG;
+use super::scalars::{self, DynDecimal};
 use super::schema::{Body, DynSchema, FieldTy, Kind, Prim};
 use super::value::{DynEnum, DynError, DynResult, DynStruct, DynUnion, DynValue};
 use super::DecodeOptions;
@@ -280,7 +281,7 @@ impl<'s, 'b> Decoder<'s, 'b> {
     ) -> DynResult<DynValue> {
         let id = info.type_id;
         if let Some(p) = Prim::from_type_id(id) {
-            return self.read_prim(p);
+            return self.read_prim(refine(p, hint));
         }
         match id {
             tid::LIST | tid::SET => self.read_collection(None, hint, id == tid::SET),
@@ -335,7 +336,7 @@ impl<'s, 'b> Decoder<'s, 'b> {
     fn read_declared(&mut self, ft: &FieldType, hint: Option<&FieldTy>) -> DynResult<DynValue> {
         let id = ft.type_id;
         if let Some(p) = Prim::from_type_id(id) {
-            return self.read_prim(p);
+            return self.read_prim(refine(p, hint));
         }
         self.enter()?;
         let v = match id {
@@ -740,6 +741,22 @@ impl<'s, 'b> Decoder<'s, 'b> {
                 let nanos = r.read_i32()?;
                 DynValue::Duration { seconds, nanos }
             }
+            Prim::Decimal => DynValue::Decimal(DynDecimal::read(r)?),
+            Prim::DecimalFixed { precision, scale } => DynValue::Decimal(
+                DynDecimal::read(r)?
+                    .rescale(precision, scale)
+                    .map_err(DynError::decode)?,
+            ),
+            Prim::Uuid | Prim::Ulid => {
+                let len = r.read_var_u32()? as usize;
+                let what = if p == Prim::Uuid { "uuid" } else { "ulid" };
+                let id = scalars::id16(r.read_bytes(len)?, what).map_err(DynError::decode)?;
+                if p == Prim::Uuid {
+                    DynValue::Uuid(id)
+                } else {
+                    DynValue::Ulid(id)
+                }
+            }
         })
     }
 
@@ -818,4 +835,15 @@ fn check_meta_hash(header: i64, body: &[u8]) -> DynResult<()> {
         return Err(DynError::decode("TypeDef hash mismatch"));
     }
     Ok(())
+}
+
+/// The local schema's reading of a wire scalar. The wire says BINARY or
+/// DECIMAL; the local field may declare it `uuid` / `ulid` (16 bytes, checked)
+/// or `decimal(p,s)` (rescaled and checked). Anything else reads as sent.
+fn refine(wire: Prim, hint: Option<&FieldTy>) -> Prim {
+    match (wire, hint.map(|h| &h.kind)) {
+        (Prim::Binary, Some(Kind::Prim(local @ (Prim::Uuid | Prim::Ulid))))
+        | (Prim::Decimal, Some(Kind::Prim(local @ Prim::DecimalFixed { .. }))) => *local,
+        _ => wire,
+    }
 }

@@ -572,6 +572,7 @@ dependencies = [
  "iroh-relay",
  "iroh-tickets",
  "libc",
+ "num-bigint",
  "proptest",
  "rand_core 0.9.5",
  "rcgen 0.14.8",

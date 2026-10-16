@@ -36,6 +36,9 @@ getrandom = "0.2"
 fory-core = "=1.7.6"
 fory-derive = "=1.7.6"
 base64 = "0.22"
+# The dynamic codec's `decimal` values (Fory DECIMAL's unscaled BigInt). Already
+# in the graph through fory-core; pinned to the version it uses.
+num-bigint = "=0.4.6"
 # Compact Ed25519 JWS signing and verification for delegation chains and
 # enrollment credentials (AWS-LC, the backend the native stack already uses).
 aws-lc-rs = { version = "1.18", optional = true }

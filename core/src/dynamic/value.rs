@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+pub use super::scalars::DynDecimal;
+
 /// A dynamically typed payload value.
 ///
 /// The variants mirror the Fory xlang wire types an Aster contract can name.
@@ -45,6 +47,13 @@ pub enum DynValue {
         seconds: i64,
         nanos: i32,
     },
+    /// `decimal` / `decimal(p,s)`: Fory DECIMAL (type id 40).
+    Decimal(DynDecimal),
+    /// `uuid`: 16 bytes (RFC 9562 order), Fory BINARY on the wire.
+    Uuid([u8; 16]),
+    /// `ulid`: 16 bytes, Fory BINARY on the wire; an identity distinct from
+    /// `uuid`.
+    Ulid([u8; 16]),
     List(Vec<DynValue>),
     Set(Vec<DynValue>),
     /// Map entries in wire order (keys may be any scalar).
@@ -151,6 +160,9 @@ impl DynValue {
             DynValue::Timestamp { .. } => "timestamp",
             DynValue::Date { .. } => "date",
             DynValue::Duration { .. } => "duration",
+            DynValue::Decimal(_) => "decimal",
+            DynValue::Uuid(_) => "uuid",
+            DynValue::Ulid(_) => "ulid",
             DynValue::List(_) => "list",
             DynValue::Set(_) => "set",
             DynValue::Map(_) => "map",

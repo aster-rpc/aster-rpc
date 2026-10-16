@@ -683,9 +683,25 @@ fn schema_errors() {
         kind_of(DynSchema::from_type_defs([message(
             "s",
             "U",
-            vec![field("id", "uuid")]
+            vec![field("id", "int128")]
         )])),
         DynErrorKind::Unsupported
+    );
+    // uuid / ulid / decimal / decimal(p,s) have a mapping
+    // (`tests/dynamic_contract_types.rs`); a malformed decimal(p,s) does not.
+    for p in ["uuid", "ulid", "decimal", "decimal(18,4)"] {
+        assert!(
+            DynSchema::from_type_defs([message("s", "U", vec![field("id", p)])]).is_ok(),
+            "{p}"
+        );
+    }
+    assert_eq!(
+        kind_of(DynSchema::from_type_defs([message(
+            "s",
+            "U",
+            vec![field("id", "decimal(4,5)")]
+        )])),
+        DynErrorKind::Schema
     );
     let dangling = ref_field("x", &user_v1());
     assert_eq!(

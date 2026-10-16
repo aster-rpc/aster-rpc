@@ -1,5 +1,6 @@
 //! [`DynSchema`]: contract `TypeDef`s resolved into Fory wire types.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use fory_core::meta::{
@@ -8,6 +9,7 @@ use fory_core::meta::{
 };
 use fory_core::type_id as tid;
 
+use super::scalars;
 use super::value::{DynError, DynResult, DynValue};
 use crate::canonical;
 use crate::contract::{
@@ -44,12 +46,30 @@ pub enum Prim {
     Timestamp,
     Date,
     Duration,
+    /// `decimal`: Fory DECIMAL, arbitrary precision, the value's own scale.
+    Decimal,
+    /// `decimal(p,s)`: Fory DECIMAL at scale exactly `scale`, at most
+    /// `precision` digits.
+    DecimalFixed {
+        precision: u32,
+        scale: u32,
+    },
+    /// `uuid`: 16-byte BINARY.
+    Uuid,
+    /// `ulid`: 16-byte BINARY, an identity distinct from `uuid`.
+    Ulid,
 }
 
 impl Prim {
     /// Parse a contract `type_primitive` (the canonical names every binding
-    /// emits, plus a few lenient aliases).
+    /// emits, plus a few lenient aliases). A malformed `decimal(p,s)` is
+    /// `None`; [`DynSchema`] reports why.
     pub fn from_contract_name(name: &str) -> Option<Prim> {
+        if let Some(params) = scalars::parse_decimal_params(name) {
+            return params
+                .ok()
+                .map(|(precision, scale)| Prim::DecimalFixed { precision, scale });
+        }
         Some(match name {
             "bool" | "boolean" => Prim::Bool,
             "int8" | "i8" => Prim::Int8,
@@ -75,13 +95,16 @@ impl Prim {
             "timestamp" => Prim::Timestamp,
             "date" => Prim::Date,
             "duration" => Prim::Duration,
+            "decimal" => Prim::Decimal,
+            "uuid" => Prim::Uuid,
+            "ulid" => Prim::Ulid,
             _ => return None,
         })
     }
 
     /// The canonical contract name.
-    pub fn contract_name(self) -> &'static str {
-        match self {
+    pub fn contract_name(self) -> Cow<'static, str> {
+        Cow::Borrowed(match self {
             Prim::Bool => "bool",
             Prim::Int8 => "int8",
             Prim::Int16 => "int16",
@@ -106,7 +129,13 @@ impl Prim {
             Prim::Timestamp => "timestamp",
             Prim::Date => "date",
             Prim::Duration => "duration",
-        }
+            Prim::Decimal => "decimal",
+            Prim::DecimalFixed { precision, scale } => {
+                return Cow::Owned(format!("decimal({precision},{scale})"))
+            }
+            Prim::Uuid => "uuid",
+            Prim::Ulid => "ulid",
+        })
     }
 
     /// The Fory internal type id.
@@ -136,6 +165,8 @@ impl Prim {
             Prim::Timestamp => tid::TIMESTAMP,
             Prim::Date => tid::DATE,
             Prim::Duration => tid::DURATION,
+            Prim::Decimal | Prim::DecimalFixed { .. } => tid::DECIMAL,
+            Prim::Uuid | Prim::Ulid => tid::BINARY,
         }
     }
 
@@ -166,6 +197,7 @@ impl Prim {
             tid::TIMESTAMP => Prim::Timestamp,
             tid::DATE => Prim::Date,
             tid::DURATION => Prim::Duration,
+            tid::DECIMAL => Prim::Decimal,
             _ => return None,
         })
     }
@@ -174,7 +206,15 @@ impl Prim {
     fn is_primitive_group(self) -> bool {
         !matches!(
             self,
-            Prim::String | Prim::Binary | Prim::Timestamp | Prim::Date | Prim::Duration
+            Prim::String
+                | Prim::Binary
+                | Prim::Timestamp
+                | Prim::Date
+                | Prim::Duration
+                | Prim::Decimal
+                | Prim::DecimalFixed { .. }
+                | Prim::Uuid
+                | Prim::Ulid
         )
     }
 
@@ -664,13 +704,18 @@ impl DynSchema {
         by_hash: &HashMap<[u8; 32], usize>,
     ) -> DynResult<Kind> {
         match kind {
-            TypeKind::Primitive => Prim::from_contract_name(primitive)
-                .map(Kind::Prim)
-                .ok_or_else(|| {
-                    DynError::unsupported(format!(
-                        "primitive {primitive:?} has no dynamic Fory mapping"
-                    ))
-                }),
+            TypeKind::Primitive => {
+                if let Some(Err(e)) = scalars::parse_decimal_params(primitive) {
+                    return Err(DynError::schema(e));
+                }
+                Prim::from_contract_name(primitive)
+                    .map(Kind::Prim)
+                    .ok_or_else(|| {
+                        DynError::unsupported(format!(
+                            "primitive {primitive:?} has no dynamic Fory mapping"
+                        ))
+                    })
+            }
             TypeKind::Ref => self.ref_kind(type_ref, by_hash),
             TypeKind::SelfRef => {
                 let idx = self

@@ -4,8 +4,10 @@
 //! "JSON Mode Encoding Table"): 64-bit integers as decimal strings, `binary`
 //! as unpadded base64url, enums by name, unions as
 //! `{"_type": "<payload type>", ...payload fields}`, maps with string keys as
-//! objects and other maps as `[[key, value], ...]`, timestamps as ISO-8601 UTC
-//! with six fractional digits.
+//! objects (also `uuid` / `ulid` keys, in their string forms) and other maps
+//! as `[[key, value], ...]`, timestamps as ISO-8601 UTC with six fractional
+//! digits, decimals as plain decimal strings, `uuid` hyphenated, `ulid` as
+//! Crockford base32.
 //!
 //! Input is schema-free ([`DynValue::from_json`]): integers become `I64`/`U64`,
 //! other numbers `F64`, objects `Map`s with string keys. Pair it with
@@ -111,18 +113,18 @@ impl DynValue {
                 m.insert("nanos".into(), Value::from(*nanos));
                 Value::Object(m)
             }
+            DynValue::Decimal(d) => Value::String(d.to_string()),
+            DynValue::Uuid(b) => Value::String(super::scalars::format_uuid(b)),
+            DynValue::Ulid(b) => Value::String(super::scalars::format_ulid(b)),
             DynValue::List(items) | DynValue::Set(items) => {
                 Value::Array(items.iter().map(|v| v.to_json(opts)).collect())
             }
             DynValue::Map(entries) => {
-                if entries
-                    .iter()
-                    .all(|(k, _)| matches!(k, DynValue::String(_)))
-                {
+                if entries.iter().all(|(k, _)| string_key(k).is_some()) {
                     let mut m = Map::new();
                     for (k, v) in entries {
-                        if let DynValue::String(k) = k {
-                            m.insert(k.clone(), v.to_json(opts));
+                        if let Some(k) = string_key(k) {
+                            m.insert(k, v.to_json(opts));
                         }
                     }
                     Value::Object(m)
@@ -167,6 +169,17 @@ impl DynValue {
                 Value::Object(m)
             }
         }
+    }
+}
+
+/// A map key that renders as a JSON object key: strings, and the string
+/// forms of `uuid` / `ulid`.
+fn string_key(k: &DynValue) -> Option<String> {
+    match k {
+        DynValue::String(s) => Some(s.clone()),
+        DynValue::Uuid(b) => Some(super::scalars::format_uuid(b)),
+        DynValue::Ulid(b) => Some(super::scalars::format_ulid(b)),
+        _ => None,
     }
 }
 

@@ -1,6 +1,7 @@
 //! Coercion: a loosely typed [`DynValue`] (e.g. from JSON) → the exact shape a
 //! schema type needs, with defaults applied.
 
+use super::scalars::{self, DynDecimal};
 use super::schema::{Body, DynSchema, FieldTy, Kind, Prim, SType};
 use super::value::{DynEnum, DynError, DynResult, DynStruct, DynUnion, DynValue};
 use super::{EncodeOptions, MissingFields, UnknownFields};
@@ -461,6 +462,12 @@ impl DynSchema {
                     seconds: 0,
                     nanos: 0,
                 },
+                Prim::Decimal => DynValue::Decimal(DynDecimal::new(0, 0)),
+                Prim::DecimalFixed { scale, .. } => {
+                    DynValue::Decimal(DynDecimal::new(0, *scale as i32))
+                }
+                Prim::Uuid => DynValue::Uuid([0; 16]),
+                Prim::Ulid => DynValue::Ulid([0; 16]),
             },
             Kind::List(_) => DynValue::List(vec![]),
             Kind::Set(_) => DynValue::Set(vec![]),
@@ -713,5 +720,50 @@ fn coerce_prim(p: Prim, v: &DynValue) -> DynResult<DynValue> {
                 })
             }
         },
+        Prim::Decimal => decimal_of(v).map(DynValue::Decimal),
+        Prim::DecimalFixed { precision, scale } => decimal_of(v)?
+            .rescale(precision, scale)
+            .map(DynValue::Decimal)
+            .map_err(DynError::invalid),
+        Prim::Uuid => id_of(v, "uuid", scalars::parse_uuid).map(DynValue::Uuid),
+        Prim::Ulid => id_of(v, "ulid", scalars::parse_ulid).map(DynValue::Ulid),
+    }
+}
+
+/// A decimal from a decimal value, a decimal string (plain or exponent
+/// notation), an integer, or a float (its shortest round-trip decimal).
+fn decimal_of(v: &DynValue) -> DynResult<DynDecimal> {
+    let parse = |s: &str| {
+        DynDecimal::parse(s).ok_or_else(|| DynError::invalid(format!("{s:?} is not a decimal")))
+    };
+    match v {
+        DynValue::Decimal(d) => Ok(d.clone()),
+        DynValue::String(s) => parse(s),
+        DynValue::F64(f) if f.is_finite() => parse(&f.to_string()),
+        DynValue::F32(f) if f.is_finite() => parse(&f.to_string()),
+        other => match int_of(other) {
+            Some(i) => Ok(DynDecimal::new(i, 0)),
+            None => Err(DynError::invalid(format!(
+                "expected a decimal, got {}",
+                other.kind_name()
+            ))),
+        },
+    }
+}
+
+/// A 16-byte identifier from its string form, 16 bytes, or the same
+/// identifier type. A `uuid` is not accepted for a `ulid` or the reverse:
+/// they are distinct contract types.
+fn id_of(v: &DynValue, what: &str, parse: fn(&str) -> Option<[u8; 16]>) -> DynResult<[u8; 16]> {
+    match (v, what) {
+        (DynValue::Uuid(b), "uuid") | (DynValue::Ulid(b), "ulid") => Ok(*b),
+        (DynValue::String(s), _) => {
+            parse(s).ok_or_else(|| DynError::invalid(format!("{s:?} is not a {what} string")))
+        }
+        (DynValue::Bytes(b), _) => scalars::id16(b, what).map_err(DynError::invalid),
+        (other, _) => Err(DynError::invalid(format!(
+            "expected a {what}, got {}",
+            other.kind_name()
+        ))),
     }
 }

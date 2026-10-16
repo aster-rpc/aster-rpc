@@ -375,6 +375,15 @@ impl<'s, 'w> Encoder<'s, 'w> {
                 w.write_var_i64(*seconds);
                 w.write_i32(*nanos);
             }
+            (Prim::Decimal, DynValue::Decimal(d)) => return d.write(w),
+            (Prim::DecimalFixed { precision, scale }, DynValue::Decimal(d)) => {
+                let d = d.rescale(precision, scale).map_err(DynError::invalid)?;
+                return d.write(w);
+            }
+            (Prim::Uuid, DynValue::Uuid(b)) | (Prim::Ulid, DynValue::Ulid(b)) => {
+                w.write_var_u32(16);
+                w.write_bytes(b);
+            }
             (p, other) => {
                 return Err(DynError::invalid(format!(
                     "expected {}, got {} (coerce the value first)",

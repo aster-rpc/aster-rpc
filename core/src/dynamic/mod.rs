@@ -31,6 +31,15 @@
 //! non-nullable numerics, nullable numerics (fixed before varint, wider first,
 //! type id, name), then everything else by snake-case name.
 //!
+//! `timestamp` / `date` are Fory TIMESTAMP (38) / DATE (39); `uuid` / `ulid`
+//! are 16-byte BINARY and `decimal` / `decimal(p,s)` Fory DECIMAL (40)
+//! (Aster-ContractIdentity.md, "Time, UUID, and Decimal"). The decoder
+//! refuses an identifier of another length and a `decimal(p,s)` value that
+//! does not fit, and hands out `decimal(p,s)` values at scale `s`; the
+//! encoder rescales by zero padding and refuses rather than rounds. JSON
+//! forms: the hyphenated UUID, the Crockford base32 ULID, the plain decimal
+//! string.
+//!
 //! # Decoding is wire-driven
 //!
 //! Compatible mode streams each struct's TypeDef, so the decoder reads the
@@ -43,8 +52,6 @@
 //!
 //! - `any`-typed fields (no static wire type) — rejected when the schema is
 //!   built (`Unsupported`).
-//! - `uuid` / `decimal` primitives — no Fory 1.7.6 xlang mapping any binding
-//!   uses yet; rejected at schema build.
 //! - Types registered by numeric id (`STRUCT`/`ENUM`/`EXT` + user id) and
 //!   `EXT` types — Aster registers by name; decode fails with `Unsupported`.
 //! - Shared/cyclic references — Aster runs with `ref=false`; a back-reference
@@ -61,13 +68,18 @@ mod contract;
 mod decode;
 mod encode;
 mod json;
+mod scalars;
 mod schema;
 mod value;
 
 pub use contract::{DynContract, DynMethod};
 pub use json::JsonOptions;
+pub use num_bigint::BigInt;
+pub use scalars::{format_ulid, format_uuid, parse_ulid, parse_uuid, MAX_DECIMAL_PRECISION};
 pub use schema::{DynSchema, Prim};
-pub use value::{DynEnum, DynError, DynErrorKind, DynResult, DynStruct, DynUnion, DynValue};
+pub use value::{
+    DynDecimal, DynEnum, DynError, DynErrorKind, DynResult, DynStruct, DynUnion, DynValue,
+};
 
 /// How the encoder writes strings. All three decode everywhere; they differ
 /// only in which typed producer they are byte-identical to.
