@@ -72,9 +72,15 @@ public sealed class ContractDefaultAttribute : Attribute;
 /// .NET → contract primitive: <c>string</c> string, <c>bool</c> bool, <c>sbyte</c> int8,
 /// <c>short</c> int16, <c>int</c> varint32, <c>long</c> varint64, <c>byte</c> uint8,
 /// <c>ushort</c> uint16, <c>uint</c> var_uint32, <c>ulong</c> var_uint64, <c>float</c> float32,
-/// <c>double</c> float64, <c>byte[]</c> binary (the same table as Rust and Java). Lists/arrays,
-/// sets and dictionaries become containers; <see cref="WireTypeAttribute"/> classes and enums
-/// become refs. Nullable value types and <c>T?</c> references are optional.
+/// <c>double</c> float64, <c>byte[]</c> binary (the same table as Rust and Java), plus the
+/// canonical contract types: <c>DateTimeOffset</c> timestamp, <c>DateOnly</c> date,
+/// <c>ForyDecimal</c> decimal (<see cref="WireDecimalAttribute"/>: <c>decimal(p,s)</c>), and
+/// <c>byte[]</c> with <see cref="WireUuidAttribute"/> / <see cref="WireUlidAttribute"/> uuid / ulid
+/// (see <see cref="AsterUuid"/>, <see cref="Ulid"/>, <see cref="AsterDecimal"/>). A
+/// <c>DateTime</c> is refused: <c>timestamp</c> is time-zone aware. Lists/arrays, sets and
+/// dictionaries become containers; <see cref="WireTypeAttribute"/> classes and enums become refs,
+/// and recursive type graphs use <c>SELF_REF</c> by the §11.3.4 Step 3 spanning-tree rule.
+/// Nullable value types and <c>T?</c> references are optional.
 /// </summary>
 public static class ContractBuilder
 {
@@ -213,29 +219,197 @@ public static class ContractBuilder
         return sb.ToString();
     }
 
+    /// <summary>The members Fory serializes (and the contract lists): public read/write properties and public fields, minus <c>[ForyField(Ignore = true)]</c>.</summary>
+    internal static IEnumerable<MemberInfo> PayloadMembers(Type type)
+    {
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance;
+        foreach (var p in type.GetProperties(flags))
+            if (p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0 && !Ignored(p)) yield return p;
+        foreach (var f in type.GetFields(flags))
+            if (!Ignored(f)) yield return f;
+    }
+
+    private static bool Ignored(MemberInfo m)
+        => m.GetCustomAttribute<Apache.Fory.ForyFieldAttribute>() is { Ignore: true };
+
+    /// <summary>A member type's (value, key) leaf types: the element / map types of a container, else the type itself.</summary>
+    internal static (Type Value, Type? Key) ContainerTypes(Type t)
+    {
+        if (Nullable.GetUnderlyingType(t) is { } inner) t = inner;
+        if (t == typeof(byte[]) || t == typeof(string)) return (t, null);
+        if (t.IsArray) return (t.GetElementType()!, null);
+        if (Generic(t, typeof(IDictionary<,>)) is { } dict) return (dict[1], dict[0]);
+        if (Generic(t, typeof(ISet<>)) is { } set) return (set[0], null);
+        if (Generic(t, typeof(IEnumerable<>)) is { } list) return (list[0], null);
+        return (t, null);
+    }
+
+    private static Type[]? Generic(Type t, Type openInterface)
+    {
+        if (t.IsGenericType && t.GetGenericTypeDefinition() == openInterface) return t.GetGenericArguments();
+        foreach (var i in t.GetInterfaces())
+            if (i.IsGenericType && i.GetGenericTypeDefinition() == openInterface) return i.GetGenericArguments();
+        return null;
+    }
+
+    /// <summary>A named type's fully qualified contract name (<c>package.Name</c>), the <c>self_ref_name</c> form.</summary>
+    private static string Fqn(Type type)
+    {
+        var (package, name) = (type.GetCustomAttribute<WireTypeAttribute>()
+            ?? throw new InvalidOperationException($"{type.FullName} has no [WireType(\"namespace/Name\")] attribute")).Split();
+        return package.Length == 0 ? name : package + "." + name;
+    }
+
+    private static readonly IComparer<string> Codepoints = Comparer<string>.Create(CompareCodepoints);
+
+    /// <summary>Unicode code point order of NFC-normalized names (§11.3.4 Step 3), not UTF-16 order.</summary>
+    private static int CompareCodepoints(string? a, string? b)
+    {
+        var ea = (a ?? "").Normalize(NormalizationForm.FormC).EnumerateRunes();
+        var eb = (b ?? "").Normalize(NormalizationForm.FormC).EnumerateRunes();
+        while (true)
+        {
+            bool ha = ea.MoveNext(), hb = eb.MoveNext();
+            if (!ha || !hb) return ha == hb ? 0 : ha ? 1 : -1;
+            int c = ea.Current.Value.CompareTo(eb.Current.Value);
+            if (c != 0) return c;
+        }
+    }
+
     private sealed class Resolver
     {
         private readonly Dictionary<Type, string> _hashes = new();
-        private readonly HashSet<Type> _inProgress = new();
         private readonly NullabilityInfoContext _nullability = new();
         private readonly Dictionary<Type, object> _defaultInstances = new();
+        /// <summary>Per source type: the in-SCC targets reached by a non-spanning-tree edge (SELF_REF).</summary>
+        private readonly Dictionary<Type, HashSet<Type>> _backEdgesBySource = new();
+        /// <summary>The back-edge targets of the TypeDef being built.</summary>
+        private HashSet<Type> _backEdges = new();
 
         public string Hash(Type type)
         {
-            if (_hashes.TryGetValue(type, out var h)) return h;
-            if (!_inProgress.Add(type))
-                throw new NotSupportedException($"recursive type graphs are not supported yet ({type.Name})");
-            try
+            if (!_hashes.TryGetValue(type, out var h))
             {
-                string json = TypeDefJson(type);
-                h = Blake3Hex(ContractIdentity.ComputeCanonicalBytes("TypeDef", json));
-                _hashes[type] = h;
-                return h;
+                HashGraph(type);
+                h = _hashes[type];
             }
-            finally { _inProgress.Remove(type); }
+            return h;
         }
 
         public string TypeDefJson(Type type)
+        {
+            if (!_hashes.ContainsKey(type)) HashGraph(type);
+            return BuildTypeDefJson(type);
+        }
+
+        /// <summary>Named (message) types a type's fields reference directly.</summary>
+        private static List<Type> Edges(Type type)
+        {
+            var edges = new List<Type>();
+            if (type.IsEnum) return edges;
+            foreach (var member in PayloadMembers(type))
+            {
+                Type t = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
+                var (value, key) = ContainerTypes(t);
+                foreach (var x in new[] { value, key })
+                {
+                    if (x is null) continue;
+                    Type u = Nullable.GetUnderlyingType(x) ?? x;
+                    if (!u.IsEnum && u.GetCustomAttribute<WireTypeAttribute>() != null) edges.Add(u);
+                }
+            }
+            return edges;
+        }
+
+        /// <summary>
+        /// Hashes every type reachable from <paramref name="root"/> (§11.3.4 Steps 2-3): Tarjan SCCs,
+        /// leaves first; in a cyclic SCC a DFS from its codepoint-smallest member (successors in
+        /// codepoint order) picks the spanning tree, every other in-SCC edge is SELF_REF, and the
+        /// members are hashed in DFS post-order so each tree edge's target is hashed before its source.
+        /// </summary>
+        private void HashGraph(Type root)
+        {
+            var graph = new Dictionary<Type, List<Type>>();
+            var pending = new Stack<Type>();
+            pending.Push(root);
+            while (pending.Count > 0)
+            {
+                var t = pending.Pop();
+                if (graph.ContainsKey(t) || _hashes.ContainsKey(t)) continue;
+                var edges = Edges(t).Where(e => !_hashes.ContainsKey(e)).Distinct().ToList();
+                graph[t] = edges;
+                foreach (var e in edges) pending.Push(e);
+            }
+
+            foreach (var scc in Tarjan(graph))
+            {
+                var members = new HashSet<Type>(scc);
+                bool cyclic = scc.Count > 1 || graph[scc[0]].Contains(scc[0]);
+                var order = new List<Type>();
+                if (!cyclic) order.Add(scc[0]);
+                else
+                {
+                    var visited = new HashSet<Type>();
+                    void Dfs(Type v)
+                    {
+                        visited.Add(v);
+                        foreach (var w in graph[v].Where(members.Contains).Distinct().OrderBy(Fqn, Codepoints))
+                        {
+                            if (!visited.Contains(w)) Dfs(w);
+                            else
+                            {
+                                if (!_backEdgesBySource.TryGetValue(v, out var set)) _backEdgesBySource[v] = set = new();
+                                set.Add(w);
+                            }
+                        }
+                        order.Add(v);
+                    }
+                    Dfs(scc.OrderBy(Fqn, Codepoints).First());
+                }
+                foreach (var t in order)
+                    _hashes[t] = Blake3Hex(ContractIdentity.ComputeCanonicalBytes("TypeDef", BuildTypeDefJson(t)));
+            }
+        }
+
+        /// <summary>Tarjan's SCCs, each after the SCCs it references (reverse topological order).</summary>
+        private static List<List<Type>> Tarjan(Dictionary<Type, List<Type>> graph)
+        {
+            int index = 0;
+            var idx = new Dictionary<Type, int>();
+            var low = new Dictionary<Type, int>();
+            var onStack = new HashSet<Type>();
+            var stack = new Stack<Type>();
+            var result = new List<List<Type>>();
+            void Strong(Type v)
+            {
+                idx[v] = low[v] = index++;
+                stack.Push(v);
+                onStack.Add(v);
+                foreach (var w in graph[v])
+                {
+                    if (!idx.ContainsKey(w)) { Strong(w); low[v] = Math.Min(low[v], low[w]); }
+                    else if (onStack.Contains(w)) low[v] = Math.Min(low[v], idx[w]);
+                }
+                if (low[v] != idx[v]) return;
+                var scc = new List<Type>();
+                Type x;
+                do { x = stack.Pop(); onStack.Remove(x); scc.Add(x); } while (x != v);
+                result.Add(scc);
+            }
+            foreach (var v in graph.Keys.ToList())
+                if (!idx.ContainsKey(v)) Strong(v);
+            return result;
+        }
+
+        private string BuildTypeDefJson(Type type)
+        {
+            var saved = _backEdges;
+            _backEdges = _backEdgesBySource.TryGetValue(type, out var b) ? b : new();
+            try { return BuildTypeDefJsonCore(type); }
+            finally { _backEdges = saved; }
+        }
+
+        private string BuildTypeDefJsonCore(Type type)
         {
             var wire = type.GetCustomAttribute<WireTypeAttribute>()
                 ?? throw new InvalidOperationException($"{type.FullName} has no [WireType(\"namespace/Name\")] attribute");
@@ -249,7 +423,7 @@ public static class ContractBuilder
                 w.WriteString("name", name);
                 w.WriteStartArray("fields");
                 if (!type.IsEnum)
-                    foreach (var member in Members(type)) WriteField(w, member);
+                    foreach (var member in PayloadMembers(type)) WriteField(w, member);
                 w.WriteEndArray();
                 w.WriteStartArray("enum_values");
                 if (type.IsEnum)
@@ -270,18 +444,6 @@ public static class ContractBuilder
             return Encoding.UTF8.GetString(ms.ToArray());
         }
 
-        private static IEnumerable<MemberInfo> Members(Type type)
-        {
-            const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance;
-            foreach (var p in type.GetProperties(flags))
-                if (p.CanRead && p.CanWrite && p.GetIndexParameters().Length == 0 && !Ignored(p)) yield return p;
-            foreach (var f in type.GetFields(flags))
-                if (!Ignored(f)) yield return f;
-        }
-
-        private static bool Ignored(MemberInfo m)
-            => m.GetCustomAttribute<Apache.Fory.ForyFieldAttribute>() is { Ignore: true };
-
         private void WriteField(Utf8JsonWriter w, MemberInfo member)
         {
             Type t = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
@@ -294,17 +456,16 @@ public static class ContractBuilder
             }
 
             string container = "none";
-            Type valueType = t;
-            Type? keyType = null;
+            var (valueType, keyType) = ContainerTypes(t);
             if (t != typeof(byte[]) && t != typeof(string))
             {
-                if (t.IsArray) { container = "list"; valueType = t.GetElementType()!; }
-                else if (Generic(t, typeof(IDictionary<,>)) is { } dict) { container = "map"; keyType = dict[0]; valueType = dict[1]; }
-                else if (Generic(t, typeof(ISet<>)) is { } set) { container = "set"; valueType = set[0]; }
-                else if (Generic(t, typeof(IEnumerable<>)) is { } list) { container = "list"; valueType = list[0]; }
+                if (keyType != null) container = "map";
+                else if (t.IsArray) container = "list";
+                else if (Generic(t, typeof(ISet<>)) != null) container = "set";
+                else if (Generic(t, typeof(IEnumerable<>)) != null) container = "list";
             }
 
-            var (kind, primitive, typeRef) = Leaf(valueType);
+            var (kind, primitive, typeRef, selfRef) = Leaf(valueType, member);
             bool required = true;
             string defaultHex = "";
             if (member.GetCustomAttribute<ContractDefaultAttribute>() != null)
@@ -318,13 +479,14 @@ public static class ContractBuilder
             w.WriteString("type_kind", kind);
             w.WriteString("type_primitive", primitive);
             w.WriteString("type_ref", typeRef);
-            w.WriteString("self_ref_name", "");
+            w.WriteString("self_ref_name", selfRef);
             w.WriteBoolean("optional", optional);
             w.WriteBoolean("ref_tracked", false);
             w.WriteString("container", container);
             if (keyType != null)
             {
-                var (kk, kp, kr) = Leaf(keyType);
+                var (kk, kp, kr, _) = Leaf(keyType, member);
+                if (kk == "self_ref") throw new NotSupportedException($"{member.Name}: a recursive message type cannot be a map key");
                 w.WriteString("container_key_kind", kk);
                 w.WriteString("container_key_primitive", kp);
                 w.WriteString("container_key_ref", kr);
@@ -415,13 +577,29 @@ public static class ContractBuilder
             }
         }
 
-        private (string Kind, string Primitive, string Ref) Leaf(Type t)
+        private (string Kind, string Primitive, string Ref, string SelfRef) Leaf(Type t, MemberInfo member)
         {
             if (Nullable.GetUnderlyingType(t) is { } inner) t = inner;
+            if (t == typeof(byte[]))
+            {
+                bool uuid = member.GetCustomAttribute<WireUuidAttribute>() != null, ulid = member.GetCustomAttribute<WireUlidAttribute>() != null;
+                if (uuid && ulid) throw new NotSupportedException($"{member.Name}: [WireUuid] and [WireUlid] are exclusive");
+                if (uuid) return ("primitive", "uuid", "", "");
+                if (ulid) return ("primitive", "ulid", "", "");
+            }
+            if (t == typeof(Apache.Fory.ForyDecimal) && member.GetCustomAttribute<WireDecimalAttribute>() is { } fixedDecimal)
+                return ("primitive", fixedDecimal.Primitive, "", "");
+            if (t == typeof(DateTime))
+                throw new NotSupportedException($"{member.Name}: DateTime has no time zone; use DateTimeOffset for the contract type timestamp");
+            if (t == typeof(decimal))
+                throw new NotSupportedException($"{member.Name}: Fory C# has no wire for System.Decimal; declare ForyDecimal (convert with AsterDecimal)");
+            if (t == typeof(Guid))
+                throw new NotSupportedException($"{member.Name}: Fory C# has no wire for Guid; declare byte[] with [WireUuid] (convert with AsterUuid)");
             string? prim = Primitive(t);
-            if (prim != null) return ("primitive", prim, "");
-            if (t == typeof(object)) return ("any", "", "");
-            if (t.GetCustomAttribute<WireTypeAttribute>() != null) return ("ref", "", Hash(t));
+            if (prim != null) return ("primitive", prim, "", "");
+            if (t == typeof(object)) return ("any", "", "", "");
+            if (t.GetCustomAttribute<WireTypeAttribute>() != null)
+                return _backEdges.Contains(t) ? ("self_ref", "", "", Fqn(t)) : ("ref", "", Hash(t), "");
             throw new NotSupportedException($"type {t.FullName} has no contract mapping (add [WireType] or use a supported primitive)");
         }
 
@@ -439,15 +617,10 @@ public static class ContractBuilder
             t == typeof(float) ? "float32" :
             t == typeof(double) ? "float64" :
             t == typeof(byte[]) ? "binary" :
+            t == typeof(DateTimeOffset) ? "timestamp" :
+            t == typeof(DateOnly) ? "date" :
+            t == typeof(Apache.Fory.ForyDecimal) ? "decimal" :
             null;
-
-        private static Type[]? Generic(Type t, Type openInterface)
-        {
-            if (t.IsGenericType && t.GetGenericTypeDefinition() == openInterface) return t.GetGenericArguments();
-            foreach (var i in t.GetInterfaces())
-                if (i.IsGenericType && i.GetGenericTypeDefinition() == openInterface) return i.GetGenericArguments();
-            return null;
-        }
     }
 
     private static unsafe string Blake3Hex(byte[] bytes)

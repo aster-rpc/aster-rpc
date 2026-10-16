@@ -57,13 +57,28 @@ public sealed class ForyCodec : ICodec, IDisposable
         return this;
     }
 
-    public byte[] Encode<T>(T value) => _fory.Serialize(in value);
+    /// <summary>
+    /// Encodes <paramref name="value"/>. The contract-type rules run first, in place
+    /// (<see cref="Aster.Rpc.ContractValues"/>): timestamps truncate to microseconds, <c>decimal(p,s)</c>
+    /// fields rescale to <c>s</c>, and a value that does not fit throws <see cref="Aster.Rpc.ContractValueException"/>.
+    /// </summary>
+    public byte[] Encode<T>(T value)
+    {
+        Aster.Rpc.ContractValues.BeforeEncode(value);
+        return _fory.Serialize(in value);
+    }
 
+    /// <summary>
+    /// Decodes a payload, then applies the contract-type rules: <c>decimal(p,s)</c> fields are rescaled to
+    /// <c>s</c> and <c>uuid</c> / <c>ulid</c> fields must be 16 bytes, else <see cref="Aster.Rpc.ContractValueException"/>.
+    /// </summary>
     public T Decode<T>(ReadOnlySpan<byte> payload)
     {
         if (payload.IsEmpty)
             throw new InvalidOperationException($"empty payload cannot be decoded as {typeof(T).Name}");
-        return _fory.Deserialize<T>(payload);
+        T value = _fory.Deserialize<T>(payload);
+        Aster.Rpc.ContractValues.AfterDecode(value);
+        return value;
     }
 
     public void Dispose() => _fory.Dispose();
