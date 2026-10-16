@@ -506,17 +506,25 @@ fn check_alpns(alpns: Vec<Vec<u8>>) -> PyResult<Vec<Vec<u8>>> {
     Ok(alpns)
 }
 
-/// Decide every inbound admission with `gate` in Rust; outbound dials (this
-/// node's own) are always allowed. Ends when the node closes.
+/// Decide every admission with `gate` in Rust: inbound peers at the
+/// handshake, and this node's own dials at `before_connect` (outbound
+/// handshakes bypass `after_handshake`; the dialed id is what TLS verifies).
+/// Ends when the node closes.
 pub(crate) fn spawn_gate_drainer(receiver: CoreHookReceiver, gate: Arc<RwLock<CoreGatePolicy>>) {
     let CoreHookReceiver {
         mut before_connect_rx,
         mut after_handshake_rx,
         ..
     } = receiver;
+    let dial_gate = Arc::clone(&gate);
     pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-        while let Some((_info, reply)) = before_connect_rx.recv().await {
-            let _ = reply.send(true);
+        while let Some((info, reply)) = before_connect_rx.recv().await {
+            let allowed = dial_gate
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .should_allow(&info.remote_endpoint_id, &info.alpn)
+                .is_allowed();
+            let _ = reply.send(allowed);
         }
     });
     pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
@@ -717,8 +725,9 @@ impl Admission {
         let before = if outbound {
             Some(before_connect_rx)
         } else {
-            // The peer id isn't authenticated before the handshake; inbound
-            // peers are decided at the handshake stage. Let our own dials go.
+            // The host loop asked for inbound requests only, so let this
+            // node's own dials go. (A dialed id is TLS-verified, so a host
+            // that wants to gate its dials passes outbound=True.)
             pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
                 while let Some((_info, reply)) = before_connect_rx.recv().await {
                     let _ = reply.send(true);

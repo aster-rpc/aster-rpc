@@ -217,6 +217,38 @@ async def test_open_dev_gate_lets_unknown_peer_in():
         await node.shutdown()
 
 
+DOCS_ALPN = b"/iroh-sync/1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.timeout(30)
+async def test_gate_decides_this_nodes_own_dials():
+    """Outbound handshakes bypass admission, so the gate decides this node's
+    own dials at connect time: a peer outside the allowlist is not dialed (as
+    docs sync to a swarm-learned peer would), an admitted one is."""
+    from aster import net_client
+
+    gate = GatePolicy()
+    node = await Node.start(AsterConfig(), alpns=[APP_ALPN], gate=gate)
+    peer = await Node.start(AsterConfig())
+    node.add_node_addr(peer)
+    try:
+        with pytest.raises(Exception) as rejected:
+            await asyncio.wait_for(
+                net_client(node).connect(peer.node_id(), DOCS_ALPN), timeout=10
+            )
+        assert not isinstance(rejected.value, asyncio.TimeoutError)
+        gate.admit(peer.id)
+        conn = await asyncio.wait_for(
+            net_client(node).connect(peer.node_id(), DOCS_ALPN), timeout=10
+        )
+        assert conn.remote_id() == peer.id
+        conn.close(0, b"done")
+    finally:
+        await peer.shutdown()
+        await node.shutdown()
+
+
 # -- node.admission(): decided in Python -------------------------------------
 
 

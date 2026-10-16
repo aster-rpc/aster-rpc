@@ -33,6 +33,8 @@
 //! node at start (or later with `aster_node_set_gate`) and the node decides
 //! inbound admission in Rust: allowed peers are accepted, others are closed
 //! with the gate's reject code and reason, and no event reaches the caller.
+//! The gate decides the node's own dials too: a dial to a peer it would not
+//! admit (on a non-admission ALPN) fails before connecting.
 //! Without a gate, a node started with `enable_hooks` raises
 //! `ASTER_EVENT_HOOK_BEFORE_CONNECT` / `ASTER_EVENT_HOOK_AFTER_CONNECT`
 //! events (same payloads as endpoint hooks, `event.handle` = node handle,
@@ -1092,9 +1094,18 @@ pub(crate) fn spawn_hook_drainers(
     bridge.runtime.spawn(async move {
         let mut rx = before_connect_rx;
         while let Some((info, reply_tx)) = rx.recv().await {
-            // Outbound dials are this node's own; a gate never blocks them.
-            if current_gate(&slot).is_some() {
-                let _ = reply_tx.send(true);
+            // With a gate, it decides our dials too: outbound handshakes
+            // bypass after_handshake, and the dialed id is what TLS verifies,
+            // so a peer the gate rejects must not be dialed (e.g. by gossip
+            // or docs sync to a swarm-learned peer).
+            if let Some(entry) = current_gate(&slot) {
+                let allowed = entry
+                    .policy
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .should_allow(&info.remote_endpoint_id, &info.alpn)
+                    .is_allowed();
+                let _ = reply_tx.send(allowed);
                 continue;
             }
             let invocation_id = b.hook_invocations.insert(HookInvocationState {

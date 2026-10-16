@@ -364,7 +364,9 @@ gate.revoke(peer_id)            # new connections are rejected again
 ```
 
 With a gate attached, every inbound connection is decided in Rust and nothing
-reaches Python. Rejected peers see the gate's close code and reason. Setters
+reaches Python. Rejected peers see the gate's close code and reason. The gate
+also decides this node's own dials (including docs sync and gossip): a dial to
+a peer it would not admit fails before connecting. Setters
 (`trust_mode`, `admission_alpns`, `set_reject`) and admissions apply to the
 next connection. `gate.store` is the live `PeerAdmissionStore` (`admit`,
 `revoke`, `get` returning a `PeerAdmission` record, `attributes`,

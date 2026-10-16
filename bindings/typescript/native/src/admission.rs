@@ -581,9 +581,16 @@ impl AdmissionHub {
     }
 
     fn on_connect(&self, info: CoreHookConnectInfo, reply: oneshot::Sender<bool>) {
-        // Outbound dials are this node's own; a gate never blocks them.
-        if self.has_gate() {
-            let _ = reply.send(true);
+        // With a gate, it decides our dials too: outbound handshakes bypass
+        // after_handshake, and the dialed id is what TLS verifies, so a peer
+        // the gate rejects must not be dialed (e.g. by gossip or docs sync).
+        if let Some(gate) = self.current_gate() {
+            let allowed = gate
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .should_allow(&info.remote_endpoint_id, &info.alpn)
+                .is_allowed();
+            let _ = reply.send(allowed);
             return;
         }
         self.forward(Pending {

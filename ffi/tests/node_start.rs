@@ -506,6 +506,85 @@ fn client_on(tokio: &tokio::runtime::Runtime) -> aster::Node {
     client(tokio)
 }
 
+/// `node` dials `to` on `alpn` through `aster_connect`; true if connected.
+unsafe fn ffi_dial(
+    rt: aster_runtime_t,
+    node: aster_node_t,
+    to: &aster::NodeAddr,
+    alpn: &[u8],
+) -> bool {
+    let id = to.node_id.as_str().to_string();
+    let direct: Vec<aster_bytes_t> = to
+        .direct_addresses
+        .iter()
+        .map(|a| bytes(a.as_bytes()))
+        .collect();
+    let addr = aster_node_addr_t {
+        endpoint_id: bytes(id.as_bytes()),
+        relay_url: bytes(b""),
+        direct_addresses: aster_bytes_list_t {
+            items: direct.as_ptr(),
+            len: direct.len(),
+        },
+    };
+    let cfg = aster_connect_config_t {
+        struct_size: std::mem::size_of::<aster_connect_config_t>() as u32,
+        flags: 0,
+        node_id: bytes(id.as_bytes()),
+        alpn: bytes(alpn),
+        addr: &addr,
+    };
+    let mut op = 0;
+    assert_eq!(aster_connect(rt, node, &cfg, 0, &mut op), 0);
+    let ev = common::wait_for_operation(rt, op);
+    if ev.kind == aster_event_kind_t::ASTER_EVENT_CONNECTED as u32 {
+        assert_eq!(aster_connection_free(rt, ev.handle), 0);
+        true
+    } else {
+        assert_eq!(ev.kind, aster_event_kind_t::ASTER_EVENT_ERROR as u32);
+        if ev.buffer != 0 {
+            aster_buffer_release(rt, ev.buffer);
+        }
+        false
+    }
+}
+
+/// A gate also decides this node's own dials (outbound handshakes bypass
+/// admission): dialing a peer the gate does not admit, on a non-admission
+/// ALPN such as gossip, is refused; once the peer is admitted it connects.
+#[test]
+fn gate_decides_this_nodes_own_dials() {
+    let tokio = tokio::runtime::Runtime::new().unwrap();
+    unsafe {
+        let rt = runtime();
+        let mut gate = 0;
+        assert_eq!(aster_gate_new(rt, &mut gate), 0);
+        let lb = loopback();
+        let node = start(rt, &lb.cfg, gate);
+        let peer = client(&tokio);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut peer_addr = peer.addr();
+        while peer_addr.direct_addresses.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            peer_addr = peer.addr();
+        }
+        assert!(
+            !ffi_dial(rt, node, &peer_addr, aster::alpns::GOSSIP),
+            "dial to a peer outside the allowlist was not rejected"
+        );
+        let pid = peer.id().as_str().to_string();
+        assert_eq!(aster_gate_admit(rt, gate, bytes(pid.as_bytes())), 0);
+        assert!(
+            ffi_dial(rt, node, &peer_addr, aster::alpns::GOSSIP),
+            "dial to an admitted peer was rejected"
+        );
+        tokio.block_on(peer.shutdown());
+        close(rt, node);
+        aster_gate_free(rt, gate);
+        close_runtime(rt);
+    }
+}
+
 #[test]
 fn hooked_node_without_gate_raises_events_and_accepts() {
     let tokio = tokio::runtime::Runtime::new().unwrap();

@@ -75,6 +75,20 @@ describe('Gate 0 in Rust (GatePolicy on a node)', () => {
     expect(await dial(client, server, APP)).toMatchObject({ closed: true, code: 403, reason: 'hook unavailable' });
   });
 
+  it("decides this node's own dials: a peer outside the allowlist is not dialed", async () => {
+    // Outbound handshakes bypass admission, so the gate must decide dials at
+    // connect time (as docs sync to a swarm-learned peer would dial).
+    const DOCS = '/iroh-sync/1';
+    const gate = GatePolicy.protected();
+    await using node = await Node.start({ ...OFFLINE, alpns: [APP] }, { gate });
+    await using peer = await Node.start(OFFLINE);
+    await ready(peer);
+    await expect(node.connect(peer.addr, DOCS)).rejects.toThrow();
+    gate.admit(peer.id);
+    const conn = await node.connect(peer.addr, DOCS);
+    conn.close(0, 'done');
+  });
+
   it('setGate / admission() need hooks', async () => {
     await using node = await Node.start(OFFLINE);
     expect(node.hasHooks).toBe(false);
