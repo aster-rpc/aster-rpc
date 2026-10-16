@@ -132,6 +132,9 @@ pub struct IssuerPublishStatus {
     pub publications: u64,
     /// Refresh attempts so far (published or not).
     pub attempts: u64,
+    /// Of those, attempts an unknown-`kid` notice brought forward from the
+    /// schedule.
+    pub forced_attempts: u64,
     /// Why the latest attempt did not publish; `None` after a success.
     pub last_error: Option<PublishError>,
 }
@@ -214,11 +217,17 @@ impl PublisherHandle {
         self.0.generation.subscribe()
     }
 
-    fn record(&self, iss: &str, outcome: std::result::Result<&Fetched, &PublishError>) {
+    fn record(
+        &self,
+        iss: &str,
+        forced: bool,
+        outcome: std::result::Result<&Fetched, &PublishError>,
+    ) {
         {
             let mut status = self.0.status.lock().unwrap_or_else(|e| e.into_inner());
             let entry = status.entry(iss.to_string()).or_default();
             entry.attempts += 1;
+            entry.forced_attempts += u64::from(forced);
             match outcome {
                 Ok(fetched) => {
                     entry.kids = fetched.kids.clone();
@@ -261,6 +270,11 @@ impl Schedule {
 
     pub(crate) fn next(&self) -> Instant {
         self.next
+    }
+
+    /// Whether the refresh now due was brought forward by a notice.
+    pub(crate) fn forced(&self) -> bool {
+        self.last_forced == Some(self.next)
     }
 
     /// After a published refresh: the next is `refresh` away, ±10 %.
@@ -341,6 +355,7 @@ async fn run(
             .collect();
         for iss in due {
             let url = &handle.0.issuers[&iss];
+            let forced = schedules[&iss].forced();
             let outcome = match backend.fetch(&iss, url).await {
                 Ok(fetched) => backend.publish(&iss, url, &fetched).await.map(|()| fetched),
                 Err(error) => Err(error),
@@ -367,7 +382,7 @@ async fn run(
                     schedule.failed(Instant::now(), jitter());
                 }
             }
-            handle.record(&iss, outcome.as_ref());
+            handle.record(&iss, forced, outcome.as_ref());
         }
         let next = schedules
             .values()
@@ -943,6 +958,11 @@ mod tests {
         assert!(Instant::now() - before < Duration::from_secs(1));
         assert_eq!(third.kids, ["k2"]);
         assert_eq!(third.last_error, Some(PublishError::Status(503)));
+        assert_eq!(
+            (second.forced_attempts, third.forced_attempts),
+            (0, 1),
+            "the notice's refresh is counted as forced"
+        );
         // Backoff retry after 2.5..=5 s, failing again; then 5..=10 s.
         let fourth = attempts(&handle, 4).await;
         assert_eq!(fourth.last_error, Some(PublishError::NoUsableKeys));
@@ -950,6 +970,7 @@ mod tests {
         let fifth = attempts(&handle, 5).await;
         assert_eq!(fifth.kids, ["k3"]);
         assert_eq!(fifth.last_error, None);
+        assert_eq!(fifth.forced_attempts, 1, "backoff retries are not forced");
         assert_eq!(
             *backend.publishes.lock().unwrap(),
             [vec!["k1"], vec!["k2"], vec!["k3"]]

@@ -741,26 +741,28 @@ async fn a_core_that_publishes_refreshes_on_a_refused_unknown_kid() {
         let keys = server.issuer_keys().unwrap();
         let publisher = server.identity_publisher().expect("a publisher");
         let edge = connect(&root, &server, GATEWAY, Some(GATEWAY_ROLE), None).await;
-        // Two attempts without a grant: the next scheduled retry is at least
-        // 5 s (the second backoff step) after the second.
+        // Two attempts without a grant: the publisher is now backing off.
         let status = wait_status(&publisher, ISS, |s| s.attempts >= 2).await;
         assert_eq!(status.last_error, Some(PublishError::NoWriteGrant));
-        let second_attempt = std::time::Instant::now();
+        assert_eq!(status.forced_attempts, 0);
 
         root.grant(SERVER).await;
         root.deliver_to(server.enrollment().unwrap()).await;
-        // Refused for the unknown kid, which makes the core's publisher
-        // fetch at once (well before its retry); then it verifies.
+        // Refused for the unknown kid, which brings the core's publisher's
+        // next fetch forward from its backoff; then it verifies. Condition
+        // waits only: the publisher counts the attempts a notice forced, so
+        // nothing here races its scheduled retry.
         let token = k1.token(ISS, "k1");
         assert_eq!(
             refused(data(&edge, &token).whoami().await),
             Some(StatusCode::Unauthenticated)
         );
+        let status = wait_status(&publisher, ISS, |s| {
+            s.forced_attempts >= 1 && s.publications >= 1
+        })
+        .await;
+        assert!(status.forced_attempts >= 1, "the notice forced a refresh");
         wait_keys(&keys, |k| kids(k, ISS) == ["k1"]).await;
-        assert!(
-            second_attempt.elapsed() < Duration::from_secs(5),
-            "published by the notice, not the scheduled retry"
-        );
         assert_eq!(
             data(&edge, &token).whoami().await.unwrap().principal,
             format!("{ISS}|alice")
