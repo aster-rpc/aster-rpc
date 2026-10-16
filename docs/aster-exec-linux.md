@@ -254,6 +254,57 @@ record names the principal, the actor, the chain digest and every credential
 id. Revoking the principal's grant cancels the job; revoking a delegate in the
 chain (`IssuerStatusV1`) stops new submissions through it.
 
+### Users forwarded by a gateway
+
+Exec also accepts users who have no Aster key and arrive through a gateway
+edge: the edge sends their token in the `aster-on-behalf-of` call metadata
+([Rust guide §4.7.1](aster-rust-getstarted.md); with
+`aster_exec_client::Client::on_behalf_of(token)`). The core checks the token and the
+edge's `aster.gateway` role before Exec runs. Exec then treats the user
+(`iss|sub`, for example `https://idp.example|alice`) as the principal and the
+edge as the actor. A grant names such a user in `caller`, the same way it
+names a node:
+
+```json
+{"caller": "https://idp.example|alice", "target": "TARGET_ID", ...}
+```
+
+How it relates to action chains:
+
+| | Action chain | Gateway-forwarded user |
+|---|---|---|
+| Principal | Holds an Aster key; signs the chain | No key; `iss|sub` from the token |
+| Carried in | the request's `on_behalf_of` field | the call's `aster-on-behalf-of` metadata |
+| Actor | The chain's leaf subject; must be enrolled | The edge; must be enrolled and hold `aster.gateway` |
+| Narrowing | The chain's operations and resources | None: the user's own grant |
+| `require_request_digest` | The chain must bind this request | Refused: a token is never bound to one request |
+| Job owner (`caller_id`) | The actor | The user, through any gateway |
+| Running job, actor revoked | Keeps running on the principal's grant | Keeps running on the user's grant |
+| Audit (`exec.intent.v1`) | `principal`, `actor`, `on_behalf_of` chain digest and ids | `principal`, `actor`, `forwarded` issuer, `jti` and `amr` |
+
+A forwarded call can't also carry an action chain. The chain's leaf names
+its actor's key, and a forwarded user has no key. A grant that sets
+`require_request_digest` is therefore usable only by its principal directly
+or through bound chains, never through a gateway.
+
+**What was unified, and what wasn't.** Exec reads its caller from the call
+context the core fills (`principal`, `actor`, and the forwarded token's
+issuer, `jti` and `amr`), and every intent record has the same `principal`
+and `actor` fields. Action chains stay in the request body, for three
+reasons:
+
+- The metadata entry is an identity assertion, verified by the core, and
+  only an edge with `aster.gateway` may send it. An action chain is authority
+  the principal signed, and any enrolled actor may present it. Moving the
+  chain into the metadata would make every orchestrator a gateway.
+- A chain narrows a grant by resources and can bind the request digest.
+  Roles can express neither.
+- The request digest already excludes the `on_behalf_of` field.
+
+The Linux host (`aster-exec-server`) runs on the low-level server without
+`[identity]`. Until it moves to the configured server path, it refuses
+forwarded calls (`PERMISSION_DENIED` from the core).
+
 Place API and helper state on a filesystem with an explicit project quota or
 dedicated bounded volume, and alert before exhaustion. Keep enough free space
 for terminal outcomes and audit retry. Outbox saturation refuses new admission.
