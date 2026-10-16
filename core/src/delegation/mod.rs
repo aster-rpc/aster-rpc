@@ -15,9 +15,11 @@
 //! consumer reads from Docs. Design: `docs/_internal/ownership-attestations.md`.
 
 mod issue;
+pub mod issuer_keys;
 pub(crate) mod jws;
 pub(crate) mod links;
 pub mod on_behalf_of;
+pub mod provider_token;
 mod rotation;
 mod verify;
 

@@ -398,6 +398,17 @@ impl Server {
         self
     }
 
+    /// The whole `[identity]` section: on-behalf-of, the trusted issuers,
+    /// the edge-token lifetime and the clock leeway.
+    /// [`AsterServer`](crate::rpc::AsterServer) sets it from the config after
+    /// [`IdentitySettings::validate`](super::IdentitySettings::validate).
+    /// Provider tokens also need the issuer keys, which only `AsterServer`
+    /// (with Enrollment) supplies.
+    pub fn identity_settings(self, settings: super::IdentitySettings) -> Self {
+        self.identity.store(settings);
+        self
+    }
+
     /// The live `[identity]` settings every dispatcher of this server reads.
     #[cfg(feature = "docs")]
     pub(crate) fn live_identity(&self) -> Arc<LiveIdentity> {

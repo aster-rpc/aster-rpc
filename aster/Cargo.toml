@@ -25,7 +25,6 @@ rpc = [
     "dep:num-bigint",
     "dep:async-trait",
     "dep:aster-macros",
-    "dep:serde",
     "dep:arc-swap",
 ]
 # Coordination (§15 Slice 0). Two features, deliberately:
@@ -57,7 +56,7 @@ coordination = [
 # turns it on. `scripts/check-coordination-deps.sh` asserts the default and
 # `coordination` graphs do not enable it.
 coordination-testing = ["coordination"]
-audit-outbox = ["dep:redb", "dep:libc", "dep:windows-sys", "dep:serde", "dep:sha2", "dep:url", "dep:reqwest", "dep:crossbeam-channel", "dep:rustls", "dep:rustls-platform-verifier", "dep:httpdate"]
+audit-outbox = ["dep:redb", "dep:libc", "dep:windows-sys", "dep:sha2", "dep:url", "dep:reqwest", "dep:crossbeam-channel", "dep:rustls", "dep:rustls-platform-verifier", "dep:httpdate"]
 discovery = []
 hooks = []
 # `aster::ops`: the /healthz, /readyz, /metrics HTTP listener (the Rust home
@@ -155,8 +154,10 @@ num-bigint = { version = "=0.4.6", optional = true }
 # macro will generate impls of it). Gated by the `rpc` feature.
 async-trait = { version = "0.1", optional = true }
 # `rpc::dynamic`: a binding registers a `DynamicService` as JSON (C ABI) or
-# builds one in Rust; the serde form is the registration schema.
-serde = { version = "1", features = ["derive"], optional = true }
+# builds one in Rust; the serde form is the registration schema. Not optional:
+# `AsterConfig`'s `[[identity.trusted_issuers]]` derive it too. It is in every
+# graph through the transport core.
+serde = { version = "1", features = ["derive"] }
 # Proc-macros: #[derive(AsterType)] (and later #[aster::service]). Gated by `rpc`.
 aster-macros = { path = "../aster-macros", version = "=0.3.0", registry = "aster", optional = true }
 # Canonical action hashing (§5.2.1): BLAKE3 over the domain-separated encoded
@@ -298,6 +299,9 @@ aster_transport_core = { path = "../core", version = "=0.3.0", registry = "aster
 portable-pty = "0.9"
 # Local terminal raw mode + size for the interactive `shell` client.
 crossterm = "0.27"
+# Provider-token tests sign RS256/PS256/ES256 JWTs with generated keys: the
+# version the transport core verifies with, so nothing new enters the graph.
+aws-lc-rs = "1.18"
 # For implementing the RPC ServiceDispatch trait in tests (mirrors the macro).
 async-trait = "0.1"
 # Coordination integration tests mint real signed genesis documents, because a

@@ -88,8 +88,13 @@ pub const RESERVED_ATTRIBUTE_PREFIX: &str = "aster.";
 pub const IDENTITY_SECTION: &str = "identity";
 /// The sections that declare themselves overridable.
 pub const OVERRIDABLE_SECTIONS: &[&str] = &[IDENTITY_SECTION];
-/// The overridable fields of `[identity]`. Slice 2 adds the trusted issuers.
-pub const IDENTITY_FIELDS: &[&str] = &["accept_on_behalf_of"];
+/// The overridable fields of `[identity]`.
+pub const IDENTITY_FIELDS: &[&str] = &[
+    "accept_on_behalf_of",
+    "trusted_issuers",
+    "edge_token_max_lifetime_secs",
+    "clock_leeway_secs",
+];
 /// Most attributes on one record.
 pub const MAX_ATTRIBUTES: usize = 64;
 /// Most tags on one record.
@@ -274,15 +279,42 @@ impl LiveProperties {
 // ── Sections ────────────────────────────────────────────────────────────────
 
 /// An override of `[identity]`. Only the fields that are set override; the
-/// rest keep their file / env / default values.
+/// rest keep their file / env / default values. `trusted_issuers` replaces
+/// the whole list. The section that results is validated as a whole
+/// ([`IdentitySettings::validate`](crate::rpc::IdentitySettings::validate))
+/// before anything is stored.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IdentityOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accept_on_behalf_of: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trusted_issuers: Option<Vec<crate::TrustedIssuer>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edge_token_max_lifetime_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock_leeway_secs: Option<u64>,
 }
 
 impl IdentityOverride {
+    /// `base` with this override's fields applied.
+    pub fn apply(&self, base: &crate::rpc::IdentitySettings) -> crate::rpc::IdentitySettings {
+        let mut out = base.clone();
+        if let Some(value) = self.accept_on_behalf_of {
+            out.accept_on_behalf_of = value;
+        }
+        if let Some(value) = &self.trusted_issuers {
+            out.trusted_issuers = value.clone();
+        }
+        if let Some(value) = self.edge_token_max_lifetime_secs {
+            out.edge_token_max_lifetime_secs = value;
+        }
+        if let Some(value) = self.clock_leeway_secs {
+            out.clock_leeway_secs = value;
+        }
+        out
+    }
+
     /// The wire form, for a [`NodeConfigSetRequest`].
     pub fn to_section(&self) -> SectionOverride {
         SectionOverride {
@@ -488,7 +520,10 @@ mod service {
     use serde::{Deserialize, Serialize};
 
     use super::*;
-    use crate::config::{ConfigSource, SETTING_ACCEPT_ON_BEHALF_OF};
+    use crate::config::{
+        ConfigSource, SETTING_ACCEPT_ON_BEHALF_OF, SETTING_CLOCK_LEEWAY,
+        SETTING_EDGE_TOKEN_MAX_LIFETIME, SETTING_TRUSTED_ISSUERS,
+    };
     use crate::docs::Doc;
     use crate::id::{AuthorId, NamespaceSecret};
     use crate::log_targets::AUDIT;
@@ -762,15 +797,7 @@ mod service {
                     .map(IdentityOverride::to_section)
                     .collect(),
                 ignored_sections: effect.ignored.clone(),
-                settings: vec![self.setting(
-                    SETTING_ACCEPT_ON_BEHALF_OF,
-                    effect
-                        .identity_override
-                        .as_ref()
-                        .and_then(|o| o.accept_on_behalf_of),
-                    inner.base_identity.accept_on_behalf_of,
-                    IdentitySettings::default().accept_on_behalf_of,
-                )],
+                settings: self.identity_settings(effect.identity_override.as_ref()),
                 overridable_sections: OVERRIDABLE_SECTIONS.iter().map(|s| s.to_string()).collect(),
                 locked_sections: inner.locks.iter().cloned().collect(),
                 ..Default::default()
@@ -799,12 +826,49 @@ mod service {
             *self.inner.applied.borrow()
         }
 
+        /// Every overridable `[identity]` setting with its effective value
+        /// and source. `trusted_issuers` is reported as its JSON text.
+        fn identity_settings(&self, o: Option<&IdentityOverride>) -> Vec<EffectiveSetting> {
+            let base = &self.inner.base_identity;
+            let default = IdentitySettings::default();
+            let issuers = |list: &Vec<crate::TrustedIssuer>| {
+                Value::from(serde_json::to_string(list).expect("JSON of plain structs"))
+            };
+            let int = |value: u64| Value::from(i64::try_from(value).unwrap_or(i64::MAX));
+            vec![
+                self.setting(
+                    SETTING_ACCEPT_ON_BEHALF_OF,
+                    o.and_then(|o| o.accept_on_behalf_of).map(Value::from),
+                    Value::from(base.accept_on_behalf_of),
+                    Value::from(default.accept_on_behalf_of),
+                ),
+                self.setting(
+                    SETTING_TRUSTED_ISSUERS,
+                    o.and_then(|o| o.trusted_issuers.as_ref()).map(issuers),
+                    issuers(&base.trusted_issuers),
+                    issuers(&default.trusted_issuers),
+                ),
+                self.setting(
+                    SETTING_EDGE_TOKEN_MAX_LIFETIME,
+                    o.and_then(|o| o.edge_token_max_lifetime_secs).map(int),
+                    int(base.edge_token_max_lifetime_secs),
+                    int(default.edge_token_max_lifetime_secs),
+                ),
+                self.setting(
+                    SETTING_CLOCK_LEEWAY,
+                    o.and_then(|o| o.clock_leeway_secs).map(int),
+                    int(base.clock_leeway_secs),
+                    int(default.clock_leeway_secs),
+                ),
+            ]
+        }
+
         fn setting(
             &self,
             key: &str,
-            overridden: Option<bool>,
-            base: bool,
-            default: bool,
+            overridden: Option<Value>,
+            base: Value,
+            default: Value,
         ) -> EffectiveSetting {
             let (value, source) = match overridden {
                 Some(value) => (value, ConfigSource::Override),
@@ -824,7 +888,7 @@ mod service {
             };
             EffectiveSetting {
                 key: key.into(),
-                value: Some(Value::from(value)),
+                value: Some(value),
                 source: source.as_str().into(),
             }
         }
@@ -854,9 +918,15 @@ mod service {
                 }
                 match parse_section(section, settings) {
                     Ok(Parsed::Identity(o)) => {
-                        if let Some(value) = o.accept_on_behalf_of {
-                            effect.identity.accept_on_behalf_of = value;
+                        // The section as a whole, against today's file
+                        // settings: a stored override that no longer
+                        // validates is ignored, never half-applied.
+                        let merged = o.apply(&inner.base_identity);
+                        if merged.validate().is_err() {
+                            effect.ignored.push(section.clone());
+                            continue;
                         }
+                        effect.identity = merged;
                         effect.identity_override = Some(o);
                     }
                     // A stored section this build no longer accepts.
@@ -1142,7 +1212,12 @@ mod service {
                 }
                 let settings: serde_json::Value = serde_json::from_str(&section.settings_json)
                     .map_err(|e| invalid(format!("[{name}]: not JSON: {e}")))?;
-                parse_section(name, &settings)?;
+                match parse_section(name, &settings)? {
+                    Parsed::Identity(o) => o
+                        .apply(&self.inner.base_identity)
+                        .validate()
+                        .map_err(|e| invalid(format!("[{name}]: {e}")))?,
+                }
                 if sections.insert(name.to_string(), settings).is_some() {
                     return Err(invalid(format!("[{name}] appears twice")));
                 }

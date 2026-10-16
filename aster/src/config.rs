@@ -110,6 +110,104 @@ impl ConfigSource {
 
 /// The [`AsterConfig::setting_sources`] key of `[identity] accept_on_behalf_of`.
 pub const SETTING_ACCEPT_ON_BEHALF_OF: &str = "identity.accept_on_behalf_of";
+/// The [`AsterConfig::setting_sources`] key of `[[identity.trusted_issuers]]`.
+pub const SETTING_TRUSTED_ISSUERS: &str = "identity.trusted_issuers";
+/// The [`AsterConfig::setting_sources`] key of
+/// `[identity] edge_token_max_lifetime_secs`.
+pub const SETTING_EDGE_TOKEN_MAX_LIFETIME: &str = "identity.edge_token_max_lifetime_secs";
+/// The [`AsterConfig::setting_sources`] key of `[identity] clock_leeway_secs`.
+pub const SETTING_CLOCK_LEEWAY: &str = "identity.clock_leeway_secs";
+
+/// Default `[[identity.trusted_issuers]] max_token_lifetime_secs`.
+pub const DEFAULT_PROVIDER_TOKEN_LIFETIME_SECS: u64 = 900;
+/// Default `[identity] edge_token_max_lifetime_secs`, also its maximum.
+pub const DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS: u64 = 300;
+/// Default `[identity] clock_leeway_secs`.
+pub const DEFAULT_CLOCK_LEEWAY_SECS: u64 = 60;
+
+/// An external identity provider whose tokens a server accepts in
+/// `aster-on-behalf-of` (`[[identity.trusted_issuers]]`; design:
+/// "External identity providers (forwarded)" in
+/// `docs/_internal/web_gateway/gateway-identity.md`). Its keys come from the
+/// fleet namespace, published by a node holding `aster.identity-publisher`;
+/// this entry says only whom to trust and how to map roles.
+///
+/// ```toml
+/// [[identity.trusted_issuers]]
+/// iss = "https://accounts.example.com"
+/// audiences = ["odata-core"]                 # required
+/// roles_claim = "groups"
+/// role_map = { "data-readers" = "data.read", "data-admins" = "data.admin" }
+/// max_token_lifetime_secs = 900              # default
+/// ```
+///
+/// Validated at start-up (and as a whole on a NodeConfig override; see
+/// `aster::rpc::identity::IdentitySettings::validate`): `iss` non-empty, at
+/// most 256 bytes, no `|` (the principal is `iss|sub`), not a node id (64
+/// hex, which selects the edge-minted path), unique; `audiences` non-empty;
+/// `role_map` values are roles (no comma, no `aster.` prefix);
+/// `max_token_lifetime_secs` in 1..=86400.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrustedIssuer {
+    /// The exact `iss` claim.
+    pub iss: String,
+    /// Accepted `aud` values: the edge's OIDC client id, or a service
+    /// audience obtained by token exchange. Required: an issuer without one
+    /// fails start-up.
+    pub audiences: Vec<String>,
+    /// The claim roles are read from: an array of strings, or one string of
+    /// space-separated values (e.g. `scope`). Unset: the issuer's tokens
+    /// grant no roles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles_claim: Option<String>,
+    /// Claim value → Aster role. **Values without a mapping are dropped**: a
+    /// provider group grants nothing until it is mapped here.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub role_map: BTreeMap<String, String>,
+    /// Longest `exp - iat` accepted.
+    #[serde(default = "default_provider_token_lifetime")]
+    pub max_token_lifetime_secs: u64,
+}
+
+fn default_provider_token_lifetime() -> u64 {
+    DEFAULT_PROVIDER_TOKEN_LIFETIME_SECS
+}
+
+impl TrustedIssuer {
+    /// An issuer accepting `audiences`, with no role mapping.
+    pub fn new<I, S>(iss: impl Into<String>, audiences: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            iss: iss.into(),
+            audiences: audiences.into_iter().map(Into::into).collect(),
+            roles_claim: None,
+            role_map: BTreeMap::new(),
+            max_token_lifetime_secs: DEFAULT_PROVIDER_TOKEN_LIFETIME_SECS,
+        }
+    }
+
+    /// Read roles from `claim`.
+    pub fn roles_claim(mut self, claim: impl Into<String>) -> Self {
+        self.roles_claim = Some(claim.into());
+        self
+    }
+
+    /// Map the claim value `value` to the Aster role `role`.
+    pub fn map_role(mut self, value: impl Into<String>, role: impl Into<String>) -> Self {
+        self.role_map.insert(value.into(), role.into());
+        self
+    }
+
+    /// Accept tokens living at most `secs` (`exp - iat`).
+    pub fn max_token_lifetime_secs(mut self, secs: u64) -> Self {
+        self.max_token_lifetime_secs = secs;
+        self
+    }
+}
 
 /// Published service metadata loaded from `.aster-identity`.
 ///
@@ -380,6 +478,25 @@ pub struct AsterConfig {
     /// Env: `ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF`; TOML:
     /// `[identity] accept_on_behalf_of`.
     pub identity_accept_on_behalf_of: bool,
+    /// External identity providers whose tokens `aster-on-behalf-of` may
+    /// carry (see [`TrustedIssuer`]). Needs Enrollment: the issuers' keys come
+    /// from its fleet namespace.
+    ///
+    /// Env: `ASTER_IDENTITY_TRUSTED_ISSUERS` (a JSON array of the same
+    /// objects); TOML: `[[identity.trusted_issuers]]`.
+    pub identity_trusted_issuers: Vec<TrustedIssuer>,
+    /// Longest lifetime (`exp - iat`) of an edge-minted token, 1..=300.
+    /// Default 300.
+    ///
+    /// Env: `ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS`; TOML:
+    /// `[identity] edge_token_max_lifetime_secs`.
+    pub identity_edge_token_max_lifetime_secs: u64,
+    /// Tolerance for a token issuer's clock running ahead, 0..=300, applied
+    /// to `iat` and `nbf` only, never to `exp`. Default 60.
+    ///
+    /// Env: `ASTER_IDENTITY_CLOCK_LEEWAY_SECS`; TOML:
+    /// `[identity] clock_leeway_secs`.
+    pub identity_clock_leeway_secs: u64,
 
     /// Serve `aster.ops.NodeConfig`, the remote overrides of overridable
     /// sections (`[identity]` today). Default `true`; `false` turns the
@@ -681,6 +798,23 @@ impl AsterConfig {
                 self.setting_sources
                     .insert(SETTING_ACCEPT_ON_BEHALF_OF.into(), ConfigSource::File);
             }
+            if let Some(value) = identity.get("trusted_issuers") {
+                self.identity_trusted_issuers = value.clone().try_into().map_err(|e| {
+                    Error::InvalidArgument(format!("{label} [[identity.trusted_issuers]]: {e}"))
+                })?;
+                self.setting_sources
+                    .insert(SETTING_TRUSTED_ISSUERS.into(), ConfigSource::File);
+            }
+            if let Some(value) = toml_u64(identity, "edge_token_max_lifetime_secs", label)? {
+                self.identity_edge_token_max_lifetime_secs = value;
+                self.setting_sources
+                    .insert(SETTING_EDGE_TOKEN_MAX_LIFETIME.into(), ConfigSource::File);
+            }
+            if let Some(value) = toml_u64(identity, "clock_leeway_secs", label)? {
+                self.identity_clock_leeway_secs = value;
+                self.setting_sources
+                    .insert(SETTING_CLOCK_LEEWAY.into(), ConfigSource::File);
+            }
         }
 
         if let Some(remote) = toml_section(raw, "remote_config", label)? {
@@ -941,6 +1075,25 @@ impl AsterConfig {
             self.identity_accept_on_behalf_of = value;
             self.setting_sources
                 .insert(SETTING_ACCEPT_ON_BEHALF_OF.into(), ConfigSource::Env);
+        }
+        if let Some(value) = env_string("ASTER_IDENTITY_TRUSTED_ISSUERS") {
+            self.identity_trusted_issuers = serde_json::from_str(&value).map_err(|e| {
+                Error::InvalidArgument(format!(
+                    "ASTER_IDENTITY_TRUSTED_ISSUERS: expected a JSON array of trusted issuers: {e}"
+                ))
+            })?;
+            self.setting_sources
+                .insert(SETTING_TRUSTED_ISSUERS.into(), ConfigSource::Env);
+        }
+        if let Some(value) = env_u64("ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS")? {
+            self.identity_edge_token_max_lifetime_secs = value;
+            self.setting_sources
+                .insert(SETTING_EDGE_TOKEN_MAX_LIFETIME.into(), ConfigSource::Env);
+        }
+        if let Some(value) = env_u64("ASTER_IDENTITY_CLOCK_LEEWAY_SECS")? {
+            self.identity_clock_leeway_secs = value;
+            self.setting_sources
+                .insert(SETTING_CLOCK_LEEWAY.into(), ConfigSource::Env);
         }
         if let Some(value) = env_bool("ASTER_REMOTE_CONFIG_ENABLED")? {
             self.remote_config_enabled = value;
@@ -1336,6 +1489,9 @@ impl Default for AsterConfig {
             log_mask: true,
             identity_file: None,
             identity_accept_on_behalf_of: false,
+            identity_trusted_issuers: Vec::new(),
+            identity_edge_token_max_lifetime_secs: DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS,
+            identity_clock_leeway_secs: DEFAULT_CLOCK_LEEWAY_SECS,
             remote_config_enabled: true,
             remote_config_lock: Vec::new(),
             setting_sources: BTreeMap::new(),
@@ -1702,6 +1858,46 @@ impl AsterConfigBuilder {
         self.config
             .setting_sources
             .insert(SETTING_ACCEPT_ON_BEHALF_OF.into(), ConfigSource::Code);
+        self
+    }
+
+    /// Trust an external identity provider's tokens (adds to
+    /// [`AsterConfig::identity_trusted_issuers`]).
+    pub fn trusted_issuer(mut self, issuer: TrustedIssuer) -> Self {
+        self.config.identity_trusted_issuers.push(issuer);
+        self.config
+            .setting_sources
+            .insert(SETTING_TRUSTED_ISSUERS.into(), ConfigSource::Code);
+        self
+    }
+
+    /// Replace the trusted issuers (see
+    /// [`AsterConfig::identity_trusted_issuers`]).
+    pub fn trusted_issuers(mut self, issuers: impl IntoIterator<Item = TrustedIssuer>) -> Self {
+        self.config.identity_trusted_issuers = issuers.into_iter().collect();
+        self.config
+            .setting_sources
+            .insert(SETTING_TRUSTED_ISSUERS.into(), ConfigSource::Code);
+        self
+    }
+
+    /// Longest lifetime of an edge-minted token (see
+    /// [`AsterConfig::identity_edge_token_max_lifetime_secs`]).
+    pub fn edge_token_max_lifetime_secs(mut self, secs: u64) -> Self {
+        self.config.identity_edge_token_max_lifetime_secs = secs;
+        self.config
+            .setting_sources
+            .insert(SETTING_EDGE_TOKEN_MAX_LIFETIME.into(), ConfigSource::Code);
+        self
+    }
+
+    /// Clock leeway for on-behalf-of tokens (see
+    /// [`AsterConfig::identity_clock_leeway_secs`]).
+    pub fn clock_leeway_secs(mut self, secs: u64) -> Self {
+        self.config.identity_clock_leeway_secs = secs;
+        self.config
+            .setting_sources
+            .insert(SETTING_CLOCK_LEEWAY.into(), ConfigSource::Code);
         self
     }
 
@@ -2286,6 +2482,9 @@ mod tests {
 
     const ASTER_ENV_KEYS: &[&str] = &[
         "ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF",
+        "ASTER_IDENTITY_TRUSTED_ISSUERS",
+        "ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS",
+        "ASTER_IDENTITY_CLOCK_LEEWAY_SECS",
         "ASTER_ROOT_PUBKEY",
         "ASTER_ROOT_PUBKEY_FILE",
         "ASTER_ENROLLMENT_CREDENTIAL",
@@ -3111,6 +3310,103 @@ mod binding_knob_tests {
                 .accept_on_behalf_of(true)
                 .build()
                 .identity_accept_on_behalf_of
+        );
+    }
+
+    #[test]
+    fn trusted_issuers_and_identity_limits_from_toml_env_and_builder() {
+        let _lock = lock_env();
+        let _env = super::tests_env_guard();
+
+        let defaults = AsterConfig::default();
+        assert!(defaults.identity_trusted_issuers.is_empty());
+        assert_eq!(defaults.identity_edge_token_max_lifetime_secs, 300);
+        assert_eq!(defaults.identity_clock_leeway_secs, 60);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        fs::write(
+            &path,
+            "[identity]\nedge_token_max_lifetime_secs = 120\nclock_leeway_secs = 10\n\
+             [[identity.trusted_issuers]]\niss = \"https://accounts.example.com\"\n\
+             audiences = [\"odata-core\"]\nroles_claim = \"groups\"\n\
+             role_map = { \"data-readers\" = \"data.read\" }\n",
+        )
+        .unwrap();
+        let file = AsterConfig::from_file(&path).unwrap();
+        assert_eq!(
+            file.identity_trusted_issuers,
+            vec![
+                TrustedIssuer::new("https://accounts.example.com", ["odata-core"])
+                    .roles_claim("groups")
+                    .map_role("data-readers", "data.read")
+            ]
+        );
+        assert_eq!(
+            file.identity_trusted_issuers[0].max_token_lifetime_secs,
+            900
+        );
+        assert_eq!(file.identity_edge_token_max_lifetime_secs, 120);
+        assert_eq!(file.identity_clock_leeway_secs, 10);
+        assert_eq!(
+            file.setting_sources.get(SETTING_TRUSTED_ISSUERS),
+            Some(&ConfigSource::File)
+        );
+
+        // Audiences are required in the file form; unknown keys are refused.
+        fs::write(
+            &path,
+            "[[identity.trusted_issuers]]\niss = \"https://accounts.example.com\"\n",
+        )
+        .unwrap();
+        let err = AsterConfig::from_file(&path).unwrap_err().to_string();
+        assert!(err.contains("audiences"), "{err}");
+        fs::write(
+            &path,
+            "[[identity.trusted_issuers]]\niss = \"x\"\naudiences = [\"a\"]\njwks_url = \"y\"\n",
+        )
+        .unwrap();
+        assert!(AsterConfig::from_file(&path).is_err());
+
+        env::set_var(
+            "ASTER_IDENTITY_TRUSTED_ISSUERS",
+            r#"[{"iss": "https://idp.example.com", "audiences": ["api"], "max_token_lifetime_secs": 60}]"#,
+        );
+        env::set_var("ASTER_IDENTITY_CLOCK_LEEWAY_SECS", "5");
+        env::set_var("ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS", "30");
+        let from_env = AsterConfig::from_env().unwrap();
+        assert_eq!(
+            from_env.identity_trusted_issuers[0].iss,
+            "https://idp.example.com"
+        );
+        assert_eq!(
+            from_env.identity_trusted_issuers[0].max_token_lifetime_secs,
+            60
+        );
+        assert_eq!(from_env.identity_clock_leeway_secs, 5);
+        assert_eq!(from_env.identity_edge_token_max_lifetime_secs, 30);
+        assert_eq!(
+            from_env.setting_sources.get(SETTING_CLOCK_LEEWAY),
+            Some(&ConfigSource::Env)
+        );
+        env::set_var("ASTER_IDENTITY_TRUSTED_ISSUERS", "not json");
+        assert!(AsterConfig::from_env().is_err());
+        env::remove_var("ASTER_IDENTITY_TRUSTED_ISSUERS");
+        env::remove_var("ASTER_IDENTITY_CLOCK_LEEWAY_SECS");
+        env::remove_var("ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS");
+
+        let built = AsterConfig::builder()
+            .trusted_issuer(TrustedIssuer::new("https://a", ["x"]))
+            .trusted_issuer(TrustedIssuer::new("https://b", ["y"]))
+            .edge_token_max_lifetime_secs(60)
+            .clock_leeway_secs(0)
+            .build();
+        assert_eq!(built.identity_trusted_issuers.len(), 2);
+        assert_eq!(built.identity_edge_token_max_lifetime_secs, 60);
+        assert_eq!(built.identity_clock_leeway_secs, 0);
+        assert_eq!(
+            built.setting_sources.get(SETTING_EDGE_TOKEN_MAX_LIFETIME),
+            Some(&ConfigSource::Code)
         );
     }
 

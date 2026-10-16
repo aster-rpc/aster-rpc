@@ -492,7 +492,12 @@ impl AsterServerBuilder {
             allow(unused_mut)
         )]
         let mut config = builder.build();
-        let accept_on_behalf_of = config.identity_accept_on_behalf_of;
+        // `[identity]`, validated as a whole before anything starts: an
+        // issuer without audiences (or any other bad value) fails here.
+        let identity_settings = super::identity::IdentitySettings::from_config(&config);
+        identity_settings
+            .validate()
+            .map_err(|e| Error::InvalidArgument(format!("[identity]: {e}")))?;
         // `aster.ops.NodeConfig`: what it overrides and what the file locks,
         // checked before the node starts.
         super::node_config::validate_locks(&config.remote_config_lock)?;
@@ -558,6 +563,19 @@ impl AsterServerBuilder {
                     .into(),
             ));
         }
+        // Provider tokens verify with issuer keys from the fleet namespace:
+        // trusting an issuer without Enrollment could never accept a token.
+        #[cfg(all(feature = "enrollment", feature = "docs"))]
+        let has_enrollment = enrollment_plan.is_some();
+        #[cfg(not(all(feature = "enrollment", feature = "docs")))]
+        let has_enrollment = false;
+        if !identity_settings.trusted_issuers.is_empty() && !has_enrollment {
+            return Err(Error::InvalidArgument(
+                "[[identity.trusted_issuers]] needs [enrollment]: issuer keys come from the \
+                 fleet namespace"
+                    .into(),
+            ));
+        }
 
         // `aster/1` always; blobs/docs/gossip ALPNs are registered by core.
         // `route_alpn`/`with_expose` also push their ALPN into `extra_alpns`, so
@@ -611,7 +629,7 @@ impl AsterServerBuilder {
         let attributes = self.attributes.unwrap_or_default();
         let mut server = Server::new(&node)
             .attributes(attributes.clone())
-            .accept_on_behalf_of(accept_on_behalf_of);
+            .identity_settings(identity_settings.clone());
         // Deferred: the slot is wired in before the acceptor starts, so no
         // call can ever see a server without it.
         let late_slot = self
@@ -639,6 +657,8 @@ impl AsterServerBuilder {
         #[cfg_attr(not(all(feature = "enrollment", feature = "docs")), allow(unused_mut))]
         let mut config_authority: Option<Arc<dyn super::AttributeSource>> = None;
         #[cfg(all(feature = "enrollment", feature = "docs"))]
+        let issuer_keys = Arc::new(super::issuer_keys::IssuerKeys::default());
+        #[cfg(all(feature = "enrollment", feature = "docs"))]
         let enrollment = match &enrollment_plan {
             None => None,
             Some(plan) => {
@@ -655,6 +675,9 @@ impl AsterServerBuilder {
                 });
                 // NodeConfig admits a change only on a credential's own role.
                 config_authority = Some(source.clone());
+                // Issuer keys for provider tokens: in place (empty) before
+                // anything is served, filled from the fleet namespace below.
+                server.live_identity().set_keys(issuer_keys.clone());
                 attributes.set_source(source);
                 if let Some(issuer) = &installed.issuer {
                     server = server.register(issuer.clone());
@@ -680,9 +703,7 @@ impl AsterServerBuilder {
                 let init = super::node_config::Init {
                     identity: server.live_identity(),
                     properties: server.live_properties(),
-                    base_identity: super::identity::IdentitySettings {
-                        accept_on_behalf_of,
-                    },
+                    base_identity: identity_settings.clone(),
                     sources,
                     locks,
                     authority: config_authority,
@@ -786,6 +807,8 @@ impl AsterServerBuilder {
         // Grab the shareable dispatcher before `serve()` consumes the server, so
         // an HTTP transport can drive the same services.
         let dispatcher = server.dispatcher();
+        #[cfg(all(feature = "enrollment", feature = "docs"))]
+        let live_identity = server.live_identity();
         #[cfg(feature = "binding-support")]
         let call_table = server.call_table();
         let handle = server.serve();
@@ -805,10 +828,31 @@ impl AsterServerBuilder {
                     return Err(err);
                 }
                 let renewal = plan.start_renewal(&installed.enrollment, None);
+                let watch = match super::issuer_keys::watch(
+                    &node,
+                    installed.enrollment.clone(),
+                    plan.mapping.clone(),
+                    live_identity.clone(),
+                    issuer_keys.clone(),
+                )
+                .await
+                {
+                    Ok(watch) => watch,
+                    Err(err) => {
+                        handle.abort();
+                        if let Some(http) = &http {
+                            http.abort();
+                        }
+                        node.shutdown().await;
+                        return Err(err);
+                    }
+                };
                 Some(ServerEnrollment {
                     enrollment: installed.enrollment,
                     issuer: installed.issuer,
                     _renewal: renewal,
+                    issuer_keys: super::issuer_keys::IssuerKeysHandle(issuer_keys),
+                    _issuer_keys_watch: watch,
                 })
             }
             _ => None,
@@ -896,6 +940,9 @@ struct ServerEnrollment {
     issuer: Option<crate::enrollment::Issuer>,
     /// Renewal of this server's own credential; dropping it stops renewal.
     _renewal: Option<crate::enrollment::RenewalHandle>,
+    /// Provider-token issuer keys from the fleet namespace.
+    issuer_keys: super::issuer_keys::IssuerKeysHandle,
+    _issuer_keys_watch: super::issuer_keys::IssuerKeysWatch,
 }
 
 /// Binding support: the baseline services [`AsterServerBuilder`] registers,
@@ -1026,6 +1073,14 @@ impl AsterServer {
     #[cfg(all(feature = "enrollment", feature = "docs"))]
     pub fn enrollment(&self) -> Option<&crate::enrollment::Enrollment> {
         self.enrollment.as_ref().map(|e| &e.enrollment)
+    }
+
+    /// The provider-token issuer keys this server holds from the fleet
+    /// namespace (see [`issuer_keys`](super::issuer_keys)); `None` without
+    /// Enrollment.
+    #[cfg(all(feature = "enrollment", feature = "docs"))]
+    pub fn issuer_keys(&self) -> Option<super::issuer_keys::IssuerKeysHandle> {
+        self.enrollment.as_ref().map(|e| e.issuer_keys.clone())
     }
 
     /// The delegated [`Issuer`](crate::enrollment::Issuer) this server runs

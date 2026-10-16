@@ -120,7 +120,7 @@ pub(crate) fn public_key(seed: &[u8; 32]) -> Result<[u8; 32], JwsError> {
         .map_err(|_| JwsError::Signature)
 }
 
-fn canonical_segment(segment: &str) -> Result<Vec<u8>, JwsError> {
+pub(crate) fn canonical_segment(segment: &str) -> Result<Vec<u8>, JwsError> {
     if segment.is_empty() {
         return Err(JwsError::Malformed);
     }

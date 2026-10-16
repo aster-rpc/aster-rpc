@@ -230,6 +230,7 @@ fn code<T: std::fmt::Debug>(result: Result<T>) -> Option<StatusCode> {
 fn accept(on: bool) -> NodeConfigSetRequest {
     NodeConfigSetRequest::new().identity(IdentityOverride {
         accept_on_behalf_of: Some(on),
+        ..Default::default()
     })
 }
 

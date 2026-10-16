@@ -35,6 +35,8 @@ pub mod empty;
 pub(crate) mod foreign;
 pub mod identity;
 pub mod interceptor;
+#[cfg(feature = "delegation")]
+pub mod issuer_keys;
 pub mod lease;
 pub mod node_config;
 pub(crate) mod observe;

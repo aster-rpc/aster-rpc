@@ -261,6 +261,7 @@ dependencies = [
  "aster-otel",
  "aster_transport_core",
  "async-trait",
+ "aws-lc-rs",
  "base64 0.22.1",
  "blake3",
  "bs58",

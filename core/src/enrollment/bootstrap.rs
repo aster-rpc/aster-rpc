@@ -1558,6 +1558,35 @@ impl EnrollmentService {
         crate::delegation::locality_statement(&chain).map(|statement| statement.into_text())
     }
 
+    /// The evidence `subject` would be admitted on now, without a session,
+    /// with admission's precedence: an active root registration answers (the
+    /// chain ignored); a definite denial answers nothing; otherwise `chain`
+    /// must verify for `subject` (pinned root and audience, delegation bounds,
+    /// delegate and credential revocations, signed validity). `None` for
+    /// anything else, including undecidable policy state. For records whose
+    /// docs author is `subject` and that carry its credential.
+    pub fn evidence_for(
+        &self,
+        subject: &[u8; 32],
+        chain: Option<&str>,
+    ) -> Option<VerifiedAdmissionEvidence> {
+        let trust = self.trust();
+        let now = unix_now();
+        match trust.stores.select_evidence(subject, None, now) {
+            Ok(record) => return Some(record),
+            Err(RecordError::Denied(reason)) if reason.is_definite() => return None,
+            Err(_) => {}
+        }
+        let evidence = trust
+            .verifier
+            .verify_with(chain?, subject, now, trust.stores.as_ref())
+            .ok()?;
+        trust
+            .stores
+            .select_evidence(subject, Some(&evidence), now)
+            .ok()
+    }
+
     /// `endpoint`'s verified declared locality, with admission's precedence:
     /// an active registration record for `endpoint` answers (its
     /// `aster.locality.*` claims, the statement ignored); a definite denial

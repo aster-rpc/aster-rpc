@@ -174,7 +174,7 @@ pub struct VerifiedEdgeToken {
 
 /// A role as Gate 3 compares it: non-empty, bounded, no control character,
 /// no comma (roles are comma-joined into `aster.role`), no surrounding space.
-fn valid_role(value: &str) -> bool {
+pub(super) fn valid_role(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_ROLE_BYTES
         && value.trim() == value
@@ -182,7 +182,7 @@ fn valid_role(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-fn valid_subject(value: &str) -> bool {
+pub(super) fn valid_subject(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_SUBJECT_BYTES && !value.chars().any(char::is_control)
 }
 
@@ -209,7 +209,7 @@ fn check_values(
 /// `exp > iat`, `nbf < exp`, `exp - iat <= max_lifetime`, then
 /// `now < exp` and `max(iat, nbf) <= now + leeway`. Leeway never extends
 /// expiry.
-fn check_times(
+pub(super) fn check_times(
     issued_at: u64,
     not_before: Option<u64>,
     expires_at: u64,

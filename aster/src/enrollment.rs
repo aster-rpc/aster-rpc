@@ -427,6 +427,19 @@ impl Enrollment {
         self.inner.verify_credential(subject, chain)
     }
 
+    /// The evidence `subject` would be admitted on now, without a session:
+    /// its active root registration, or else `chain` verified for it against
+    /// the root's records (revocations, denials). `None` when neither holds or
+    /// policy cannot be decided. For records a node authored in a shared
+    /// namespace that carry its credential (issuer key sets).
+    pub fn evidence_for(
+        &self,
+        subject: &[u8; 32],
+        chain: Option<&str>,
+    ) -> Option<VerifiedAdmissionEvidence> {
+        self.inner.evidence_for(subject, chain)
+    }
+
     pub async fn check_connection(
         &self,
         connection: &crate::Connection,

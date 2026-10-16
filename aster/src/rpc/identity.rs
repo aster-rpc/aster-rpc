@@ -1,7 +1,7 @@
 //! Gateway identity: calls an edge (a gateway, an HTTP front end) makes on
 //! behalf of a user who holds no Aster key. Design:
-//! `docs/_internal/web_gateway/gateway-identity.md`; this is slice 1
-//! (edge-minted tokens only).
+//! `docs/_internal/web_gateway/gateway-identity.md`; slices 1 (edge-minted
+//! tokens) and 2 (provider tokens).
 //!
 //! Three questions, each answered once:
 //!
@@ -9,10 +9,25 @@
 //! - **May it forward users' identities?** The role [`GATEWAY_ROLE`] among
 //!   the edge's own Gate-3 roles (from its enrollment credential).
 //! - **Who is the user?** One JWT per call in the [`ON_BEHALF_OF_METADATA`]
-//!   metadata entry, verified before Gate 3. In this slice the JWT is
-//!   edge-minted: signed by the edge's node key (`iss` = the edge's node id,
-//!   which must be the transport peer), with roles inside the issuer
-//!   delegation its credential carries ([`ISSUABLE_ROLES_ATTRIBUTE`]).
+//!   metadata entry, verified before Gate 3. The token's `iss` chooses how:
+//!   - **Edge-minted** (`iss` is a node id, 64 hex): signed by the edge's
+//!     node key (`iss` must be the transport peer), with roles inside the
+//!     issuer delegation its credential carries ([`ISSUABLE_ROLES_ATTRIBUTE`]),
+//!     at most `[identity] edge_token_max_lifetime_secs` long.
+//!   - **Provider** (any other `iss`): an identity provider's own token,
+//!     forwarded unchanged. `iss` must be a
+//!     [`TrustedIssuer`](crate::TrustedIssuer) (`[[identity.trusted_issuers]]`);
+//!     the signature must verify (RS256, PS256 or ES256, matching the key's
+//!     algorithm) under the issuer key for `kid`, which comes from the fleet
+//!     namespace (see [`issuer_keys`](super::issuer_keys)), never from a
+//!     fetch; `aud` must be a configured audience; `exp - iat` at most the
+//!     issuer's `max_token_lifetime_secs`. Roles come from the issuer's
+//!     `roles_claim` through its `role_map`; **unmapped values are dropped**.
+//!     `principal` is `iss|sub`; `auth_methods()` is the token's `amr`, empty
+//!     when it has none; `jti` is empty when it has none.
+//!
+//!   Both: `[identity] clock_leeway_secs` (default 60) applies to `iat` and
+//!   `nbf`, never to `exp`.
 //!
 //! A call without the entry is authorised as the peer, as before. A call with
 //! it is authorised as the user: Gate 3's `requires` checks the token's
@@ -27,18 +42,24 @@
 //! | The server does not accept the entry (`[identity] accept_on_behalf_of = false`, the default) | `PERMISSION_DENIED` |
 //! | The transport did not authenticate the peer (HTTP, WebTransport) | `PERMISSION_DENIED` |
 //! | The peer lacks `aster.gateway` | `PERMISSION_DENIED` |
-//! | The entry repeats, or the token does not verify (malformed, wrong type, `iss` not the peer, bad signature, expired, not yet valid, lifetime above 5 min) | `UNAUTHENTICATED` |
-//! | The peer's credential has no issuer delegation, or the token claims a role outside it | `PERMISSION_DENIED` |
+//! | The entry repeats, or the token does not verify (malformed, wrong type, `iss` not the peer, bad signature, expired, not yet valid, lifetime above the limit) | `UNAUTHENTICATED` |
+//! | Edge-minted: the peer's credential has no issuer delegation, or the token claims a role outside it | `PERMISSION_DENIED` |
+//! | Provider: `iss` not trusted, no key for `kid` (no fetch happens), `alg` refused or not the key's, wrong `aud` | `UNAUTHENTICATED` |
 //!
 //! There is no per-call audit hook: an accepted call records `principal`,
 //! `actor`, `obo_iss` and `obo_jti` on its `rpc` span (OTel:
 //! `aster.principal`, `aster.actor`, `aster.on_behalf_of.iss`,
 //! `aster.on_behalf_of.jti`) and logs one debug event under
 //! [`IDENTITY`](crate::log_targets::IDENTITY). Token contents beyond `iss`,
-//! `sub` and `jti` are never logged.
+//! `sub`, `jti` and `kid` are never logged.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
+
+use crate::config::{
+    AsterConfig, TrustedIssuer, DEFAULT_CLOCK_LEEWAY_SECS, DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS,
+};
 
 use super::auth::{AttributeStore, ROLE_ATTRIBUTE};
 use super::codec::{RpcStatus, StreamHeader};
@@ -58,12 +79,24 @@ pub const GATEWAY_ROLE: &str = "aster.gateway";
 /// (`aster enroll delegate --attribute-key aster.identity.issuable_roles`).
 /// Read only from the verified credential, never from runtime attributes.
 pub const ISSUABLE_ROLES_ATTRIBUTE: &str = "aster.identity.issuable_roles";
-/// Default tolerance for the edge's clock running ahead (`iat`, `nbf` only;
-/// expiry is never extended). Fixed in this slice; configurable later.
-pub const DEFAULT_CLOCK_LEEWAY: Duration = Duration::from_secs(60);
-/// Longest lifetime (`exp - iat`) of an edge-minted token. Fixed in this
-/// slice; configurable (down) later.
-pub const MAX_EDGE_TOKEN_LIFETIME: Duration = Duration::from_secs(300);
+/// Default tolerance for an issuer's clock running ahead (`iat`, `nbf` only;
+/// expiry is never extended): `[identity] clock_leeway_secs`, at most
+/// [`MAX_CLOCK_LEEWAY`].
+pub const DEFAULT_CLOCK_LEEWAY: Duration = Duration::from_secs(DEFAULT_CLOCK_LEEWAY_SECS);
+/// The cap on `[identity] clock_leeway_secs`.
+pub const MAX_CLOCK_LEEWAY: Duration = Duration::from_secs(300);
+/// Longest lifetime (`exp - iat`) of an edge-minted token: the default and the
+/// cap of `[identity] edge_token_max_lifetime_secs` (configurable down).
+pub const MAX_EDGE_TOKEN_LIFETIME: Duration =
+    Duration::from_secs(DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS);
+/// The cap on a trusted issuer's `max_token_lifetime_secs`.
+pub const MAX_PROVIDER_TOKEN_LIFETIME: Duration = Duration::from_secs(86_400);
+/// Most `[[identity.trusted_issuers]]`.
+pub const MAX_TRUSTED_ISSUERS: usize = 32;
+/// Most `audiences` of one trusted issuer.
+pub const MAX_ISSUER_AUDIENCES: usize = 16;
+/// Most `role_map` entries of one trusted issuer.
+pub const MAX_ROLE_MAP_ENTRIES: usize = 256;
 
 /// A forwarded user identity, verified for one call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,12 +157,165 @@ impl ForwardedIdentity {
 }
 
 /// The `[identity]` settings a server has in force: the file and environment
-/// values, with any `aster.ops.NodeConfig` override applied. Slice 2 adds the
-/// trusted issuers here.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// values, with any `aster.ops.NodeConfig` override applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentitySettings {
     /// Accept the `aster-on-behalf-of` entry (`[identity] accept_on_behalf_of`).
     pub accept_on_behalf_of: bool,
+    /// External identity providers (`[[identity.trusted_issuers]]`).
+    pub trusted_issuers: Vec<TrustedIssuer>,
+    /// Longest edge-minted token, 1..=300 (`[identity]
+    /// edge_token_max_lifetime_secs`).
+    pub edge_token_max_lifetime_secs: u64,
+    /// Leeway on `iat` / `nbf`, 0..=300 (`[identity] clock_leeway_secs`).
+    pub clock_leeway_secs: u64,
+}
+
+impl Default for IdentitySettings {
+    fn default() -> Self {
+        Self {
+            accept_on_behalf_of: false,
+            trusted_issuers: Vec::new(),
+            edge_token_max_lifetime_secs: DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS,
+            clock_leeway_secs: DEFAULT_CLOCK_LEEWAY_SECS,
+        }
+    }
+}
+
+/// Whether `value` looks like a node id (64 hex): such an `iss` selects the
+/// edge-minted path, so no trusted issuer may use one.
+fn node_id_shaped(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn check_text(what: &str, value: &str, max: usize) -> Result<(), String> {
+    if value.is_empty() {
+        return Err(format!("{what} is empty"));
+    }
+    if value.len() > max {
+        return Err(format!("{what} is longer than {max} bytes"));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(format!("{what} contains a control character"));
+    }
+    Ok(())
+}
+
+impl IdentitySettings {
+    /// The settings `config` gives (file, environment, builder).
+    pub fn from_config(config: &AsterConfig) -> Self {
+        Self {
+            accept_on_behalf_of: config.identity_accept_on_behalf_of,
+            trusted_issuers: config.identity_trusted_issuers.clone(),
+            edge_token_max_lifetime_secs: config.identity_edge_token_max_lifetime_secs,
+            clock_leeway_secs: config.identity_clock_leeway_secs,
+        }
+    }
+
+    /// The trusted issuer with this exact `iss`.
+    pub fn trusted_issuer(&self, iss: &str) -> Option<&TrustedIssuer> {
+        self.trusted_issuers.iter().find(|issuer| issuer.iss == iss)
+    }
+
+    /// Validate the whole section. `AsterServer` refuses to start, and
+    /// `aster.ops.NodeConfig` refuses an override, that fails it.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_EDGE_TOKEN_LIFETIME.as_secs()).contains(&self.edge_token_max_lifetime_secs) {
+            return Err(format!(
+                "identity.edge_token_max_lifetime_secs must be in 1..={}",
+                MAX_EDGE_TOKEN_LIFETIME.as_secs()
+            ));
+        }
+        if self.clock_leeway_secs > MAX_CLOCK_LEEWAY.as_secs() {
+            return Err(format!(
+                "identity.clock_leeway_secs must be at most {}",
+                MAX_CLOCK_LEEWAY.as_secs()
+            ));
+        }
+        if self.trusted_issuers.len() > MAX_TRUSTED_ISSUERS {
+            return Err(format!(
+                "identity.trusted_issuers: at most {MAX_TRUSTED_ISSUERS} issuers"
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        for issuer in &self.trusted_issuers {
+            let iss = &issuer.iss;
+            let at = |what: &str| format!("identity.trusted_issuers[{iss:?}].{what}");
+            check_text("identity.trusted_issuers.iss", iss, 256)?;
+            if iss.contains('|') {
+                return Err(format!(
+                    "{}: may not contain '|' (the principal is iss|sub)",
+                    at("iss")
+                ));
+            }
+            if node_id_shaped(iss) {
+                return Err(format!(
+                    "{}: a node id is an edge issuer, not a trusted issuer",
+                    at("iss")
+                ));
+            }
+            if !seen.insert(iss.as_str()) {
+                return Err(format!("{}: listed twice", at("iss")));
+            }
+            if issuer.audiences.is_empty() {
+                return Err(format!(
+                    "{} is required: an issuer without audiences would accept a token \
+                     issued to anyone",
+                    at("audiences")
+                ));
+            }
+            if issuer.audiences.len() > MAX_ISSUER_AUDIENCES {
+                return Err(format!(
+                    "{}: at most {MAX_ISSUER_AUDIENCES}",
+                    at("audiences")
+                ));
+            }
+            for audience in &issuer.audiences {
+                check_text(&at("audiences"), audience, 256)?;
+            }
+            if let Some(claim) = &issuer.roles_claim {
+                check_text(&at("roles_claim"), claim, 128)?;
+            } else if !issuer.role_map.is_empty() {
+                return Err(format!("{} needs roles_claim", at("role_map")));
+            }
+            if issuer.role_map.len() > MAX_ROLE_MAP_ENTRIES {
+                return Err(format!(
+                    "{}: at most {MAX_ROLE_MAP_ENTRIES} entries",
+                    at("role_map")
+                ));
+            }
+            for (value, role) in &issuer.role_map {
+                check_text(&at("role_map key"), value, 256)?;
+                check_text(&at("role_map value"), role, 128)?;
+                if role.trim() != role || role.contains(',') {
+                    return Err(format!(
+                        "{}: {role:?} is not a role (no comma, no surrounding space)",
+                        at("role_map")
+                    ));
+                }
+                if role
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("aster."))
+                {
+                    return Err(format!(
+                        "{}: {role:?}: roles starting \"aster.\" are the framework's and are \
+                         never granted by an identity provider",
+                        at("role_map")
+                    ));
+                }
+            }
+            if !(1..=MAX_PROVIDER_TOKEN_LIFETIME.as_secs())
+                .contains(&issuer.max_token_lifetime_secs)
+            {
+                return Err(format!(
+                    "{} must be in 1..={}",
+                    at("max_token_lifetime_secs"),
+                    MAX_PROVIDER_TOKEN_LIFETIME.as_secs()
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The [`IdentitySettings`] every dispatcher of one server reads, per call.
@@ -138,6 +324,10 @@ pub struct IdentitySettings {
 #[derive(Debug, Default)]
 pub(crate) struct LiveIdentity {
     current: arc_swap::ArcSwap<IdentitySettings>,
+    /// The issuer keys from the fleet namespace, when the server has
+    /// Enrollment.
+    #[cfg(feature = "delegation")]
+    keys: arc_swap::ArcSwapOption<super::issuer_keys::IssuerKeys>,
 }
 
 impl LiveIdentity {
@@ -146,33 +336,36 @@ impl LiveIdentity {
     }
 
     pub(crate) fn store(&self, settings: IdentitySettings) {
-        self.current.store(std::sync::Arc::new(settings));
+        self.current.store(Arc::new(settings));
+    }
+
+    #[cfg(all(feature = "enrollment", feature = "docs"))]
+    pub(crate) fn set_keys(&self, keys: Arc<super::issuer_keys::IssuerKeys>) {
+        self.keys.store(Some(keys));
     }
 
     /// The verification policy in force, `None` when the entry is refused.
     pub(crate) fn policy(&self) -> Option<OnBehalfOfPolicy> {
-        self.current
-            .load()
-            .accept_on_behalf_of
-            .then(OnBehalfOfPolicy::default)
+        let settings = self.current.load_full();
+        if !settings.accept_on_behalf_of {
+            return None;
+        }
+        Some(OnBehalfOfPolicy {
+            settings,
+            #[cfg(feature = "delegation")]
+            keys: self.keys.load_full(),
+        })
     }
 }
 
 /// How a server verifies `aster-on-behalf-of`. Present only when the server
 /// accepts the entry.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct OnBehalfOfPolicy {
-    pub(crate) leeway: Duration,
-    pub(crate) max_lifetime: Duration,
-}
-
-impl Default for OnBehalfOfPolicy {
-    fn default() -> Self {
-        Self {
-            leeway: DEFAULT_CLOCK_LEEWAY,
-            max_lifetime: MAX_EDGE_TOKEN_LIFETIME,
-        }
-    }
+    #[cfg_attr(not(feature = "delegation"), allow(dead_code))]
+    pub(crate) settings: Arc<IdentitySettings>,
+    #[cfg(feature = "delegation")]
+    pub(crate) keys: Option<Arc<super::issuer_keys::IssuerKeys>>,
 }
 
 /// Parse an [`ISSUABLE_ROLES_ATTRIBUTE`] value: comma-separated, trimmed,
@@ -260,8 +453,108 @@ pub(crate) fn resolve(
     verify(policy, token, transport_peer, store).or_else(|(status, reason)| refuse(status, reason))
 }
 
+/// Choose the verifier from the token's (unverified) `iss`: a node id is an
+/// edge-minted token, anything else a provider token.
 #[cfg(feature = "delegation")]
 fn verify(
+    policy: &OnBehalfOfPolicy,
+    token: &str,
+    transport_peer: &str,
+    store: &AttributeStore,
+) -> Result<Option<ForwardedIdentity>, (RpcStatus, &'static str)> {
+    use aster_transport_core::delegation::provider_token::peek_issuer;
+    let iss =
+        peek_issuer(token).map_err(|error| (unauthenticated(&error.to_string()), "malformed"))?;
+    if node_id_shaped(&iss) {
+        verify_edge(policy, token, transport_peer, store)
+    } else {
+        verify_provider(policy, token, &iss, transport_peer)
+    }
+}
+
+#[cfg(feature = "delegation")]
+fn verify_provider(
+    policy: &OnBehalfOfPolicy,
+    token: &str,
+    iss: &str,
+    transport_peer: &str,
+) -> Result<Option<ForwardedIdentity>, (RpcStatus, &'static str)> {
+    use aster_transport_core::delegation::provider_token::{
+        verify_provider_token, ProviderIssuerPolicy, ProviderTokenError, ProviderTokenLimits,
+    };
+    let Some(issuer) = policy.settings.trusted_issuer(iss) else {
+        return Err((
+            unauthenticated("on-behalf-of token issuer is not trusted"),
+            "issuer not trusted",
+        ));
+    };
+    let Some(keys) = policy.keys.as_ref() else {
+        return Err((
+            unauthenticated("this server holds no issuer keys (it needs Enrollment)"),
+            "no issuer keys",
+        ));
+    };
+    let now = unix_now();
+    let lookup = |kid: &str| keys.key(iss, kid, now);
+    let verified = verify_provider_token(
+        token,
+        &ProviderIssuerPolicy {
+            iss: &issuer.iss,
+            audiences: &issuer.audiences,
+            roles_claim: issuer.roles_claim.as_deref(),
+            role_map: &issuer.role_map,
+            max_lifetime: issuer.max_token_lifetime_secs,
+        },
+        &lookup,
+        &ProviderTokenLimits {
+            now,
+            leeway: policy.settings.clock_leeway_secs,
+        },
+    )
+    .map_err(|error| {
+        use ProviderTokenError as E;
+        let reason = match error {
+            E::Configuration => "configuration",
+            E::Size => "size",
+            E::Malformed => "malformed",
+            E::Header => "header",
+            E::Algorithm => "algorithm",
+            E::Issuer => "issuer mismatch",
+            E::UnknownKey => "unknown kid",
+            E::AlgorithmMismatch => "algorithm mismatch",
+            E::Signature => "signature",
+            E::Audience => "audience",
+            E::NotYetValid => "not yet valid",
+            E::Expired => "expired",
+            E::Lifetime => "lifetime",
+        };
+        (unauthenticated(&error.to_string()), reason)
+    })?;
+    let identity = ForwardedIdentity {
+        principal: format!("{}|{}", verified.issuer, verified.subject),
+        actor: transport_peer.to_string(),
+        issuer: verified.issuer,
+        subject: verified.subject,
+        roles: verified.roles.into_iter().collect(),
+        auth_methods: verified.amr,
+        jti: verified.jti.unwrap_or_default(),
+        expires_at: verified.expires_at,
+    };
+    tracing::debug!(
+        target: IDENTITY,
+        principal = identity.principal.as_str(),
+        actor = identity.actor.as_str(),
+        iss = identity.issuer.as_str(),
+        sub = identity.subject.as_str(),
+        jti = identity.jti.as_str(),
+        kid = verified.kid.as_str(),
+        "on-behalf-of accepted (provider token)"
+    );
+    Ok(Some(identity))
+}
+
+#[cfg(feature = "delegation")]
+fn verify_edge(
     policy: &OnBehalfOfPolicy,
     token: &str,
     transport_peer: &str,
@@ -282,8 +575,8 @@ fn verify(
     };
     let limits = EdgeTokenLimits {
         now: unix_now(),
-        leeway: policy.leeway.as_secs(),
-        max_lifetime: policy.max_lifetime.as_secs(),
+        leeway: policy.settings.clock_leeway_secs,
+        max_lifetime: policy.settings.edge_token_max_lifetime_secs,
     };
     let verified = match verify_edge_token(token, &peer_key, &issuable, &limits) {
         Ok(verified) => verified,
@@ -588,10 +881,17 @@ mod tests {
             StatusCode::Unauthenticated
         );
         // A gateway without an issuer delegation cannot mint.
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        let edge_shaped = format!(
+            "{}.{}.AAAA",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"aster-on-behalf-of-v1+jwt"}"#),
+            URL_SAFE_NO_PAD.encode(format!(r#"{{"iss":"{peer}"}}"#))
+        );
+        let edge_entry = header(&[(ON_BEHALF_OF_METADATA, edge_shaped.as_str())]);
         assert_eq!(
             code(resolve(
                 Some(&policy),
-                &entry,
+                &edge_entry,
                 iroh,
                 &peer,
                 &gateway(),
@@ -603,6 +903,86 @@ mod tests {
                 StatusCode::Unauthenticated
             }
         );
+        // Garbage, and a provider token from an issuer nobody trusts.
+        assert_eq!(
+            code(resolve(
+                Some(&policy),
+                &entry,
+                iroh,
+                &peer,
+                &gateway(),
+                &store
+            )),
+            StatusCode::Unauthenticated
+        );
+        let provider = format!(
+            "{}.{}.AAAA",
+            URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","kid":"k"}"#),
+            URL_SAFE_NO_PAD.encode(r#"{"iss":"https://idp.example.com"}"#)
+        );
+        assert_eq!(
+            code(resolve(
+                Some(&policy),
+                &header(&[(ON_BEHALF_OF_METADATA, provider.as_str())]),
+                iroh,
+                &peer,
+                &gateway(),
+                &store
+            )),
+            StatusCode::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn settings_validate_as_a_whole() {
+        use crate::TrustedIssuer;
+        let ok = || {
+            TrustedIssuer::new("https://idp.example.com", ["api"])
+                .roles_claim("groups")
+                .map_role("g", "data.read")
+        };
+        let with = |issuers: Vec<TrustedIssuer>| IdentitySettings {
+            trusted_issuers: issuers,
+            ..Default::default()
+        };
+        with(vec![ok()]).validate().unwrap();
+        IdentitySettings::default().validate().unwrap();
+        let refused = [
+            with(vec![TrustedIssuer::new(
+                "https://idp.example.com",
+                Vec::<String>::new(),
+            )]),
+            with(vec![ok(), ok()]),
+            with(vec![TrustedIssuer::new("ab".repeat(32), ["api"])]),
+            with(vec![TrustedIssuer::new("a|b", ["api"])]),
+            with(vec![TrustedIssuer::new("", ["api"])]),
+            with(vec![ok().map_role("x", "a,b")]),
+            with(vec![ok().map_role("x", "aster.config-admin")]),
+            with(vec![
+                TrustedIssuer::new("https://i", ["api"]).map_role("x", "y")
+            ]),
+            with(vec![ok().max_token_lifetime_secs(0)]),
+            with(vec![ok().max_token_lifetime_secs(86_401)]),
+            IdentitySettings {
+                edge_token_max_lifetime_secs: 301,
+                ..Default::default()
+            },
+            IdentitySettings {
+                edge_token_max_lifetime_secs: 0,
+                ..Default::default()
+            },
+            IdentitySettings {
+                clock_leeway_secs: 301,
+                ..Default::default()
+            },
+        ];
+        for settings in refused {
+            assert!(settings.validate().is_err(), "{settings:?}");
+        }
+        let err = with(vec![TrustedIssuer::new("https://i", Vec::<String>::new())])
+            .validate()
+            .unwrap_err();
+        assert!(err.contains("audiences"), "{err}");
     }
 
     #[test]
