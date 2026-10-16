@@ -97,7 +97,128 @@ public final class NativeConfig {
   static final int REUSE_LAST_PORT_ENABLED = 1;
   static final int REUSE_LAST_PORT_DISABLED = 2;
 
+  // aster_discovery_t (ABI 7.3)
+  static final int DISCOVERY_DEFAULT = 0;
+  static final int DISCOVERY_NONE = 1;
+  static final int DISCOVERY_LOCAL = 2;
+  static final int DISCOVERY_CUSTOM = 3;
+
+  /** {@code sizeof(aster_network_config_t)} (ABI 7.3). */
+  public static final long NETWORK_SIZE = 96;
+
+  /** {@code sizeof(aster_metrics_config_t)} (ABI 7.4). */
+  public static final long METRICS_SIZE = 16;
+
+  // aster_network_config_t offsets
+  private static final long N_DISCOVERY = 4;
+  private static final long N_BIND_ADDR_V6 = 8;
+  private static final long N_ADVERTISE_ADDRS = 24;
+  private static final long N_RELAY_CA_CERTS = 40;
+  private static final long N_RELAY_CA_ONLY = 56;
+  private static final long N_DNS_ORIGIN = 64;
+  private static final long N_PKARR_RELAYS = 80;
+
+  // aster_metrics_config_t offsets
+  private static final long M_PEER_LABELS = 4;
+  private static final long M_PEER_LABEL_CAP = 8;
+
+  private static final java.lang.foreign.FunctionDescriptor CONFIG_PAIR =
+      java.lang.foreign.FunctionDescriptor.of(
+          ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.ADDRESS);
+
   private NativeConfig() {}
+
+  private static int callPair(String fn, MemorySegment config, MemorySegment arg) {
+    try {
+      return (int) IrohLibrary.getInstance().getHandle(fn, CONFIG_PAIR).invoke(config, arg);
+    } catch (RuntimeException | Error e) {
+      throw e;
+    } catch (Throwable t) {
+      throw new IrohException(fn + ": " + t);
+    }
+  }
+
+  /**
+   * Copy the cluster network (ABI 7.3) and {@code [metrics]} (ABI 7.4) settings of {@code c} into
+   * the library-owned storage of {@code seg} when any differs from its default. The caller then
+   * releases {@code seg} with {@code aster_config_release} (a no-op without storage).
+   */
+  static void putExtensions(AsterConfig c, MemorySegment seg, Arena arena) {
+    if (c.hasNetworkSettings()) {
+      MemorySegment n = arena.allocate(NETWORK_SIZE, 8);
+      n.set(ValueLayout.JAVA_INT, 0, (int) NETWORK_SIZE);
+      n.set(ValueLayout.JAVA_INT, N_DISCOVERY, discoveryToNative(c.discovery()));
+      putStr(n, N_BIND_ADDR_V6, c.bindAddrV6(), arena);
+      putList(n, N_ADVERTISE_ADDRS, utf8List(c.advertiseAddrs()), arena);
+      putList(n, N_RELAY_CA_CERTS, utf8List(c.relayCaCerts()), arena);
+      n.set(ValueLayout.JAVA_INT, N_RELAY_CA_ONLY, c.relayCaOnly() ? 1 : 0);
+      putStr(n, N_DNS_ORIGIN, c.discoveryDnsOrigin(), arena);
+      putList(n, N_PKARR_RELAYS, utf8List(c.discoveryPkarrRelays()), arena);
+      check(callPair("aster_config_set_network", seg, n), "aster_config_set_network");
+    }
+    if (c.metricsPeerLabels()
+        || c.metricsPeerLabelCap() != AsterConfig.METRICS_PEER_LABEL_CAP_DEFAULT) {
+      MemorySegment m = arena.allocate(METRICS_SIZE, 8);
+      m.set(ValueLayout.JAVA_INT, 0, (int) METRICS_SIZE);
+      m.set(ValueLayout.JAVA_INT, M_PEER_LABELS, c.metricsPeerLabels() ? 1 : 0);
+      m.set(ValueLayout.JAVA_INT, M_PEER_LABEL_CAP, c.metricsPeerLabelCap());
+      check(callPair("aster_config_set_metrics", seg, m), "aster_config_set_metrics");
+    }
+  }
+
+  /** Read the network and metrics settings of a native config into {@code b}. */
+  static void applyExtensions(MemorySegment seg, AsterConfig.Builder b) {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment n = arena.allocate(NETWORK_SIZE, 8);
+      n.set(ValueLayout.JAVA_INT, 0, (int) NETWORK_SIZE);
+      check(callPair("aster_config_network", seg, n), "aster_config_network");
+      b.discovery(
+          switch (n.get(ValueLayout.JAVA_INT, N_DISCOVERY)) {
+            case DISCOVERY_NONE -> AsterConfig.DISCOVERY_NONE;
+            case DISCOVERY_LOCAL -> AsterConfig.DISCOVERY_LOCAL;
+            case DISCOVERY_CUSTOM -> AsterConfig.DISCOVERY_CUSTOM;
+            default -> AsterConfig.DISCOVERY_DEFAULT;
+          });
+      b.bindAddrV6(getStr(n, N_BIND_ADDR_V6));
+      b.advertiseAddrs(strList(getList(n, N_ADVERTISE_ADDRS)));
+      b.relayCaCerts(strList(getList(n, N_RELAY_CA_CERTS)));
+      b.relayCaOnly(n.get(ValueLayout.JAVA_INT, N_RELAY_CA_ONLY) != 0);
+      b.discoveryDnsOrigin(getStr(n, N_DNS_ORIGIN));
+      b.discoveryPkarrRelays(strList(getList(n, N_PKARR_RELAYS)));
+
+      MemorySegment m = arena.allocate(METRICS_SIZE, 8);
+      m.set(ValueLayout.JAVA_INT, 0, (int) METRICS_SIZE);
+      check(callPair("aster_config_metrics", seg, m), "aster_config_metrics");
+      b.metricsPeerLabels(m.get(ValueLayout.JAVA_INT, M_PEER_LABELS) != 0);
+      b.metricsPeerLabelCap(m.get(ValueLayout.JAVA_INT, M_PEER_LABEL_CAP));
+    }
+  }
+
+  static int discoveryToNative(String mode) {
+    String m = mode == null ? "" : mode.trim().toLowerCase(java.util.Locale.ROOT);
+    return switch (m) {
+      case "", AsterConfig.DISCOVERY_DEFAULT -> DISCOVERY_DEFAULT;
+      case AsterConfig.DISCOVERY_NONE -> DISCOVERY_NONE;
+      case AsterConfig.DISCOVERY_LOCAL -> DISCOVERY_LOCAL;
+      case AsterConfig.DISCOVERY_CUSTOM -> DISCOVERY_CUSTOM;
+      default ->
+          throw new IllegalArgumentException(
+              "discovery " + mode + ": want default, none, local or custom");
+    };
+  }
+
+  private static List<byte[]> utf8List(List<String> items) {
+    return items.stream().map(NativeConfig::utf8).toList();
+  }
+
+  private static List<String> strList(List<byte[]> items) {
+    return items.stream().map(NativeConfig::str).toList();
+  }
+
+  /** {@code aster_config_release}: frees the library-owned storage of a config (no-op without). */
+  public static void release(MemorySegment seg) {
+    IrohLibrary.getInstance().configRelease(seg);
+  }
 
   // ── Java -> native ────────────────────────────────────────────────────
 
@@ -187,6 +308,8 @@ public final class NativeConfig {
       set |= T_GSO;
     }
     seg.set(ValueLayout.JAVA_INT, TRANSPORT_SET, set);
+    // ABI 7.3 / 7.4 settings live in library-owned storage: release with release(seg).
+    putExtensions(c, seg, arena);
     return seg;
   }
 
@@ -249,6 +372,7 @@ public final class NativeConfig {
         (set & T_FAIRNESS) != 0 ? seg.get(ValueLayout.JAVA_INT, T_FAIRNESS_OFF) != 0 : null);
     b.transportEnableSegmentationOffload(
         (set & T_GSO) != 0 ? seg.get(ValueLayout.JAVA_INT, T_GSO_OFF) != 0 : null);
+    applyExtensions(seg, b);
     return b;
   }
 
@@ -387,6 +511,7 @@ public final class NativeConfig {
                           ValueLayout.JAVA_LONG,
                           ValueLayout.ADDRESS))
                   .invoke(runtime.nativeHandle(), cfg, bytesStruct(trustJson, arena), side, 0L, op);
+      release(cfg);
       check(status, "aster_node_start_enrolled");
       opId = op.get(ValueLayout.JAVA_LONG, 0);
     } catch (RuntimeException e) {
@@ -442,7 +567,9 @@ public final class NativeConfig {
         putBytes(cfg, SECRET_KEY, secretKeyOverride, arena);
       }
       MemorySegment op = arena.allocate(ValueLayout.JAVA_LONG);
-      check(lib.nodeStartAsync(runtime.nativeHandle(), cfg, gate, op), "aster_node_start");
+      int status = lib.nodeStartAsync(runtime.nativeHandle(), cfg, gate, op);
+      release(cfg);
+      check(status, "aster_node_start");
       opId = op.get(ValueLayout.JAVA_LONG, 0);
     }
     try {

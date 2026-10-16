@@ -1,17 +1,21 @@
 package site.aster.audit;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import java.io.IOException;
 import java.lang.invoke.MethodHandle;
 import java.lang.ref.Cleaner;
 import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import site.aster.ffi.DataPlane;
 import site.aster.ffi.IrohEventKind;
@@ -44,15 +48,39 @@ public final class AuditOutbox implements AutoCloseable {
     }
   }
 
-  /** Limits include retained dead-letter evidence and receipts. */
+  /**
+   * Limits include retained dead-letter evidence and receipts. {@code acknowledgementLogMaxEntries}
+   * and {@code acknowledgementLogMaxAgeMs} bound the acknowledgement log (ABI 7.1); {@code null}
+   * keeps the Rust defaults (100,000 entries, 7 days).
+   */
   public record Config(
-      Path directory, Destination destination, BigInteger maxRetainedBytes, int maxEventBytes) {
+      Path directory,
+      Destination destination,
+      BigInteger maxRetainedBytes,
+      int maxEventBytes,
+      Long acknowledgementLogMaxEntries,
+      Long acknowledgementLogMaxAgeMs) {
     public Config {
       Objects.requireNonNull(directory, "directory");
       Objects.requireNonNull(destination, "destination");
       unsigned(maxRetainedBytes);
       if (maxEventBytes < 0)
         throw new IllegalArgumentException("maxEventBytes must be nonnegative");
+      if (acknowledgementLogMaxEntries != null && acknowledgementLogMaxEntries < 0)
+        throw new IllegalArgumentException("acknowledgementLogMaxEntries must be nonnegative");
+      if (acknowledgementLogMaxAgeMs != null && acknowledgementLogMaxAgeMs < 0)
+        throw new IllegalArgumentException("acknowledgementLogMaxAgeMs must be nonnegative");
+    }
+
+    public Config(
+        Path directory, Destination destination, BigInteger maxRetainedBytes, int maxEventBytes) {
+      this(directory, destination, maxRetainedBytes, maxEventBytes, null, null);
+    }
+
+    /** A copy with the acknowledgement-log bounds set ({@code null} = the Rust default). */
+    public Config withAcknowledgementLog(Long maxEntries, Long maxAgeMs) {
+      return new Config(
+          directory, destination, maxRetainedBytes, maxEventBytes, maxEntries, maxAgeMs);
     }
 
     public Config(Path directory, Destination destination) {
@@ -134,6 +162,34 @@ public final class AuditOutbox implements AutoCloseable {
       receipts = List.copyOf(receipts);
     }
   }
+
+  /**
+   * One event the receiver acknowledged as durably stored (ABI 7.1). The outbox writes it in the
+   * same local transaction that deletes the event, so an event is either still pending or present
+   * here until the log's count / age bounds prune it. {@code cursor} increases with each
+   * acknowledgement and is never reused: pass the last one seen as {@code after} to continue.
+   * {@code batchId} is the digest the receiver echoed; {@code acknowledgedAtMs} is local Unix
+   * milliseconds when the acknowledgement committed.
+   */
+  public record Acknowledgement(
+      long cursor, String eventId, long sequence, String batchId, long acknowledgedAtMs) {
+    public Acknowledgement {
+      Objects.requireNonNull(eventId, "eventId");
+      Objects.requireNonNull(batchId, "batchId");
+    }
+
+    public Instant acknowledgedAt() {
+      return Instant.ofEpochMilli(acknowledgedAtMs);
+    }
+  }
+
+  /** The largest page one acknowledgement read returns. */
+  public static final int ACKNOWLEDGEMENT_PAGE_MAX = 1000;
+
+  /** Mirrors {@code ASTER_AUDIT_OUTBOX_MAX_ACK_WAIT_MS}: one hour. */
+  public static final Duration ACKNOWLEDGEMENT_MAX_WAIT = Duration.ofMillis(3_600_000L);
+
+  private static final Duration WATCH_WAIT = Duration.ofSeconds(30);
 
   private final IrohRuntime runtime;
   private final long handle;
@@ -321,6 +377,118 @@ public final class AuditOutbox implements AutoCloseable {
 
   public CompletableFuture<Void> replay(String eventId) {
     return unit("replay", "event_id", eventId, AuditNative.REPLAY);
+  }
+
+  /**
+   * Up to {@code limit} (1..{@link #ACKNOWLEDGEMENT_PAGE_MAX}) logged acknowledgements with a
+   * cursor greater than {@code after}, oldest first. Pass 0 to start at the oldest retained entry.
+   */
+  public CompletableFuture<List<Acknowledgement>> acknowledgements(long after, int limit) {
+    return waitAcknowledgements(after, limit, Duration.ZERO);
+  }
+
+  /**
+   * {@link #acknowledgements}, but when nothing follows {@code after} the read waits up to {@code
+   * wait} (at most {@link #ACKNOWLEDGEMENT_MAX_WAIT}) for the next acknowledgement, then completes
+   * with an empty page. Cancelling the future abandons the wait.
+   */
+  public CompletableFuture<List<Acknowledgement>> waitAcknowledgements(
+      long after, int limit, Duration wait) {
+    if (limit < 1 || limit > ACKNOWLEDGEMENT_PAGE_MAX)
+      return invalidAck("acknowledgement limit must be between 1 and 1000");
+    if (after < 0) return invalidAck("acknowledgement cursor must be nonnegative");
+    if (wait == null || wait.isNegative() || wait.compareTo(ACKNOWLEDGEMENT_MAX_WAIT) > 0)
+      return invalidAck("acknowledgement wait must be between 0 and one hour");
+    byte[] json;
+    try {
+      json =
+          AuditJson.MAPPER.writeValueAsBytes(
+              Map.of("version", 1, "after", after, "limit", limit, "wait_ms", wait.toMillis()));
+    } catch (IOException error) {
+      return invalidAck("invalid acknowledgement request");
+    }
+    return call(
+        "acknowledgements",
+        json,
+        AuditNative.ACKNOWLEDGEMENTS,
+        IrohEventKind.AUDIT_OUTBOX_ACKNOWLEDGEMENTS,
+        result -> AuditJson.acknowledgements(result.data()));
+  }
+
+  private static <T> CompletableFuture<T> invalidAck(String message) {
+    return CompletableFuture.failedFuture(
+        new AuditOutboxException(AuditOutboxException.Kind.INVALID_EVENT, message));
+  }
+
+  /**
+   * Streams acknowledgements with a cursor greater than {@code after} to {@code consumer}, in
+   * order, until the returned handle is closed or the outbox fails. Delivery is lossless while
+   * entries are retained: record the last {@link Acknowledgement#cursor()} to resume after a
+   * restart. {@link Watch#done()} completes normally after {@link Watch#close()} and exceptionally
+   * with the failure otherwise.
+   */
+  public Watch watchAcknowledgements(long after, Consumer<Acknowledgement> consumer) {
+    Objects.requireNonNull(consumer, "consumer");
+    Watch watch = new Watch();
+    watch.next(this, after, consumer);
+    return watch;
+  }
+
+  /** A running {@link #watchAcknowledgements} loop. */
+  public static final class Watch implements AutoCloseable {
+    private final CompletableFuture<Void> done = new CompletableFuture<>();
+    private volatile boolean stopped;
+    private volatile CompletableFuture<?> pending;
+
+    private Watch() {}
+
+    private void next(AuditOutbox outbox, long after, Consumer<Acknowledgement> consumer) {
+      if (stopped) {
+        done.complete(null);
+        return;
+      }
+      CompletableFuture<List<Acknowledgement>> page =
+          outbox.waitAcknowledgements(after, ACKNOWLEDGEMENT_PAGE_MAX, WATCH_WAIT);
+      pending = page;
+      page.whenComplete(
+          (acks, failure) -> {
+            if (stopped) {
+              done.complete(null);
+              return;
+            }
+            if (failure != null) {
+              done.completeExceptionally(
+                  failure instanceof CompletionException ? failure.getCause() : failure);
+              return;
+            }
+            long cursor = after;
+            try {
+              for (Acknowledgement ack : acks) {
+                if (stopped) break;
+                consumer.accept(ack);
+                cursor = ack.cursor();
+              }
+            } catch (RuntimeException error) {
+              done.completeExceptionally(error);
+              return;
+            }
+            next(outbox, cursor, consumer);
+          });
+    }
+
+    /** Completes when the loop stops. */
+    public CompletableFuture<Void> done() {
+      return done;
+    }
+
+    /** Stop the loop; a waiting read is abandoned. */
+    @Override
+    public void close() {
+      stopped = true;
+      CompletableFuture<?> current = pending;
+      if (current != null) current.cancel(true);
+      done.complete(null);
+    }
   }
 
   private static Void unitResult(DataPlane.Result result) {

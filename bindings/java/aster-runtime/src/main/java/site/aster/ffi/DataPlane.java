@@ -35,6 +35,12 @@ public final class DataPlane {
   /** {@code ASTER_FETCH_TO_STORE}. */
   public static final int FETCH_TO_STORE = 1;
 
+  /**
+   * {@code ASTER_FETCH_REPORT_V2} (ABI 7.4): the reporting fetches write fetch report v2
+   * (per-provider transfer counters) instead of v1.
+   */
+  public static final int FETCH_REPORT_V2 = 2;
+
   public static final MemoryLayout ASTER_PATH_INFO =
       MemoryLayout.structLayout(
           ValueLayout.JAVA_INT.withName("struct_size"), // 0

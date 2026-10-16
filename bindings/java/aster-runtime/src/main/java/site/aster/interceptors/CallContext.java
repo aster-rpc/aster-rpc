@@ -2,11 +2,14 @@ package site.aster.interceptors;
 
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 /**
  * Context for a single RPC call, available to interceptors and handlers.
@@ -17,11 +20,11 @@ import java.util.function.BooleanSupplier;
  */
 public final class CallContext {
 
-  // Async-local current-context holder. Published by the dispatcher via runWith(...) for the
-  // duration of a handler invocation so deeply-nested handler code can access the context
-  // without threading it through every call. Falls back to a ThreadLocal until Java's
-  // ScopedValue graduates out of preview.
-  private static final ThreadLocal<CallContext> CURRENT = new ThreadLocal<>();
+  // The current-context holder (Java 25 ScopedValue, ffi_spec/handler-context-design.md). The
+  // server binds it around each handler invocation (every pattern) so deeply-nested handler code
+  // can reach the context without threading it through every call. A ScopedValue is not
+  // inherited by threads the handler starts itself; pass the context explicitly there.
+  private static final ScopedValue<CallContext> CURRENT = ScopedValue.newInstance();
 
   /**
    * Return the {@link CallContext} for the currently-executing dispatch.
@@ -29,29 +32,28 @@ public final class CallContext {
    * @throws IllegalStateException if called outside of a dispatcher-managed scope
    */
   public static CallContext current() {
-    CallContext ctx = CURRENT.get();
-    if (ctx == null) {
+    if (!CURRENT.isBound()) {
       throw new IllegalStateException("CallContext.current() called outside of a dispatch scope");
     }
-    return ctx;
+    return CURRENT.get();
+  }
+
+  /** The current context, or {@code null} outside a dispatch scope. */
+  public static CallContext currentOrNull() {
+    return CURRENT.isBound() ? CURRENT.get() : null;
   }
 
   /**
-   * Publish {@code ctx} as the current call context for the duration of {@code action}. Used by
-   * generated dispatchers to make {@link #current()} accessible from user handlers.
+   * Publish {@code ctx} as the current call context for the duration of {@code action}. The server
+   * does this for every handler; generated dispatchers do it too (nesting restores the outer one).
    */
   public static <T> T runWith(CallContext ctx, Callable<T> action) throws Exception {
-    CallContext prior = CURRENT.get();
-    CURRENT.set(ctx);
-    try {
-      return action.call();
-    } finally {
-      if (prior == null) {
-        CURRENT.remove();
-      } else {
-        CURRENT.set(prior);
-      }
-    }
+    return ScopedValue.where(CURRENT, ctx).call(action::call);
+  }
+
+  /** {@link #runWith(CallContext, Callable)} for an action without a result. */
+  public static void runScoped(CallContext ctx, Runnable action) {
+    ScopedValue.where(CURRENT, ctx).run(action);
   }
 
   private final String service;
@@ -59,6 +61,9 @@ public final class CallContext {
   private final String callId;
   private final String sessionId;
   private final String peer;
+  private final String principal;
+  private final int wireCallId;
+  private final long dispatchCallId;
   private final boolean irohAuthenticated;
   private final Map<String, String> metadata;
   private final Map<String, String> attributes;
@@ -71,6 +76,7 @@ public final class CallContext {
   private final String relayUrl;
   private final Duration rtt;
   private final BooleanSupplier cancellation;
+  private final Supplier<CompletableFuture<Void>> cancelledSignal;
 
   private CallContext(Builder builder) {
     this.service = builder.service;
@@ -78,6 +84,9 @@ public final class CallContext {
     this.callId = builder.callId != null ? builder.callId : UUID.randomUUID().toString();
     this.sessionId = builder.sessionId;
     this.peer = builder.peer;
+    this.principal = builder.principal != null ? builder.principal : builder.peer;
+    this.wireCallId = builder.wireCallId;
+    this.dispatchCallId = builder.dispatchCallId;
     this.irohAuthenticated = builder.irohAuthenticated;
     this.metadata = builder.metadata;
     this.attributes = builder.attributes;
@@ -90,6 +99,7 @@ public final class CallContext {
     this.relayUrl = builder.relayUrl;
     this.rtt = builder.rtt;
     this.cancellation = builder.cancellation;
+    this.cancelledSignal = builder.cancelledSignal;
   }
 
   public String service() {
@@ -100,16 +110,46 @@ public final class CallContext {
     return method;
   }
 
+  /**
+   * The call id. On the server it is the caller's {@code StreamHeader.call_id} (as {@link
+   * #wireCallId()}, {@code "0"} when unset), matching Rust's {@code CallContext::call_id}.
+   */
   public String callId() {
     return callId;
+  }
+
+  /** The caller's {@code StreamHeader.call_id} ({@code 0} when unset or not a server call). */
+  public int wireCallId() {
+    return wireCallId;
+  }
+
+  /**
+   * Rust's dispatch-table id for this call ({@code aster_dispatch_event_t.call_id}, unique per
+   * server, from 1); {@code 0} when the context is not backed by a live server call.
+   */
+  public long dispatchCallId() {
+    return dispatchCallId;
   }
 
   public String sessionId() {
     return sessionId;
   }
 
+  /**
+   * The transport's caller id: the peer's endpoint id (64 hex) over Iroh; over HTTP / WebTransport
+   * the id the transport resolved (the remote address). See {@link #irohAuthenticated()} for how
+   * far to trust it, and {@link #principal()} for the verified caller.
+   */
   public String peer() {
     return peer;
+  }
+
+  /**
+   * The verified caller: the {@code Authenticator}'s principal when it resolved one (HTTP auth
+   * callbacks), else {@link #peer()} (ABI 7.5).
+   */
+  public String principal() {
+    return principal;
   }
 
   /** True only for native Iroh endpoint authentication, never for an HTTP auth callback. */
@@ -121,13 +161,42 @@ public final class CallContext {
     return metadata;
   }
 
+  /** One metadata value, or {@code null}. */
+  public String metadataValue(String key) {
+    return metadata.get(key);
+  }
+
+  /** The caller's attributes: the merged set Gate 3 checked (e.g. {@code aster.role}). */
   public Map<String, String> attributes() {
     return attributes;
+  }
+
+  /** One attribute, or {@code null}. */
+  public String attribute(String key) {
+    return attributes.get(key);
   }
 
   /** Returns the absolute deadline as epoch seconds, or {@code null} if no deadline is set. */
   public Double deadline() {
     return deadline;
+  }
+
+  /**
+   * When the server cancels the call with {@code DEADLINE_EXCEEDED} (the minimum of the caller's
+   * deadline, the method timeout and the server's handler timeout); {@code null} = none.
+   */
+  public Instant deadlineInstant() {
+    return deadline == null ? null : Instant.ofEpochMilli(Math.round(deadline * 1000.0));
+  }
+
+  /** Time left until {@link #deadlineInstant()} (zero once passed); {@code null} = no deadline. */
+  public Duration remaining() {
+    Instant at = deadlineInstant();
+    if (at == null) {
+      return null;
+    }
+    Duration left = Duration.between(Instant.now(), at);
+    return left.isNegative() ? Duration.ZERO : left;
   }
 
   public boolean isStreaming() {
@@ -183,6 +252,18 @@ public final class CallContext {
   }
 
   /**
+   * Completes once {@link #isCancelled()} becomes true (peer cancel, deadline, connection gone).
+   * Never completes for a call that finishes normally, or for a context not backed by a live call.
+   * Each call returns a fresh view: cancelling it does not cancel the RPC.
+   */
+  public CompletableFuture<Void> cancelled() {
+    if (cancelledSignal == null) {
+      return new CompletableFuture<>();
+    }
+    return cancelledSignal.get().copy();
+  }
+
+  /**
    * Returns the number of seconds remaining until the deadline, or {@code null} if no deadline is
    * set.
    */
@@ -210,6 +291,9 @@ public final class CallContext {
     private String callId;
     private String sessionId;
     private String peer;
+    private String principal;
+    private int wireCallId;
+    private long dispatchCallId;
     private boolean irohAuthenticated;
     private Map<String, String> metadata = new HashMap<>();
     private Map<String, String> attributes = new HashMap<>();
@@ -222,6 +306,7 @@ public final class CallContext {
     private String relayUrl;
     private Duration rtt;
     private BooleanSupplier cancellation;
+    private Supplier<CompletableFuture<Void>> cancelledSignal;
 
     private Builder(String service, String method) {
       this.service = service;
@@ -240,6 +325,22 @@ public final class CallContext {
 
     public Builder peer(String peer) {
       this.peer = peer;
+      return this;
+    }
+
+    /** The verified principal; defaults to {@link #peer(String)}. */
+    public Builder principal(String principal) {
+      this.principal = principal;
+      return this;
+    }
+
+    public Builder wireCallId(int wireCallId) {
+      this.wireCallId = wireCallId;
+      return this;
+    }
+
+    public Builder dispatchCallId(long dispatchCallId) {
+      this.dispatchCallId = dispatchCallId;
       return this;
     }
 
@@ -310,6 +411,12 @@ public final class CallContext {
     /** Liveness probe behind {@link CallContext#isCancelled()}. */
     public Builder cancellation(BooleanSupplier cancellation) {
       this.cancellation = cancellation;
+      return this;
+    }
+
+    /** The signal behind {@link CallContext#cancelled()}; called lazily, once per access. */
+    public Builder cancelledSignal(Supplier<CompletableFuture<Void>> signal) {
+      this.cancelledSignal = signal;
       return this;
     }
 

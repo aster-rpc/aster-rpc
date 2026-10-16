@@ -42,6 +42,29 @@ public class RpcError extends RuntimeException {
     return Collections.unmodifiableMap(details);
   }
 
+  /**
+   * Whether a draining server answered this call ({@code UNAVAILABLE} with the {@code
+   * aster.draining} detail, ABI 7.2). Retrying on the same connection cannot succeed; connect to
+   * another replica.
+   */
+  public boolean isDraining() {
+    return code == StatusCode.UNAVAILABLE
+        && details.containsKey(site.aster.server.DrainReport.DRAINING_DETAIL_KEY);
+  }
+
+  /** Whether {@code t} is, or is caused by, a draining server's {@link RpcError}. */
+  public static boolean isDraining(Throwable t) {
+    for (Throwable c = t; c != null; c = c.getCause()) {
+      if (c instanceof RpcError e && e.isDraining()) {
+        return true;
+      }
+      if (c.getCause() == c) {
+        break;
+      }
+    }
+    return false;
+  }
+
   @Override
   public String toString() {
     return "RpcError(code=" + code + ", message=" + rpcMessage + ", details=" + details + ")";

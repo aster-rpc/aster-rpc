@@ -226,7 +226,7 @@ public final class BlobCustody implements AutoCloseable {
                 DataPlane.utf8List(a, providers),
                 code,
                 strategy.code,
-                toStore ? DataPlane.FETCH_TO_STORE : 0,
+                DataPlane.FETCH_REPORT_V2 | (toStore ? DataPlane.FETCH_TO_STORE : 0),
                 0L,
                 o),
         e -> {

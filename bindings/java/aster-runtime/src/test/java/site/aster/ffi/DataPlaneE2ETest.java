@@ -88,9 +88,44 @@ final class DataPlaneE2ETest {
     assertEquals("0a".repeat(32), o.nodeId());
     assertEquals(3, o.attempts());
     assertTrue(o.failed() && o.served());
-    p[0] = 2;
+    p[0] = 3;
+    assertThrows(IllegalArgumentException.class, () -> FetchReport.parse(p));
+    p[0] = 2; // a v2 header over a v1-sized record is truncated
     assertThrows(IllegalArgumentException.class, () -> FetchReport.parse(p));
     assertThrows(IllegalArgumentException.class, () -> FetchReport.parse(new byte[4]));
+  }
+
+  @Test
+  void fetchReportV2ParsesPerProviderCounters() {
+    java.nio.ByteBuffer b =
+        java.nio.ByteBuffer.allocate(16 + 72 * 2 + 2).order(java.nio.ByteOrder.LITTLE_ENDIAN);
+    b.put((byte) 2).put(new byte[3]).putInt(2).putLong(1000);
+    for (int i = 0; i < 2; i++) {
+      byte[] id = new byte[32];
+      Arrays.fill(id, (byte) (0x10 + i));
+      b.put(id);
+      b.putInt(2).putInt(i).putInt(1); // attempts, failures, completed
+      b.putInt(i).putInt(1 - i); // in_flight, plain_fallbacks
+      b.putInt(i == 0 ? 1 : 0); // flags: HAS_WIRE_BYTES on the first
+      b.putLong(600 - 200L * i).putLong(i == 0 ? 450 : 0);
+    }
+    b.put((byte) 'o').put((byte) 'k');
+    FetchResult r = FetchResult.parse(b.array());
+    assertArrayEquals("ok".getBytes(StandardCharsets.UTF_8), r.data());
+    FetchReport rep = r.report();
+    assertEquals(1000, rep.bytesTransferred());
+    var first = rep.providers().get(0);
+    var second = rep.providers().get(1);
+    assertEquals("10".repeat(32), first.nodeId());
+    assertEquals(0, first.inFlight());
+    assertEquals(1, first.plainFallbacks());
+    assertEquals(600, first.bytesTransferred());
+    assertEquals(450L, first.wireBytes());
+    assertEquals(1, second.inFlight());
+    assertEquals(400, second.bytesTransferred());
+    assertEquals(null, second.wireBytes());
+    assertEquals(List.of("11".repeat(32)), rep.inFlight());
+    assertEquals(List.of("10".repeat(32)), rep.plainOnly());
   }
 
   @Test
@@ -121,6 +156,12 @@ final class DataPlaneE2ETest {
       assertEquals(List.of(dead), r.report().failed());
       assertEquals(List.of(pid), r.report().served());
       assertTrue(r.report().bytesTransferred() >= big.length);
+      // Fetch report v2 (ABI 7.4): per-provider payload bytes.
+      var served = r.report().providers().get(1);
+      assertEquals(pid, served.nodeId());
+      assertTrue(served.bytesTransferred() >= big.length, served.toString());
+      assertEquals(0, served.inFlight());
+      assertEquals(0, r.report().providers().get(0).bytesTransferred());
 
       FetchResult stored =
           await(

@@ -4,12 +4,14 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.ServiceLoader;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -96,6 +98,7 @@ public final class AsterServer implements AutoCloseable {
   private final AsterConfig config;
   private final List<ServiceDescriptor> manifest;
   private final AtomicBoolean running = new AtomicBoolean(true);
+  private final AtomicBoolean draining = new AtomicBoolean(false);
   private final Thread pollThread;
   private final ExecutorService callExecutor;
   private final ExecutorService streamingExecutor;
@@ -137,6 +140,9 @@ public final class AsterServer implements AutoCloseable {
    * merged into every {@link CallContext#attributes()} for calls from that peer.
    */
   private final Map<String, Map<String, String>> peerAttributes = new ConcurrentHashMap<>();
+
+  /** Live calls whose handler asked {@link CallContext#cancelled()}: completed on CANCELLED. */
+  private final Map<Long, CompletableFuture<Void>> cancelSignals = new ConcurrentHashMap<>();
 
   private AsterServer(
       Builder b,
@@ -365,6 +371,52 @@ public final class AsterServer implements AutoCloseable {
     return dispatch.startPublicHttp(config);
   }
 
+  /**
+   * Take the server out of rotation, then close it (ABI 7.2, {@code aster::AsterServer::drain}):
+   *
+   * <ol>
+   *   <li>an attached health listener reports not ready;
+   *   <li>new connections are closed right after their handshake with {@link
+   *       DrainReport#DRAIN_CLOSE_CODE}, and new calls answer {@code UNAVAILABLE} with the {@code
+   *       aster.draining} detail ({@link RpcError#isDraining()}); calls on a session that already
+   *       exists still run;
+   *   <li>each connection is closed once it has no call in flight and no live session;
+   *   <li>calls still running at {@code grace} are cancelled by closing their connection (handlers
+   *       see {@link CallContext#isCancelled()}), and the drain waits up to 2 s for them to end.
+   * </ol>
+   *
+   * <p>Blocks until done. A concurrent {@code drain} with a shorter grace cuts a running one short
+   * ({@link Duration#ZERO} ends it now) and returns the same report. The server is closed whatever
+   * happens.
+   *
+   * @throws IllegalArgumentException if {@code grace} is negative
+   * @throws IrohException {@code ALREADY_CLOSED} if the server is closed
+   */
+  public DrainReport drain(Duration grace) {
+    Objects.requireNonNull(grace, "grace");
+    if (grace.isNegative()) {
+      throw new IllegalArgumentException("drain grace must be nonnegative");
+    }
+    if (!running.get()) {
+      throw IrohException.forStatus(site.aster.ffi.IrohStatus.ALREADY_CLOSED, "server closed");
+    }
+    draining.set(true);
+    long ms =
+        grace.compareTo(Duration.ofMillis(0xFFFF_FFFFL)) >= 0
+            ? 0xFFFF_FFFFL
+            : grace.toMillis() + (grace.toNanosPart() % 1_000_000 != 0 ? 1 : 0);
+    try {
+      return dispatch.drain(ms);
+    } finally {
+      close();
+    }
+  }
+
+  /** Whether {@link #drain} has started on this server. */
+  public boolean isDraining() {
+    return draining.get();
+  }
+
   @Override
   public void close() {
     if (!running.compareAndSet(true, false)) {
@@ -411,7 +463,10 @@ public final class AsterServer implements AutoCloseable {
       int sessionId,
       byte[] request,
       String peer,
-      long connectionHandle) {}
+      String transportPeer,
+      int wireCallId,
+      long connectionHandle,
+      java.util.concurrent.atomic.AtomicBoolean over) {}
 
   private void pollLoop() {
     long size = Dispatch.EVENT_LAYOUT.byteSize();
@@ -440,7 +495,12 @@ public final class AsterServer implements AutoCloseable {
               kind, ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CALL_ID));
       case Dispatch.EVENT_CANCELLED -> {
         // Rust already answered (deadline / corrupt request) or there is nobody to answer (peer
-        // cancel); handlers see it through isCancelled() and GONE results.
+        // cancel); handlers see it through isCancelled(), cancelled() and GONE results.
+        CompletableFuture<Void> signal =
+            cancelSignals.remove(ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CALL_ID));
+        if (signal != null) {
+          signal.complete(null);
+        }
       }
       case Dispatch.EVENT_SESSION_CLOSED -> {
         long key = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_SESSION_KEY);
@@ -472,11 +532,21 @@ public final class AsterServer implements AutoCloseable {
     long connectionId = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CONNECTION_ID);
     long connectionHandle = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_CONNECTION_HANDLE);
     long deadline = ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_DEADLINE_UNIX_MS);
+    int wireCallId = ev.get(ValueLayout.JAVA_INT, Dispatch.OFFSET_WIRE_CALL_ID);
     byte[] request = bytes(ev, Dispatch.OFFSET_REQUEST_PTR, Dispatch.OFFSET_REQUEST_LEN);
+    // peer_ptr is the principal (ABI 7.5); with HAS_PRINCIPAL the transport peer differs and is
+    // read now, while the call is live (NOT_FOUND = already over: fall back to the principal).
     String peer =
         new String(
             bytes(ev, Dispatch.OFFSET_PEER_PTR, Dispatch.OFFSET_PEER_LEN), StandardCharsets.UTF_8);
     dispatch.bufferRelease(ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_BUFFER));
+    String transportPeer = peer;
+    if ((flags & Dispatch.FLAG_HAS_PRINCIPAL) != 0) {
+      Dispatch.Identity identity = dispatch.identity(callId);
+      if (identity != null && !identity.peer().isEmpty()) {
+        transportPeer = identity.peer();
+      }
+    }
 
     RegisteredService svc = serviceIdx < byIndex.length ? byIndex[serviceIdx] : null;
     if (svc == null || methodIdx < 0 || methodIdx >= svc.methods.length) {
@@ -503,7 +573,10 @@ public final class AsterServer implements AutoCloseable {
             sessionId,
             request,
             peer,
-            connectionHandle);
+            transportPeer,
+            wireCallId,
+            connectionHandle,
+            new AtomicBoolean());
     callExecutor.execute(() -> dispatchCall(call));
   }
 
@@ -561,11 +634,35 @@ public final class AsterServer implements AutoCloseable {
       }
       Tracing.runIn(trace, () -> runDispatch(call, method, ctx, probeT2, probeT3));
     } catch (Throwable t) {
+      call.over().set(true);
+      cancelSignals.remove(callId);
       failWith(callId, t);
     }
   }
 
+  /** The signal behind {@link CallContext#cancelled()} for a live call. */
+  private CompletableFuture<Void> cancelSignal(long callId) {
+    CompletableFuture<Void> signal =
+        cancelSignals.computeIfAbsent(callId, id -> new CompletableFuture<>());
+    // The CANCELLED event may have been handled before the signal existed.
+    if (!signal.isDone() && dispatch.isCancelled(callId)) {
+      cancelSignals.remove(callId);
+      signal.complete(null);
+    }
+    return signal;
+  }
+
   private void runDispatch(
+      Inbound call, MethodDispatcher method, CallContext ctx, long probeT2, long probeT3) {
+    try {
+      CallContext.runScoped(ctx, () -> runHandler(call, method, ctx, probeT2, probeT3));
+    } finally {
+      call.over().set(true);
+      cancelSignals.remove(call.callId());
+    }
+  }
+
+  private void runHandler(
       Inbound call, MethodDispatcher method, CallContext ctx, long probeT2, long probeT3) {
     long callId = call.callId();
     Object instance = call.instance();
@@ -620,7 +717,9 @@ public final class AsterServer implements AutoCloseable {
             : new HashMap<>();
     Map<String, String> attributes = new HashMap<>();
     Map<String, String> peerAttrs =
-        (flags & Dispatch.FLAG_IROH_AUTHENTICATED) != 0 ? peerAttributes.get(call.peer()) : null;
+        (flags & Dispatch.FLAG_IROH_AUTHENTICATED) != 0
+            ? peerAttributes.get(call.transportPeer())
+            : null;
     if (peerAttrs != null) {
       attributes.putAll(peerAttrs);
       // Roles are Rust's to decide (an enrolled peer's come from its credential).
@@ -648,7 +747,11 @@ public final class AsterServer implements AutoCloseable {
     }
     var d = method.descriptor();
     return CallContext.builder(call.service().descriptor.name(), d.name())
-        .peer(call.peer())
+        .callId(Integer.toString(call.wireCallId()))
+        .wireCallId(call.wireCallId())
+        .dispatchCallId(callId)
+        .peer(call.transportPeer())
+        .principal(call.peer())
         .irohAuthenticated((flags & Dispatch.FLAG_IROH_AUTHENTICATED) != 0)
         .metadata(metadata)
         .attributes(attributes)
@@ -661,6 +764,9 @@ public final class AsterServer implements AutoCloseable {
         .relayUrl(relayUrl)
         .rtt(rtt)
         .cancellation(() -> dispatch.isCancelled(callId))
+        // A call that ended normally never reports cancelled (Rust CallContext::cancelled).
+        .cancelledSignal(
+            () -> call.over().get() ? new CompletableFuture<Void>() : cancelSignal(callId))
         .build();
   }
 

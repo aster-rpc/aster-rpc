@@ -887,6 +887,40 @@ public class IrohBlobs {
     return new BlobInfo(id, localBytes, isComplete == 1 ? BlobStatus.COMPLETE : BlobStatus.PARTIAL);
   }
 
+  // ── ABI 7.4 transfer metrics ────────────────────────────────────────────
+
+  /**
+   * The node's blob transfer counters since it started ({@code aster::Blobs::transfer_stats},
+   * {@code aster_blobs_transfer_stats}): every fetch and serve, plain and zstd. Synchronous.
+   */
+  public BlobTransferStats transferStats() {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment out = arena.allocate(BlobTransferStats.SIZE, 8);
+      out.set(ValueLayout.JAVA_INT, 0, (int) BlobTransferStats.SIZE);
+      int status =
+          (int)
+              IrohLibrary.getInstance()
+                  .getHandle(
+                      "aster_blobs_transfer_stats",
+                      java.lang.foreign.FunctionDescriptor.of(
+                          ValueLayout.JAVA_INT,
+                          ValueLayout.JAVA_LONG,
+                          ValueLayout.JAVA_LONG,
+                          ValueLayout.ADDRESS))
+                  .invoke(runtime.nativeHandle(), nodeHandle, out);
+      if (status != 0) {
+        throw IrohException.forStatus(
+            IrohStatus.fromCode(status),
+            "aster_blobs_transfer_stats failed: " + site.aster.ffi.NativeConfig.lastError());
+      }
+      return BlobTransferStats.fromNative(out);
+    } catch (RuntimeException | Error e) {
+      throw e;
+    } catch (Throwable t) {
+      throw new IrohException("aster_blobs_transfer_stats: " + t);
+    }
+  }
+
   // ── ABI 3.3 data plane ──────────────────────────────────────────────────
 
   /**
@@ -910,7 +944,7 @@ public class IrohBlobs {
             providers,
             format.code,
             strategy.code,
-            toStore ? DataPlane.FETCH_TO_STORE : 0)
+            DataPlane.FETCH_REPORT_V2 | (toStore ? DataPlane.FETCH_TO_STORE : 0))
         .thenApply(
             r -> {
               if (r.event().kind() != IrohEventKind.BLOB_FETCHED) {

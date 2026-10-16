@@ -173,6 +173,72 @@ public final class TopologyTest {
   }
 
   @Test
+  void peerParserReadsQuicTrafficAndBlobTransfer() throws Exception {
+    var value =
+        Topology.JSON.readTree(
+            """
+      {"node_id":"id","level":0,"level_reason":"t","rtt_us":null,"jitter_us":null,"loss_ppm":0,
+       "throughput_bps":0,"cwnd_ceiling_bps":0,"direct":true,"relay_url":null,"remote_addr":null,
+       "congestion_events":0,"samples":0,"confidence_ppm":0,"last_measured_unix_ms":0,
+       "cluster_held_since_unix_ms":0,"is_connected":true,
+       "quic_traffic":{"blobs":{"quic_bytes_sent":10,"quic_bytes_received":20},
+                       "rpc":{"quic_bytes_sent":4294967296,"quic_bytes_received":0}},
+       "blob_transfer":{"fetched_payload_bytes":1,"fetched_zstd_payload_bytes":2,
+         "fetched_wire_bytes":3,"fetched_plain_bytes":4,"served_payload_bytes":5,
+         "served_zstd_payload_bytes":6,"served_wire_bytes":7,"served_plain_bytes":8,
+         "plain_fallbacks":9}}
+      """);
+    var peer = Topology.peer(value);
+    assertEquals(new Topology.QuicBytes(10, 20), peer.quicTraffic("blobs"));
+    assertEquals(4294967296L, peer.quicTraffic("rpc").quicBytesSent());
+    assertEquals(Topology.QuicBytes.ZERO, peer.quicTraffic("gossip"));
+    assertEquals(new Topology.PeerBlobStats(1, 2, 3, 4, 5, 6, 7, 8, 9), peer.blobTransfer());
+    // A 7.3-shaped peer (no traffic keys) still parses, with zeros.
+    ((com.fasterxml.jackson.databind.node.ObjectNode) value).remove("quic_traffic");
+    ((com.fasterxml.jackson.databind.node.ObjectNode) value).remove("blob_transfer");
+    var old = Topology.peer(value);
+    assertTrue(old.quicTraffic().isEmpty());
+    assertEquals(Topology.PeerBlobStats.ZERO, old.blobTransfer());
+  }
+
+  @Test
+  void peerViewCountsBlobTrafficOfARealFetch() throws Exception {
+    var a = node(true);
+    var b = node(true);
+    try (var ar = a.runtime();
+        var br = b.runtime();
+        a;
+        b) {
+      until(
+          () ->
+              !a.nodeAddr().directAddresses().isEmpty()
+                  && !b.nodeAddr().directAddresses().isEmpty());
+      add(a, b);
+      byte[] data = new byte[64 * 1024];
+      new java.util.Random(7).nextBytes(data);
+      var hash = b.blobs().addBytesAsync(data).get(20, TimeUnit.SECONDS);
+      var fetched =
+          a.blobs().downloadHashFromAsync(hash, List.of(b.nodeId())).get(30, TimeUnit.SECONDS);
+      assertArrayEquals(data, fetched.data());
+      String bid = b.nodeId();
+      until(
+          () ->
+              a.topology()
+                  .peer(bid)
+                  .map(p -> p.blobTransfer().fetchedPayloadBytes() >= data.length)
+                  .orElse(false));
+      var peer = a.topology().peer(bid).orElseThrow();
+      long received =
+          peer.quicTraffic("blobs").quicBytesReceived()
+              + peer.quicTraffic("blobs-zstd").quicBytesReceived();
+      assertTrue(received > 0, peer.quicTraffic().toString());
+      var stats = a.blobs().transferStats();
+      assertTrue(stats.fetchedPayloadBytes() >= data.length, stats.toString());
+      assertTrue(b.blobs().transferStats().servedPayloadBytes() >= data.length);
+    }
+  }
+
+  @Test
   void optionalTimingPreservesZeroAndRejectsOverflow() {
     assertDoesNotThrow(() -> new Topology.Timing(Duration.ZERO, null, null, null, 0L, 0L));
     assertThrows(

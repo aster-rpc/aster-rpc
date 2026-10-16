@@ -127,7 +127,10 @@ public enum IrohEventKind {
   RAW_WT_DATAGRAM(124),
   RAW_WT_CLOSED(125),
   RAW_WT_ACKED(126),
-  ENROLLMENT_RESULT(127);
+  ENROLLMENT_RESULT(127),
+
+  // Audit outbox acknowledgement log (ABI 7.1)
+  AUDIT_OUTBOX_ACKNOWLEDGEMENTS(128);
 
   public final int code;
 

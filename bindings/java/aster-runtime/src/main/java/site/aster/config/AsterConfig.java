@@ -92,6 +92,19 @@ public final class AsterConfig {
   private boolean localDiscovery;
   private Boolean reuseLastPort;
 
+  // ── Cluster network settings (C ABI 7.3, [network]) ────────────────────
+  private String bindAddrV6;
+  private List<String> advertiseAddrs = List.of();
+  private List<String> relayCaCerts = List.of();
+  private boolean relayCaOnly;
+  private String discovery = DISCOVERY_DEFAULT;
+  private String discoveryDnsOrigin;
+  private List<String> discoveryPkarrRelays = List.of();
+
+  // ── Metrics (C ABI 7.4, [metrics]) ─────────────────────────────────────
+  private boolean metricsPeerLabels;
+  private int metricsPeerLabelCap = METRICS_PEER_LABEL_CAP_DEFAULT;
+
   // ── Blob transport ([storage] blob_zstd_level) ─────────────────────────
   private Integer blobZstdLevel;
 
@@ -107,6 +120,21 @@ public final class AsterConfig {
 
   // ── Identity ───────────────────────────────────────────────────────────
   private String identityFile;
+
+  /** {@link #discovery()}: n0 pkarr and DNS at {@code iroh.link} (custom servers select custom). */
+  public static final String DISCOVERY_DEFAULT = "default";
+
+  /** {@link #discovery()}: no address lookup; dial peers by full address. */
+  public static final String DISCOVERY_NONE = "none";
+
+  /** {@link #discovery()}: local-network mDNS only. */
+  public static final String DISCOVERY_LOCAL = "local";
+
+  /** {@link #discovery()}: only {@link #discoveryDnsOrigin()} / {@link #discoveryPkarrRelays()}. */
+  public static final String DISCOVERY_CUSTOM = "custom";
+
+  /** {@code ASTER_METRICS_PEER_LABEL_CAP_DEFAULT}: what {@link #metricsPeerLabelCap()} 0 means. */
+  public static final int METRICS_PEER_LABEL_CAP_DEFAULT = 64;
 
   private AsterConfig() {}
 
@@ -281,6 +309,98 @@ public final class AsterConfig {
    */
   public Boolean reuseLastPort() {
     return reuseLastPort;
+  }
+
+  // ── Cluster network settings (C ABI 7.3) ───────────────────────────────
+
+  /**
+   * IPv6 bind address, e.g. {@code [::]:7842}: pins the IPv6 UDP port as {@link #bindAddr()} pins
+   * the IPv4 one. Env {@code ASTER_BIND_ADDR_V6}; TOML {@code [network] bind_addr_v6}.
+   */
+  public String bindAddrV6() {
+    return bindAddrV6;
+  }
+
+  /**
+   * Extra direct addresses ({@code IP:port}) to advertise, e.g. a NodePort. Hints only: peers still
+   * verify the node key. Env {@code ASTER_ADVERTISE_ADDRS} (comma-separated); TOML {@code [network]
+   * advertise_addrs}.
+   */
+  public List<String> advertiseAddrs() {
+    return advertiseAddrs;
+  }
+
+  /**
+   * PEM files with CA certificates trusted for relay TLS, in addition to the WebPKI roots. Env
+   * {@code ASTER_RELAY_CA_CERTS}; TOML {@code [network] relay_ca_certs}.
+   */
+  public List<String> relayCaCerts() {
+    return relayCaCerts;
+  }
+
+  /**
+   * Trust only {@link #relayCaCerts()} for relay TLS, not the WebPKI roots. Env {@code
+   * ASTER_RELAY_CA_ONLY}; TOML {@code [network] relay_ca_only}.
+   */
+  public boolean relayCaOnly() {
+    return relayCaOnly;
+  }
+
+  /**
+   * How the node publishes its addresses and finds peers by bare node id: {@link
+   * #DISCOVERY_DEFAULT}, {@link #DISCOVERY_NONE}, {@link #DISCOVERY_LOCAL} or {@link
+   * #DISCOVERY_CUSTOM}. Env {@code ASTER_DISCOVERY}; TOML {@code [network] discovery}.
+   */
+  public String discovery() {
+    return discovery;
+  }
+
+  /**
+   * DNS origin for custom discovery, e.g. {@code dns.example.internal}. Env {@code
+   * ASTER_DISCOVERY_DNS_ORIGIN}; TOML {@code [network] discovery_dns_origin}.
+   */
+  public String discoveryDnsOrigin() {
+    return discoveryDnsOrigin;
+  }
+
+  /**
+   * Pkarr relay URLs for custom discovery. Env {@code ASTER_DISCOVERY_PKARR_RELAYS}; TOML {@code
+   * [network] discovery_pkarr_relays}.
+   */
+  public List<String> discoveryPkarrRelays() {
+    return discoveryPkarrRelays;
+  }
+
+  /** Whether any cluster network setting differs from its default. */
+  public boolean hasNetworkSettings() {
+    String d = discovery == null ? "" : discovery.trim().toLowerCase(java.util.Locale.ROOT);
+    return (bindAddrV6 != null && !bindAddrV6.isEmpty())
+        || !advertiseAddrs.isEmpty()
+        || !relayCaCerts.isEmpty()
+        || relayCaOnly
+        || (!d.isEmpty() && !d.equals(DISCOVERY_DEFAULT))
+        || (discoveryDnsOrigin != null && !discoveryDnsOrigin.isEmpty())
+        || !discoveryPkarrRelays.isEmpty();
+  }
+
+  // ── Metrics (C ABI 7.4) ────────────────────────────────────────────────
+
+  /**
+   * Label {@code aster.peer.bytes} per peer ({@code aster.peer}) instead of by locality level: the
+   * first {@link #metricsPeerLabelCap()} peers seen get their own series, later ones count under
+   * {@code _OTHER}. Env {@code ASTER_METRICS_PEER_LABELS}; TOML {@code [metrics] peer_labels}.
+   */
+  public boolean metricsPeerLabels() {
+    return metricsPeerLabels;
+  }
+
+  /**
+   * How many peers get their own {@code aster.peer} series (default {@value
+   * #METRICS_PEER_LABEL_CAP_DEFAULT}). Env {@code ASTER_METRICS_PEER_LABEL_CAP}; TOML {@code
+   * [metrics] peer_label_cap}.
+   */
+  public int metricsPeerLabelCap() {
+    return metricsPeerLabelCap;
   }
 
   public String proxyUrl() {
@@ -561,6 +681,74 @@ public final class AsterConfig {
      */
     public Builder reuseLastPort(Boolean v) {
       c.reuseLastPort = v;
+      return this;
+    }
+
+    /** See {@link AsterConfig#bindAddrV6()}. */
+    public Builder bindAddrV6(String addr) {
+      c.bindAddrV6 = addr;
+      return this;
+    }
+
+    /** See {@link AsterConfig#advertiseAddrs()}. */
+    public Builder advertiseAddrs(List<String> addrs) {
+      c.advertiseAddrs = addrs == null ? List.of() : List.copyOf(addrs);
+      return this;
+    }
+
+    /** See {@link AsterConfig#relayCaCerts()}. */
+    public Builder relayCaCerts(List<String> pemPaths) {
+      c.relayCaCerts = pemPaths == null ? List.of() : List.copyOf(pemPaths);
+      return this;
+    }
+
+    /** See {@link AsterConfig#relayCaOnly()}. */
+    public Builder relayCaOnly(boolean v) {
+      c.relayCaOnly = v;
+      return this;
+    }
+
+    /**
+     * See {@link AsterConfig#discovery()}; {@code null} = default.
+     *
+     * @throws IllegalArgumentException for a value other than default / none / local / custom
+     */
+    public Builder discovery(String mode) {
+      String m = mode == null ? "" : mode.trim().toLowerCase(java.util.Locale.ROOT);
+      switch (m) {
+        case "", DISCOVERY_DEFAULT -> c.discovery = DISCOVERY_DEFAULT;
+        case DISCOVERY_NONE, DISCOVERY_LOCAL, DISCOVERY_CUSTOM -> c.discovery = m;
+        default ->
+            throw new IllegalArgumentException(
+                "discovery " + mode + ": want default, none, local or custom");
+      }
+      return this;
+    }
+
+    /** See {@link AsterConfig#discoveryDnsOrigin()}. */
+    public Builder discoveryDnsOrigin(String origin) {
+      c.discoveryDnsOrigin = origin;
+      return this;
+    }
+
+    /** See {@link AsterConfig#discoveryPkarrRelays()}. */
+    public Builder discoveryPkarrRelays(List<String> urls) {
+      c.discoveryPkarrRelays = urls == null ? List.of() : List.copyOf(urls);
+      return this;
+    }
+
+    /** See {@link AsterConfig#metricsPeerLabels()}. */
+    public Builder metricsPeerLabels(boolean v) {
+      c.metricsPeerLabels = v;
+      return this;
+    }
+
+    /** See {@link AsterConfig#metricsPeerLabelCap()}; {@code 0} = the default. */
+    public Builder metricsPeerLabelCap(int cap) {
+      if (cap < 0) {
+        throw new IllegalArgumentException("metricsPeerLabelCap must be nonnegative");
+      }
+      c.metricsPeerLabelCap = cap == 0 ? METRICS_PEER_LABEL_CAP_DEFAULT : cap;
       return this;
     }
 

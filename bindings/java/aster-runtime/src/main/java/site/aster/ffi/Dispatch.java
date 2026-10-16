@@ -112,6 +112,53 @@ public final class Dispatch implements AutoCloseable {
   /** The caller sent {@code baggage} / {@code tracestate}: read them with {@link #inboundTrace}. */
   public static final int FLAG_HAS_INBOUND_TRACE = 0x800;
 
+  /**
+   * ABI 7.5: an {@code Authenticator} resolved a principal other than the transport peer id. {@code
+   * peer_ptr} is then that principal; the transport peer comes from {@link #identity}. Clear:
+   * {@code peer_ptr} is both.
+   */
+  public static final int FLAG_HAS_PRINCIPAL = 0x1000;
+
+  // ── aster_dispatch_identity_t (64 bytes, ABI 7.5) ───────────────────────
+
+  public static final MemoryLayout IDENTITY_LAYOUT =
+      MemoryLayout.structLayout(
+          ValueLayout.JAVA_INT.withName("struct_size"), //               0
+          ValueLayout.JAVA_INT.withName("flags"), //                     4
+          ValueLayout.ADDRESS.withName("peer_ptr"), //                   8
+          ValueLayout.JAVA_INT.withName("peer_len"), //                 16
+          MemoryLayout.paddingLayout(4), //                             20
+          ValueLayout.ADDRESS.withName("principal_ptr"), //             24
+          ValueLayout.JAVA_INT.withName("principal_len"), //            32
+          MemoryLayout.paddingLayout(4), //                             36
+          ValueLayout.ADDRESS.withName("actor_ptr"), //                 40
+          ValueLayout.JAVA_INT.withName("actor_len"), //                48
+          ValueLayout.JAVA_INT.withName("reserved"), //                 52
+          ValueLayout.JAVA_LONG.withName("buffer") //                   56
+          );
+
+  // ── aster_drain_report_t (64 bytes, ABI 7.2) ────────────────────────────
+
+  public static final MemoryLayout DRAIN_REPORT_LAYOUT =
+      MemoryLayout.structLayout(
+          ValueLayout.JAVA_LONG.withName("calls_in_flight"), //          0
+          ValueLayout.JAVA_LONG.withName("calls_completed"), //          8
+          ValueLayout.JAVA_LONG.withName("calls_cancelled"), //         16
+          ValueLayout.JAVA_LONG.withName("calls_refused"), //           24
+          ValueLayout.JAVA_LONG.withName("connections_closed"), //      32
+          ValueLayout.JAVA_LONG.withName("connections_refused"), //     40
+          ValueLayout.JAVA_LONG.withName("elapsed_ms"), //              48
+          ValueLayout.JAVA_INT.withName("deadline_reached"), //         56
+          ValueLayout.JAVA_INT.withName("reserved") //                  60
+          );
+
+  /**
+   * Who a live call is from (ABI 7.5): {@code peer} is the transport id (64-hex node id over iroh,
+   * the remote address over HTTP / WebTransport); {@code principal} the {@code Authenticator}'s
+   * principal, else the same as {@code peer}.
+   */
+  public record Identity(String peer, String principal) {}
+
   /** {@code aster_server_option_t}. */
   public static final int OPTION_BUILTIN_NODE_INFO = 1;
 
@@ -206,6 +253,10 @@ public final class Dispatch implements AutoCloseable {
           FunctionDescriptor.of(I32, I64, I64, IrohLibrary.ASTER_BYTES, IrohLibrary.ASTER_BYTES));
   private static final MethodHandle ATTACH_HEALTH =
       h("aster_server_attach_health", FunctionDescriptor.of(I32, I64, I64));
+  private static final MethodHandle IDENTITY =
+      h("aster_dispatch_identity", FunctionDescriptor.of(I32, I64, I64, I64, PTR));
+  private static final MethodHandle DRAIN =
+      h("aster_server_drain", FunctionDescriptor.of(I32, I64, I64, I32, PTR));
 
   // ── builder ──────────────────────────────────────────────────────────────
 
@@ -577,6 +628,59 @@ public final class Dispatch implements AutoCloseable {
    */
   public Map<String, String> inboundTrace(long callId) {
     return kvOut(INBOUND_TRACE, callId, "aster_dispatch_inbound_trace");
+  }
+
+  /**
+   * The transport peer and principal of a live call (ABI 7.5; only needed with {@link
+   * #FLAG_HAS_PRINCIPAL}). {@code null} once the call is over ({@code NOT_FOUND}).
+   */
+  public Identity identity(long callId) {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment out = arena.allocate(IDENTITY_LAYOUT);
+      out.set(I32, 0, (int) IDENTITY_LAYOUT.byteSize());
+      int status = (int) IDENTITY.invoke(runtimeHandle, handle, callId, out);
+      if (status == IrohStatus.NOT_FOUND.code) {
+        return null;
+      }
+      check(status, "aster_dispatch_identity");
+      String peer = utf8(out.get(PTR, 8), out.get(I32, 16));
+      String principal = utf8(out.get(PTR, 24), out.get(I32, 32));
+      bufferRelease(out.get(I64, 56));
+      return new Identity(peer, principal.isEmpty() ? peer : principal);
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  private static String utf8(MemorySegment ptr, int len) {
+    if (len == 0 || ptr.equals(MemorySegment.NULL)) {
+      return "";
+    }
+    return new String(ptr.reinterpret(len).toArray(U8), StandardCharsets.UTF_8);
+  }
+
+  /**
+   * {@code aster_server_drain} (ABI 7.2): blocks until the drain ends (see {@link
+   * site.aster.server.AsterServer#drain}). A concurrent call with a shorter grace cuts a running
+   * drain short and returns the same report. Must not run on a tokio thread.
+   */
+  public site.aster.server.DrainReport drain(long graceMs) {
+    int grace = (int) Math.min(Math.max(graceMs, 0L), 0xFFFF_FFFFL);
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment out = arena.allocate(DRAIN_REPORT_LAYOUT);
+      check((int) DRAIN.invoke(runtimeHandle, handle, grace, out), "aster_server_drain");
+      return new site.aster.server.DrainReport(
+          out.get(I64, 0),
+          out.get(I64, 8),
+          out.get(I64, 16),
+          out.get(I64, 24),
+          out.get(I64, 32),
+          out.get(I64, 40),
+          out.get(I32, 56) != 0,
+          java.time.Duration.ofMillis(out.get(I64, 48)));
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
   }
 
   private Map<String, String> kvOut(MethodHandle fn, long callId, String op) {

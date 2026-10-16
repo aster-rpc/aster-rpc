@@ -25,6 +25,7 @@ final class AuditNative {
   static final MethodHandle QUARANTINE = json("quarantine");
   static final MethodHandle EXPORT = json("export");
   static final MethodHandle REPLAY = json("replay");
+  static final MethodHandle ACKNOWLEDGEMENTS = json("acknowledgements");
   static final MethodHandle STATUS = h("status", FunctionDescriptor.of(I, J, J, J, A));
   static final MethodHandle CLOSE = h("close", FunctionDescriptor.of(I, J, J, J, A));
   static final MethodHandle FLUSH = h("flush", FunctionDescriptor.of(I, J, J, J, J, A));

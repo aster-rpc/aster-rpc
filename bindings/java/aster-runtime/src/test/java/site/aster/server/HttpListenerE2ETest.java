@@ -373,7 +373,10 @@ final class HttpListenerE2ETest {
           Msg result = (Msg) f.codec.decode(reply.payloads().getFirst(), Msg.class);
           assertEquals("admin", result.text());
           CallContext ctx = f.calls.getLast();
-          assertEquals(principal, ctx.peer());
+          // ABI 7.5: the Authenticator's principal, apart from the transport peer (the address).
+          assertEquals(principal, ctx.principal());
+          assertNotEquals(principal, ctx.peer());
+          assertTrue(ctx.peer().contains(":"), ctx.peer());
           assertFalse(ctx.irohAuthenticated());
           assertEquals(
               Map.of("aster.role", "admin", "tenant", principal.equals("alice") ? "a" : "b"),

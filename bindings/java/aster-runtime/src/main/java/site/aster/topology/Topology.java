@@ -66,7 +66,48 @@ public final class Topology {
       long confidencePpm,
       BigInteger lastMeasuredUnixMs,
       BigInteger clusterHeldSinceUnixMs,
-      boolean isConnected) {}
+      boolean isConnected,
+      Map<String, QuicBytes> quicTraffic,
+      PeerBlobStats blobTransfer) {
+    public PeerView {
+      quicTraffic = Map.copyOf(quicTraffic);
+    }
+
+    /**
+     * QUIC bytes exchanged with the peer for one protocol family ({@code blobs}, {@code rpc}, …).
+     */
+    public QuicBytes quicTraffic(String family) {
+      return quicTraffic.getOrDefault(family, QuicBytes.ZERO);
+    }
+  }
+
+  /**
+   * Protocol families of {@link PeerView#quicTraffic()} ({@code aster::topology::ProtocolFamily}).
+   */
+  public static final List<String> PROTOCOL_FAMILIES =
+      List.of("blobs", "blobs-zstd", "docs", "gossip", "rpc", "other");
+
+  /** QUIC stream bytes sent to / received from a peer (C ABI 7.4, {@code QuicBytes}). */
+  public record QuicBytes(long quicBytesSent, long quicBytesReceived) {
+    public static final QuicBytes ZERO = new QuicBytes(0, 0);
+  }
+
+  /**
+   * Exact blob payload bytes exchanged with a peer (C ABI 7.4, {@code aster::topology::
+   * PeerBlobStats}); same meanings as {@code BlobTransferStats}, per peer.
+   */
+  public record PeerBlobStats(
+      long fetchedPayloadBytes,
+      long fetchedZstdPayloadBytes,
+      long fetchedWireBytes,
+      long fetchedPlainBytes,
+      long servedPayloadBytes,
+      long servedZstdPayloadBytes,
+      long servedWireBytes,
+      long servedPlainBytes,
+      long plainFallbacks) {
+    public static final PeerBlobStats ZERO = new PeerBlobStats(0, 0, 0, 0, 0, 0, 0, 0, 0);
+  }
 
   /** Members and witnesses are immutable, with native ordering preserved. */
   public record ClusterView(List<String> members, String bridge, List<String> witnesses) {
@@ -320,7 +361,42 @@ public final class Topology {
         v.get("confidence_ppm").asLong(),
         unsigned(v.get("last_measured_unix_ms")),
         unsigned(v.get("cluster_held_since_unix_ms")),
-        v.get("is_connected").asBoolean());
+        v.get("is_connected").asBoolean(),
+        quicTraffic(v.get("quic_traffic")),
+        blobTransfer(v.get("blob_transfer")));
+  }
+
+  private static Map<String, QuicBytes> quicTraffic(JsonNode v) {
+    Map<String, QuicBytes> out = new java.util.LinkedHashMap<>();
+    if (v == null || !v.isObject()) return out;
+    v.fields()
+        .forEachRemaining(
+            e ->
+                out.put(
+                    e.getKey(),
+                    new QuicBytes(
+                        unsignedLong(e.getValue().get("quic_bytes_sent")),
+                        unsignedLong(e.getValue().get("quic_bytes_received")))));
+    return out;
+  }
+
+  private static PeerBlobStats blobTransfer(JsonNode v) {
+    if (v == null || !v.isObject()) return PeerBlobStats.ZERO;
+    return new PeerBlobStats(
+        unsignedLong(v.get("fetched_payload_bytes")),
+        unsignedLong(v.get("fetched_zstd_payload_bytes")),
+        unsignedLong(v.get("fetched_wire_bytes")),
+        unsignedLong(v.get("fetched_plain_bytes")),
+        unsignedLong(v.get("served_payload_bytes")),
+        unsignedLong(v.get("served_zstd_payload_bytes")),
+        unsignedLong(v.get("served_wire_bytes")),
+        unsignedLong(v.get("served_plain_bytes")),
+        unsignedLong(v.get("plain_fallbacks")));
+  }
+
+  /** A u64 counter as a Java long (two's complement above {@code Long.MAX_VALUE}); absent = 0. */
+  private static long unsignedLong(JsonNode v) {
+    return v == null || v.isNull() ? 0L : unsigned(v).longValue();
   }
 
   private static BigInteger nullableUnsigned(JsonNode v) {

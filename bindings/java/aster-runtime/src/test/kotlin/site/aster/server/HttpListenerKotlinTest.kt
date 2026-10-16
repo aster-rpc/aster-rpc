@@ -2,6 +2,7 @@ package site.aster.server
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Test
 import site.aster.server.DispatchServerE2ETest.Msg
 import site.aster.upcall.Ucv1
@@ -43,7 +44,8 @@ class HttpListenerKotlinTest {
                         client, listener.tcpAddress(), "echo", "kotlin", fixture.body(Msg("jvm", 1))
                     )
                     assertEquals(0, reply.status().code())
-                    assertEquals("kotlin/alice", fixture.calls.last().peer())
+                    assertEquals("kotlin/alice", fixture.calls.last().principal())
+                    assertNotEquals("kotlin/alice", fixture.calls.last().peer())
                     assertEquals(mapOf("language" to "kotlin"), fixture.calls.last().attributes())
                     assertFalse(fixture.calls.last().irohAuthenticated())
                 }
