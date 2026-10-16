@@ -333,6 +333,18 @@ OFF(aster_dispatch_event_t, request_len, 72);
 OFF(aster_dispatch_event_t, peer_ptr, 80);
 OFF(aster_dispatch_event_t, peer_len, 88);
 OFF(aster_dispatch_event_t, buffer, 96);
+/* ABI 7.5: a live call's transport peer and principal (server.rs). */
+LAYOUT(aster_dispatch_identity_t, 64);
+OFF(aster_dispatch_identity_t, struct_size, 0);
+OFF(aster_dispatch_identity_t, flags, 4);
+OFF(aster_dispatch_identity_t, peer_ptr, 8);
+OFF(aster_dispatch_identity_t, peer_len, 16);
+OFF(aster_dispatch_identity_t, principal_ptr, 24);
+OFF(aster_dispatch_identity_t, principal_len, 32);
+OFF(aster_dispatch_identity_t, actor_ptr, 40);
+OFF(aster_dispatch_identity_t, actor_len, 48);
+OFF(aster_dispatch_identity_t, reserved, 52);
+OFF(aster_dispatch_identity_t, buffer, 56);
 
 /* ABI 7.2: server drain */
 LAYOUT(aster_drain_report_t, 64);
@@ -521,7 +533,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 4); /* 7.4: transfer metrics, [metrics] peer labels; 7.3: cluster network settings; 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 5); /* 7.5: dispatch identity (peer vs principal); 7.4: transfer metrics, [metrics] peer labels; 7.3: cluster network settings; 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
     {
         /* A 5.x caller (280-byte aster_config_t, no 6.x handshake) is refused
          * cleanly and nothing is written past, or into, its struct. This runs
@@ -679,6 +691,9 @@ static void test_enum_values(void) {
     CHECK(ASTER_SPAN_INTERNAL == 0 && ASTER_SPAN_CONSUMER == 4);
     CHECK(ASTER_DISPATCH_FLAG_HAS_TRACE == 0x400);
     CHECK(ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE == 0x800);
+    /* 7.5 */
+    CHECK(ASTER_DISPATCH_FLAG_HAS_PRINCIPAL == 0x1000);
+    CHECK(ASTER_DISPATCH_IDENTITY_PRINCIPAL == 1 && ASTER_DISPATCH_IDENTITY_ACTOR == 2);
 }
 
 static void test_data_plane(void) {
@@ -1091,6 +1106,14 @@ static void test_dispatch_server(void) {
     CHECK(aster_dispatch_respond(rt, srv, 1, NULL, 0, NULL, 0, &required) == ASTER_STATUS_NOT_FOUND);
     CHECK(aster_dispatch_send(rt, srv, 1, (const uint8_t *)"x", 1, &required) == ASTER_STATUS_NOT_FOUND);
     CHECK(aster_dispatch_is_cancelled(rt, srv, 1) == 1);
+    /* 7.5: identity of an unknown call; struct_size and NULL checked first. */
+    aster_dispatch_identity_t ident;
+    memset(&ident, 0, sizeof ident);
+    CHECK(aster_dispatch_identity(rt, srv, 1, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_dispatch_identity(rt, srv, 1, &ident) == ASTER_STATUS_INVALID_ARGUMENT);
+    ident.struct_size = sizeof ident;
+    CHECK(aster_dispatch_identity(rt, srv, 1, &ident) == ASTER_STATUS_NOT_FOUND);
+    CHECK(aster_dispatch_identity(rt, 424242, 1, &ident) == ASTER_STATUS_NOT_FOUND);
     CHECK(aster_dispatch_buffer_release(rt, srv, 0) == ASTER_STATUS_OK);
     CHECK(aster_server_live_calls(srv) == 0);
     /* ABI 7.2: an idle server drains at once; a second drain returns the

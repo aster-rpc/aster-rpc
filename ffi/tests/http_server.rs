@@ -205,6 +205,53 @@ impl Fixture {
                                     ),
                                     b"user/alice"
                                 );
+                                // ABI 7.5: the authenticator's principal differs
+                                // from the transport peer, and both are reported.
+                                assert_ne!(event.flags & ASTER_DISPATCH_FLAG_HAS_PRINCIPAL, 0);
+                                let mut ident: aster_dispatch_identity_t = std::mem::zeroed();
+                                ident.struct_size =
+                                    std::mem::size_of::<aster_dispatch_identity_t>() as u32;
+                                assert_eq!(
+                                    aster_dispatch_identity(rt, server, event.call_id, &mut ident),
+                                    0
+                                );
+                                assert_eq!(ident.flags, ASTER_DISPATCH_IDENTITY_PRINCIPAL);
+                                let principal = std::slice::from_raw_parts(
+                                    ident.principal_ptr,
+                                    ident.principal_len as usize,
+                                );
+                                assert_eq!(principal, b"user/alice");
+                                assert!(ident.peer_len > 0);
+                                let peer = std::slice::from_raw_parts(
+                                    ident.peer_ptr,
+                                    ident.peer_len as usize,
+                                );
+                                assert_ne!(peer, principal);
+                                assert!(ident.actor_ptr.is_null() && ident.actor_len == 0);
+                                assert_eq!(
+                                    aster_dispatch_buffer_release(rt, server, ident.buffer),
+                                    0
+                                );
+                                // The authenticator's attributes are what Gate 3 saw.
+                                let (mut p, mut l, mut b) = (ptr::null(), 0u32, 0u64);
+                                assert_eq!(
+                                    aster_dispatch_attributes(
+                                        rt,
+                                        server,
+                                        event.call_id,
+                                        &mut p,
+                                        &mut l,
+                                        &mut b
+                                    ),
+                                    0
+                                );
+                                let attrs = std::slice::from_raw_parts(p, l as usize);
+                                assert!(attrs.windows(8).any(|w| w == b"operator"));
+                                assert_eq!(aster_dispatch_buffer_release(rt, server, b), 0);
+                                assert_eq!(
+                                    aster_dispatch_is_cancelled(rt, server, event.call_id),
+                                    0
+                                );
                                 let mut needed = 0;
                                 assert_eq!(
                                     aster_dispatch_respond(

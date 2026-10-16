@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 7
 
-#define ASTER_ABI_VERSION_MINOR 4
+#define ASTER_ABI_VERSION_MINOR 5
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -372,6 +372,26 @@
  * hidden from its metadata; read them with `aster_dispatch_inbound_trace`.
  */
 #define ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE 2048
+
+/**
+ * ABI 7.5: an `Authenticator` resolved a principal other than the
+ * transport's peer id. `peer_ptr` is then that principal; the transport
+ * peer id comes from `aster_dispatch_identity`. Clear: `peer_ptr` is both.
+ */
+#define ASTER_DISPATCH_FLAG_HAS_PRINCIPAL 4096
+
+/**
+ * `aster_dispatch_identity_t.flags`: `principal` differs from `peer` (an
+ * `Authenticator` resolved it). Matches `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`.
+ */
+#define ASTER_DISPATCH_IDENTITY_PRINCIPAL 1
+
+/**
+ * `aster_dispatch_identity_t.flags`: reserved for a gateway's on-behalf-of
+ * `actor` (`docs/_internal/web_gateway/gateway-identity.md`). Never set in
+ * 7.5; `actor_ptr` is NULL.
+ */
+#define ASTER_DISPATCH_IDENTITY_ACTOR 2
 
 /**
  * `timeout_ms` value for "wait without a limit" (`aster_dispatch_recv`,
@@ -3024,6 +3044,9 @@ typedef struct aster_dispatch_event_t {
   uint32_t _p2;
   /**
    * `CALL`, `CONNECTION_CLOSED`: peer id (UTF-8, not NUL-terminated).
+   * On `CALL`, the `Authenticator` principal when one resolved a
+   * different one (`ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`; the transport
+   * peer id is then in `aster_dispatch_identity`).
    */
   const uint8_t *peer_ptr;
   uint32_t peer_len;
@@ -3033,6 +3056,45 @@ typedef struct aster_dispatch_event_t {
    */
   uint64_t buffer;
 } aster_dispatch_event_t;
+
+/**
+ * ABI 7.5: who a live call is from, filled by `aster_dispatch_identity`.
+ * 64 bytes (LP64). The caller sets `struct_size`. Strings are UTF-8, not
+ * NUL-terminated, and point into one lease, `buffer`, valid until
+ * `aster_dispatch_buffer_release(server, buffer)`.
+ *
+ * `peer` is the transport's caller id (64-hex node id over iroh; over HTTP
+ * the id the transport resolved). `principal` is the `Authenticator`'s
+ * `AuthOutcome.principal`, else the same as `peer` (then the two may share
+ * one pointer). `aster_dispatch_event_t.peer_ptr` is always `principal`.
+ * `actor` is reserved for a gateway's on-behalf-of caller: NULL / 0 in 7.5.
+ */
+typedef struct aster_dispatch_identity_t {
+  /**
+   * `sizeof(aster_dispatch_identity_t)`, set by the caller.
+   */
+  uint32_t struct_size;
+  /**
+   * `ASTER_DISPATCH_IDENTITY_*`.
+   */
+  uint32_t flags;
+  const uint8_t *peer_ptr;
+  uint32_t peer_len;
+  uint32_t _p0;
+  const uint8_t *principal_ptr;
+  uint32_t principal_len;
+  uint32_t _p1;
+  /**
+   * Reserved (`ASTER_DISPATCH_IDENTITY_ACTOR`): NULL in 7.5.
+   */
+  const uint8_t *actor_ptr;
+  uint32_t actor_len;
+  uint32_t reserved;
+  /**
+   * Lease for `peer` + `principal`.
+   */
+  uint64_t buffer;
+} aster_dispatch_identity_t;
 
 /**
  * What `aster_server_drain` did. 64 bytes. Calls count those admitted to a
@@ -7596,6 +7658,19 @@ int32_t aster_dispatch_attributes(aster_runtime_t runtime,
                                   aster_buffer_t *out_buffer);
 
 /**
+ * ABI 7.5: the transport peer id and the resolved principal of a live call
+ * (`aster_dispatch_identity_t`; the caller sets `out->struct_size`), so a
+ * binding's handler context can report `peer()` and `principal()` apart.
+ * Only needed when the `CALL` event has `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`;
+ * otherwise `peer_ptr` is both. Release `out->buffer` with
+ * `aster_dispatch_buffer_release`. `NOT_FOUND` once the call is over.
+ */
+int32_t aster_dispatch_identity(aster_runtime_t runtime,
+                                aster_server_t server_h,
+                                uint64_t call_id,
+                                struct aster_dispatch_identity_t *out);
+
+/**
  * The server span context of a live call (design §5.2), for the binding's
  * handler spans and logs: set with `ASTER_DISPATCH_FLAG_HAS_TRACE` on its
  * `CALL` event. A call whose span is not exported gets an all-zero context
@@ -7630,7 +7705,8 @@ int32_t aster_dispatch_abandon(aster_runtime_t runtime, aster_server_t server_h,
 
 /**
  * Release one lease (`aster_dispatch_event_t.buffer`, `aster_dispatch_recv`,
- * `_metadata`, `_attributes`). 0 is a no-op; an unknown id is `NOT_FOUND`.
+ * `_metadata`, `_attributes`, `_identity`). 0 is a no-op; an unknown id is
+ * `NOT_FOUND`.
  */
 int32_t aster_dispatch_buffer_release(aster_runtime_t runtime,
                                       aster_server_t server_h,

@@ -1044,6 +1044,7 @@ impl Dispatcher {
             session_scoped,
             call_admission,
             drain: Some(self.drain.admit()),
+            transport_peer: None,
         };
         if self.authenticator.is_some() {
             return Route::Authenticate(routed);
@@ -1286,7 +1287,10 @@ impl Dispatcher {
                 return Err(deadline_status());
             }
             if let Some(principal) = outcome.principal {
-                parts.peer_id = principal;
+                if principal != parts.peer_id {
+                    // Kept for foreign calls, which report both ids.
+                    routed.transport_peer = Some(std::mem::replace(&mut parts.peer_id, principal));
+                }
             }
             for (k, v) in outcome.attributes {
                 // The credential sets an enrolled peer's maximum roles.
@@ -1321,6 +1325,7 @@ impl Dispatcher {
             attributes,
             deadline,
             call_admission,
+            transport_peer,
             ..
         } = routed;
         let (svc, session) = match target {
@@ -1336,6 +1341,7 @@ impl Dispatcher {
                 attributes,
                 deadline,
                 parts,
+                transport_peer,
                 obs,
                 call_admission: call_admission.expect("foreign route admission"),
             },
@@ -1632,6 +1638,9 @@ pub struct Routed {
     /// Counts the call in flight for a drain; moved into its telemetry when
     /// the call is opened, so it ends exactly when the call does.
     drain: Option<DrainTicket>,
+    /// The transport's caller id, set when an authenticator resolved a
+    /// different principal (which then replaced `CallParts::peer_id`).
+    transport_peer: Option<String>,
 }
 
 impl Routed {

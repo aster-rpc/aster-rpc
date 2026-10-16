@@ -147,10 +147,53 @@ pub const ASTER_DISPATCH_FLAG_HAS_TRACE: u32 = 0x400;
 /// ABI 4.6: the call carried W3C `baggage` and/or `tracestate`, which are
 /// hidden from its metadata; read them with `aster_dispatch_inbound_trace`.
 pub const ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE: u32 = 0x800;
+/// ABI 7.5: an `Authenticator` resolved a principal other than the
+/// transport's peer id. `peer_ptr` is then that principal; the transport
+/// peer id comes from `aster_dispatch_identity`. Clear: `peer_ptr` is both.
+pub const ASTER_DISPATCH_FLAG_HAS_PRINCIPAL: u32 = 0x1000;
+
+/// `aster_dispatch_identity_t.flags`: `principal` differs from `peer` (an
+/// `Authenticator` resolved it). Matches `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`.
+pub const ASTER_DISPATCH_IDENTITY_PRINCIPAL: u32 = 0x1;
+/// `aster_dispatch_identity_t.flags`: reserved for a gateway's on-behalf-of
+/// `actor` (`docs/_internal/web_gateway/gateway-identity.md`). Never set in
+/// 7.5; `actor_ptr` is NULL.
+pub const ASTER_DISPATCH_IDENTITY_ACTOR: u32 = 0x2;
 
 /// `timeout_ms` value for "wait without a limit" (`aster_dispatch_recv`,
 /// `aster_call_recv_payload`).
 pub const ASTER_TIMEOUT_INFINITE: u32 = u32::MAX;
+
+/// ABI 7.5: who a live call is from, filled by `aster_dispatch_identity`.
+/// 64 bytes (LP64). The caller sets `struct_size`. Strings are UTF-8, not
+/// NUL-terminated, and point into one lease, `buffer`, valid until
+/// `aster_dispatch_buffer_release(server, buffer)`.
+///
+/// `peer` is the transport's caller id (64-hex node id over iroh; over HTTP
+/// the id the transport resolved). `principal` is the `Authenticator`'s
+/// `AuthOutcome.principal`, else the same as `peer` (then the two may share
+/// one pointer). `aster_dispatch_event_t.peer_ptr` is always `principal`.
+/// `actor` is reserved for a gateway's on-behalf-of caller: NULL / 0 in 7.5.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct aster_dispatch_identity_t {
+    /// `sizeof(aster_dispatch_identity_t)`, set by the caller.
+    pub struct_size: u32,
+    /// `ASTER_DISPATCH_IDENTITY_*`.
+    pub flags: u32,
+    pub peer_ptr: *const u8,
+    pub peer_len: u32,
+    pub _p0: u32,
+    pub principal_ptr: *const u8,
+    pub principal_len: u32,
+    pub _p1: u32,
+    /// Reserved (`ASTER_DISPATCH_IDENTITY_ACTOR`): NULL in 7.5.
+    pub actor_ptr: *const u8,
+    pub actor_len: u32,
+    pub reserved: u32,
+    /// Lease for `peer` + `principal`.
+    pub buffer: u64,
+}
 
 /// One dispatch event, filled by `aster_server_poll`. 104 bytes (LP64).
 ///
@@ -196,6 +239,9 @@ pub struct aster_dispatch_event_t {
     pub request_len: u32,
     pub _p2: u32,
     /// `CALL`, `CONNECTION_CLOSED`: peer id (UTF-8, not NUL-terminated).
+    /// On `CALL`, the `Authenticator` principal when one resolved a
+    /// different one (`ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`; the transport
+    /// peer id is then in `aster_dispatch_identity`).
     pub peer_ptr: *const u8,
     pub peer_len: u32,
     pub _p3: u32,
@@ -1345,6 +1391,7 @@ fn lower_call(
         wire_call_id,
         deadline_unix_ms,
         peer_id,
+        transport_peer_id,
         request,
         header,
         attributes,
@@ -1356,6 +1403,9 @@ fn lower_call(
     } = call;
     // Answered by id from now on.
     handle.detach();
+    if transport_peer_id.is_some() {
+        flags |= ASTER_DISPATCH_FLAG_HAS_PRINCIPAL;
+    }
     if trace_context.is_some() {
         flags |= ASTER_DISPATCH_FLAG_HAS_TRACE;
     }
@@ -1738,6 +1788,74 @@ unsafe fn kv_out(
     status(aster_status_t::ASTER_STATUS_OK)
 }
 
+/// ABI 7.5: the transport peer id and the resolved principal of a live call
+/// (`aster_dispatch_identity_t`; the caller sets `out->struct_size`), so a
+/// binding's handler context can report `peer()` and `principal()` apart.
+/// Only needed when the `CALL` event has `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`;
+/// otherwise `peer_ptr` is both. Release `out->buffer` with
+/// `aster_dispatch_buffer_release`. `NOT_FOUND` once the call is over.
+#[no_mangle]
+pub unsafe extern "C" fn aster_dispatch_identity(
+    runtime: aster_runtime_t,
+    server_h: aster_server_t,
+    call_id: u64,
+    out: *mut aster_dispatch_identity_t,
+) -> i32 {
+    let _ = runtime;
+    if out.is_null() {
+        return fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "aster_dispatch_identity: out is NULL",
+        );
+    }
+    // SAFETY: non-null; the caller provides at least the size field.
+    let size = unsafe { out.cast::<u32>().read_unaligned() };
+    let expected = std::mem::size_of::<aster_dispatch_identity_t>() as u32;
+    if size != expected {
+        return fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            format!("aster_dispatch_identity: out->struct_size is {size}, expected {expected}"),
+        );
+    }
+    let state = match server(server_h) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let Some(call) = state.table.get(call_id) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    let principal = call.peer().clone();
+    let (flags, buffer, peer, principal) = match call.transport_peer() {
+        Some(transport) => {
+            let (id, tp, tl, pp, pl) = state
+                .leases
+                .insert_always(transport.as_bytes().to_vec(), principal);
+            (ASTER_DISPATCH_IDENTITY_PRINCIPAL, id, (tp, tl), (pp, pl))
+        }
+        None => {
+            let (id, _, _, pp, pl) = state.leases.insert(Vec::new(), principal);
+            (0, id, (pp, pl), (pp, pl))
+        }
+    };
+    let ident = aster_dispatch_identity_t {
+        struct_size: expected,
+        flags,
+        peer_ptr: peer.0,
+        peer_len: peer.1,
+        _p0: 0,
+        principal_ptr: principal.0,
+        principal_len: principal.1,
+        _p1: 0,
+        actor_ptr: ptr::null(),
+        actor_len: 0,
+        reserved: 0,
+        buffer,
+    };
+    // SAFETY: checked non-null; the caller sized it.
+    unsafe { ptr::write(out, ident) };
+    status(aster_status_t::ASTER_STATUS_OK)
+}
+
 /// The server span context of a live call (design §5.2), for the binding's
 /// handler spans and logs: set with `ASTER_DISPATCH_FLAG_HAS_TRACE` on its
 /// `CALL` event. A call whose span is not exported gets an all-zero context
@@ -1830,7 +1948,8 @@ pub extern "C" fn aster_dispatch_abandon(
 }
 
 /// Release one lease (`aster_dispatch_event_t.buffer`, `aster_dispatch_recv`,
-/// `_metadata`, `_attributes`). 0 is a no-op; an unknown id is `NOT_FOUND`.
+/// `_metadata`, `_attributes`, `_identity`). 0 is a no-op; an unknown id is
+/// `NOT_FOUND`.
 #[no_mangle]
 pub extern "C" fn aster_dispatch_buffer_release(
     runtime: aster_runtime_t,

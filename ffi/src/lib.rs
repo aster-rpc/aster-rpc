@@ -221,8 +221,13 @@ pub mod upcall;
 //   `blob_transfer`; `[metrics]` peer labels beside `aster_config_t`
 //   (`aster_metrics_config_t`, `aster_config_set_metrics`,
 //   `aster_config_metrics`; `config_metrics.rs`). See `ffi/RENAME_MAP.md` "7.4".
+// - 7.5.0 (additive): handler call identity. `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`
+//   on a `CALL` event whose `Authenticator` principal differs from the
+//   transport peer; `aster_dispatch_identity` / `aster_dispatch_identity_t`
+//   return both (plus a reserved `actor` slot). `peer_ptr` keeps its meaning.
+//   See `ffi/RENAME_MAP.md` "7.5".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 4;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 5;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

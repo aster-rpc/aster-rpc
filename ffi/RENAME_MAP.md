@@ -1,4 +1,30 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.4)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.5)
+
+## New in 7.5 (handler call identity; additive)
+
+The C ABI side of `aster::rpc::CallContext::peer()` / `principal()`, so a
+binding's handler context can report the transport peer and the
+`Authenticator`'s principal apart. `aster_dispatch_event_t` does not change:
+`peer_ptr` is still the principal-or-peer, so 7.4 readers keep working.
+
+| Item | Role |
+|---|---|
+| `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL` (`0x1000`) | On a `CALL` event: an `Authenticator` resolved a principal other than the transport peer id. `peer_ptr` is that principal. Clear: `peer_ptr` is the transport peer and the principal, and the binding need not call `aster_dispatch_identity`. |
+| `aster_dispatch_identity(rt, server, call_id, out)` / `aster_dispatch_identity_t` (64 bytes) | A live call's `peer` (transport id: 64-hex node id over iroh, the remote socket address over HTTP / WebTransport), `principal` (`AuthOutcome.principal`, else `peer`) and `flags` (`ASTER_DISPATCH_IDENTITY_PRINCIPAL` = 1). The caller sets `out->struct_size`; the strings live in one lease, `out->buffer` (`aster_dispatch_buffer_release`). `NOT_FOUND` once the call is over. |
+| `actor_ptr` / `actor_len`, `ASTER_DISPATCH_IDENTITY_ACTOR` (= 2) | Reserved for a gateway's on-behalf-of `actor()` (`docs/_internal/web_gateway/gateway-identity.md`): NULL / 0 and never set in 7.5. A later minor fills them without changing the struct. |
+
+The rest of the handler context was already in the ABI: `call_id` /
+`wire_call_id`, `session_id` / `session_key`, `deadline_unix_ms`,
+`service_idx` / `method_idx`, `ASTER_DISPATCH_FLAG_IROH_AUTHENTICATED`
+(provenance), `aster_dispatch_metadata`, `aster_dispatch_attributes` (the
+merged set Gate 3 checked, authenticator attributes included), and
+cancellation through the `CANCELLED` event (reason `PEER` / `DEADLINE` /
+`INVALID_REQUEST`) and `aster_dispatch_is_cancelled`.
+
+Go requires 7.5 (`ABIMinorRequired = 5`): `CallInfo.PeerID` is now the
+transport peer and `CallInfo.Principal` (also on `SessionInfo`) the
+principal. Rust: `aster::binding_support::dispatch::ForeignCall::transport_peer_id`
+and `CallRef::transport_peer`.
 
 ## New in 7.4 (transfer metrics; additive)
 

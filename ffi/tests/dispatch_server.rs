@@ -467,6 +467,26 @@ unsafe fn lease_kv(
     out
 }
 
+/// ABI 7.5: a live call's `(flags, peer, principal)`; the actor slot is
+/// reserved (NULL).
+unsafe fn identity(srv: Srv, id: u64) -> (u32, String, String) {
+    let mut out: aster_dispatch_identity_t = std::mem::zeroed();
+    out.struct_size = std::mem::size_of::<aster_dispatch_identity_t>() as u32;
+    assert_eq!(
+        aster_dispatch_identity(srv.rt, srv.server, id, &mut out),
+        OK
+    );
+    assert!(out.actor_ptr.is_null() && out.actor_len == 0);
+    assert_eq!(out.flags & ASTER_DISPATCH_IDENTITY_ACTOR, 0);
+    let peer = String::from_utf8(copy(out.peer_ptr, out.peer_len)).unwrap();
+    let principal = String::from_utf8(copy(out.principal_ptr, out.principal_len)).unwrap();
+    assert_eq!(
+        aster_dispatch_buffer_release(srv.rt, srv.server, out.buffer),
+        OK
+    );
+    (out.flags, peer, principal)
+}
+
 fn handle(srv: Srv, call: Ev, events: mpsc::Receiver<Ev>, observed: Arc<Mutex<Observed>>) {
     let id = call.call_id;
     match (call.service_idx, call.method_idx) {
@@ -477,6 +497,15 @@ fn handle(srv: Srv, call: Ev, events: mpsc::Receiver<Ev>, observed: Arc<Mutex<Ob
             assert_eq!(call.session_key, 0);
             assert_eq!(call.pattern, 0);
             assert_ne!(call.connection_handle, 0);
+            // No authenticator: the transport peer is the principal.
+            assert_eq!(call.flags & ASTER_DISPATCH_FLAG_HAS_PRINCIPAL, 0);
+            if call.request == b"hello" {
+                let (flags, peer, principal) = unsafe { identity(srv, id) };
+                assert_eq!(flags, 0);
+                assert_eq!(peer, call.peer);
+                assert_eq!(principal, call.peer);
+                assert_eq!(peer.len(), 64);
+            }
             if call.request == b"fail" {
                 let st = status_aev1(StatusCode::NotFound, "no such thing");
                 assert_eq!(respond(srv, id, &[], Some(&st)), OK);

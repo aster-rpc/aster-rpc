@@ -45,7 +45,7 @@ use crate::raw_webtransport::aster_raw_wt_config_t;
 use crate::rpc::aster_call_options_t;
 use crate::server::{
     aster_cancel_reason_t, aster_dispatch_event_kind_t, aster_dispatch_event_t,
-    aster_method_pattern_t, aster_server_option_t,
+    aster_dispatch_identity_t, aster_method_pattern_t, aster_server_option_t,
 };
 use crate::tls::aster_generated_cert_t;
 use crate::upcall::{
@@ -419,6 +419,20 @@ mod lp64 {
         peer_ptr = 80,
         peer_len = 88,
         buffer = 96,
+    });
+
+    // ABI 7.5: a live call's transport peer and principal (server.rs).
+    assert_layout!(aster_dispatch_identity_t, size = 64, align = 8, {
+        struct_size = 0,
+        flags = 4,
+        peer_ptr = 8,
+        peer_len = 16,
+        principal_ptr = 24,
+        principal_len = 32,
+        actor_ptr = 40,
+        actor_len = 48,
+        reserved = 52,
+        buffer = 56,
     });
 
     assert_layout!(aster_call_options_t, size = 72, align = 8, {

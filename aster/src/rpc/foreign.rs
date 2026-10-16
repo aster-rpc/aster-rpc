@@ -398,6 +398,11 @@ pub struct ForeignCall {
     pub deadline_unix_ms: u64,
     /// The peer id, or the `Authenticator` principal when one resolved it.
     pub peer_id: Arc<str>,
+    /// The transport's caller id when an `Authenticator` resolved a
+    /// principal other than it (`peer_id` is then that principal); `None`
+    /// when `peer_id` is the transport's id. A handler context's `peer()` is
+    /// this, else `peer_id`; its `principal()` is `peer_id`.
+    pub transport_peer_id: Option<Arc<str>>,
     /// The first request payload, already decompressed.
     pub request: Vec<u8>,
     /// The decoded header (metadata, deadline, session id).
@@ -667,6 +672,7 @@ impl Foreign {
             attributes,
             deadline,
             parts,
+            transport_peer,
             obs,
             call_admission,
         } = d;
@@ -731,6 +737,7 @@ impl Foreign {
         };
 
         let peer_id: Arc<str> = Arc::from(peer_id);
+        let transport_peer_id: Option<Arc<str>> = transport_peer.map(Arc::from);
         let header = Arc::new(header);
         let attributes = if attributes.is_empty() {
             empty_attributes()
@@ -757,6 +764,7 @@ impl Foreign {
             }),
             header: header.clone(),
             peer: peer_id.clone(),
+            transport_peer: transport_peer_id.clone(),
             attributes: attributes.clone(),
             trace_context,
             inbound_trace: inbound_trace.clone(),
@@ -793,6 +801,7 @@ impl Foreign {
             wire_call_id: header.call_id,
             deadline_unix_ms,
             peer_id,
+            transport_peer_id,
             request: request_payload,
             header,
             attributes,
@@ -856,6 +865,8 @@ pub(crate) struct Delivery {
     pub(crate) attributes: HashMap<String, String>,
     pub(crate) deadline: Option<Instant>,
     pub(crate) parts: CallParts,
+    /// See [`ForeignCall::transport_peer_id`].
+    pub(crate) transport_peer: Option<String>,
     pub(crate) obs: CallObs,
     pub(crate) call_admission: DispatchPermit,
 }
@@ -1109,6 +1120,8 @@ pub(crate) struct CallState {
     /// The call's header and peer (shared with the [`ForeignCall`]), for logs.
     header: Arc<StreamHeader>,
     peer: Arc<str>,
+    /// See [`ForeignCall::transport_peer_id`].
+    transport_peer: Option<Arc<str>>,
     /// The caller's attributes (shared with the [`ForeignCall`]), so bindings
     /// that answer by id can read them later ([`CallRef::attributes`]).
     attributes: Arc<PeerAttributes>,
@@ -1460,9 +1473,16 @@ impl CallRef {
         &self.0.header
     }
 
-    /// The caller's peer id (the same as [`ForeignCall::peer_id`]).
+    /// The caller's peer id (the same as [`ForeignCall::peer_id`]): the
+    /// `Authenticator` principal when one resolved it, else the transport's.
     pub fn peer(&self) -> &Arc<str> {
         &self.0.peer
+    }
+
+    /// The transport's caller id when an `Authenticator` replaced it with a
+    /// different principal (the same as [`ForeignCall::transport_peer_id`]).
+    pub fn transport_peer(&self) -> Option<&Arc<str>> {
+        self.0.transport_peer.as_ref()
     }
 
     /// The caller's attributes (the same as [`ForeignCall::attributes`]).
