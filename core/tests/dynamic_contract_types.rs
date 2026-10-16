@@ -202,3 +202,41 @@ fn malformed_decimal_params_are_a_schema_error() {
         assert!(err.message.contains("decimal(p,s)"), "{bad}: {err}");
     }
 }
+
+/// Field names (Aster-FieldNaming.md): a contract's JSON keys are its field
+/// names verbatim. The Rust-defined and the Java-defined `names.v1.Order`
+/// share one Fory payload (Fory matches the snake_case form); decoded with
+/// each contract's schema it has that contract's keys, and encodes back to the
+/// same bytes.
+#[test]
+fn field_names_are_contract_names_verbatim() {
+    let v = vectors();
+    let fnames = &v["vector"]["field_names"];
+    for def in ["rust_defined", "java_defined"] {
+        let d = &fnames[def];
+        let schema = schema(d);
+        for (name, t) in d["types"].as_object().unwrap() {
+            assert_eq!(
+                hex::encode(schema.type_hash(name).expect(name)),
+                t["expected_type_hash"].as_str().unwrap(),
+                "{def} {name}"
+            );
+        }
+        let p = &d["payload"];
+        let ty = p["type"].as_str().unwrap();
+        let decoded = schema.decode_as(ty, &hex_of(&p["hex"])).unwrap();
+        assert_eq!(
+            decoded.to_json(&JsonOptions::default()),
+            p["value"],
+            "{def}"
+        );
+        let encoded = schema
+            .encode(ty, &DynValue::from_json(&p["value"]))
+            .unwrap();
+        assert_eq!(hex::encode(encoded), p["hex"].as_str().unwrap(), "{def}");
+    }
+    assert_eq!(
+        fnames["rust_defined"]["payload"]["hex"],
+        fnames["java_defined"]["payload"]["hex"]
+    );
+}

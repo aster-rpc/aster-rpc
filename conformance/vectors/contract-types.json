@@ -58,6 +58,680 @@
     },
     "expected_contract_id": "269b6d809959aabe5b4f55cff9e804b491c854eb58f8adf2cd8f6f080dcb4d50",
     "expected_ids_contract_id": "210334410c14ec44812156c5f37a31c2bd1683666871bfa2802cc91e2eb03196",
+    "field_names": {
+      "accepted": [
+        {
+          "fields": [
+            {
+              "member_snake": "written_by",
+              "name": "writtenBy"
+            }
+          ]
+        },
+        {
+          "fields": [
+            {
+              "member_snake": "written_by",
+              "name": "WrittenBy"
+            }
+          ]
+        },
+        {
+          "fields": [
+            {
+              "member_snake": "written_by",
+              "name": "written_by"
+            }
+          ]
+        },
+        {
+          "fields": [
+            {
+              "member_snake": "id",
+              "name": "Id"
+            }
+          ]
+        },
+        {
+          "fields": [
+            {
+              "member_snake": "user_id2",
+              "name": "userId2"
+            }
+          ]
+        },
+        {
+          "fields": [
+            {
+              "member_snake": "x509_cert",
+              "name": "x509Cert"
+            }
+          ]
+        },
+        {
+          "fields": [
+            {
+              "member_snake": "http_server",
+              "name": "HttpServer"
+            }
+          ]
+        },
+        {
+          "fields": [
+            {
+              "member_snake": "_private",
+              "name": "_private"
+            }
+          ]
+        },
+        {
+          "fields": [
+            {
+              "member_snake": "order_id",
+              "name": "orderId"
+            },
+            {
+              "member_snake": "line_items",
+              "name": "lineItems"
+            },
+            {
+              "member_snake": "total_cents",
+              "name": "totalCents"
+            },
+            {
+              "member_snake": "note",
+              "name": "note"
+            }
+          ]
+        }
+      ],
+      "java_defined": {
+        "expected_contract_id": "49f9e6e024d0588bb1cf800c90dd021688d1b30ba417a0b6a78379937d8c1860",
+        "payload": {
+          "hex": "01ff1e002ea03eb54d38024fe41e9a018225f2ba8013ba23244058054dd302f6223672581678ad0d26d13232404a1535d3205415ba2324768180c41302081e0222a00dcf893f2417e21e9a018225f2ba801eca41a2449886005805d1a89ec4ea36605415c954d89c32000416736b752d610216736b752d62fd0e6f2d31",
+          "type": "names.v1.Order",
+          "value": {
+            "lineItems": [
+              {
+                "skuCode": "sku-a",
+                "unitCount": 2
+              },
+              {
+                "skuCode": "sku-b",
+                "unitCount": 1
+              }
+            ],
+            "note": null,
+            "orderId": "o-1",
+            "totalCents": 1250
+          }
+        },
+        "service": "Orders v1, xlang, SHARED; unary method place(Order)->Order",
+        "types": {
+          "names.v1.LineItem": {
+            "expected_canonical_type_def_hex": "00226e616d65732e7631224c696e654974656d020c021e736b75436f6465001a737472696e67000200000000020001000426756e6974436f756e740022766172696e74333200020000000002000100000c000c",
+            "expected_type_hash": "944cc5021780f62c90ab4f4974300e1e6e20b033d650567fad5c2ca3d5a6d9fb",
+            "fields_in_declaration_order": [
+              {
+                "container": 0,
+                "name": "skuCode",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": 0,
+                "name": "unitCount",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "varint32",
+                "type_ref": ""
+              }
+            ],
+            "name": "LineItem",
+            "package": "names.v1"
+          },
+          "names.v1.Order": {
+            "expected_canonical_type_def_hex": "00226e616d65732e7631164f72646572040c02266c696e654974656d73010220944cc5021780f62c90ab4f4974300e1e6e20b033d650567fad5c2ca3d5a6d9fb02000001000200010004126e6f7465001a737472696e6700020100000002000100061e6f726465724964001a737472696e6700020000000002000100082a746f74616c43656e74730022766172696e74333200020000000002000100000c000c",
+            "expected_type_hash": "45d78188035ca9f45810c7585465be7cc6099b8a4852b6313ccb6318edee4938",
+            "fields_in_declaration_order": [
+              {
+                "container": 0,
+                "name": "orderId",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": 1,
+                "name": "lineItems",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 1,
+                "type_primitive": "",
+                "type_ref": "944cc5021780f62c90ab4f4974300e1e6e20b033d650567fad5c2ca3d5a6d9fb"
+              },
+              {
+                "container": 0,
+                "name": "totalCents",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": 0,
+                "name": "note",
+                "optional": true,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "name": "Order",
+            "package": "names.v1"
+          }
+        }
+      },
+      "refused": [
+        {
+          "case": "collision",
+          "error": "collide",
+          "fields": [
+            {
+              "member_snake": "user_id",
+              "name": "userId"
+            },
+            {
+              "member_snake": "user_id",
+              "name": "user_id"
+            }
+          ]
+        },
+        {
+          "case": "override_mismatch",
+          "error": "does not match",
+          "fields": [
+            {
+              "member_snake": "author",
+              "name": "writtenBy"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "id",
+              "name": "ID"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "user_id",
+              "name": "userID"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "user_i_d2",
+              "name": "userID2"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "http_server",
+              "name": "HTTPServer"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "i_pv6_addr",
+              "name": "IPv6Addr"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "a_b_c1",
+              "name": "aBC1"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "a__b",
+              "name": "a_B"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "type_",
+              "name": "type_"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "maxÉcart",
+              "name": "maxÉcart"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "名_value",
+              "name": "名Value"
+            }
+          ]
+        },
+        {
+          "case": "not_plain",
+          "error": "not a plain field name",
+          "fields": [
+            {
+              "member_snake": "get_http_response",
+              "name": "getHTTPResponse"
+            }
+          ]
+        }
+      ],
+      "rules": {
+        "name": "a field's contract name is the declared name in the language that defines the contract, verbatim; a binding consuming it elsewhere declares an explicit override. No binding converts case",
+        "plain": "a name is plain when every ASCII uppercase letter starts it or follows an ASCII lowercase letter or a digit, no non-ASCII letter is uppercase, and it does not end in _. For a plain name every Fory implementation writes the reference form (Fory Java prefixes _ to a leading capital, so Java refuses a member starting with one)",
+        "refused": "contract definition refuses a name that is not plain, a field whose member's Fory snake_case form (member_snake) differs from the reference form of its name, and two fields with the same reference form; error is a phrase the message contains",
+        "snake_case": "the reference snake_case form is Rust fory-core / Fory JS to_snake_case; snake_case lists each Fory implementation's form of awkward names"
+      },
+      "rust_defined": {
+        "expected_contract_id": "d3b9ae3d187c20e511acb2adefe6dec3912bbb5062578b0c3086318b4b3dd36e",
+        "payload": {
+          "hex": "01ff1e002ea03eb54d38024fe41e9a018225f2ba8013ba23244058054dd302f6223672581678ad0d26d13232404a1535d3205415ba2324768180c41302081e0222a00dcf893f2417e21e9a018225f2ba801eca41a2449886005805d1a89ec4ea36605415c954d89c32000416736b752d610216736b752d62fd0e6f2d31",
+          "type": "names.v1.Order",
+          "value": {
+            "line_items": [
+              {
+                "sku_code": "sku-a",
+                "unit_count": 2
+              },
+              {
+                "sku_code": "sku-b",
+                "unit_count": 1
+              }
+            ],
+            "note": null,
+            "order_id": "o-1",
+            "total_cents": 1250
+          }
+        },
+        "service": "Orders v1, xlang, SHARED; unary method place(Order)->Order",
+        "types": {
+          "names.v1.LineItem": {
+            "expected_canonical_type_def_hex": "00226e616d65732e7631224c696e654974656d020c0222736b755f636f6465001a737472696e6700020000000002000100042a756e69745f636f756e740022766172696e74333200020000000002000100000c000c",
+            "expected_type_hash": "e0a73469f1d0449310a4093e5e36342ba23b2240d2bb0ff6d29711c1ba5774d9",
+            "fields_in_declaration_order": [
+              {
+                "container": 0,
+                "name": "sku_code",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": 0,
+                "name": "unit_count",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "varint32",
+                "type_ref": ""
+              }
+            ],
+            "name": "LineItem",
+            "package": "names.v1"
+          },
+          "names.v1.Order": {
+            "expected_canonical_type_def_hex": "00226e616d65732e7631164f72646572040c022a6c696e655f6974656d73010220e0a73469f1d0449310a4093e5e36342ba23b2240d2bb0ff6d29711c1ba5774d902000001000200010004126e6f7465001a737472696e670002010000000200010006226f726465725f6964001a737472696e6700020000000002000100082e746f74616c5f63656e74730022766172696e74333200020000000002000100000c000c",
+            "expected_type_hash": "0c0a845ec6b06ab39a37c913357394ec489e6f8c3d14ef84a7b57b1bc92c4c82",
+            "fields_in_declaration_order": [
+              {
+                "container": 0,
+                "name": "order_id",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "string",
+                "type_ref": ""
+              },
+              {
+                "container": 1,
+                "name": "line_items",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 1,
+                "type_primitive": "",
+                "type_ref": "e0a73469f1d0449310a4093e5e36342ba23b2240d2bb0ff6d29711c1ba5774d9"
+              },
+              {
+                "container": 0,
+                "name": "total_cents",
+                "optional": false,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "varint32",
+                "type_ref": ""
+              },
+              {
+                "container": 0,
+                "name": "note",
+                "optional": true,
+                "self_ref_name": "",
+                "type_kind": 0,
+                "type_primitive": "string",
+                "type_ref": ""
+              }
+            ],
+            "name": "Order",
+            "package": "names.v1"
+          }
+        }
+      },
+      "snake_case": {
+        "HTTPServer": {
+          "csharp": "http_server",
+          "go": "h_t_t_p_server",
+          "java": "_h_t_t_p_server",
+          "javascript": "http_server",
+          "plain": false,
+          "python": "http_server",
+          "rust": "http_server"
+        },
+        "HttpServer": {
+          "csharp": "http_server",
+          "go": "http_server",
+          "java": "_http_server",
+          "javascript": "http_server",
+          "plain": true,
+          "python": "http_server",
+          "rust": "http_server"
+        },
+        "ID": {
+          "csharp": "id",
+          "go": "i_d",
+          "java": "_i_d",
+          "javascript": "id",
+          "plain": false,
+          "python": "id",
+          "rust": "id"
+        },
+        "IPv6Addr": {
+          "csharp": "i_pv6_addr",
+          "go": "i_pv6_addr",
+          "java": "_i_pv6_addr",
+          "javascript": "i_pv6_addr",
+          "plain": false,
+          "python": "i_pv6_addr",
+          "rust": "i_pv6_addr"
+        },
+        "Id": {
+          "csharp": "id",
+          "go": "id",
+          "java": "_id",
+          "javascript": "id",
+          "plain": true,
+          "python": "id",
+          "rust": "id"
+        },
+        "OrderId": {
+          "csharp": "order_id",
+          "go": "order_id",
+          "java": "_order_id",
+          "javascript": "order_id",
+          "plain": true,
+          "python": "order_id",
+          "rust": "order_id"
+        },
+        "WrittenBy": {
+          "csharp": "written_by",
+          "go": "written_by",
+          "java": "_written_by",
+          "javascript": "written_by",
+          "plain": true,
+          "python": "written_by",
+          "rust": "written_by"
+        },
+        "X509Cert": {
+          "csharp": "x509_cert",
+          "go": "x509_cert",
+          "java": "_x509_cert",
+          "javascript": "x509_cert",
+          "plain": true,
+          "python": "x509_cert",
+          "rust": "x509_cert"
+        },
+        "_private": {
+          "csharp": "_private",
+          "go": "_private",
+          "java": "_private",
+          "javascript": "_private",
+          "plain": true,
+          "python": "_private",
+          "rust": "_private"
+        },
+        "aBC1": {
+          "csharp": "a_b_c1",
+          "go": "a_b_c1",
+          "java": "a_b_c1",
+          "javascript": "a_b_c1",
+          "plain": false,
+          "python": "a_bc1",
+          "rust": "a_b_c1"
+        },
+        "a_B": {
+          "csharp": "a__b",
+          "go": "a__b",
+          "java": "a__b",
+          "javascript": "a__b",
+          "plain": false,
+          "python": "a_b",
+          "rust": "a__b"
+        },
+        "a__b": {
+          "csharp": "a__b",
+          "go": "a__b",
+          "java": "a__b",
+          "javascript": "a__b",
+          "plain": true,
+          "python": "a__b",
+          "rust": "a__b"
+        },
+        "getHTTPResponse": {
+          "csharp": "get_http_response",
+          "go": "get_h_t_t_p_response",
+          "java": "get_h_t_t_p_response",
+          "javascript": "get_http_response",
+          "plain": false,
+          "python": "get_http_response",
+          "rust": "get_http_response"
+        },
+        "httpServer": {
+          "csharp": "http_server",
+          "go": "http_server",
+          "java": "http_server",
+          "javascript": "http_server",
+          "plain": true,
+          "python": "http_server",
+          "rust": "http_server"
+        },
+        "ipv6Addr": {
+          "csharp": "ipv6_addr",
+          "go": "ipv6_addr",
+          "java": "ipv6_addr",
+          "javascript": "ipv6_addr",
+          "plain": true,
+          "python": "ipv6_addr",
+          "rust": "ipv6_addr"
+        },
+        "maxÉcart": {
+          "csharp": "max_écart",
+          "go": "maxÉcart",
+          "java": "maxÉcart",
+          "javascript": "maxÉcart",
+          "plain": false,
+          "python": "max_écart",
+          "rust": "maxÉcart"
+        },
+        "orderId": {
+          "csharp": "order_id",
+          "go": "order_id",
+          "java": "order_id",
+          "javascript": "order_id",
+          "plain": true,
+          "python": "order_id",
+          "rust": "order_id"
+        },
+        "type_": {
+          "csharp": "type_",
+          "go": "type_",
+          "java": "type_",
+          "javascript": "type_",
+          "plain": false,
+          "python": "type",
+          "rust": "type_"
+        },
+        "userID": {
+          "csharp": "user_id",
+          "go": "user_i_d",
+          "java": "user_i_d",
+          "javascript": "user_id",
+          "plain": false,
+          "python": "user_id",
+          "rust": "user_id"
+        },
+        "userID2": {
+          "csharp": "user_i_d2",
+          "go": "user_i_d2",
+          "java": "user_i_d2",
+          "javascript": "user_i_d2",
+          "plain": false,
+          "python": "user_id2",
+          "rust": "user_i_d2"
+        },
+        "userId": {
+          "csharp": "user_id",
+          "go": "user_id",
+          "java": "user_id",
+          "javascript": "user_id",
+          "plain": true,
+          "python": "user_id",
+          "rust": "user_id"
+        },
+        "userId2": {
+          "csharp": "user_id2",
+          "go": "user_id2",
+          "java": "user_id2",
+          "javascript": "user_id2",
+          "plain": true,
+          "python": "user_id2",
+          "rust": "user_id2"
+        },
+        "user_id": {
+          "csharp": "user_id",
+          "go": "user_id",
+          "java": "user_id",
+          "javascript": "user_id",
+          "plain": true,
+          "python": "user_id",
+          "rust": "user_id"
+        },
+        "value": {
+          "csharp": "value",
+          "go": "value",
+          "java": "value",
+          "javascript": "value",
+          "plain": true,
+          "python": "value",
+          "rust": "value"
+        },
+        "writtenBy": {
+          "csharp": "written_by",
+          "go": "written_by",
+          "java": "written_by",
+          "javascript": "written_by",
+          "plain": true,
+          "python": "written_by",
+          "rust": "written_by"
+        },
+        "written_by": {
+          "csharp": "written_by",
+          "go": "written_by",
+          "java": "written_by",
+          "javascript": "written_by",
+          "plain": true,
+          "python": "written_by",
+          "rust": "written_by"
+        },
+        "x509Cert": {
+          "csharp": "x509_cert",
+          "go": "x509_cert",
+          "java": "x509_cert",
+          "javascript": "x509_cert",
+          "plain": true,
+          "python": "x509_cert",
+          "rust": "x509_cert"
+        },
+        "名Value": {
+          "csharp": "名_value",
+          "go": "名_value",
+          "java": "名_value",
+          "javascript": "名_value",
+          "plain": false,
+          "python": "名value",
+          "rust": "名_value"
+        }
+      }
+    },
     "ids_service": "Ids v1, xlang, SHARED; unary method price(Identified)->Priced",
     "payloads": {
       "author": {

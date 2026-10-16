@@ -9,6 +9,12 @@
 //! - `#[aster(wire = "namespace/Name")]` (struct): the wire tag → TypeDef
 //!   `package`/`name`. Recommended for cross-binding stability; defaults to
 //!   `package = ""`, `name = <StructName>` if omitted.
+//! - `#[aster(name = "writtenBy")]` (field): the field's contract name, when it
+//!   differs from the Rust field name (a contract defined in another language).
+//!   Without it the contract name is the field name, verbatim. The derive
+//!   refuses a name that is not plain, an override whose snake_case form is not
+//!   the field's, and two fields with the same snake_case form, because Fory
+//!   matches fields by that form (`ffi_spec/Aster-FieldNaming.md`).
 //! - `#[aster(default = <expr>)]` (field): a scalar default value, lowered into
 //!   the contract per §11.3.2.3 (`required = false`, `default_value` = canonical
 //!   bytes of the default). Supported for `String` / `bool` / `i32` / `i64` /
@@ -36,6 +42,8 @@
 //! a `Vec<u8>` is only with `#[fory(bytes)]` (`list(element(bytes))` /
 //! `map(key(bytes))` / `map(value(bytes))` when nested). An unannotated
 //! `Vec<u8>` is a compile error — the derive cannot add the attribute itself.
+
+mod field_names;
 
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
@@ -85,8 +93,17 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     // register themselves and recurse further.
     let mut register_children: Vec<TokenStream2> = Vec::new();
     let mut collect_children: Vec<TokenStream2> = Vec::new();
+    let mut names: Vec<(String, String)> = Vec::new();
+    let mut spans: Vec<proc_macro2::Span> = Vec::new();
     for f in fields {
-        let fname = f.ident.as_ref().unwrap().to_string();
+        let member = f.ident.as_ref().unwrap().to_string();
+        let (fname, span) = match parse_name_override(&f.attrs)? {
+            Some((name, span)) => (name, span),
+            None => (member.clone(), f.ident.as_ref().unwrap().span()),
+        };
+        // Fory's Rust derive writes the member's snake_case form.
+        names.push((field_names::fory_snake_case(&member), fname.clone()));
+        spans.push(span);
         let info = analyze_field(f)?;
         let default_expr = parse_default(&f.attrs, &info)?;
         let leaf = &info.leaf_expr;
@@ -107,6 +124,10 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
                 <#child as ::aster::rpc::WireField>::collect_type_defs(__set);
             });
         }
+    }
+
+    if let Err((i, msg)) = field_names::check(&names) {
+        return Err(syn::Error::new(spans[i], msg));
     }
 
     Ok(quote! {
@@ -350,6 +371,34 @@ fn parse_wire_tag(attrs: &[syn::Attribute], ident: &str) -> syn::Result<(String,
         }
         None => Ok((String::new(), ident.to_string())),
     }
+}
+
+/// Read a field's `#[aster(name = "...")]` contract-name override.
+fn parse_name_override(
+    attrs: &[syn::Attribute],
+) -> syn::Result<Option<(String, proc_macro2::Span)>> {
+    let mut name: Option<(String, proc_macro2::Span)> = None;
+    for attr in attrs {
+        if !attr.path().is_ident("aster") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("name") {
+                let lit: syn::LitStr = meta.value()?.parse()?;
+                if name.is_some() {
+                    return Err(meta.error("a field has at most one `name`"));
+                }
+                if lit.value().is_empty() {
+                    return Err(meta.error("`name` must not be empty"));
+                }
+                name = Some((lit.value(), lit.span()));
+                Ok(())
+            } else {
+                skip_meta(&meta)
+            }
+        })?;
+    }
+    Ok(name)
 }
 
 /// Whether `value` falls in the reserved `aster` namespace: the bare package

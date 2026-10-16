@@ -629,6 +629,472 @@ fn box_does_not_change_the_wire() {
     assert_eq!(boxed, plain);
 }
 
+// ── Field names (ffi_spec/Aster-FieldNaming.md) ──────────────────────────────
+
+/// A contract defined in Rust: its field names are the Rust (snake_case) ones.
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "names.v1/Order")]
+struct RsOrder {
+    order_id: String,
+    line_items: Vec<RsLineItem>,
+    total_cents: i32,
+    note: Option<String>,
+}
+
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "names.v1/LineItem")]
+struct RsLineItem {
+    sku_code: String,
+    unit_count: i32,
+}
+
+/// The same wire types as a contract defined in Java (`orderId`, ...): Rust
+/// reproduces it with name overrides. Same Fory bytes, other contract.
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "names.v1/Order")]
+struct JvOrder {
+    #[aster(name = "orderId")]
+    order_id: String,
+    #[aster(name = "lineItems")]
+    line_items: Vec<JvLineItem>,
+    #[aster(name = "totalCents")]
+    total_cents: i32,
+    note: Option<String>,
+}
+
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "names.v1/LineItem")]
+struct JvLineItem {
+    #[aster(name = "skuCode")]
+    sku_code: String,
+    #[aster(name = "unitCount")]
+    unit_count: i32,
+}
+
+fn sample_order() -> RsOrder {
+    RsOrder {
+        order_id: "o-1".into(),
+        line_items: vec![
+            RsLineItem {
+                sku_code: "sku-a".into(),
+                unit_count: 2,
+            },
+            RsLineItem {
+                sku_code: "sku-b".into(),
+                unit_count: 1,
+            },
+        ],
+        total_cents: 1250,
+        note: None,
+    }
+}
+
+fn sample_jv_order() -> JvOrder {
+    let o = sample_order();
+    JvOrder {
+        order_id: o.order_id,
+        line_items: o
+            .line_items
+            .into_iter()
+            .map(|l| JvLineItem {
+                sku_code: l.sku_code,
+                unit_count: l.unit_count,
+            })
+            .collect(),
+        total_cents: o.total_cents,
+        note: o.note,
+    }
+}
+
+/// Each Fory implementation's snake_case form of awkward field names:
+/// (name, plain, [rust, go, java, csharp, javascript, python]).
+const SNAKE_CASE: &[(&str, bool, [&str; 6])] = &[
+    (
+        "value",
+        true,
+        ["value", "value", "value", "value", "value", "value"],
+    ),
+    (
+        "writtenBy",
+        true,
+        [
+            "written_by",
+            "written_by",
+            "written_by",
+            "written_by",
+            "written_by",
+            "written_by",
+        ],
+    ),
+    (
+        "WrittenBy",
+        true,
+        [
+            "written_by",
+            "written_by",
+            "_written_by",
+            "written_by",
+            "written_by",
+            "written_by",
+        ],
+    ),
+    (
+        "written_by",
+        true,
+        [
+            "written_by",
+            "written_by",
+            "written_by",
+            "written_by",
+            "written_by",
+            "written_by",
+        ],
+    ),
+    (
+        "orderId",
+        true,
+        [
+            "order_id", "order_id", "order_id", "order_id", "order_id", "order_id",
+        ],
+    ),
+    (
+        "OrderId",
+        true,
+        [
+            "order_id",
+            "order_id",
+            "_order_id",
+            "order_id",
+            "order_id",
+            "order_id",
+        ],
+    ),
+    ("ID", false, ["id", "i_d", "_i_d", "id", "id", "id"]),
+    ("Id", true, ["id", "id", "_id", "id", "id", "id"]),
+    (
+        "userID",
+        false,
+        [
+            "user_id", "user_i_d", "user_i_d", "user_id", "user_id", "user_id",
+        ],
+    ),
+    (
+        "userId",
+        true,
+        [
+            "user_id", "user_id", "user_id", "user_id", "user_id", "user_id",
+        ],
+    ),
+    (
+        "user_id",
+        true,
+        [
+            "user_id", "user_id", "user_id", "user_id", "user_id", "user_id",
+        ],
+    ),
+    (
+        "userId2",
+        true,
+        [
+            "user_id2", "user_id2", "user_id2", "user_id2", "user_id2", "user_id2",
+        ],
+    ),
+    (
+        "userID2",
+        false,
+        [
+            "user_i_d2",
+            "user_i_d2",
+            "user_i_d2",
+            "user_i_d2",
+            "user_i_d2",
+            "user_id2",
+        ],
+    ),
+    (
+        "HTTPServer",
+        false,
+        [
+            "http_server",
+            "h_t_t_p_server",
+            "_h_t_t_p_server",
+            "http_server",
+            "http_server",
+            "http_server",
+        ],
+    ),
+    (
+        "HttpServer",
+        true,
+        [
+            "http_server",
+            "http_server",
+            "_http_server",
+            "http_server",
+            "http_server",
+            "http_server",
+        ],
+    ),
+    (
+        "httpServer",
+        true,
+        [
+            "http_server",
+            "http_server",
+            "http_server",
+            "http_server",
+            "http_server",
+            "http_server",
+        ],
+    ),
+    (
+        "x509Cert",
+        true,
+        [
+            "x509_cert",
+            "x509_cert",
+            "x509_cert",
+            "x509_cert",
+            "x509_cert",
+            "x509_cert",
+        ],
+    ),
+    (
+        "X509Cert",
+        true,
+        [
+            "x509_cert",
+            "x509_cert",
+            "_x509_cert",
+            "x509_cert",
+            "x509_cert",
+            "x509_cert",
+        ],
+    ),
+    (
+        "ipv6Addr",
+        true,
+        [
+            "ipv6_addr",
+            "ipv6_addr",
+            "ipv6_addr",
+            "ipv6_addr",
+            "ipv6_addr",
+            "ipv6_addr",
+        ],
+    ),
+    (
+        "IPv6Addr",
+        false,
+        [
+            "i_pv6_addr",
+            "i_pv6_addr",
+            "_i_pv6_addr",
+            "i_pv6_addr",
+            "i_pv6_addr",
+            "i_pv6_addr",
+        ],
+    ),
+    (
+        "aBC1",
+        false,
+        ["a_b_c1", "a_b_c1", "a_b_c1", "a_b_c1", "a_b_c1", "a_bc1"],
+    ),
+    (
+        "a_B",
+        false,
+        ["a__b", "a__b", "a__b", "a__b", "a__b", "a_b"],
+    ),
+    (
+        "a__b",
+        true,
+        ["a__b", "a__b", "a__b", "a__b", "a__b", "a__b"],
+    ),
+    (
+        "type_",
+        false,
+        ["type_", "type_", "type_", "type_", "type_", "type"],
+    ),
+    (
+        "_private",
+        true,
+        [
+            "_private", "_private", "_private", "_private", "_private", "_private",
+        ],
+    ),
+    (
+        "maxÉcart",
+        false,
+        [
+            "maxÉcart",
+            "maxÉcart",
+            "maxÉcart",
+            "max_écart",
+            "maxÉcart",
+            "max_écart",
+        ],
+    ),
+    (
+        "名Value",
+        false,
+        [
+            "名_value",
+            "名_value",
+            "名_value",
+            "名_value",
+            "名_value",
+            "名value",
+        ],
+    ),
+    (
+        "getHTTPResponse",
+        false,
+        [
+            "get_http_response",
+            "get_h_t_t_p_response",
+            "get_h_t_t_p_response",
+            "get_http_response",
+            "get_http_response",
+            "get_http_response",
+        ],
+    ),
+];
+
+const SNAKE_IMPLS: [&str; 6] = ["rust", "go", "java", "csharp", "javascript", "python"];
+
+#[test]
+fn override_names_the_field_and_keeps_the_wire() {
+    let td = JvOrder::aster_type_def();
+    let names: Vec<&str> = td.fields.iter().map(|f| f.name.as_str()).collect();
+    for n in ["orderId", "lineItems", "totalCents", "note"] {
+        assert!(names.contains(&n), "{names:?}");
+    }
+    assert_ne!(JvOrder::aster_type_hash(), RsOrder::aster_type_hash());
+    // Fory matches by the snake_case form: the bytes are the same.
+    assert_eq!(roundtrip(&sample_order()), roundtrip(&sample_jv_order()));
+}
+
+#[test]
+fn rust_fory_snake_case_is_the_vector_reference() {
+    for (name, plain, forms) in SNAKE_CASE {
+        assert_eq!(fory_core::util::to_snake_case(name), forms[0], "{name}");
+        // A plain name: every Fory implementation agrees, except Fory Java on
+        // a leading capital (Java refuses such a member locally).
+        if *plain {
+            for (k, form) in forms.iter().enumerate() {
+                if SNAKE_IMPLS[k] == "java" && name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    continue;
+                }
+                assert_eq!(*form, forms[0], "{name}: {}", SNAKE_IMPLS[k]);
+            }
+        }
+    }
+}
+
+fn orders_service(req: String) -> ServiceContract {
+    ServiceContract {
+        name: "Orders".into(),
+        version: 1,
+        methods: vec![unary("place", req.clone(), req)],
+        serialization_modes: vec!["xlang".into()],
+        scoped: ScopeKind::Shared,
+        requires: None,
+        producer_language: String::new(),
+    }
+}
+
+fn field_names() -> Value {
+    let snake: serde_json::Map<String, Value> = SNAKE_CASE
+        .iter()
+        .map(|(name, plain, forms)| {
+            let mut row = serde_json::Map::new();
+            row.insert("plain".into(), json!(plain));
+            for (k, form) in forms.iter().enumerate() {
+                row.insert(SNAKE_IMPLS[k].into(), json!(form));
+            }
+            (name.to_string(), Value::Object(row))
+        })
+        .collect();
+    let field =
+        |member_snake: &str, name: &str| json!({"member_snake": member_snake, "name": name});
+    let mut refused = vec![
+        json!({"case": "collision", "error": "collide",
+               "fields": [field("user_id", "userId"), field("user_id", "user_id")]}),
+        json!({"case": "override_mismatch", "error": "does not match",
+               "fields": [field("author", "writtenBy")]}),
+    ];
+    for (name, plain, forms) in SNAKE_CASE {
+        if !plain {
+            refused.push(
+                json!({"case": "not_plain", "error": "not a plain field name",
+                                "fields": [field(forms[0], name)]}),
+            );
+        }
+    }
+    let accepted = json!([
+        {"fields": [field("written_by", "writtenBy")]},
+        {"fields": [field("written_by", "WrittenBy")]},
+        {"fields": [field("written_by", "written_by")]},
+        {"fields": [field("id", "Id")]},
+        {"fields": [field("user_id2", "userId2")]},
+        {"fields": [field("x509_cert", "x509Cert")]},
+        {"fields": [field("http_server", "HttpServer")]},
+        {"fields": [field("_private", "_private")]},
+        {"fields": [field("order_id", "orderId"), field("line_items", "lineItems"),
+                    field("total_cents", "totalCents"), field("note", "note")]},
+    ]);
+    let order_hex = hex::encode(roundtrip(&sample_order()));
+    json!({
+        "rules": {
+            "name": "a field's contract name is the declared name in the language that defines the contract, verbatim; a binding consuming it elsewhere declares an explicit override. No binding converts case",
+            "snake_case": "the reference snake_case form is Rust fory-core / Fory JS to_snake_case; snake_case lists each Fory implementation's form of awkward names",
+            "plain": "a name is plain when every ASCII uppercase letter starts it or follows an ASCII lowercase letter or a digit, no non-ASCII letter is uppercase, and it does not end in _. For a plain name every Fory implementation writes the reference form (Fory Java prefixes _ to a leading capital, so Java refuses a member starting with one)",
+            "refused": "contract definition refuses a name that is not plain, a field whose member's Fory snake_case form (member_snake) differs from the reference form of its name, and two fields with the same reference form; error is a phrase the message contains",
+        },
+        "snake_case": snake,
+        "refused": refused,
+        "accepted": accepted,
+        "rust_defined": {
+            "types": {
+                "names.v1.Order": type_entry::<RsOrder>(),
+                "names.v1.LineItem": type_entry::<RsLineItem>(),
+            },
+            "service": "Orders v1, xlang, SHARED; unary method place(Order)->Order",
+            "expected_contract_id": contract_id(&orders_service(RsOrder::aster_type_hash_hex())),
+            "payload": {
+                "type": "names.v1.Order",
+                "hex": order_hex,
+                "value": {
+                    "order_id": "o-1",
+                    "line_items": [{"sku_code": "sku-a", "unit_count": 2},
+                                   {"sku_code": "sku-b", "unit_count": 1}],
+                    "total_cents": 1250,
+                    "note": null,
+                },
+            },
+        },
+        "java_defined": {
+            "types": {
+                "names.v1.Order": type_entry::<JvOrder>(),
+                "names.v1.LineItem": type_entry::<JvLineItem>(),
+            },
+            "service": "Orders v1, xlang, SHARED; unary method place(Order)->Order",
+            "expected_contract_id": contract_id(&orders_service(JvOrder::aster_type_hash_hex())),
+            "payload": {
+                "type": "names.v1.Order",
+                "hex": hex::encode(roundtrip(&sample_jv_order())),
+                "value": {
+                    "orderId": "o-1",
+                    "lineItems": [{"skuCode": "sku-a", "unitCount": 2},
+                                  {"skuCode": "sku-b", "unitCount": 1}],
+                    "totalCents": 1250,
+                    "note": null,
+                },
+            },
+        },
+    })
+}
+
 // ── Cross-binding vector ─────────────────────────────────────────────────────
 
 fn path() -> PathBuf {
@@ -801,6 +1267,7 @@ fn actual() -> Value {
             },
         },
         "decode_cases": decode_cases(),
+        "field_names": field_names(),
     })
 }
 
