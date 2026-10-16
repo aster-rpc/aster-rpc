@@ -2,10 +2,34 @@
 
 ## Unreleased
 
+### Added: gateway identity (C ABI 7.7 required)
+
+`Native.RequiredAbiMinor` is now 7; a 7.0 – 7.6 library is refused. Gateway
+identity runs on the config-driven `AsterServer` / `AsterClient` path, with
+Rust doing all validation and wiring:
+
+- `AsterConfig.Identity` (`IdentityConfig`: `AcceptOnBehalfOf`,
+  `TrustedIssuers`, `EdgeTokenMaxLifetimeSecs`, `ClockLeewaySecs`,
+  `MaxKeySetAgeSecs`, `Publisher`) and `AsterConfig.RemoteConfig`
+  (`Disabled`, `Lock`), read from `ASTER_IDENTITY_*` / `ASTER_REMOTE_CONFIG_*`
+  and TOML by Rust; file / env sources survive into NodeConfig `get` unless
+  code changes the value.
+- `AsterServerOptions.AcceptOnBehalfOf` (overrides the config) and
+  `AuditOutbox` (durable NodeConfig set / clear audit).
+- `ServerCallContext.Actor`, `OnBehalfOf` (`ForwardedIdentity`),
+  `AuthMethods`, `RequireAuthMethod(m)`, `NodeProperties`,
+  `NodeAttribute(key)`; `AsterServer.NodeProperties()` (cached per
+  NodeConfig generation).
+- `CallOptions.OnBehalfOf` (the `aster-on-behalf-of` entry; a client running
+  `[identity.publisher]` notices the token), `AsterClient.MintUserToken` /
+  `Enrollment.MintUserToken`, `Enrollment.NoticeKid` / `NoticeToken` /
+  `PublisherStatus`, `GatewayIdentity` constants and `BearerToken`.
+- `NodeConfigClient` (`GetAsync`, `SetAsync`, `ClearAsync`, `AckAsync`) over
+  an `RpcConnection`.
+
 ### Changed: native C ABI 7.5 required
 
-`Native.RequiredAbiMinor` is now 5; a 7.0 – 7.4 library is refused. Added
-on the way:
+`Native.RequiredAbiMinor` was raised to 5 (now 7, above). Added on the way:
 
 - **7.1** `AuditOutbox.AcknowledgementsAsync` / `WaitAcknowledgementsAsync` /
   `WatchAcknowledgementsAsync` (`IAsyncEnumerable<AuditAcknowledgement>`).

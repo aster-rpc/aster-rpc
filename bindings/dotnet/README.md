@@ -125,7 +125,48 @@ log, `WaitAcknowledgementsAsync` waits for the next entry, and
 
 Clients: `RpcConnection.UnaryAsync` / `ServerStreamAsync` /
 `ClientStreamAsync` / `BidiStreamAsync` take `CallOptions` (deadline,
-metadata, session id). There is no generated .NET client yet.
+metadata, session id, `OnBehalfOf`). There is no generated .NET client yet.
+
+## Gateway identity: calls on behalf of users (C ABI 7.7)
+
+An edge holding `aster.gateway` calls a service on behalf of a user with one
+JWT per call: a provider's token forwarded unchanged, or one the edge mints.
+The server verifies it before Gate 3, so `requires` checks the user's roles,
+and the handler sees who is calling:
+
+```csharp
+// Server: accept forwarded users (env ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF=true, or TOML [identity]).
+var config = AsterConfig.FromEnv() with { Identity = new IdentityConfig { AcceptOnBehalfOf = true } };
+var notes = ServiceDefinition.Create("Notes", 1)
+    .Unary<PublishRequest, PublishReply>("publish", (req, ctx) =>
+    {
+        ctx.RequireAuthMethod(GatewayIdentity.AmrWebAuthn); // a passkey sign-in, or PERMISSION_DENIED
+        // ctx.Principal = "iss|sub", ctx.Actor = the gateway, ctx.OnBehalfOf = issuer / subject / jti / expiry
+        return ValueTask.FromResult(new PublishReply());
+    }, requires: CapabilityRequirement.Role("notes.write"))
+    .Build();
+
+// Edge: mint a token within the delegation in its credential (aster.identity.issuable_roles).
+string token = edge.MintUserToken("alice", ["notes.write"], [GatewayIdentity.AmrWebAuthn], TimeSpan.FromMinutes(1));
+await conn.UnaryAsync<PublishRequest, PublishReply>("Notes", "publish", req, new CallOptions { OnBehalfOf = token });
+```
+
+Provider tokens: list the provider in `Identity.TrustedIssuers` (`Iss`,
+`Audiences`, `RolesClaim`, `RoleMap`); its keys come from the fleet namespace,
+published by a node with `[identity.publisher]` (`Identity.Publisher`) and the
+`aster.identity-publisher` role. Forward the browser's token with
+`OnBehalfOf = GatewayIdentity.BearerToken(authorizationHeader)`; a client
+running the publisher notices the token's key id on every such call.
+`AsterServerOptions.AcceptOnBehalfOf` overrides the config.
+
+NodeConfig (`aster.ops.NodeConfig`, served unless `RemoteConfig.Disabled`):
+a peer holding `aster.config-admin` reads and changes a server's name, tags,
+typed attributes and `[identity]` overrides with `NodeConfigClient`
+(`GetAsync`, `SetAsync`, `ClearAsync`, `AckAsync`). Handlers read the
+properties with `ctx.NodeAttribute("tier")?.AsInt()` / `ctx.NodeProperties`;
+attributes never authorise. `RemoteConfig.Lock = ["identity"]` refuses
+remote identity overrides; `AsterServerOptions.AuditOutbox` records every
+change durably.
 
 ## Contract types: timestamp, date, decimal, uuid, ulid, recursion
 
