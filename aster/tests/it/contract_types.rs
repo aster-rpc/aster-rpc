@@ -1,6 +1,7 @@
 #![cfg(feature = "rpc")]
-//! Contract identity and wire for the canonical temporal / decimal types and
-//! for recursive payload types, published as
+//! Contract identity and wire for the canonical temporal / decimal types, the
+//! `uuid` / `ulid` identifiers and `decimal(p, s)`, and for recursive payload
+//! types, published as
 //! `conformance/vectors/contract-types.json` so the other bindings can check
 //! they compute the same type hashes and decode the same payload bytes
 //! (`tests/python/conformance/test_rust_golden_vectors.py`).
@@ -8,11 +9,12 @@
 //! Regenerate (only for an intended, recorded change):
 //! `ASTER_VECTORS_WRITE=1 cargo test -p aster --features rpc --test it contract_types::`
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use aster::rpc::{
-    contract_id, AsterType, BigInt, Date, Decimal, MethodDef, MethodPattern, PayloadRegistry,
-    ScopeKind, ServiceContract, Timestamp, TypeDef, WireField,
+    contract_id, AsterType, BigInt, Date, Decimal, FixedDecimal, MethodDef, MethodPattern,
+    PayloadRegistry, ScopeKind, ServiceContract, Timestamp, TypeDef, Ulid, Uuid, WireField,
 };
 use aster_transport_core::contract::{canonical_xlang_bytes_type_def, TypeKind};
 use fory_derive::ForyStruct;
@@ -89,6 +91,61 @@ struct Forest {
     trees: Vec<TreeNode>,
 }
 
+/// The 16-byte identifiers: `uuid` and `ulid`, as scalars, nullable, list
+/// elements and map keys.
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/Identified")]
+struct Identified {
+    #[aster(uuid)]
+    id: [u8; 16],
+    #[aster(ulid)]
+    trace: [u8; 16],
+    #[aster(uuid)]
+    parent: Option<[u8; 16]>,
+    #[aster(ulid)]
+    history: Vec<[u8; 16]>,
+    #[aster(uuid)]
+    names: BTreeMap<[u8; 16], String>,
+}
+
+/// `decimal(p, s)` beside the unconstrained `decimal`.
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/Priced")]
+struct Priced {
+    price: FixedDecimal<18, 4>,
+    rate: FixedDecimal<5, 0>,
+    maybe_price: Option<FixedDecimal<18, 4>>,
+    amount: Decimal,
+}
+
+/// `Priced` with unconstrained decimals, standing in for a peer that sends
+/// values outside `decimal(18,4)` / `decimal(5,0)` (same wire name and fields).
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/Priced")]
+struct LoosePriced {
+    price: Decimal,
+    rate: Decimal,
+    maybe_price: Option<Decimal>,
+    amount: Decimal,
+}
+
+/// `Identified` with plain byte strings: the wire `uuid` / `ulid` share with
+/// `binary`, and a peer that sends the wrong length.
+#[derive(ForyStruct, aster::AsterType, Debug, Default, Clone, PartialEq)]
+#[aster(wire = "types.v1/Identified")]
+struct LooseIdentified {
+    #[fory(bytes)]
+    id: Vec<u8>,
+    #[fory(bytes)]
+    trace: Vec<u8>,
+    #[fory(bytes)]
+    parent: Option<Vec<u8>>,
+    #[fory(list(element(bytes)))]
+    history: Vec<Vec<u8>>,
+    #[fory(map(key(bytes)))]
+    names: BTreeMap<Vec<u8>, String>,
+}
+
 fn field<'a>(td: &'a TypeDef, name: &str) -> &'a aster_transport_core::contract::FieldDef {
     td.fields.iter().find(|f| f.name == name).unwrap()
 }
@@ -109,6 +166,56 @@ fn temporal_and_decimal_map_to_canonical_primitives() {
         assert_eq!(f.optional, optional, "{name}");
         assert_eq!(f.container as u8, container, "{name}");
     }
+}
+
+#[test]
+fn identifiers_and_fixed_decimals_map_to_canonical_primitives() {
+    let td = Identified::aster_type_def();
+    for (name, prim, optional, container) in [
+        ("id", "uuid", false, 0u8),
+        ("trace", "ulid", false, 0),
+        ("parent", "uuid", true, 0),
+        ("history", "ulid", false, 1),
+        ("names", "string", false, 3),
+    ] {
+        let f = field(&td, name);
+        assert_eq!(f.type_kind, TypeKind::Primitive, "{name}");
+        assert_eq!(f.type_primitive, prim, "{name}");
+        assert_eq!(f.optional, optional, "{name}");
+        assert_eq!(f.container as u8, container, "{name}");
+    }
+    assert_eq!(field(&td, "names").container_key_primitive, "uuid");
+
+    let td = Priced::aster_type_def();
+    assert_eq!(field(&td, "price").type_primitive, "decimal(18,4)");
+    assert_eq!(field(&td, "rate").type_primitive, "decimal(5,0)");
+    assert_eq!(field(&td, "maybe_price").type_primitive, "decimal(18,4)");
+    assert_eq!(field(&td, "amount").type_primitive, "decimal");
+    // (p, s) is part of identity: the loose mirror hashes differently.
+    assert_ne!(Priced::aster_type_hash(), LoosePriced::aster_type_hash());
+}
+
+#[test]
+fn uuid_and_ulid_are_distinct_contract_types() {
+    #[derive(ForyStruct, aster::AsterType, Default)]
+    #[aster(wire = "types.v1/OneId")]
+    struct ByUuid {
+        #[aster(uuid)]
+        id: [u8; 16],
+    }
+    #[derive(ForyStruct, aster::AsterType, Default)]
+    #[aster(wire = "types.v1/OneId")]
+    struct ByUlid {
+        #[aster(ulid)]
+        id: [u8; 16],
+    }
+    #[derive(ForyStruct, aster::AsterType, Default)]
+    #[aster(wire = "types.v1/OneId")]
+    struct ByBytes {
+        id: [u8; 16],
+    }
+    assert_ne!(ByUuid::aster_type_hash(), ByUlid::aster_type_hash());
+    assert_ne!(ByUuid::aster_type_hash(), ByBytes::aster_type_hash());
 }
 
 #[test]
@@ -220,6 +327,59 @@ fn sample_big_decimal() -> Temporal {
     }
 }
 
+const SAMPLE_UUID: &str = "0190f2a8-1b2c-7d3e-8f40-123456789abc";
+const SAMPLE_ULID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+fn sample_identified() -> Identified {
+    let id: [u8; 16] = SAMPLE_UUID.parse::<Uuid>().unwrap().into();
+    let trace: [u8; 16] = SAMPLE_ULID.parse::<Ulid>().unwrap().into();
+    Identified {
+        id,
+        trace,
+        parent: None,
+        history: vec![trace, Ulid::from_u128(0).into()],
+        names: BTreeMap::from([(id, "primary".to_string())]),
+    }
+}
+
+fn loose(id: &Identified) -> LooseIdentified {
+    LooseIdentified {
+        id: id.id.to_vec(),
+        trace: id.trace.to_vec(),
+        parent: id.parent.map(|p| p.to_vec()),
+        history: id.history.iter().map(|u| u.to_vec()).collect(),
+        names: id
+            .names
+            .iter()
+            .map(|(k, v)| (k.to_vec(), v.clone()))
+            .collect(),
+    }
+}
+
+fn sample_priced() -> Priced {
+    Priced {
+        price: "-12345.67".parse().unwrap(),
+        rate: "99999".parse().unwrap(),
+        maybe_price: Some("0.0001".parse().unwrap()),
+        amount: Decimal::new(BigInt::from(15), 1),
+    }
+}
+
+/// A `Decimal` at exactly the scale written: `"1.50"` is unscaled 150, scale 2.
+fn dec(s: &str) -> Decimal {
+    let (int, frac) = s.split_once('.').unwrap_or((s, ""));
+    Decimal::new(format!("{int}{frac}").parse().unwrap(), frac.len() as i32)
+}
+
+fn loose_priced(price: &str, rate: &str) -> LoosePriced {
+    LoosePriced {
+        price: dec(price),
+        rate: dec(rate),
+        maybe_price: None,
+        amount: dec("0"),
+    }
+}
+
 fn sample_tree() -> TreeNode {
     TreeNode {
         value: "root".into(),
@@ -267,6 +427,88 @@ where
 fn temporal_and_decimal_roundtrip() {
     roundtrip(&sample_temporal());
     roundtrip(&sample_big_decimal());
+}
+
+#[test]
+fn identifiers_roundtrip_as_16_byte_binary() {
+    let id = sample_identified();
+    let bytes = roundtrip(&id);
+    // Byte-for-byte the wire of `binary` fields holding the same 16 bytes.
+    let fory = fory_for::<LooseIdentified>();
+    assert_eq!(fory.serialize(&loose(&id)).unwrap(), bytes);
+    roundtrip(&Identified {
+        parent: Some(Uuid::from_u128(1).into()),
+        ..id
+    });
+}
+
+#[test]
+fn wrong_length_identifier_is_refused() {
+    let fory = fory_for::<Identified>();
+    let send = |l: &LooseIdentified| fory_for::<LooseIdentified>().serialize(l).unwrap();
+    for bad in [15usize, 17, 0] {
+        let mut l = loose(&sample_identified());
+        l.id = vec![7; bad];
+        let err = fory.deserialize::<Identified>(&send(&l)).unwrap_err();
+        assert!(
+            err.to_string().contains("expected 16 bytes"),
+            "{bad}: {err}"
+        );
+    }
+    let mut l = loose(&sample_identified());
+    l.history[1] = vec![0; 32];
+    assert!(fory.deserialize::<Identified>(&send(&l)).is_err());
+}
+
+#[test]
+fn fixed_decimal_roundtrip_writes_the_declared_scale() {
+    let bytes = roundtrip(&sample_priced());
+    let back: LoosePriced = fory_for::<LoosePriced>().deserialize(&bytes).unwrap();
+    assert_eq!(back.price, Decimal::new(BigInt::from(-123_456_700), 4));
+    assert_eq!(back.rate, Decimal::new(BigInt::from(99_999), 0));
+}
+
+#[test]
+fn fixed_decimal_decode_applies_the_constraint() {
+    let fory = fory_for::<Priced>();
+    let send = |l: &LoosePriced| fory_for::<LoosePriced>().serialize(l).unwrap();
+    // Zero padding is exact: 1.5 arrives at scale 1 and decodes at scale 4.
+    let ok: Priced = fory.deserialize(&send(&loose_priced("1.5", "7"))).unwrap();
+    assert_eq!(
+        ok.price.as_decimal(),
+        &Decimal::new(BigInt::from(15_000), 4)
+    );
+    // Trailing zeros past the scale drop exactly.
+    let ok: Priced = fory
+        .deserialize(&send(&loose_priced("1.500000", "7.0")))
+        .unwrap();
+    assert_eq!(ok.price.to_string(), "1.5000");
+    assert_eq!(ok.rate.to_string(), "7");
+    // Needs rounding.
+    let err = fory
+        .deserialize::<Priced>(&send(&loose_priced("1.23456", "7")))
+        .unwrap_err();
+    assert!(err.to_string().contains("rounding"), "{err}");
+    // More than 18 digits at scale 4.
+    let err = fory
+        .deserialize::<Priced>(&send(&loose_priced("123456789012345", "7")))
+        .unwrap_err();
+    assert!(err.to_string().contains("more than 18 digits"), "{err}");
+    // More than 5 digits at scale 0.
+    assert!(fory
+        .deserialize::<Priced>(&send(&loose_priced("1", "123456")))
+        .is_err());
+}
+
+#[test]
+fn fixed_decimal_encode_refuses_what_does_not_fit() {
+    assert!("1.23456".parse::<FixedDecimal<18, 4>>().is_err());
+    assert!("123456789012345".parse::<FixedDecimal<18, 4>>().is_err());
+    assert!(FixedDecimal::<5, 0>::new(dec("0.5")).is_err());
+    assert_eq!(
+        FixedDecimal::<18, 4>::new(dec("2")).unwrap().as_decimal(),
+        &Decimal::new(BigInt::from(20_000), 4)
+    );
 }
 
 #[test]
@@ -398,9 +640,13 @@ fn actual() -> Value {
             "types.v1.Gamma": type_entry::<Gamma>(),
             "types.v1.Forest": type_entry::<Forest>(),
             "types.v1.Chain": type_entry::<Chain>(),
+            "types.v1.Identified": type_entry::<Identified>(),
+            "types.v1.Priced": type_entry::<Priced>(),
         },
         "service": "Types v1, xlang, SHARED; unary methods echo_temporal(Temporal)->Temporal, plant(TreeNode)->Forest, author(Book)->Author, cycle(Alpha)->Gamma",
         "expected_contract_id": contract_id(&service()),
+        "ids_service": "Ids v1, xlang, SHARED; unary method price(Identified)->Priced",
+        "expected_ids_contract_id": contract_id(&ids_service()),
         "payloads": {
             "temporal_small_decimal": {
                 "type": "types.v1.Temporal",
@@ -440,6 +686,27 @@ fn actual() -> Value {
                 "hex": hex::encode(roundtrip(&sample_cycle())),
                 "value": {"next": {"next": {"next": [{"next": null}]}}},
             },
+            "identified": {
+                "type": "types.v1.Identified",
+                "hex": hex::encode(roundtrip(&sample_identified())),
+                "value": {
+                    "id": SAMPLE_UUID,
+                    "trace": SAMPLE_ULID,
+                    "parent": null,
+                    "history": [SAMPLE_ULID, "00000000000000000000000000"],
+                    "names": {SAMPLE_UUID: "primary"},
+                },
+            },
+            "priced": {
+                "type": "types.v1.Priced",
+                "hex": hex::encode(roundtrip(&sample_priced())),
+                "value": {
+                    "price": "-12345.6700",
+                    "rate": "99999",
+                    "maybe_price": "0.0001",
+                    "amount": "1.5",
+                },
+            },
             "author": {
                 "type": "types.v1.Author",
                 "hex": hex::encode(roundtrip(&sample_author())),
@@ -449,7 +716,94 @@ fn actual() -> Value {
                 },
             },
         },
+        "decode_cases": decode_cases(),
     })
+}
+
+/// Payloads a peer may send that a `Priced` / `Identified` decoder must accept
+/// (with the value given) or refuse.
+fn decode_cases() -> Value {
+    let priced = |price: &str, rate: &str| {
+        let l = loose_priced(price, rate);
+        hex::encode(fory_for::<LoosePriced>().serialize(&l).unwrap())
+    };
+    let ids =
+        |l: &LooseIdentified| hex::encode(fory_for::<LooseIdentified>().serialize(l).unwrap());
+    let mut short = loose(&sample_identified());
+    short.id = vec![0xab; 15];
+    let mut long = loose(&sample_identified());
+    long.history[0] = vec![0xab; 17];
+    json!({
+        "priced_zero_padding": {
+            "type": "types.v1.Priced",
+            "hex": priced("1.5", "7.0"),
+            "sent": "price 1.5 (scale 1), rate 7.0 (scale 1)",
+            "refused": false,
+            "value": {"price": "1.5000", "rate": "7", "maybe_price": null, "amount": "0"},
+        },
+        "priced_needs_rounding": {
+            "type": "types.v1.Priced",
+            "hex": priced("1.23456", "7"),
+            "sent": "price 1.23456 into decimal(18,4)",
+            "refused": true,
+        },
+        "priced_too_many_digits": {
+            "type": "types.v1.Priced",
+            "hex": priced("123456789012345", "7"),
+            "sent": "price 123456789012345 (19 digits at scale 4) into decimal(18,4)",
+            "refused": true,
+        },
+        "priced_rate_too_many_digits": {
+            "type": "types.v1.Priced",
+            "hex": priced("1", "123456"),
+            "sent": "rate 123456 into decimal(5,0)",
+            "refused": true,
+        },
+        "uuid_15_bytes": {
+            "type": "types.v1.Identified",
+            "hex": ids(&short),
+            "sent": "id as 15 bytes",
+            "refused": true,
+        },
+        "ulid_17_bytes": {
+            "type": "types.v1.Identified",
+            "hex": ids(&long),
+            "sent": "history[0] as 17 bytes",
+            "refused": true,
+        },
+    })
+}
+
+fn ids_service() -> ServiceContract {
+    ServiceContract {
+        name: "Ids".into(),
+        version: 1,
+        methods: vec![unary(
+            "price",
+            Identified::aster_type_hash_hex(),
+            Priced::aster_type_hash_hex(),
+        )],
+        serialization_modes: vec!["xlang".into()],
+        scoped: ScopeKind::Shared,
+        requires: None,
+        producer_language: String::new(),
+    }
+}
+
+#[test]
+fn decode_cases_match_the_rust_decoder() {
+    let cases = decode_cases();
+    for (name, case) in cases.as_object().unwrap() {
+        let bytes = hex::decode(case["hex"].as_str().unwrap()).unwrap();
+        let refused = case["refused"].as_bool().unwrap();
+        let ok = match case["type"].as_str().unwrap() {
+            "types.v1.Priced" => fory_for::<Priced>().deserialize::<Priced>(&bytes).is_ok(),
+            _ => fory_for::<Identified>()
+                .deserialize::<Identified>(&bytes)
+                .is_ok(),
+        };
+        assert_eq!(ok, !refused, "{name}");
+    }
 }
 
 #[test]
@@ -457,13 +811,16 @@ fn contract_types_vector() {
     let got = actual();
     if std::env::var_os("ASTER_VECTORS_WRITE").is_some() {
         let doc = json!({
-            "description": "Contract-identity and wire vectors for the canonical timestamp / date / decimal types and for recursive types (Aster-ContractIdentity.md, 'Language-Native Default Mapping' Rust rows and §11.3.4 Step 3 / Appendix B). Produced by the Rust #[derive(AsterType)].",
+            "description": "Contract-identity and wire vectors for the canonical timestamp / date / decimal / decimal(p,s) / uuid / ulid types and for recursive types (Aster-ContractIdentity.md, 'Language-Native Default Mapping' Rust rows and §11.3.4 Step 3 / Appendix B). Produced by the Rust #[derive(AsterType)].",
             "rules": {
                 "timestamp": "Fory xlang TIMESTAMP (type id 38): int64 seconds + uint32 nanos since the Unix epoch, UTC",
                 "date": "Fory xlang DATE (type id 39): varint64 days since 1970-01-01",
                 "decimal": "Fory xlang DECIMAL (type id 40): varint32 scale, then the unscaled value (zig-zag varint64 << 1, or a flagged little-endian magnitude)",
                 "self_ref": "an edge outside an SCC's spanning tree (DFS from the codepoint-smallest member, successors in codepoint order) is type_kind SELF_REF (2) with self_ref_name = the target's package.name; tree edges are REF (1) to the target's hash",
-                "box": "Rust Box<T> is transparent in both the contract and the wire"
+                "box": "Rust Box<T> is transparent in both the contract and the wire",
+                "uuid": "contract type uuid: Fory xlang BINARY (type id 41) of exactly 16 bytes (varuint32 length 16, then the bytes); a decoder refuses any other length. String form 8-4-4-4-12 lowercase hex",
+                "ulid": "contract type ulid (an identity distinct from uuid): the same 16-byte BINARY wire; string form 26 characters of Crockford base32",
+                "decimal(p,s)": "type_primitive is the ASCII string decimal(p,s) with no spaces, e.g. decimal(18,4). Wire: Fory DECIMAL with scale exactly s; the encoder zero-pads to scale s and refuses a value that needs rounding or has more than p digits; the decoder applies the same rule. decode_cases lists payloads a decoder must accept (with the value) or refuse"
             },
             "rust_source": "aster/tests/it/contract_types.rs",
             "vector": got,

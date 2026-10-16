@@ -63,7 +63,7 @@ pub trait AsterType {
 /// scalars here and for `#[derive(AsterType)]` structs (as a named `Ref`).
 pub struct Leaf {
     kind: TypeKind,
-    primitive: &'static str,
+    primitive: std::borrow::Cow<'static, str>,
     type_ref: Vec<u8>,
     /// A reference to a derived type, resolved together with the enclosing
     /// type graph (so a reference closing a cycle can become `SELF_REF`).
@@ -75,7 +75,18 @@ impl Leaf {
     pub fn primitive(name: &'static str) -> Self {
         Leaf {
             kind: TypeKind::Primitive,
-            primitive: name,
+            primitive: std::borrow::Cow::Borrowed(name),
+            type_ref: Vec::new(),
+            target: None,
+        }
+    }
+
+    /// A primitive leaf whose canonical type name is built at run time, such
+    /// as a parameterised `decimal(18,4)`.
+    pub fn primitive_owned(name: String) -> Self {
+        Leaf {
+            kind: TypeKind::Primitive,
+            primitive: std::borrow::Cow::Owned(name),
             type_ref: Vec::new(),
             target: None,
         }
@@ -85,7 +96,7 @@ impl Leaf {
     pub fn reference(hash: [u8; 32]) -> Self {
         Leaf {
             kind: TypeKind::Ref,
-            primitive: "",
+            primitive: std::borrow::Cow::Borrowed(""),
             type_ref: hash.to_vec(),
             target: None,
         }
@@ -97,7 +108,7 @@ impl Leaf {
     pub fn named(shape: ShapeFn) -> Self {
         Leaf {
             kind: TypeKind::Ref,
-            primitive: "",
+            primitive: std::borrow::Cow::Borrowed(""),
             type_ref: Vec::new(),
             target: Some(shape),
         }

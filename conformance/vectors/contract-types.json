@@ -1,15 +1,64 @@
 {
-  "description": "Contract-identity and wire vectors for the canonical timestamp / date / decimal types and for recursive types (Aster-ContractIdentity.md, 'Language-Native Default Mapping' Rust rows and §11.3.4 Step 3 / Appendix B). Produced by the Rust #[derive(AsterType)].",
+  "description": "Contract-identity and wire vectors for the canonical timestamp / date / decimal / decimal(p,s) / uuid / ulid types and for recursive types (Aster-ContractIdentity.md, 'Language-Native Default Mapping' Rust rows and §11.3.4 Step 3 / Appendix B). Produced by the Rust #[derive(AsterType)].",
   "rules": {
     "box": "Rust Box<T> is transparent in both the contract and the wire",
     "date": "Fory xlang DATE (type id 39): varint64 days since 1970-01-01",
     "decimal": "Fory xlang DECIMAL (type id 40): varint32 scale, then the unscaled value (zig-zag varint64 << 1, or a flagged little-endian magnitude)",
+    "decimal(p,s)": "type_primitive is the ASCII string decimal(p,s) with no spaces, e.g. decimal(18,4). Wire: Fory DECIMAL with scale exactly s; the encoder zero-pads to scale s and refuses a value that needs rounding or has more than p digits; the decoder applies the same rule. decode_cases lists payloads a decoder must accept (with the value) or refuse",
     "self_ref": "an edge outside an SCC's spanning tree (DFS from the codepoint-smallest member, successors in codepoint order) is type_kind SELF_REF (2) with self_ref_name = the target's package.name; tree edges are REF (1) to the target's hash",
-    "timestamp": "Fory xlang TIMESTAMP (type id 38): int64 seconds + uint32 nanos since the Unix epoch, UTC"
+    "timestamp": "Fory xlang TIMESTAMP (type id 38): int64 seconds + uint32 nanos since the Unix epoch, UTC",
+    "ulid": "contract type ulid (an identity distinct from uuid): the same 16-byte BINARY wire; string form 26 characters of Crockford base32",
+    "uuid": "contract type uuid: Fory xlang BINARY (type id 41) of exactly 16 bytes (varuint32 length 16, then the bytes); a decoder refuses any other length. String form 8-4-4-4-12 lowercase hex"
   },
   "rust_source": "aster/tests/it/contract_types.rs",
   "vector": {
+    "decode_cases": {
+      "priced_needs_rounding": {
+        "hex": "01ff1e002860bcab92659b62e41ea6c1e225f2ba80133e2811064c28018ea3665a2830180936f8a0444c28be28110048284413200000fd0a80921e001c",
+        "refused": true,
+        "sent": "price 1.23456 into decimal(18,4)",
+        "type": "types.v1.Priced"
+      },
+      "priced_rate_too_many_digits": {
+        "hex": "01ff1e002860bcab92659b62e41ea6c1e225f2ba80133e2811064c28018ea3665a2830180936f8a0444c28be28110048284413200000fd00040080921e",
+        "refused": true,
+        "sent": "rate 123456 into decimal(5,0)",
+        "type": "types.v1.Priced"
+      },
+      "priced_too_many_digits": {
+        "hex": "01ff1e002860bcab92659b62e41ea6c1e225f2ba80133e2811064c28018ea3665a2830180936f8a0444c28be28110048284413200000fd00e4fbddc1a1a470001c",
+        "refused": true,
+        "sent": "price 123456789012345 (19 digits at scale 4) into decimal(18,4)",
+        "type": "types.v1.Priced"
+      },
+      "priced_zero_padding": {
+        "hex": "01ff1e002860bcab92659b62e41ea6c1e225f2ba80133e2811064c28018ea3665a2830180936f8a0444c28be28110048284413200000fd023c029802",
+        "refused": false,
+        "sent": "price 1.5 (scale 1), rate 7.0 (scale 1)",
+        "type": "types.v1.Priced",
+        "value": {
+          "amount": "0",
+          "maybe_price": null,
+          "price": "1.5000",
+          "rate": "7"
+        }
+      },
+      "ulid_17_bytes": {
+        "hex": "01ff1e0033806b47ffdc375ae51ea6c1e225f2ba801fa0646cd05410605016a4011d129ba3804429a0604c18a40154b40c24804e293c1123664c29ce201100020c11ababababababababababababababababab1000000000000000000000000000000000100190f2a81b2c7d3e8f40123456789abc012401100190f2a81b2c7d3e8f40123456789abc1e7072696d617279fd1001563e3ab5d3d6764c61efb99302bd5b",
+        "refused": true,
+        "sent": "history[0] as 17 bytes",
+        "type": "types.v1.Identified"
+      },
+      "uuid_15_bytes": {
+        "hex": "01ff1e0033806b47ffdc375ae51ea6c1e225f2ba801fa0646cd05410605016a4011d129ba3804429a0604c18a40154b40c24804e293c1123664c29ce201100020c1001563e3ab5d3d6764c61efb99302bd5b10000000000000000000000000000000000fababababababababababababababab012401100190f2a81b2c7d3e8f40123456789abc1e7072696d617279fd1001563e3ab5d3d6764c61efb99302bd5b",
+        "refused": true,
+        "sent": "id as 15 bytes",
+        "type": "types.v1.Identified"
+      }
+    },
     "expected_contract_id": "269b6d809959aabe5b4f55cff9e804b491c854eb58f8adf2cd8f6f080dcb4d50",
+    "expected_ids_contract_id": "210334410c14ec44812156c5f37a31c2bd1683666871bfa2802cc91e2eb03196",
+    "ids_service": "Ids v1, xlang, SHARED; unary method price(Identified)->Priced",
     "payloads": {
       "author": {
         "hex": "01ff1e001ab035e387144d2fe21ea6c1e225f2ba801302933ba24c167885ce54804815340c2001081e021c00310967c5e158e21ea6c1e225f2ba800f05ce504c15cd1359005a1eda289cc8dd87004254686520446973706f73736573736564ff1e01001a557273756c611a557273756c61",
@@ -40,6 +89,32 @@
               ]
             }
           }
+        }
+      },
+      "identified": {
+        "hex": "01ff1e0033806b47ffdc375ae51ea6c1e225f2ba801fa0646cd05410605016a4011d129ba3804429a0604c18a40154b40c24804e293c1123664c29ce201100020c1001563e3ab5d3d6764c61efb99302bd5b1000000000000000000000000000000000100190f2a81b2c7d3e8f40123456789abc012401100190f2a81b2c7d3e8f40123456789abc1e7072696d617279fd1001563e3ab5d3d6764c61efb99302bd5b",
+        "type": "types.v1.Identified",
+        "value": {
+          "history": [
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "00000000000000000000000000"
+          ],
+          "id": "0190f2a8-1b2c-7d3e-8f40-123456789abc",
+          "names": {
+            "0190f2a8-1b2c-7d3e-8f40-123456789abc": "primary"
+          },
+          "parent": null,
+          "trace": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        }
+      },
+      "priced": {
+        "hex": "01ff1e002860bcab92659b62e41ea6c1e225f2ba80133e2811064c28018ea3665a2830180936f8a0444c28be2811004828441320023cff080408eee5bceb0100fcb418",
+        "type": "types.v1.Priced",
+        "value": {
+          "amount": "1.5",
+          "maybe_price": "0.0001",
+          "price": "-12345.6700",
+          "rate": "99999"
         }
       },
       "temporal_big_decimal": {
@@ -239,6 +314,103 @@
           }
         ],
         "name": "Gamma",
+        "package": "types.v1"
+      },
+      "types.v1.Identified": {
+        "expected_canonical_type_def_hex": "002274797065732e76312a4964656e746966696564050c021e686973746f72790012756c696400020000010002000100040a69640012757569640002000000000200010006166e616d6573001a737472696e670002000003001275756964000100081a706172656e74001275756964000201000000020001000a1674726163650012756c696400020000000002000100000c000c",
+        "expected_type_hash": "bb3b0254aa7fb26d589f9c9ffd6b305077952d3e92114252ba313f5b31848814",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "id",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "uuid",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "trace",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "ulid",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "parent",
+            "optional": true,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "uuid",
+            "type_ref": ""
+          },
+          {
+            "container": 1,
+            "name": "history",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "ulid",
+            "type_ref": ""
+          },
+          {
+            "container": 3,
+            "name": "names",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "string",
+            "type_ref": ""
+          }
+        ],
+        "name": "Identified",
+        "package": "types.v1"
+      },
+      "types.v1.Priced": {
+        "expected_canonical_type_def_hex": "002274797065732e76311a507269636564040c021a616d6f756e74001e646563696d616c00020000000002000100042e6d617962655f70726963650036646563696d616c2831382c342900020100000002000100061670726963650036646563696d616c2831382c3429000200000000020001000812726174650032646563696d616c28352c302900020000000002000100000c000c",
+        "expected_type_hash": "1411e52384fe870d7ed4e6440e8d720d68e706d4023a5d44490b75d4b24b7227",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "price",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "decimal(18,4)",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "rate",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "decimal(5,0)",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "maybe_price",
+            "optional": true,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "decimal(18,4)",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "amount",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "decimal",
+            "type_ref": ""
+          }
+        ],
+        "name": "Priced",
         "package": "types.v1"
       },
       "types.v1.Temporal": {

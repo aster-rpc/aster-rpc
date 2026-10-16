@@ -17,6 +17,7 @@ import dataclasses
 import datetime as _dt
 import decimal as _decimal
 import unicodedata
+import uuid as _uuid
 import warnings
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -576,7 +577,9 @@ def contract_id_from_service(service_cls: type) -> str:
 # Rust ``aster::rpc::{Timestamp, Date, Decimal}``, Java ``Instant`` /
 # ``LocalDate`` / ``BigDecimal`` and TypeScript ``Date`` use. Lookup is by
 # exact type, so ``datetime`` (a ``date`` subclass) is not mistaken for
-# ``date``. Vectors: conformance/vectors/contract-types.json.
+# ``date``. ``uuid.UUID`` / ``aster.ULID`` are the 16-byte ``uuid`` / ``ulid``
+# and ``aster.decimal(p, s)`` the constrained ``decimal(p,s)``
+# (aster/scalars.py). Vectors: conformance/vectors/contract-types.json.
 _PYTHON_TO_XLANG_PRIMITIVE: dict[type, str] = {
     str: "string",
     int: "varint64",
@@ -587,6 +590,7 @@ _PYTHON_TO_XLANG_PRIMITIVE: dict[type, str] = {
     _dt.datetime: "timestamp",
     _dt.date: "date",
     _decimal.Decimal: "decimal",
+    _uuid.UUID: "uuid",
 }
 
 
@@ -958,6 +962,12 @@ def _resolve_field_type(
 
     if isinstance(tp, type) and tp in _PYTHON_TO_XLANG_PRIMITIVE:
         return TypeKind.PRIMITIVE, _PYTHON_TO_XLANG_PRIMITIVE[tp], b"", ""
+
+    from aster.scalars import type_primitive as _scalar_primitive
+
+    scalar = _scalar_primitive(tp)
+    if scalar is not None:
+        return TypeKind.PRIMITIVE, scalar, b"", ""
 
     if dataclasses.is_dataclass(tp) and isinstance(tp, type):
         fqn = _get_fqn(tp)

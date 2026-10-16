@@ -17,9 +17,16 @@
 //!   `map`) — `required = false`, `default_value` = the `0x00` sentinel.
 //! - `#[aster(uint8_list)]` (field): keep a `Vec<u8>` / `VecDeque<u8>` as a Fory
 //!   list and publish it as `list<uint8>` instead of `binary`.
+//! - `#[aster(uuid)]` / `#[aster(ulid)]` (field): publish the field's `[u8; 16]`
+//!   leaves (the field itself, an `Option`, list / set elements, map keys or
+//!   values) as `uuid` / `ulid` instead of `binary`. The wire stays Fory
+//!   BINARY of exactly 16 bytes, which Fory's `[u8; 16]` decoder enforces.
+//!   `aster::rpc::{Uuid, Ulid}` convert to and from the array and parse /
+//!   format the string forms.
 //!
 //! Field types: scalars, `aster::rpc::{Timestamp, Date, Decimal}` (published as
-//! `timestamp` / `date` / `decimal`), other `AsterType`s, and `Option` / `Vec`
+//! `timestamp` / `date` / `decimal`), `aster::rpc::FixedDecimal<P, S>`
+//! (`decimal(P,S)`), other `AsterType`s, and `Option` / `Vec`
 //! / sets / maps of them. `Box<T>` is transparent. Types may be recursive or
 //! mutually recursive: identity follows the spec's SCC rule (§11.3.4 Step 3),
 //! resolved at runtime by `aster::rpc::resolve_type_def`.
@@ -473,18 +480,41 @@ fn skip_meta(meta: &syn::meta::ParseNestedMeta) -> syn::Result<()> {
     Ok(())
 }
 
-/// Whether the field carries `#[aster(uint8_list)]` — the explicit opt-out
-/// that keeps a `Vec<u8>` as a Fory LIST<UINT8> and publishes it as
-/// `list<uint8>` instead of `binary`.
-fn has_uint8_list_attr(attrs: &[syn::Attribute]) -> syn::Result<bool> {
-    let mut found = false;
+/// The field-level `#[aster(...)]` flags that change how a byte leaf is
+/// published.
+#[derive(Default)]
+struct FieldOpts {
+    /// `#[aster(uint8_list)]` — the explicit opt-out that keeps a `Vec<u8>` as
+    /// a Fory LIST<UINT8> and publishes it as `list<uint8>` instead of
+    /// `binary`.
+    uint8_list: bool,
+    /// `#[aster(uuid)]` / `#[aster(ulid)]` — publish `[u8; 16]` leaves as this
+    /// canonical identifier type instead of `binary`.
+    id16: Option<&'static str>,
+    /// Set once an `id16` leaf has been published, so an attribute that
+    /// matched nothing is an error.
+    id16_used: std::cell::Cell<bool>,
+}
+
+fn field_opts(attrs: &[syn::Attribute]) -> syn::Result<FieldOpts> {
+    let mut opts = FieldOpts::default();
     for attr in attrs {
         if !attr.path().is_ident("aster") {
             continue;
         }
         attr.parse_nested_meta(|meta| {
             if meta.path.is_ident("uint8_list") {
-                found = true;
+                opts.uint8_list = true;
+            } else if meta.path.is_ident("uuid") || meta.path.is_ident("ulid") {
+                let id = if meta.path.is_ident("uuid") {
+                    "uuid"
+                } else {
+                    "ulid"
+                };
+                if opts.id16.is_some_and(|prev| prev != id) {
+                    return Err(meta.error("a field is either `uuid` or `ulid`, not both"));
+                }
+                opts.id16 = Some(id);
             } else {
                 // `default` etc. are parsed by `parse_default`.
                 skip_meta(&meta)?;
@@ -492,7 +522,21 @@ fn has_uint8_list_attr(attrs: &[syn::Attribute]) -> syn::Result<bool> {
             Ok(())
         })?;
     }
-    Ok(found)
+    Ok(opts)
+}
+
+/// Whether `ty` is `[u8; 16]` (the length written as the literal `16`).
+fn is_u8_16(ty: &Type) -> bool {
+    match ty {
+        Type::Array(a) => {
+            is_u8(&a.elem)
+                && matches!(&a.len, Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(n), .. })
+                    if n.base10_parse::<usize>().ok() == Some(16))
+        }
+        Type::Paren(p) => is_u8_16(&p.elem),
+        Type::Group(g) => is_u8_16(&g.elem),
+        _ => false,
+    }
 }
 
 /// The Rust byte-buffer shapes a contract `binary` could map to.
@@ -551,7 +595,21 @@ fn binary_leaf(
     shape: ByteShape,
     node: Option<&ForyNode>,
     pos: BytePos,
+    opts: &FieldOpts,
 ) -> syn::Result<TokenStream2> {
+    if let Some(id) = opts.id16 {
+        if shape == ByteShape::Array && is_u8_16(ty) {
+            opts.id16_used.set(true);
+            return Ok(quote!(::aster::rpc::Leaf::primitive(#id)));
+        }
+        return Err(syn::Error::new_spanned(
+            ty,
+            format!(
+                "`#[aster({id})]` publishes the field's byte leaves as `{id}`, 16 bytes on the \
+                 wire, so each must be written `[u8; 16]`"
+            ),
+        ));
+    }
     let binary = quote!(::aster::rpc::Leaf::primitive("binary"));
     let bytes = node.is_some_and(|n| n.bytes);
     let array = node.is_some_and(|n| n.array);
@@ -599,9 +657,14 @@ fn binary_leaf(
 }
 
 /// The contract leaf for a container's element / key / value type.
-fn child_leaf(ty: &Type, node: Option<&ForyNode>, pos: BytePos) -> syn::Result<TokenStream2> {
+fn child_leaf(
+    ty: &Type,
+    node: Option<&ForyNode>,
+    pos: BytePos,
+    opts: &FieldOpts,
+) -> syn::Result<TokenStream2> {
     match byte_shape(ty) {
-        Some(shape) => binary_leaf(ty, shape, node, pos),
+        Some(shape) => binary_leaf(ty, shape, node, pos, opts),
         None => Ok(leaf_of(ty)),
     }
 }
@@ -612,24 +675,40 @@ fn child_leaf(ty: &Type, node: Option<&ForyNode>, pos: BytePos) -> syn::Result<T
 /// resolves its leaf via the `WireField` impl.
 fn analyze_field(f: &syn::Field) -> syn::Result<FieldInfo> {
     let fory = ForyNode::from_attrs(&f.attrs)?;
-    let uint8_list = has_uint8_list_attr(&f.attrs)?;
-    analyze_type(&f.ty, &fory, uint8_list)
+    let opts = field_opts(&f.attrs)?;
+    if opts.uint8_list && opts.id16.is_some() {
+        return Err(syn::Error::new_spanned(
+            &f.ty,
+            "`#[aster(uint8_list)]` and `#[aster(uuid)]` / `#[aster(ulid)]` contradict each other",
+        ));
+    }
+    let info = analyze_type(&f.ty, &fory, &opts)?;
+    if let (Some(id), false) = (opts.id16, opts.id16_used.get()) {
+        return Err(syn::Error::new_spanned(
+            &f.ty,
+            format!(
+                "`#[aster({id})]` applies only to a `[u8; 16]` field, or an `Option`, `Vec`, \
+                 set or map of `[u8; 16]`"
+            ),
+        ));
+    }
+    Ok(info)
 }
 
-fn analyze_type(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<FieldInfo> {
+fn analyze_type(ty: &Type, fory: &ForyNode, opts: &FieldOpts) -> syn::Result<FieldInfo> {
     let ty = &unbox(ty);
     if let Some((ident, args)) = path_segment(ty) {
         if ident == "Option" {
             if let Some(inner) = args.first() {
                 // `Option` is transparent to Fory's field config: the
                 // attributes apply to the inner type.
-                let mut info = analyze_inner(&unbox(inner), fory, uint8_list)?;
+                let mut info = analyze_inner(&unbox(inner), fory, opts)?;
                 info.optional = true;
                 return Ok(info);
             }
         }
     }
-    analyze_inner(ty, fory, uint8_list)
+    analyze_inner(ty, fory, opts)
 }
 
 /// Strip `Box<…>` layers: a box is transparent on the Fory wire and in the
@@ -642,9 +721,9 @@ fn unbox(ty: &Type) -> Type {
     }
 }
 
-fn analyze_inner(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<FieldInfo> {
+fn analyze_inner(ty: &Type, fory: &ForyNode, opts: &FieldOpts) -> syn::Result<FieldInfo> {
     let shape = byte_shape(ty);
-    if uint8_list {
+    if opts.uint8_list {
         return match shape {
             Some(ByteShape::Vec | ByteShape::VecDeque) if !fory.bytes && !fory.array => {
                 Ok(FieldInfo {
@@ -671,7 +750,7 @@ fn analyze_inner(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<Fi
         return Ok(FieldInfo {
             optional: false,
             container: 0,
-            leaf_expr: binary_leaf(ty, shape, Some(fory), BytePos::Field)?,
+            leaf_expr: binary_leaf(ty, shape, Some(fory), BytePos::Field, opts)?,
             key_expr: None,
             default_ty: None,
         });
@@ -685,7 +764,7 @@ fn analyze_inner(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<Fi
                 return Ok(FieldInfo {
                     optional: false,
                     container: 1,
-                    leaf_expr: child_leaf(elem, fory.element(), BytePos::ListElement)?,
+                    leaf_expr: child_leaf(elem, fory.element(), BytePos::ListElement, opts)?,
                     key_expr: None,
                     default_ty: None,
                 });
@@ -697,7 +776,7 @@ fn analyze_inner(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<Fi
                 return Ok(FieldInfo {
                     optional: false,
                     container: 2,
-                    leaf_expr: child_leaf(elem, fory.element(), BytePos::ListElement)?,
+                    leaf_expr: child_leaf(elem, fory.element(), BytePos::ListElement, opts)?,
                     key_expr: None,
                     default_ty: None,
                 });
@@ -712,8 +791,8 @@ fn analyze_inner(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<Fi
                 return Ok(FieldInfo {
                     optional: false,
                     container: 3,
-                    leaf_expr: child_leaf(val, fory.value(), BytePos::MapValue)?,
-                    key_expr: Some(child_leaf(key, fory.key(), BytePos::MapKey)?),
+                    leaf_expr: child_leaf(val, fory.value(), BytePos::MapValue, opts)?,
+                    key_expr: Some(child_leaf(key, fory.key(), BytePos::MapKey, opts)?),
                     default_ty: None,
                 });
             }
@@ -1703,6 +1782,35 @@ mod tests {
         assert!(msg.contains("#[fory(bytes)]"), "{msg}");
         // Fully qualified paths are recognised too.
         err("data: ::std::vec::Vec<u8>");
+    }
+
+    #[test]
+    fn uuid_and_ulid_publish_16_byte_leaves() {
+        let one = field("#[aster(uuid)] id: [u8; 16]").unwrap();
+        assert!(leaf(&one).contains("\"uuid\""), "{}", leaf(&one));
+        let opt = field("#[aster(ulid)] id: Option<[u8; 16]>").unwrap();
+        assert!(opt.optional);
+        assert!(leaf(&opt).contains("\"ulid\""));
+        let list = field("#[aster(ulid)] ids: Vec<[u8; 16]>").unwrap();
+        assert_eq!(list.container, 1);
+        assert!(leaf(&list).contains("\"ulid\""));
+        let map = field("#[aster(uuid)] names: BTreeMap<[u8; 16], String>").unwrap();
+        assert_eq!(map.container, 3);
+        assert!(map
+            .key_expr
+            .as_ref()
+            .unwrap()
+            .to_string()
+            .contains("\"uuid\""));
+        assert!(!leaf(&map).contains("uuid"));
+        // Without the attribute it stays binary.
+        assert!(leaf(&field("id: [u8; 16]").unwrap()).contains("\"binary\""));
+
+        assert!(err("#[aster(uuid)] id: [u8; 32]").contains("[u8; 16]"));
+        assert!(err("#[aster(uuid)] id: String").contains("applies only"));
+        assert!(err("#[aster(uuid)] #[aster(ulid)] id: [u8; 16]").contains("not both"));
+        assert!(err("#[aster(uuid)] #[fory(bytes)] id: Vec<u8>").contains("[u8; 16]"));
+        assert!(err("#[aster(uuid)] #[aster(uint8_list)] id: Vec<u8>").contains("contradict"));
     }
 
     #[test]

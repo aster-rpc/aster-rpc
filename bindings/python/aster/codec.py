@@ -516,6 +516,15 @@ class ForyCodec:
 
         self._registered_types = all_types
 
+        # uuid / ulid / decimal(p, s) fields reach pyfory as bytes / Decimal
+        # carriers (aster.scalars); XLANG only, NATIVE pickles natively.
+        self._adapters = None
+        if self.fory_config.resolved_xlang(mode):
+            from aster.scalars import WireAdapters
+
+            adapters = WireAdapters(all_types)
+            self._adapters = adapters if adapters else None
+
         # §5.3.1: Detect duplicate wire_type tags before registration.
         self._tag_to_type: dict[str, type] = {}
         for tp in all_types:
@@ -562,11 +571,16 @@ class ForyCodec:
         """Create and return the configured ``pyfory.Fory`` instance."""
         kwargs = self.fory_config.to_kwargs(self.mode)
         try:
-            return pyfory.Fory(**kwargs)
+            fory = pyfory.Fory(**kwargs)
         except TypeError as exc:
             raise TypeError(
                 f"Failed to construct pyfory.Fory with kwargs {kwargs!r}"
             ) from exc
+        if kwargs.get("xlang"):
+            from aster.scalars import install_pyfory
+
+            install_pyfory(fory)
+        return fory
 
     def _setup_row(self, types: list[type]) -> None:
         """Set up ROW-mode encoder/decoder if pyfory supports it."""
@@ -596,6 +610,8 @@ class ForyCodec:
             row = self._row_encoder.to_row(obj)
             return bytes(row.to_bytes())
 
+        if self._adapters is not None:
+            obj = self._adapters.encode(obj)
         data = self._fory.serialize(obj)
         return bytes(data)
 
@@ -632,6 +648,8 @@ class ForyCodec:
                 result = self._row_to_dataclass(row, check_type)
         else:
             result = self._fory.deserialize(data)
+            if self._adapters is not None:
+                result = self._adapters.decode(result)
 
         # Coerce raw primitives (str/int) into enum members when the target
         # type expects enums.  This handles cross-language interop where the

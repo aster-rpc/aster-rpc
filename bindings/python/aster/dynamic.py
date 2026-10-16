@@ -27,9 +27,12 @@ import datetime
 import decimal
 import logging
 import re
+import uuid
 from typing import Any
 
 from aster.codec import wire_type
+from aster.scalars import ULID
+from aster.scalars import decimal as aster_decimal
 
 
 _CAMEL_SPLIT_1 = re.compile(r"(.)([A-Z][a-z]+)")
@@ -484,7 +487,7 @@ class DynamicTypeFactory:
         type_defs_by_hash: dict[str, dict[str, Any]],
     ) -> Any:
         if type_kind == "primitive":
-            return _primitive_to_py().get(type_primitive, object)
+            return _primitive_annotation(type_primitive)
         if type_kind == "ref":
             nested_td = type_defs_by_hash.get(type_ref_hex)
             if nested_td is None:
@@ -506,6 +509,8 @@ class DynamicTypeFactory:
             prim = f.get("type_primitive", "string")
             if prim in _PRIMITIVE_DEFAULTS:
                 return _PRIMITIVE_DEFAULTS[prim]
+            if _DECIMAL_PS.fullmatch(prim):
+                return decimal.Decimal(0)
         return None
 
 
@@ -543,7 +548,9 @@ def _build_primitive_map() -> dict[str, Any]:
         "timestamp": datetime.datetime,
         "date": datetime.date,
         "decimal": decimal.Decimal,
-        "uuid": str,
+        # 16 bytes on the wire (Fory BINARY); the codec converts.
+        "uuid": uuid.UUID,
+        "ulid": ULID,
     }
 
 
@@ -555,6 +562,18 @@ def _primitive_to_py() -> dict[str, Any]:
     if _PRIMITIVE_TO_PY is None:
         _PRIMITIVE_TO_PY = _build_primitive_map()
     return _PRIMITIVE_TO_PY
+
+
+_DECIMAL_PS = re.compile(r"decimal\((\d+),(\d+)\)")
+
+
+def _primitive_annotation(prim: str) -> Any:
+    """The Python annotation for a canonical ``type_primitive``, including
+    the parameterised ``decimal(p,s)``; ``object`` when unknown."""
+    m = _DECIMAL_PS.fullmatch(prim)
+    if m is not None:
+        return aster_decimal(int(m.group(1)), int(m.group(2)))
+    return _primitive_to_py().get(prim, object)
 
 
 # Default values per primitive, keyed by canonical primitive name.
@@ -581,7 +600,8 @@ _PRIMITIVE_DEFAULTS: dict[str, Any] = {
     "timestamp": datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
     "date": datetime.date(1970, 1, 1),
     "decimal": decimal.Decimal(0),
-    "uuid": "",
+    "uuid": uuid.UUID(int=0),
+    "ulid": ULID(bytes(16)),
 }
 
 

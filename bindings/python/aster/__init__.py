@@ -300,6 +300,7 @@ from .codec import (
     ForyConfig,
     DEFAULT_COMPRESSION_THRESHOLD,
 )
+from .scalars import ULID, ScalarError, decimal
 from .transport.base import (
     Transport,
     BidiChannel,
@@ -559,6 +560,9 @@ __all__ = [
     "RpcStatus",
     "wire_type",
     "contract_default",
+    "ULID",
+    "ScalarError",
+    "decimal",
     "Metadata",
     "describe",
     "Description",

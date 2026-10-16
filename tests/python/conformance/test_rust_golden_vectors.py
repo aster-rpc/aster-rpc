@@ -5,8 +5,9 @@ Golden vectors produced by Rust core / the ``aster`` crate, checked from Python.
 - ``conformance/vectors/compression.json``       -- zstd payload frames (§5.6)
 - ``conformance/vectors/contract-defaults.json`` -- contract defaults
   (Aster-ContractIdentity §11.3.2.3)
-- ``conformance/vectors/contract-types.json``    -- timestamp / date / decimal
-  and recursive types (identity and payload bytes)
+- ``conformance/vectors/contract-types.json``    -- timestamp / date / decimal,
+  uuid / ulid / decimal(p, s), and recursive types (identity, payload bytes,
+  and the payloads a decoder must refuse)
 
 Python must produce the exact bytes / ids the Rust side does.
 """
@@ -18,6 +19,7 @@ import datetime
 import decimal
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -25,7 +27,8 @@ from typing import Optional
 import pyfory
 import pytest
 
-from aster import _aster
+from aster import ULID, ScalarError, _aster
+from aster import decimal as aster_decimal
 from aster.codec import contract_default, wire_type
 from aster.limits import LimitExceeded
 from aster.wire import (
@@ -362,7 +365,44 @@ class Forest:
     trees: list[TreeNode] = field(default_factory=list)
 
 
-_TYPE_CLASSES = [Temporal, TreeNode, Chain, Author, Book, Alpha, Beta, Gamma, Forest]
+_ZERO_UUID = uuid.UUID(int=0)
+_ZERO_ULID = ULID(bytes(16))
+Money = aster_decimal(18, 4)
+Rate = aster_decimal(5, 0)
+
+
+@wire_type("types.v1/Identified")
+@dataclass
+class Identified:
+    id: uuid.UUID = _ZERO_UUID
+    trace: ULID = _ZERO_ULID
+    parent: Optional[uuid.UUID] = None
+    history: list[ULID] = field(default_factory=list)
+    names: dict[uuid.UUID, str] = field(default_factory=dict)
+
+
+@wire_type("types.v1/Priced")
+@dataclass
+class Priced:
+    price: Money = decimal.Decimal(0)
+    rate: Rate = decimal.Decimal(0)
+    maybe_price: Optional[Money] = None
+    amount: decimal.Decimal = decimal.Decimal(0)
+
+
+_TYPE_CLASSES = [
+    Temporal,
+    TreeNode,
+    Chain,
+    Author,
+    Book,
+    Alpha,
+    Beta,
+    Gamma,
+    Forest,
+    Identified,
+    Priced,
+]
 
 
 def _types_type_defs():
@@ -416,6 +456,47 @@ def test_contract_types_contract_id_matches_rust():
     assert contract_id_from_service(TypesService) == _TYPES["expected_contract_id"]
 
 
+def test_ids_contract_id_matches_rust():
+    from aster import rpc, service
+    from aster.contract.identity import contract_id_from_service
+
+    @service(name="Ids", version=1)
+    class IdsService:
+        @rpc
+        async def price(self, req: Identified) -> Priced:
+            return Priced()
+
+    assert contract_id_from_service(IdsService) == _TYPES["expected_ids_contract_id"]
+
+
+def test_decimal_precision_and_scale_are_identity():
+    from aster.contract.identity import build_type_graph, canonical_xlang_bytes, compute_type_hash, resolve_with_cycles
+
+    def type_hash(price_type):
+        # make_dataclass: a real annotation, not a string naming a local.
+        P = wire_type("types.v1/Priced")(dataclasses.make_dataclass("P", [("price", price_type)]))
+        td = resolve_with_cycles(build_type_graph([P]))["types.v1.Priced"]
+        return td.fields[0].type_primitive, compute_type_hash(canonical_xlang_bytes(td))
+
+    p184, h184 = type_hash(aster_decimal(18, 4))
+    p102, h102 = type_hash(aster_decimal(10, 2))
+    p, h = type_hash(decimal.Decimal)
+    assert (p184, p102, p) == ("decimal(18,4)", "decimal(10,2)", "decimal")
+    assert len({h184, h102, h}) == 3
+    assert aster_decimal(18, 4) is Money
+
+
+def test_uuid_and_ulid_are_distinct_identities():
+    from aster.contract.identity import build_type_graph, canonical_xlang_bytes, compute_type_hash, resolve_with_cycles
+
+    def type_hash(id_type):
+        One = wire_type("types.v1/OneId")(dataclasses.make_dataclass("One", [("id", id_type)]))
+        td = resolve_with_cycles(build_type_graph([One]))["types.v1.OneId"]
+        return compute_type_hash(canonical_xlang_bytes(td))
+
+    assert len({type_hash(uuid.UUID), type_hash(ULID), type_hash(bytes)}) == 3
+
+
 def _timestamp(s: str) -> datetime.datetime:
     return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
         tzinfo=datetime.timezone.utc
@@ -440,6 +521,22 @@ def _expected(cls: type, value):
         return Author(value["name"], [_expected(Book, b) for b in value["books"]])
     if cls is Book:
         return Book(value["title"], _expected(Author, value["written_by"]))
+    if cls is Identified:
+        return Identified(
+            id=uuid.UUID(value["id"]),
+            trace=ULID(value["trace"]),
+            parent=None if value["parent"] is None else uuid.UUID(value["parent"]),
+            history=[ULID(u) for u in value["history"]],
+            names={uuid.UUID(k): v for k, v in value["names"].items()},
+        )
+    if cls is Priced:
+        maybe = value["maybe_price"]
+        return Priced(
+            price=decimal.Decimal(value["price"]),
+            rate=decimal.Decimal(value["rate"]),
+            maybe_price=None if maybe is None else decimal.Decimal(maybe),
+            amount=decimal.Decimal(value["amount"]),
+        )
     if cls is Alpha:
         return Alpha(_expected(Beta, value["next"]))
     if cls is Beta:
@@ -460,3 +557,157 @@ def test_contract_types_rust_payload_decodes(name):
     assert got == _expected(cls, case["value"])
     # And back: what Python writes decodes to the same value.
     assert codec.decode(codec.encode(got), cls) == got
+
+
+def _same_decimals(a, b) -> bool:
+    """Equal values at the same scale (Decimal("1.5") == Decimal("1.50"))."""
+    return a == b and str(a) == str(b)
+
+
+def test_python_encodes_canonical_scalars_like_rust():
+    from aster.codec import ForyCodec
+
+    codec = ForyCodec(types=_TYPE_CLASSES)
+    priced = _TYPES["payloads"]["priced"]["hex"]
+    got = codec.decode(bytes.fromhex(priced), Priced)
+    # The decoder hands back plain Decimals at the declared scale ...
+    assert _same_decimals(got.price, decimal.Decimal("-12345.6700"))
+    assert _same_decimals(got.rate, decimal.Decimal("99999"))
+    assert type(got.price) is decimal.Decimal
+    # ... and Python writes Rust's bytes.
+    assert codec.encode(got).hex() == priced
+
+    identified = bytes.fromhex(_TYPES["payloads"]["identified"]["hex"])
+    got = codec.decode(identified, Identified)
+    assert type(got.id) is uuid.UUID and type(got.trace) is ULID
+    # Byte-identical except the map value's string header: pyfory writes an
+    # ASCII string as LATIN1 (0x1c for 7 bytes), Fory Rust as UTF-8 (0x1e).
+    # Both decode everywhere; it is not a uuid / ulid difference.
+    ours = codec.encode(got)
+    assert ours == identified.replace(bytes.fromhex("1e") + b"primary", bytes.fromhex("1c") + b"primary")
+
+
+def test_encode_rescales_to_the_declared_scale():
+    from aster.codec import ForyCodec
+
+    codec = ForyCodec(types=_TYPE_CLASSES)
+    # Unpadded values encode exactly as Rust's FixedDecimal does.
+    value = Priced(
+        price=decimal.Decimal("-12345.67"),
+        rate=99999,
+        maybe_price=decimal.Decimal("0.0001"),
+        amount=decimal.Decimal("1.5"),
+    )
+    assert codec.encode(value).hex() == _TYPES["payloads"]["priced"]["hex"]
+    # The caller's object is not modified.
+    assert str(value.price) == "-12345.67"
+
+
+@pytest.mark.parametrize(
+    "price, message",
+    [
+        (decimal.Decimal("1.23456"), "rounding"),
+        (decimal.Decimal("123456789012345"), "more than 18 digits"),
+        ("NaN", "not finite"),
+    ],
+)
+def test_encode_refuses_a_decimal_outside_its_declaration(price, message):
+    from aster.codec import ForyCodec
+
+    codec = ForyCodec(types=_TYPE_CLASSES)
+    with pytest.raises(ScalarError, match=message):
+        codec.encode(Priced(price=price))
+    with pytest.raises(TypeError):
+        codec.encode(Priced(price=1.5))
+
+
+def test_encode_refuses_a_wrong_length_identifier():
+    from aster.codec import ForyCodec
+
+    codec = ForyCodec(types=_TYPE_CLASSES)
+    with pytest.raises(TypeError):
+        codec.encode(Identified(id=b"\x00" * 15))
+    with pytest.raises(ScalarError):
+        codec.encode(Identified(trace="01ARZ3NDEKTSV4RRFFQ69G5FA"))
+
+
+@pytest.mark.parametrize("name", sorted(_TYPES["decode_cases"]))
+def test_rust_decode_cases(name):
+    from aster.codec import ForyCodec
+
+    case = _TYPES["decode_cases"][name]
+    cls = {f"types.v1.{c.__name__}": c for c in _TYPE_CLASSES}[case["type"]]
+    codec = ForyCodec(types=_TYPE_CLASSES)
+    data = bytes.fromhex(case["hex"])
+    if case["refused"]:
+        with pytest.raises(ScalarError):
+            codec.decode(data, cls)
+        return
+    got = codec.decode(data, cls)
+    want = _expected(cls, case["value"])
+    assert got == want
+    for f in ("price", "rate", "amount"):
+        assert _same_decimals(getattr(got, f), getattr(want, f)), f
+
+
+def test_ulid_string_form():
+    u = ULID("01arz3ndektsv4rrffq69g5fav")
+    assert str(u) == "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+    assert u.timestamp_ms == 1469922850259
+    assert str(ULID.from_int(2**128 - 1)) == "7ZZZZZZZZZZZZZZZZZZZZZZZZZ"
+    for bad in ["8ZZZZZZZZZZZZZZZZZZZZZZZZZ", "01ARZ3NDEKTSV4RRFFQ69G5FAU", "01ARZ3NDEKTSV4RRFFQ69G5FA"]:
+        with pytest.raises(ScalarError):
+            ULID(bad)
+    with pytest.raises(ScalarError):
+        ULID(b"\x00" * 15)
+    assert ULID(u.bytes) == u and hash(ULID(u.bytes)) == hash(u)
+
+
+def test_dynamic_client_builds_canonical_scalars_from_rust_type_defs():
+    """The dynamic client (TypeDef path) synthesises uuid / ulid /
+    decimal(p, s) fields that decode Rust's payloads and refuse what Rust
+    refuses (it used to treat a uuid field as a string)."""
+    from aster._aster import contract as _contract_native
+    from aster.codec import ForyCodec
+    from aster.dynamic import DynamicTypeFactory
+
+    by_tag, by_hash = {}, {}
+    for fqn in ("types.v1.Identified", "types.v1.Priced"):
+        entry = _TYPES["types"][fqn]
+        td = json.loads(
+            _contract_native.canonical_bytes_to_json(
+                "TypeDef", bytes.fromhex(entry["expected_canonical_type_def_hex"])
+            )
+        )
+        by_hash[entry["expected_type_hash"]] = td
+        by_tag[f"{td['package']}/{td['name']}"] = td
+    factory = DynamicTypeFactory()
+    roots = ["types.v1/Identified", "types.v1/Priced"]
+    assert factory.register_from_type_defs(roots, by_tag, by_hash) == set(roots)
+    DynIdentified = factory.get_type("types.v1/Identified")
+    DynPriced = factory.get_type("types.v1/Priced")
+    hints = {f.name: f.type for f in dataclasses.fields(DynIdentified)}
+    assert hints["id"] is uuid.UUID and hints["trace"] is ULID
+    assert {f.name: f.type for f in dataclasses.fields(DynPriced)}["price"] is Money
+
+    codec = ForyCodec(types=factory.get_all_types())
+    got = codec.decode(bytes.fromhex(_TYPES["payloads"]["identified"]["hex"]), DynIdentified)
+    want = _expected(Identified, _TYPES["payloads"]["identified"]["value"])
+    # (The TypeDef path does not model `optional` yet: `parent` and
+    # `maybe_price` are synthesised non-nullable, so compare the other
+    # fields and not the re-encoded bytes.)
+    for name in ("id", "trace", "history", "names"):
+        assert getattr(got, name) == getattr(want, name), name
+    got = codec.decode(bytes.fromhex(_TYPES["payloads"]["priced"]["hex"]), DynPriced)
+    assert _same_decimals(got.price, decimal.Decimal("-12345.6700"))
+    assert _same_decimals(got.rate, decimal.Decimal("99999"))
+    for name, case in _TYPES["decode_cases"].items():
+        cls = DynPriced if case["type"] == "types.v1.Priced" else DynIdentified
+        if case["refused"]:
+            with pytest.raises(ScalarError):
+                codec.decode(bytes.fromhex(case["hex"]), cls)
+        else:
+            codec.decode(bytes.fromhex(case["hex"]), cls)
+    # A dict from an agent: strings for the identifiers and the decimal.
+    req = DynPriced(price="2.5", rate=3)
+    assert str(codec.decode(codec.encode(req), DynPriced).price) == "2.5000"

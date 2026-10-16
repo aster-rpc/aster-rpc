@@ -37,6 +37,7 @@ pub(crate) mod observe;
 pub mod projection;
 pub mod proxy;
 pub mod runtime;
+pub mod scalars;
 pub mod server;
 mod sessions;
 pub mod status;
@@ -80,6 +81,7 @@ pub use publish::{
     fetch_and_verify_contract, publish_contract, FetchedContract, PublishedContract,
 };
 pub use runtime::{AsterServer, AsterServerBuilder};
+pub use scalars::{rescale_decimal, FixedDecimal, ScalarError, Ulid, Uuid, MAX_DECIMAL_PRECISION};
 pub use server::{
     AlpnHandler, Call, CallParts, Dispatcher, HttpTransport, PeerProvenance, Route, Routed, Server,
     ServerHandle, ServiceDispatch, DEFAULT_HANDLER_TIMEOUT, RPC_ALPN,
