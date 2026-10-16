@@ -94,7 +94,7 @@ pub(crate) struct PublisherSlot {
     /// A client's `[identity.publisher]` (validated at start) and its
     /// key-set age bound.
     pub(crate) config: Option<(IdentityPublisherConfig, u64)>,
-    owned: Option<(IssuerKeyPublisher, Vec<aster::NodeId>)>,
+    owned: Option<IssuerKeyPublisher>,
     server: Option<PublisherHandle>,
 }
 
@@ -109,15 +109,18 @@ impl PublisherSlot {
     pub(crate) fn handle(&self) -> Option<PublisherHandle> {
         self.server
             .clone()
-            .or_else(|| self.owned.as_ref().map(|(p, _)| p.handle()))
+            .or_else(|| self.owned.as_ref().map(IssuerKeyPublisher::handle))
     }
 
     pub(crate) fn set_server(&mut self, handle: Option<PublisherHandle>) {
         self.server = handle;
     }
 
-    /// A client enrolled with `server`: (re)start the publisher so it also
-    /// delivers there. No-op without `[identity.publisher]`.
+    /// A client enrolled with `server`: start the publisher on the first
+    /// server, and add each later one as a delivery target of the running
+    /// publisher (no restart: its schedule, status and any fetch in flight
+    /// carry on). No-op without `[identity.publisher]`. An error is only a
+    /// failed first start; the next enrollment tries again.
     pub(crate) fn enrolled(
         &mut self,
         node: &aster::Node,
@@ -127,23 +130,13 @@ impl PublisherSlot {
         let Some((config, max_age)) = &self.config else {
             return Ok(());
         };
-        let mut deliver_to = self
-            .owned
-            .as_ref()
-            .map(|(_, d)| d.clone())
-            .unwrap_or_default();
-        if deliver_to.contains(&server) {
+        if let Some(publisher) = &self.owned {
+            publisher.add_delivery_target(server);
             return Ok(());
         }
-        deliver_to.push(server);
-        let publisher = IssuerKeyPublisher::start(
-            node,
-            enrollment.clone(),
-            config,
-            *max_age,
-            deliver_to.clone(),
-        )?;
-        self.owned = Some((publisher, deliver_to));
+        let publisher =
+            IssuerKeyPublisher::start(node, enrollment.clone(), config, *max_age, vec![server])?;
+        self.owned = Some(publisher);
         Ok(())
     }
 

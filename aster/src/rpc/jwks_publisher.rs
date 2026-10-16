@@ -410,6 +410,10 @@ async fn run(
 pub struct IssuerKeyPublisher {
     handle: PublisherHandle,
     task: tokio::task::JoinHandle<()>,
+    /// The live backend, for [`Self::add_delivery_target`] (`None` behind a
+    /// test backend).
+    live: Option<Arc<Live>>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl Drop for IssuerKeyPublisher {
@@ -443,14 +447,53 @@ impl IssuerKeyPublisher {
             node: node.clone(),
             enrollment,
             client,
-            deliver_to,
+            deliver_to: Mutex::new(deliver_to),
         });
-        Ok(Self::start_with(
+        let mut publisher = Self::start_with(
             issuers,
-            backend,
+            backend.clone(),
             Duration::from_secs(config.refresh_secs),
             Duration::from_secs(config.min_refresh_secs),
-        ))
+        );
+        publisher.live = Some(backend);
+        Ok(publisher)
+    }
+
+    /// Also deliver to `peer` from now on: a client that enrolled with
+    /// another server. The running publisher keeps its schedule, status and
+    /// any fetch in flight (nothing is refetched); what it already published
+    /// is synced to `peer` in the background, and later publications reach
+    /// every target. `false` when `peer` already was one.
+    pub fn add_delivery_target(&self, peer: NodeId) -> bool {
+        let Some(live) = &self.live else {
+            return false;
+        };
+        {
+            let mut targets = live.deliver_to.lock().unwrap_or_else(|e| e.into_inner());
+            if targets.contains(&peer) {
+                return false;
+            }
+            targets.push(peer.clone());
+        }
+        if self
+            .handle
+            .status()
+            .values()
+            .any(|status| status.publications > 0)
+        {
+            let live = live.clone();
+            self.runtime
+                .spawn(async move { live.deliver_published(&peer).await });
+        }
+        true
+    }
+
+    /// The peers each publication is delivered to.
+    pub fn delivery_targets(&self) -> Vec<NodeId> {
+        self.live
+            .as_ref()
+            .map(|live| live.targets())
+            .unwrap_or_default()
     }
 
     pub(crate) fn start_with(
@@ -472,7 +515,12 @@ impl IssuerKeyPublisher {
             notices,
         }));
         let task = tokio::spawn(run(handle.clone(), backend, refresh, min_refresh, receiver));
-        Self { handle, task }
+        Self {
+            handle,
+            task,
+            live: None,
+            runtime: tokio::runtime::Handle::current(),
+        }
     }
 
     /// The handle for notices and status.
@@ -598,10 +646,45 @@ struct Live {
     node: Node,
     enrollment: Enrollment,
     client: reqwest::Client,
-    deliver_to: Vec<NodeId>,
+    /// Grows as a client enrolls with more servers
+    /// ([`IssuerKeyPublisher::add_delivery_target`]).
+    deliver_to: Mutex<Vec<NodeId>>,
 }
 
 impl Live {
+    fn targets(&self) -> Vec<NodeId> {
+        self.deliver_to
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Sync the fleet namespace (what this node already published) to a
+    /// newly added delivery target.
+    async fn deliver_published(&self, peer: &NodeId) {
+        let fleet = self.enrollment.fleet_namespace();
+        let Ok(doc) = self
+            .node
+            .docs()
+            .open_or_import_read_namespace(crate::NamespaceId::from_bytes(fleet))
+            .await
+        else {
+            return;
+        };
+        if let Err(error) = doc
+            .sync_with_timeout(std::slice::from_ref(peer), DELIVERY_TIMEOUT)
+            .await
+        {
+            // Live sync and the next refresh retry.
+            tracing::debug!(
+                target: IDENTITY,
+                peer = peer.as_str(),
+                error = %error,
+                "issuer keys: delivery to a new target did not complete"
+            );
+        }
+    }
+
     /// The fleet namespace opened for writing, from the root's grant. Pulls
     /// from the delivery peers once when the grant is not there yet.
     async fn writable_fleet(&self) -> std::result::Result<crate::Doc, PublishError> {
@@ -618,10 +701,9 @@ impl Live {
             .await
             .map_err(|_| PublishError::NoWriteGrant)?;
         let mut grant = crate::enrollment::open_publisher_grant(&doc, &root, &secret).await;
-        if !matches!(grant, Ok(PublisherGrant::Active(_))) && !self.deliver_to.is_empty() {
-            let _ = doc
-                .sync_with_timeout(&self.deliver_to, DELIVERY_TIMEOUT)
-                .await;
+        let targets = self.targets();
+        if !matches!(grant, Ok(PublisherGrant::Active(_))) && !targets.is_empty() {
+            let _ = doc.sync_with_timeout(&targets, DELIVERY_TIMEOUT).await;
             grant = crate::enrollment::open_publisher_grant(&doc, &root, &secret).await;
         }
         let write = match grant {
@@ -704,7 +786,7 @@ impl Backend for Live {
             Error::InvalidArgument(_) => PublishError::Invalid,
             _ => PublishError::Write,
         })?;
-        for peer in &self.deliver_to {
+        for peer in &self.targets() {
             if let Err(error) = fleet
                 .sync_with_timeout(std::slice::from_ref(peer), DELIVERY_TIMEOUT)
                 .await

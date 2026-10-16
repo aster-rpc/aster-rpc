@@ -295,10 +295,12 @@ unsafe fn enroll(rt: aster_runtime_t, enrollment: u64, server: u64) {
         OK
     );
     let event = common::wait_for_operation(rt, op);
+    let data = String::from_utf8_lossy(&copy(event.data_ptr, event.data_len as u32)).into_owned();
     aster_buffer_release(rt, event.buffer);
     assert_eq!(
         event.kind,
-        aster_event_kind_t::ASTER_EVENT_ENROLLMENT_RESULT as u32
+        aster_event_kind_t::ASTER_EVENT_ENROLLMENT_RESULT as u32,
+        "{data}"
     );
 }
 
@@ -781,4 +783,93 @@ fn server_identity_settings_are_validated_on_the_node_config() {
             OK
         );
     }
+}
+
+/// The edge's issuer-key publisher status, as JSON per issuer.
+unsafe fn publisher_status(rt: aster_runtime_t, edge: u64) -> Value {
+    let mut out = bytes(b"");
+    assert_eq!(aster_enrollment_publisher_status(rt, edge, &mut out), OK);
+    let json = serde_json::from_slice(&copy(out.ptr, out.len as u32)).unwrap();
+    aster_string_release(out.ptr, out.len);
+    json
+}
+
+/// A client's `[identity.publisher]` starts on its first enrollment and keeps
+/// running when the client enrolls with another server (added as a delivery
+/// target): its status, here two failed fetches, carries on instead of
+/// starting over (FFI-7).
+#[test]
+fn a_client_publisher_is_not_restarted_per_enrolled_server() {
+    const ISS: &str = "https://idp.example";
+    let root = root();
+    let files = tempfile::tempdir().unwrap();
+    unsafe {
+        let rt = runtime();
+        let server = |seed: u8, name: &str| {
+            let (node, _) = start(
+                rt,
+                seed,
+                Some(&trust(
+                    &root,
+                    &credential(seed, None, None),
+                    json!({"state_path": files.path().join(name).to_str().unwrap()}),
+                )),
+                SERVER,
+                None,
+            )
+            .unwrap();
+            // The server answers the enrollment handshake.
+            let mut builder = 0;
+            assert_eq!(aster_server_builder_new(rt, node, &mut builder), OK);
+            let mut srv = 0;
+            assert_eq!(aster_server_start(rt, builder, 16, &mut srv), OK);
+            node
+        };
+        let (a, b) = (server(2, "a.json"), server(3, "b.json"));
+        // Nothing listens at the JWKS URL: every attempt fails fast, then backs
+        // off (BACKOFF_BASE: at least 2.5 s before the second attempt).
+        let mut identity = identity_view();
+        let publisher =
+            json!({"issuers": [ISS], "jwks_url": {ISS: "https://127.0.0.1:1/jwks"}}).to_string();
+        identity.publisher_json = bytes(publisher.as_bytes());
+        let (_edge_node, edge) = start(
+            rt,
+            6,
+            Some(&trust(&root, &credential(6, None, None), json!({}))),
+            CLIENT,
+            Some(&identity),
+        )
+        .unwrap();
+        // No publisher before the first enrollment.
+        let mut none = bytes(b"");
+        assert_eq!(
+            aster_enrollment_publisher_status(rt, edge, &mut none),
+            aster_status_t::ASTER_STATUS_NOT_FOUND as i32
+        );
+
+        enroll(rt, edge, a);
+        let attempts = |s: &Value| s[ISS]["attempts"].as_u64().unwrap_or(0);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let status = publisher_status(rt, edge);
+            if attempts(&status) >= 2 {
+                assert!(status[ISS]["last_error"].is_string(), "{status}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no second attempt: {status}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        // A restarted publisher would start its status over (at most one
+        // attempt before its first back-off).
+        enroll(rt, edge, b);
+        let status = publisher_status(rt, edge);
+        assert!(attempts(&status) >= 2, "publisher restarted: {status}");
+
+        assert_eq!(
+            aster_runtime_close_and_wait(rt, Duration::from_secs(10)),
+            OK
+        );
+    }
+    root.tokio.block_on(root.node.clone().shutdown());
 }

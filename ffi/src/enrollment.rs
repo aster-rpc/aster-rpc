@@ -935,7 +935,11 @@ impl AddrJson {
 /// "direct_addresses": ["ip:port"]?}`. Completes with
 /// `ASTER_EVENT_ENROLLMENT_RESULT`: `{"readiness": {"peer", "source":
 /// "chain"|"registration", "observed_source", "policy_sync", "local_clock"},
-/// "renewing": bool}`, or `ASTER_EVENT_ERROR`. An admission decision by
+/// "renewing": bool, "publisher_error": "…"?}`, or `ASTER_EVENT_ERROR`. With
+/// `[identity.publisher]` the first enrollment starts the issuer-key
+/// publisher and each later one adds its server as a delivery target; a
+/// publisher that would not start is `publisher_error`, not a failed
+/// enrollment. An admission decision by
 /// either side keeps its `aster_enrollment_error_t` in `flags`, with status
 /// `PERMISSION_DENIED` (`DENIED`: the server refused this node, or this node
 /// refused the server), `UNAUTHENTICATED` (`NOT_ADMITTED`) or `UNAVAILABLE`
@@ -976,17 +980,19 @@ pub unsafe extern "C" fn aster_enrollment_enroll(
             .map_err(enroll_error)?;
         let renewing = state.start_renewal(Some(&server));
         // `[identity.publisher]` on a client delivers to every server it
-        // enrolled with (Rust `AsterClient` delivers to its one server).
-        state
+        // enrolled with (Rust `AsterClient` delivers to its one server). The
+        // enrollment has succeeded: a publisher that would not start is
+        // reported beside it, not as its error.
+        let publisher = state
             .publisher
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .enrolled(&state.node, &state.enrollment, server.node_id.clone())
-            .map_err(other_error)?;
-        Ok(result(
-            enrollment,
-            json!({"readiness": readiness_json(&readiness), "renewing": renewing}),
-        ))
+            .enrolled(&state.node, &state.enrollment, server.node_id.clone());
+        let mut out = json!({"readiness": readiness_json(&readiness), "renewing": renewing});
+        if let Err(error) = publisher {
+            out["publisher_error"] = json!(error.to_string());
+        }
+        Ok(result(enrollment, out))
     })
 }
 
