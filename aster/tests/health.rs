@@ -63,6 +63,7 @@ fn child() {
             "audit_readiness" => case_audit_readiness(),
             "blob_peer_metrics" => case_blob_peer_metrics().await,
             "peer_label_cap" => case_peer_label_cap().await,
+            "peer_label_cap_per_node" => case_peer_label_cap_per_node().await,
             other => panic!("unknown case {other}"),
         }
     });
@@ -819,6 +820,46 @@ async fn case_peer_label_cap() {
     c.shutdown().await;
 }
 
+/// TM-4: the label slots belong to each node. Node A fills its one slot with
+/// B; node C, a second node in the same process with its own health server,
+/// still gives its first peer D a series of its own.
+async fn case_peer_label_cap_per_node() {
+    let a = monitored_node().await;
+    let b = monitored_node().await;
+    let c = monitored_node().await;
+    let d = monitored_node().await;
+    let health_a = HealthServer::start(&a, HealthConfig::new("127.0.0.1", 0).with_peer_labels(1))
+        .await
+        .unwrap();
+    let health_c = HealthServer::start(&c, HealthConfig::new("127.0.0.1", 0).with_peer_labels(1))
+        .await
+        .unwrap();
+    let b_id = b.id().to_string();
+    let d_id = d.id().to_string();
+
+    fetch_blob(&a, &b, b'b').await;
+    scrape_until(health_a.addr(), "B's own series", |s| {
+        peer_bytes(s, ("aster_peer", &b_id), "blobs-zstd", "received") > 0.0
+    })
+    .await;
+
+    fetch_blob(&c, &d, b'd').await;
+    let s = scrape_until(health_c.addr(), "D's own series", |s| {
+        peer_bytes(s, ("aster_peer", &d_id), "blobs-zstd", "received") > 0.0
+    })
+    .await;
+    assert_eq!(
+        peer_bytes(&s, ("aster_peer", "_OTHER"), "blobs-zstd", "received"),
+        0.0,
+        "no peer folded: each node had a free slot"
+    );
+    health_a.shutdown().await;
+    health_c.shutdown().await;
+    for n in [a, b, c, d] {
+        n.shutdown().await;
+    }
+}
+
 /// Design §3.5: once a log bridge is open, `/readyz` carries an `audit`
 /// check, and a dropped `aster::audit` record fails readiness.
 fn case_audit_readiness() {
@@ -913,6 +954,11 @@ fn blob_transfers_and_peer_bytes_reach_metrics() {
 #[test]
 fn peer_labels_fold_past_the_cap() {
     run("peer_label_cap");
+}
+
+#[test]
+fn peer_label_slots_are_per_node() {
+    run("peer_label_cap_per_node");
 }
 
 #[test]

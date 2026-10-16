@@ -113,8 +113,9 @@ pub struct HealthConfig {
     pub port: u16,
     /// `None` (the default) groups `aster.peer.bytes` by
     /// `aster.locality.level`. `Some(cap)` labels it per peer (`aster.peer`):
-    /// the first `cap` peers seen keep their own series for the life of the
-    /// process, every later peer is counted under `_OTHER`. From
+    /// the first `cap` peers this server's node sees keep their own series
+    /// while it runs, every later peer is counted under `_OTHER`. Each node
+    /// has its own `cap` slots. From
     /// [`AsterConfig::metrics_peer_labels`](crate::AsterConfig::metrics_peer_labels).
     pub peer_label_cap: Option<usize>,
 }
@@ -196,6 +197,11 @@ struct StateInner {
     node: Option<Node>,
     /// [`HealthConfig::peer_label_cap`], [`NO_PEER_LABELS`] when `None`.
     peer_label_cap: AtomicUsize,
+    /// Peers of this state's node given their own `aster.peer` series, first
+    /// come first served, up to `peer_label_cap`. Cleared when a
+    /// [`HealthServer`] starts on this state, so another node's (or an
+    /// earlier server's) peers never take this node's slots.
+    peer_series: Mutex<std::collections::HashSet<String>>,
     started: Instant,
     healthy: AtomicBool,
     ready: AtomicBool,
@@ -233,6 +239,7 @@ impl HealthState {
         let inner = Arc::new(StateInner {
             node: node.cloned(),
             peer_label_cap: AtomicUsize::new(NO_PEER_LABELS),
+            peer_series: Mutex::new(Default::default()),
             started: Instant::now(),
             healthy: AtomicBool::new(true),
             ready: AtomicBool::new(false),
@@ -446,23 +453,28 @@ const NO_PEER_LABELS: usize = usize::MAX;
 /// The `aster.peer` value of every peer folded past the cap.
 const OTHER_PEER: &str = "_OTHER";
 
-/// The distinct nodes of `states`, each with the peer-label cap of the first
-/// state naming it (`None`: group by level).
-fn distinct_nodes(states: &[Arc<StateInner>]) -> Vec<(Node, Option<usize>)> {
-    let mut out: Vec<(Node, Option<usize>)> = Vec::new();
+/// A node, with the peer-label cap and the state holding its labelled peers
+/// (`None`: group by level).
+type NodeSource = (Node, Option<(usize, Arc<StateInner>)>);
+
+/// The distinct nodes of `states`, each with the peer labelling of the first
+/// state naming it.
+fn distinct_nodes(states: &[Arc<StateInner>]) -> Vec<NodeSource> {
+    let mut out: Vec<NodeSource> = Vec::new();
     for s in states {
         let Some(node) = &s.node else { continue };
         if out.iter().any(|(n, _)| n.id() == node.id()) {
             continue;
         }
         let cap = s.peer_label_cap.load(Ordering::Relaxed);
-        out.push((node.clone(), (cap != NO_PEER_LABELS).then_some(cap)));
+        let labels = (cap != NO_PEER_LABELS).then(|| (cap, Arc::clone(s)));
+        out.push((node.clone(), labels));
     }
     out
 }
 
 /// The blob transfer counters summed over `nodes`.
-fn blob_stats(nodes: &[(Node, Option<usize>)]) -> aster_transport_core::CoreBlobTransferStats {
+fn blob_stats(nodes: &[NodeSource]) -> aster_transport_core::CoreBlobTransferStats {
     let mut sum = aster_transport_core::CoreBlobTransferStats::default();
     for (node, _) in nodes {
         let c = node.core().blob_transfer_stats();
@@ -487,13 +499,6 @@ fn blob_stats(nodes: &[(Node, Option<usize>)]) -> aster_transport_core::CoreBlob
     sum
 }
 
-/// Peers given their own `aster.peer` series, first come first served. Kept
-/// for the life of the process, so a peer's series never changes name.
-fn peer_series() -> &'static Mutex<std::collections::HashSet<String>> {
-    static SERIES: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-    SERIES.get_or_init(Default::default)
-}
-
 /// One `aster.peer.bytes` series: (group label key, group, protocol,
 /// direction).
 type PeerSeries = (&'static str, String, &'static str, &'static str);
@@ -504,7 +509,7 @@ type PeerSeries = (&'static str, String, &'static str, &'static str);
 /// Every series only grows. A level series comes from the node's level
 /// ledger, which leaves a peer's bytes under the level they were read at when
 /// the peer changes level, rather than summing the peers at each level now.
-fn peer_bytes(nodes: &[(Node, Option<usize>)]) -> BTreeMap<PeerSeries, u64> {
+fn peer_bytes(nodes: &[NodeSource]) -> BTreeMap<PeerSeries, u64> {
     let mut out = BTreeMap::new();
     let mut add = |key, group: &str, traffic: &aster_transport_core::CoreQuicTraffic| {
         for (family, bytes) in traffic.iter() {
@@ -519,15 +524,15 @@ fn peer_bytes(nodes: &[(Node, Option<usize>)]) -> BTreeMap<PeerSeries, u64> {
             }
         }
     };
-    for (node, cap) in nodes {
-        let Some(cap) = cap else {
+    for (node, labels) in nodes {
+        let Some((cap, state)) = labels else {
             for (level, traffic) in node.core().quic_traffic_by_level() {
                 add("aster.locality.level", level.as_str(), &traffic);
             }
             continue;
         };
         for view in node.core().peer_views() {
-            let mut series = peer_series().lock().unwrap_or_else(|e| e.into_inner());
+            let mut series = state.peer_series.lock().unwrap_or_else(|e| e.into_inner());
             let own = series.contains(&view.node_id)
                 || (series.len() < *cap && series.insert(view.node_id.clone()));
             drop(series);
@@ -941,6 +946,12 @@ impl HealthServer {
             config.peer_label_cap.unwrap_or(NO_PEER_LABELS),
             Ordering::Relaxed,
         );
+        state
+            .inner
+            .peer_series
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         let observability = acquire_observability().await?;
         let (stop_tx, stop_rx) = oneshot::channel();
         let task = tokio::spawn(accept_loop(listener, state.clone(), stop_rx));

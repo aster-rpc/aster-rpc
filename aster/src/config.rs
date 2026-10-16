@@ -766,9 +766,9 @@ pub struct AsterConfig {
     pub health_enabled: Option<bool>,
     /// Label `aster.peer.bytes` per peer (`aster.peer`) instead of grouping it
     /// by locality level. For small fleets and debugging: the first
-    /// [`metrics_peer_label_cap`](Self::metrics_peer_label_cap) peers seen
-    /// keep their own series for the life of the process, every later peer is
-    /// counted under `_OTHER`. Default off.
+    /// [`metrics_peer_label_cap`](Self::metrics_peer_label_cap) peers this
+    /// node sees keep their own series while its health server runs, every
+    /// later peer is counted under `_OTHER`. Default off.
     ///
     /// Env: `ASTER_METRICS_PEER_LABELS`; TOML: `[metrics] peer_labels`.
     pub metrics_peer_labels: bool,
