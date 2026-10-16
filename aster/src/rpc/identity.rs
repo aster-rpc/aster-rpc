@@ -73,6 +73,27 @@ use crate::log_targets::IDENTITY;
 pub const ON_BEHALF_OF_METADATA: &str = "aster-on-behalf-of";
 /// The role that lets a peer forward users' identities.
 pub const GATEWAY_ROLE: &str = "aster.gateway";
+/// The `amr` value of a passkey (WebAuthn) sign-in (RFC 8176 has no entry for
+/// it; `hwk`/`swk` describe the key, not the ceremony).
+pub const AMR_WEBAUTHN: &str = "webauthn";
+/// The `amr` value of a password sign-in (RFC 8176).
+pub const AMR_PASSWORD: &str = "pwd";
+/// The `amr` value an edge uses for an API-key caller.
+pub const AMR_API_KEY: &str = "apikey";
+
+/// The token of an HTTP `Authorization: Bearer <token>` header value: the
+/// scheme matched case-insensitively, surrounding whitespace dropped. `None`
+/// for another scheme or an empty token. An edge forwards it unchanged with
+/// [`CallOptions::on_behalf_of`](super::CallOptions::on_behalf_of).
+pub fn bearer_token(authorization: &str) -> Option<&str> {
+    let value = authorization.trim();
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+    let token = token.trim();
+    (!token.is_empty() && !token.contains(char::is_whitespace)).then_some(token)
+}
 /// The enrollment-credential attribute that is an edge's issuer delegation:
 /// a string of comma-separated roles the edge may put in a token it mints,
 /// e.g. `"data.read,data.admin"`. Signed by the edge's issuer, so a delegated
@@ -890,6 +911,18 @@ mod tests {
 
     fn code(result: Result<Option<ForwardedIdentity>, RpcStatus>) -> StatusCode {
         result.unwrap_err().status_code()
+    }
+
+    #[test]
+    fn bearer_tokens_are_read_from_the_authorization_header() {
+        assert_eq!(bearer_token("Bearer abc.def.ghi"), Some("abc.def.ghi"));
+        assert_eq!(bearer_token("  bearer   abc  "), Some("abc"));
+        assert_eq!(bearer_token("BEARER abc"), Some("abc"));
+        assert_eq!(bearer_token("Basic abc"), None);
+        assert_eq!(bearer_token("Bearer"), None);
+        assert_eq!(bearer_token("Bearer   "), None);
+        assert_eq!(bearer_token("Bearer a b"), None);
+        assert_eq!(bearer_token("Bearerabc"), None);
     }
 
     #[test]

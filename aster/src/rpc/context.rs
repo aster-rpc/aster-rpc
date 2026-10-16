@@ -182,6 +182,22 @@ impl CallContext {
             .map_or(&[], ForwardedIdentity::auth_methods)
     }
 
+    /// Refuse the call with `PERMISSION_DENIED` unless the user signed in
+    /// with `method` (one of [`auth_methods`](Self::auth_methods), e.g.
+    /// [`AMR_WEBAUTHN`](super::identity::AMR_WEBAUTHN)). A call made by the
+    /// peer as itself carries no sign-in method and is refused too. Use it
+    /// after `requires` for methods that need a stronger sign-in:
+    /// `ctx.require_auth_method(AMR_WEBAUTHN)?;`.
+    pub fn require_auth_method(&self, method: &str) -> crate::Result<()> {
+        if self.auth_methods().iter().any(|held| held == method) {
+            return Ok(());
+        }
+        Err(crate::Error::rpc(
+            super::StatusCode::PermissionDenied,
+            format!("this method needs a sign-in with {method}"),
+        ))
+    }
+
     /// The whole verified on-behalf-of identity (issuer, subject, `jti`,
     /// expiry), for a forwarded call.
     pub fn on_behalf_of(&self) -> Option<&ForwardedIdentity> {

@@ -274,6 +274,29 @@ impl AsterClient {
         self.publisher.as_ref().map(|publisher| publisher.handle())
     }
 
+    /// The [`Issuer`](super::identity::Issuer) an edge mints users' tokens
+    /// with: this node's key, bounded by the issuer delegation
+    /// (`aster.identity.issuable_roles`) in the credential `[enrollment]`
+    /// holds, read again at every mint. Fails without enrollment, since a core
+    /// refuses an edge-minted token without that delegation.
+    ///
+    /// ```ignore
+    /// let issuer = edge.user_token_issuer()?;
+    /// let jwt = issuer.mint_user_token("bob", ["notes.read"], [AMR_WEBAUTHN], Duration::from_secs(60))?;
+    /// let notes = notes.with_options(CallOptions::new().on_behalf_of(jwt));
+    /// ```
+    #[cfg(all(feature = "enrollment", feature = "docs", feature = "delegation"))]
+    pub fn user_token_issuer(&self) -> Result<super::identity::Issuer> {
+        let enrollment = self.enrollment().ok_or_else(|| {
+            Error::InvalidArgument(
+                "minting users' tokens needs [enrollment]: a core checks the issuer \
+                 delegation in this node's credential"
+                    .into(),
+            )
+        })?;
+        super::identity::Issuer::from_enrollment(&self.node, enrollment)
+    }
+
     /// Start configuring a client.
     pub fn builder() -> AsterClientBuilder {
         AsterClientBuilder::default()

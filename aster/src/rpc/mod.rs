@@ -81,7 +81,10 @@ pub use contract::{
 pub use drain::{draining_status, DrainReport, DRAINING_DETAIL_KEY, DRAIN_CLOSE_CODE};
 pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationError};
 pub use empty::Empty;
-pub use identity::{ForwardedIdentity, IdentitySettings, GATEWAY_ROLE, ON_BEHALF_OF_METADATA};
+pub use identity::{
+    bearer_token, ForwardedIdentity, IdentitySettings, AMR_API_KEY, AMR_PASSWORD, AMR_WEBAUTHN,
+    GATEWAY_ROLE, ON_BEHALF_OF_METADATA,
+};
 pub use interceptor::{CircuitBreaker, ClientCallContext, Interceptor, Pipeline, RetryPolicy};
 pub use node_config::{AttrValue, NodeProperties, CONFIG_ADMIN_ROLE};
 #[cfg(feature = "docs")]
