@@ -1,6 +1,7 @@
 package aster
 
 import (
+	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -232,7 +233,11 @@ func (c *ForyCodec) with(fn func(*forygo.Fory) error) error {
 	if c.newFory == nil || c.single.Load() {
 		c.singleM.Lock()
 		defer c.singleM.Unlock()
-		return fn(c.fory)
+		if err := guardedFory(fn, c.fory); err != nil {
+			c.fory.Reset()
+			return err
+		}
+		return nil
 	}
 	p, _ := c.pool.Get().(*pooledFory)
 	if p == nil {
@@ -248,12 +253,33 @@ func (c *ForyCodec) with(fn func(*forygo.Fory) error) error {
 		}
 		p.n++
 	}
-	err := fn(p.f)
-	if err != nil {
+	err := guardedFory(fn, p.f)
+	var panicked *foryPanic
+	switch {
+	case errors.As(err, &panicked):
+		return err // drop the instance: its state is unknown
+	case err != nil:
 		p.f.Reset()
 	}
 	c.pool.Put(p)
 	return err
+}
+
+// foryPanic is a panic inside Fory turned into an error. Fory Go 1.7.6
+// panics on some peer metadata (building a Go type for map<binary, _> from a
+// TypeDef that differs from the local one), and a payload must not crash the
+// process.
+type foryPanic struct{ v any }
+
+func (p *foryPanic) Error() string { return fmt.Sprintf("aster: fory: %v", p.v) }
+
+func guardedFory(fn func(*forygo.Fory) error, f *forygo.Fory) (err error) {
+	defer func() {
+		if v := recover(); v != nil {
+			err = &foryPanic{v}
+		}
+	}()
+	return fn(f)
 }
 
 func (c *ForyCodec) Encode(value any) ([]byte, error) {
@@ -263,6 +289,10 @@ func (c *ForyCodec) Encode(value any) ([]byte, error) {
 	if err := c.ensureRegistered(value); err != nil {
 		return nil, err
 	}
+	value, err := normalizeEncode(value)
+	if err != nil {
+		return nil, err
+	}
 	if rv := reflect.ValueOf(value); rv.Kind() == reflect.Struct {
 		// Fory serializes structs through a pointer.
 		p := reflect.New(rv.Type())
@@ -270,7 +300,7 @@ func (c *ForyCodec) Encode(value any) ([]byte, error) {
 		value = p.Interface()
 	}
 	var out []byte
-	err := c.with(func(f *forygo.Fory) error {
+	err = c.with(func(f *forygo.Fory) error {
 		b, err := f.Marshal(value)
 		if err != nil {
 			return err
@@ -293,7 +323,10 @@ func (c *ForyCodec) Decode(payload []byte, dest any) error {
 	if err := c.ensureRegistered(dest); err != nil {
 		return err
 	}
-	return c.with(func(f *forygo.Fory) error { return f.Unmarshal(payload, dest) })
+	if err := c.with(func(f *forygo.Fory) error { return f.Unmarshal(payload, dest) }); err != nil {
+		return err
+	}
+	return normalizeDecode(dest)
 }
 
 // foryName maps "namespace/Name" to Fory's "namespace.Name" (Fory splits the

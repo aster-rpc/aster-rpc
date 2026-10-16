@@ -50,28 +50,7 @@ type asterTag struct {
 	hasDefault bool
 	hasValue   bool   // `default=VALUE` rather than a bare `default`
 	defValue   string // raw text of VALUE
-}
-
-// splitTagOptions splits on commas outside double quotes.
-func splitTagOptions(tag string) []string {
-	var out []string
-	start, inQuote := 0, false
-	for i := 0; i < len(tag); i++ {
-		switch tag[i] {
-		case '\\':
-			if inQuote {
-				i++
-			}
-		case '"':
-			inQuote = !inQuote
-		case ',':
-			if !inQuote {
-				out = append(out, tag[start:i])
-				start = i + 1
-			}
-		}
-	}
-	return append(out, tag[start:])
+	scalar     scalarTag
 }
 
 func parseAsterTag(sf reflect.StructField) (asterTag, error) {
@@ -84,7 +63,7 @@ func parseAsterTag(sf reflect.StructField) (asterTag, error) {
 		opt = strings.TrimSpace(opt)
 		k, v, hasEq := strings.Cut(opt, "=")
 		switch strings.TrimSpace(k) {
-		case "":
+		case "", "uuid", "ulid":
 		case "uint8_list":
 			t.uint8List = true
 		case "default":
@@ -93,10 +72,15 @@ func parseAsterTag(sf reflect.StructField) (asterTag, error) {
 				t.hasValue, t.defValue = true, strings.TrimSpace(v)
 			}
 		default:
+			if strings.HasPrefix(opt, "decimal(") {
+				continue
+			}
 			return t, fmt.Errorf("unknown aster tag option %q", opt)
 		}
 	}
-	return t, nil
+	sc, err := parseScalarTag(sf)
+	t.scalar = sc
+	return t, err
 }
 
 // applyDefault marks f as having a contract default when the tag declares one.

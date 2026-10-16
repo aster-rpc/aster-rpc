@@ -29,6 +29,12 @@ import (
 // fields are optional. A []byte field must be tagged `fory:"type=bytes"`
 // (binary; untagged, Fory Go writes list<uint8>) or `aster:"uint8_list"`
 // (list<uint8>). Field names are Fory's snake_case of the Go name.
+//
+// The canonical scalars (scalars.go): time.Time timestamp, aster.Date date,
+// aster.Decimal decimal (decimal(p,s) with an `aster:"decimal(p,s)"` tag),
+// aster.UUID uuid and aster.ULID ulid (or a [16]byte tagged `aster:"uuid"` /
+// `aster:"ulid"`; both need a Fory bytes hint). Recursive type graphs are
+// supported (contract_graph.go): back-edges become SELF_REF.
 
 // ServiceContractJSON returns the ServiceContract JSON handed to
 // aster_contract_id. Service.ContractID uses the registration form
@@ -88,7 +94,11 @@ func TypeDefJSON(v any) (string, error) {
 	if t == nil {
 		return "", fmt.Errorf("aster: TypeDefJSON needs a struct type, got %T", v)
 	}
-	return newTypeResolver().typeDefJSON(t)
+	r := newTypeResolver()
+	if _, err := r.hash(t); err != nil {
+		return "", err
+	}
+	return r.jsons[t], nil
 }
 
 // TypeHash returns the 64-hex BLAKE3 of the canonical TypeDef of a WireTyped
@@ -99,43 +109,6 @@ func TypeHash(v any) (string, error) {
 		return "", fmt.Errorf("aster: TypeHash needs a struct type, got %T", v)
 	}
 	return newTypeResolver().hash(t)
-}
-
-type typeResolver struct {
-	hashes     map[reflect.Type]string
-	inProgress map[reflect.Type]bool
-}
-
-func newTypeResolver() *typeResolver {
-	return &typeResolver{hashes: map[reflect.Type]string{}, inProgress: map[reflect.Type]bool{}}
-}
-
-func (r *typeResolver) hash(t reflect.Type) (string, error) {
-	for t.Kind() == reflect.Pointer {
-		t = t.Elem()
-	}
-	if h, ok := r.hashes[t]; ok {
-		return h, nil
-	}
-	if r.inProgress[t] {
-		return "", fmt.Errorf("recursive type graphs are not supported yet (%v)", t)
-	}
-	r.inProgress[t] = true
-	defer delete(r.inProgress, t)
-	js, err := r.typeDefJSON(t)
-	if err != nil {
-		return "", err
-	}
-	canon, err := ComputeCanonicalBytes("TypeDef", js)
-	if err != nil {
-		return "", err
-	}
-	h, err := Blake3Hex(canon)
-	if err != nil {
-		return "", err
-	}
-	r.hashes[t] = h
-	return h, nil
 }
 
 type fieldJSON struct {
@@ -253,7 +226,7 @@ func (r *typeResolver) field(sf reflect.StructField) (fieldJSON, error) {
 	container := "none"
 	value := t
 	var key reflect.Type
-	if !isBytes(t) {
+	if !isBytes(t) && scalarPrimitive(t, tag.scalar) == "" {
 		switch t.Kind() {
 		case reflect.Slice, reflect.Array:
 			container, value = "list", t.Elem()
@@ -269,46 +242,127 @@ func (r *typeResolver) field(sf reflect.StructField) (fieldJSON, error) {
 	if container == "none" {
 		enc = foryEncoding(sf)
 	}
-	kind, prim, ref, err := r.leaf(value, enc)
+	usedDecimal, usedID := false, false
+	resolve := func(lt reflect.Type, pos string) (leafJSON, error) {
+		l, err := r.leaf(lt, enc, tag.scalar)
+		if err != nil {
+			return l, err
+		}
+		switch {
+		case strings.HasPrefix(l.prim, "decimal"):
+			usedDecimal = true
+		case l.prim == "uuid" || l.prim == "ulid":
+			usedID = true
+			if err := checkIDHint(sf, container, pos); err != nil {
+				return l, err
+			}
+		}
+		return l, nil
+	}
+	pos := "value"
+	if container == "list" || container == "set" {
+		pos = "element"
+	}
+	l, err := resolve(value, pos)
 	if err != nil {
 		return fieldJSON{}, err
 	}
 	f := fieldJSON{
-		Name: forygo.SnakeCase(sf.Name), TypeKind: kind, TypePrimitive: prim, TypeRef: ref,
-		Optional: optional, Container: container,
+		Name: forygo.SnakeCase(sf.Name), TypeKind: l.kind, TypePrimitive: l.prim, TypeRef: l.ref,
+		SelfRefName: l.selfRef, Optional: optional, Container: container,
 		ContainerKeyKind: "primitive", Required: true,
 	}
 	if key != nil {
-		kk, kp, kr, err := r.leaf(key, "")
+		k, err := resolve(key, "key")
 		if err != nil {
 			return fieldJSON{}, err
 		}
-		f.ContainerKeyKind, f.ContainerKeyPrimitive, f.ContainerKeyRef = kk, kp, kr
+		if k.kind == "self_ref" {
+			return fieldJSON{}, fmt.Errorf("a recursive map key (%v) is not expressible: container_key has no self_ref_name", key)
+		}
+		f.ContainerKeyKind, f.ContainerKeyPrimitive, f.ContainerKeyRef = k.kind, k.prim, k.ref
+	}
+	if tag.scalar.decimal != nil && !usedDecimal {
+		return fieldJSON{}, fmt.Errorf("`aster:\"%s\"` needs an aster.Decimal field (or a list / map of them)", tag.scalar.decimal.primitive())
+	}
+	if tag.scalar.id16 != "" && !usedID {
+		return fieldJSON{}, fmt.Errorf("`aster:\"%s\"` needs a [16]byte field (or a list / map of them)", tag.scalar.id16)
 	}
 	return f, tag.applyDefault(&f)
+}
+
+// checkIDHint checks a uuid / ulid at pos ("value", "element" or "key") has
+// the `fory:"type=..."` hint that makes Fory Go write it as BINARY.
+func checkIDHint(sf reflect.StructField, container, pos string) error {
+	hint := strings.ReplaceAll(foryTypeHintFull(sf), " ", "")
+	want, example := "", ""
+	switch {
+	case container == "none":
+		want, example = "bytes", `fory:"type=bytes"`
+		if strings.HasPrefix(hint, want) {
+			return nil
+		}
+	case pos == "element":
+		want, example = "element=bytes", `fory:"type=list(element=bytes(nullable=false))"`
+		if container == "set" {
+			example = `fory:"type=set(element=bytes(nullable=false))"`
+		}
+	case pos == "key":
+		want, example = "key=bytes", `fory:"type=map(key=bytes(nullable=false),value=_(nullable=false))"`
+	default:
+		want, example = "value=bytes", `fory:"type=map(key=_(nullable=false),value=bytes(nullable=false))"`
+	}
+	if container != "none" && strings.Contains(hint, want) {
+		return nil
+	}
+	return fmt.Errorf("a uuid / ulid %s needs a Fory BINARY hint, e.g. `%s` (untagged, Fory Go writes a [16]byte as an array)", pos, example)
+}
+
+// foryTypeHintFull returns the whole `type=...` value of the fory tag,
+// nested parentheses included.
+func foryTypeHintFull(sf reflect.StructField) string {
+	for _, part := range splitTagOptions(sf.Tag.Get("fory")) {
+		k, v, ok := strings.Cut(strings.TrimSpace(part), "=")
+		if ok && strings.TrimSpace(k) == "type" {
+			return strings.ToLower(strings.TrimSpace(v))
+		}
+	}
+	return ""
 }
 
 func isBytes(t reflect.Type) bool {
 	return t.Kind() == reflect.Slice && t.Elem().Kind() == reflect.Uint8
 }
 
-func (r *typeResolver) leaf(t reflect.Type, enc string) (kind, prim, ref string, err error) {
+type leafJSON struct{ kind, prim, ref, selfRef string }
+
+func (r *typeResolver) leaf(t reflect.Type, enc string, sc scalarTag) (leafJSON, error) {
 	if t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
+	if (t == uuidType || t == ulidType) && sc.id16 != "" && scalarPrimitive(t, scalarTag{}) != sc.id16 {
+		return leafJSON{}, fmt.Errorf("`aster:\"%s\"` on an %v", sc.id16, t)
+	}
+	if p := scalarPrimitive(t, sc); p != "" {
+		return leafJSON{kind: "primitive", prim: p}, nil
+	}
 	if p := primitiveName(t, enc); p != "" {
-		return "primitive", p, "", nil
+		return leafJSON{kind: "primitive", prim: p}, nil
 	}
 	if t.Kind() == reflect.Interface {
-		return "any", "", "", nil
+		return leafJSON{kind: "any"}, nil
 	}
 	if t.Kind() == reflect.Struct {
 		if _, ok := wireTypeOf(t); ok {
+			fqn, _ := fqnOf(t)
+			if r.selfRefs[fqn] {
+				return leafJSON{kind: "self_ref", selfRef: fqn}, nil
+			}
 			h, err := r.hash(t)
-			return "ref", "", h, err
+			return leafJSON{kind: "ref", ref: h}, err
 		}
 	}
-	return "", "", "", fmt.Errorf("type %v has no contract mapping (implement aster.WireTyped or use a supported primitive)", t)
+	return leafJSON{}, fmt.Errorf("type %v has no contract mapping (implement aster.WireTyped or use a supported primitive)", t)
 }
 
 func primitiveName(t reflect.Type, enc string) string {
