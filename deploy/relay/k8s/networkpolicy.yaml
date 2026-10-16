@@ -1,0 +1,41 @@
+# Works alongside a namespace default-deny policy. Admits relay traffic only
+# from pods labelled aster.io/relay-client=true (in any namespace) and metrics
+# scrapes only from the `monitoring` namespace. The relay itself needs no
+# egress: its certificate comes from the mounted Secret. Add an egress rule
+# only if you switch to `access.http` (to that URL).
+#
+# Clients need a matching egress rule to these pods: TCP 8443 and UDP 7842
+# (NetworkPolicy matches the pod ports after Service translation), plus TCP
+# 8080 if you want the captive-portal probe.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aster-relay
+  labels:
+    app.kubernetes.io/name: aster-relay
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: aster-relay
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              aster.io/relay-client: "true"
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 8443
+          protocol: TCP
+        - port: 7842
+          protocol: UDP
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 9090
+          protocol: TCP
+  egress: []

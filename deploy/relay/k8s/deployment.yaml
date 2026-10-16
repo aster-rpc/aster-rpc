@@ -1,0 +1,107 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aster-relay
+  labels:
+    app.kubernetes.io/name: aster-relay
+    app.kubernetes.io/component: relay
+spec:
+  # Exactly one replica per relay URL: two endpoints only reach each other
+  # through the same relay process, so never scale this Deployment out behind
+  # one Service. For redundancy, deploy a second copy under another hostname
+  # and list both URLs in the nodes' RelayURLs.
+  replicas: 1
+  # Recreate, so a rollout never runs two relays behind one URL.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: aster-relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: aster-relay
+        app.kubernetes.io/component: relay
+    spec:
+      serviceAccountName: aster-relay
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      # The image's stop signal is SIGINT: iroh-relay ignores SIGTERM as PID 1.
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: relay
+          # Pinned by digest: kustomization.yaml `images:` sets the registry
+          # (your mirror) and the digest from the release record.
+          image: forge.emrul.dev/aster/aster-relay
+          imagePullPolicy: IfNotPresent
+          args: ["--config-path", "/etc/iroh-relay/config.toml"]
+          env:
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+            - name: https
+              containerPort: 8443
+              protocol: TCP
+            - name: quic
+              containerPort: 7842
+              protocol: UDP
+            - name: metrics
+              containerPort: 9090
+              protocol: TCP
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "2"
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          volumeMounts:
+            - name: config
+              mountPath: /etc/iroh-relay
+              readOnly: true
+            - name: tls
+              mountPath: /etc/iroh-relay/tls
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: aster-relay-config
+            items:
+              - key: config.toml
+                path: config.toml
+        - name: tls
+          secret:
+            # kubernetes.io/tls Secret: tls.crt (leaf first, then
+            # intermediates) and tls.key. See cert-manager-certificate.example.yaml.
+            secretName: aster-relay-tls
+            defaultMode: 0440

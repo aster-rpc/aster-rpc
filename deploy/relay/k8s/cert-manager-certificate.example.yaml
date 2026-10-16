@@ -1,0 +1,26 @@
+# Optional: issue the relay certificate from a cert-manager issuer. Not part
+# of kustomization.yaml; apply it yourself or add it to `resources`.
+#
+# NOTE: Aster nodes verify relay TLS against the built-in WebPKI roots only.
+# Until private-CA trust ships (docs/relay-self-hosted.md, "Not yet
+# supported"), a relay certificate issued by a private CA is rejected by
+# Aster nodes. Use a publicly trusted certificate for the relay hostname, or
+# wait for that feature for a fully air-gapped install.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: aster-relay
+  namespace: aster-relay
+spec:
+  secretName: aster-relay-tls
+  duration: 2160h
+  renewBefore: 360h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  dnsNames:
+    - relay.example.com
+  issuerRef:
+    kind: ClusterIssuer
+    name: example-issuer

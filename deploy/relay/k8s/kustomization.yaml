@@ -1,0 +1,21 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: aster-relay
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - configmap.yaml
+  - deployment.yaml
+  - service.yaml
+  - networkpolicy.yaml
+# Create the TLS Secret yourself (or with cert-manager-certificate.example.yaml):
+#   kubectl -n aster-relay create secret tls aster-relay-tls --cert=tls.crt --key=tls.key
+#
+# Air-gapped: copy the image into your registry by digest (see
+# docs/relay-self-hosted.md) and point newName at it. Replace the digest with
+# `index_digest` from the release's aster-relay-<version>.json record. Nothing
+# is pulled from the internet at runtime.
+images:
+  - name: forge.emrul.dev/aster/aster-relay
+    newName: forge.emrul.dev/aster/aster-relay
+    digest: sha256:0000000000000000000000000000000000000000000000000000000000000000

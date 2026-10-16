@@ -1,0 +1,32 @@
+# ClusterIP for nodes inside the cluster. For nodes outside it, change the
+# type to LoadBalancer (or NodePort) and set externalTrafficPolicy: Local so
+# QUIC address discovery sees the client's real source address.
+apiVersion: v1
+kind: Service
+metadata:
+  name: aster-relay
+  labels:
+    app.kubernetes.io/name: aster-relay
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: aster-relay
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+    - name: https
+      port: 443
+      targetPort: https
+      protocol: TCP
+    # Clients dial QUIC address discovery on 7842 by default; keep the
+    # Service port equal to it.
+    - name: quic
+      port: 7842
+      targetPort: quic
+      protocol: UDP
+    - name: metrics
+      port: 9090
+      targetPort: metrics
+      protocol: TCP

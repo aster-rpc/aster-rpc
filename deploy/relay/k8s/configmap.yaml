@@ -1,0 +1,36 @@
+# iroh-relay configuration (TOML). Field reference: docs/relay-self-hosted.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: aster-relay-config
+  labels:
+    app.kubernetes.io/name: aster-relay
+data:
+  config.toml: |
+    # Relay traffic between endpoints that cannot reach each other directly.
+    enable_relay = true
+    # Plain HTTP serves only the captive-portal probe (/generate_204) once TLS
+    # is on. 0.0.0.0 binds IPv4 only; on a dual-stack cluster use "[::]:8080"
+    # here and below. Ports are unprivileged, so no capability is needed.
+    http_bind_addr = "0.0.0.0:8080"
+    # Lets endpoints learn their observed address over QUIC (UDP 7842).
+    enable_quic_addr_discovery = true
+    enable_metrics = true
+    metrics_bind_addr = "0.0.0.0:9090"
+    # "everyone" admits any endpoint that can reach the relay; the
+    # NetworkPolicy limits who can. Alternatives: access.allowlist = [ids],
+    # or access.http.url (needs an egress rule to that URL).
+    access = "everyone"
+
+    [tls]
+    https_bind_addr = "0.0.0.0:8443"
+    quic_bind_addr = "0.0.0.0:7842"
+    # Reloading re-reads the mounted Secret, so certificate rotation needs no
+    # restart. Don't use LetsEncrypt: an air-gapped install can't reach ACME.
+    cert_mode = "Reloading"
+    manual_cert_path = "/etc/iroh-relay/tls/tls.crt"
+    manual_key_path = "/etc/iroh-relay/tls/tls.key"
+
+    [limits]
+    accept_conn_limit = 200.0
+    accept_conn_burst = 512
