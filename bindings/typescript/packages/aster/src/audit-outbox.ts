@@ -317,3 +317,8 @@ export class AuditOutbox implements AsyncDisposable {
   }
   async [Symbol.asyncDispose](): Promise<void> { await this.close(); }
 }
+
+/** The native handle behind `outbox`, for a server that records into it. @internal */
+export function nativeOutbox(outbox: AuditOutbox | undefined): NativeAuditOutbox | undefined {
+  return outbox ? (outbox as unknown as { native: NativeAuditOutbox }).native : undefined;
+}

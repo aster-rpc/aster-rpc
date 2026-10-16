@@ -12,6 +12,14 @@ import type { StatusCode } from '../status.js';
 /** Options for a single RPC call. */
 export interface CallOptions {
   metadata?: Record<string, string>;
+  /**
+   * Make this call on behalf of a user (gateway identity): the user's JWT,
+   * either a provider's token forwarded unchanged or one this node minted
+   * (`AsterClientWrapper.mintUserToken`). Sent as the `aster-on-behalf-of`
+   * metadata entry, replacing any in `metadata`. The calling node needs
+   * `aster.gateway`; the server authorises the user, with the token's roles.
+   */
+  onBehalfOf?: string;
   /** Total call budget in seconds (fractions allowed); enforced client-side, sent rounded up. */
   deadlineSecs?: number;
   serializationMode?: number;

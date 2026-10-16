@@ -26,6 +26,60 @@ const NEVER_ABORTED: AbortSignal = new AbortController().signal;
 /** How the transport learned a call's peer id ({@link CallContext.provenance}). */
 export type PeerProvenance = 'iroh_authenticated' | 'other';
 
+/**
+ * The verified identity of a call a gateway forwarded on behalf of a user
+ * (the `aster-on-behalf-of` entry; Rust `ForwardedIdentity`).
+ * @group Gateway identity
+ */
+export interface ForwardedIdentity {
+  /** `iss|sub`: the user, which is the call's {@link CallContext.principal}. */
+  readonly principal: string;
+  /** The gateway that forwarded the call (its node id; {@link CallContext.peer}). */
+  readonly actor: string;
+  /** The token's issuer: a provider's URL, or the gateway's node id for an edge-minted token. */
+  readonly issuer: string;
+  readonly subject: string;
+  /** The roles the token granted (what `requires` checked). */
+  readonly roles: readonly string[];
+  /** How the user signed in (`amr`, e.g. `webauthn`, `pwd`, `apikey`). */
+  readonly authMethods: readonly string[];
+  /** The token id (`jti`; empty when the token has none). */
+  readonly jti: string;
+  /** The token's expiry, Unix seconds. */
+  readonly expiresAt: number;
+}
+
+/**
+ * A typed `aster.ops.NodeConfig` attribute value.
+ * @group Gateway identity
+ */
+export type NodeAttribute =
+  | { type: 'bool'; value: boolean }
+  | { type: 'int'; value: number }
+  | { type: 'float'; value: number }
+  | { type: 'string'; value: string };
+
+/**
+ * **This node's** properties (name, tags, typed attributes) as the root or
+ * an issuer last set them through `aster.ops.NodeConfig`. They describe the
+ * node, not the caller, and never authorise: `requires` never reads them.
+ * @group Gateway identity
+ */
+export interface NodeProperties {
+  /** The NodeConfig generation in effect (0: never set, or NodeConfig off). */
+  readonly generation: number;
+  readonly name: string;
+  readonly tags: readonly string[];
+  readonly attributes: Readonly<Record<string, NodeAttribute>>;
+}
+
+const NO_NODE_PROPERTIES: NodeProperties = Object.freeze({
+  generation: 0,
+  name: '',
+  tags: Object.freeze([]) as readonly string[],
+  attributes: Object.freeze({}),
+});
+
 /** Peer's UDP socket address when the selected QUIC path is direct. */
 export interface PeerAddr {
   host: string;
@@ -54,6 +108,16 @@ export class CallContext {
   principal: string | undefined;
   /** True only for native Iroh endpoint authentication, never an HTTP/WT auth callback. */
   readonly irohAuthenticated: boolean;
+  /**
+   * For a call a gateway forwarded on behalf of a user: the verified
+   * identity ({@link principal} is then the user's `iss|sub` and
+   * {@link peer} the gateway). `undefined` for a call made by the peer as
+   * itself.
+   */
+  readonly onBehalfOf: ForwardedIdentity | undefined;
+  /** Server side: reads this node's NodeConfig properties on first access. */
+  protected _nodePropertiesLoader?: () => NodeProperties | undefined;
+  private _nodeProperties: NodeProperties | undefined;
   metadata: Record<string, string>;
   private _attributes: Record<string, string>;
   /** Server side: resolves `attributes` on first access when the call carried none. */
@@ -81,6 +145,8 @@ export class CallContext {
     peer?: string;
     principal?: string;
     irohAuthenticated?: boolean;
+    onBehalfOf?: ForwardedIdentity;
+    nodeProperties?: NodeProperties;
     metadata?: Record<string, string>;
     attributes?: Record<string, string>;
     deadline?: number;
@@ -99,6 +165,8 @@ export class CallContext {
     this.peer = init.peer;
     this.principal = init.principal ?? init.peer;
     this.irohAuthenticated = init.irohAuthenticated ?? false;
+    this.onBehalfOf = init.onBehalfOf;
+    this._nodeProperties = init.nodeProperties;
     this.metadata = init.metadata ?? {};
     this._attributes = init.attributes ?? {};
     this.deadline = init.deadline;
@@ -126,6 +194,56 @@ export class CallContext {
   set attributes(v: Record<string, string>) {
     this._attributesLoader = undefined;
     this._attributes = v;
+  }
+
+  /**
+   * The gateway that forwarded this call on behalf of {@link principal}
+   * (its node id, which is also {@link peer}); `undefined` for a call made
+   * by the peer as itself.
+   */
+  get actor(): string | undefined {
+    return this.onBehalfOf?.actor;
+  }
+
+  /**
+   * How the user signed in (the token's `amr`, e.g. `webauthn`, `pwd`,
+   * `apikey`), for a forwarded call; empty otherwise.
+   */
+  get authMethods(): readonly string[] {
+    return this.onBehalfOf?.authMethods ?? [];
+  }
+
+  /**
+   * Throw `PERMISSION_DENIED` unless the user signed in with `method` (one
+   * of {@link authMethods}, e.g. `AMR_WEBAUTHN`). A call made by the peer as
+   * itself carries no sign-in method and is refused too. Use it after
+   * `requires` in methods that need a stronger sign-in.
+   */
+  requireAuthMethod(method: string): void {
+    if (this.authMethods.includes(method)) return;
+    throw new RpcError(StatusCode.PERMISSION_DENIED, `this method needs a sign-in with ${method}`);
+  }
+
+  /**
+   * **This node's** `aster.ops.NodeConfig` properties (name, tags, typed
+   * attributes). They describe the node, not the caller, and never
+   * authorise. Empty when no record is set or the service is off.
+   */
+  get nodeProperties(): NodeProperties {
+    const load = this._nodePropertiesLoader;
+    if (load) {
+      this._nodePropertiesLoader = undefined;
+      try {
+        this._nodeProperties = load();
+      } catch { /* keep empty */ }
+    }
+    return this._nodeProperties ?? NO_NODE_PROPERTIES;
+  }
+
+  /** One of this node's NodeConfig attributes, by key (see {@link nodeProperties}). */
+  nodeAttribute(key: string): NodeAttribute | undefined {
+    const attributes = this.nodeProperties.attributes;
+    return Object.prototype.hasOwnProperty.call(attributes, key) ? attributes[key] : undefined;
   }
 
   private _loadTransport(): void {

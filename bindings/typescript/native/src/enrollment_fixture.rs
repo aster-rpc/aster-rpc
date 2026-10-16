@@ -62,6 +62,10 @@ pub struct TestEnrollmentRoot {
     audience: String,
     node: Node,
     fleet: Doc,
+    /// The fleet namespace's write secret (gateway-identity tests write
+    /// issuer key sets with it as a publisher node, as the sealed grant
+    /// `aster enroll identity-publisher` hands one would).
+    fleet_secret: [u8; 32],
     enrollment: Enrollment,
     _files: Arc<TempDir>,
 }
@@ -104,7 +108,12 @@ impl TestEnrollmentRoot {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let fleet = node.docs().create().await.map_err(aster_err)?;
+            let fleet_secret = SecretKey::generate().to_bytes();
+            let fleet = node
+                .docs()
+                .open_or_import_write_namespace(aster::NamespaceSecret::from_bytes(fleet_secret))
+                .await
+                .map_err(aster_err)?;
             let namespace = key32(&fleet.id().map_err(aster_err)?.to_string())?;
             let root = key.public_key().to_bytes();
             let mut request = EnrollmentIssueRequest::new(root, &audience, now() + 3600);
@@ -151,6 +160,7 @@ impl TestEnrollmentRoot {
                 audience,
                 node,
                 fleet,
+                fleet_secret,
                 enrollment,
                 _files: files,
             })
@@ -169,6 +179,12 @@ impl TestEnrollmentRoot {
         Ok(self.fleet.id().map_err(aster_err)?.to_string())
     }
 
+    /// The fleet namespace's write secret (hex).
+    #[napi(getter)]
+    pub fn fleet_secret(&self) -> String {
+        hex::encode(self.fleet_secret)
+    }
+
     /// The root node's `aster1…` ticket (a policy replica).
     #[napi(getter)]
     pub fn ticket(&self) -> Result<String> {
@@ -180,18 +196,30 @@ impl TestEnrollmentRoot {
     /// What `aster enroll node --subject <subject> --audience <audience>
     /// --attributes roles.json` writes: a root-issued credential for
     /// `subject` (hex node id) carrying `roles` (comma-separated) in
-    /// `aster.role`. `lifetimeSecs` defaults to one hour.
+    /// `aster.role`. `lifetimeSecs` defaults to one hour. `issuableRoles`
+    /// adds the gateway issuer delegation (`aster enroll node
+    /// --attribute-key aster.identity.issuable_roles`): the roles the node
+    /// may put in edge-minted tokens (comma-separated).
     #[napi]
     pub fn issue(
         &self,
         subject: String,
         roles: Option<String>,
         lifetime_secs: Option<u32>,
+        issuable_roles: Option<String>,
     ) -> Result<String> {
         let lifetime = u64::from(lifetime_secs.unwrap_or(3600));
         let mut request =
             EnrollmentIssueRequest::new(key32(&subject)?, &self.audience, now() + lifetime);
         request.claims = role_claims(roles.as_deref());
+        if let (Some(issuable), Some(attributes)) =
+            (issuable_roles, request.claims.attributes.as_mut())
+        {
+            attributes.insert(
+                aster::rpc::identity::ISSUABLE_ROLES_ATTRIBUTE.into(),
+                TypedAttribute::String(issuable),
+            );
+        }
         Ok(issue_credential(&self.key, &request, now())
             .map_err(reason)?
             .into_chain())

@@ -71,7 +71,7 @@ fn status_err(st: &RpcStatus) -> Error {
     Error::from_reason(format!("{RPC_ERROR_PREFIX}{body}"))
 }
 
-fn rpc_err(e: aster::Error) -> Error {
+pub(crate) fn rpc_err(e: aster::Error) -> Error {
     status_err(&error_status(&e))
 }
 

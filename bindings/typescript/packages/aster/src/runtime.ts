@@ -24,16 +24,19 @@ import type {
   DispatchServer as NativeDispatchServer,
   DrainReport,
   HealthServer,
+  IssuerPublishStatus,
 } from '@aster-rpc/transport';
 import { ensureObservability } from './observability.js';
 import { DEFAULT_BACKOFF, RpcPattern, RpcScope, type ExponentialBackoff } from './types.js';
 import { createXlangCodec, getXlangForyAndType } from './xlang.js';
 import { RpcServer } from './dispatch.js';
-import type { Interceptor } from './interceptors/base.js';
+import type { Interceptor, NodeProperties } from './interceptors/base.js';
+import type { AuditOutbox } from './audit-outbox.js';
+import { NodeConfigClient } from './identity.js';
 import { buildTypeGraph, canonicalXlangBytes, contractIdFromContract, fromServiceInfo } from './contract/identity.js';
 import type { ContractManifest, ManifestMethod, ManifestField } from './contract/manifest.js';
 import { getGeneratedMethodFields, getWireShape, registerGenerated, type RegisterGeneratedOptions } from './generated.js';
-import { IrohTransport } from './transport/iroh.js';
+import { IrohTransport, setOnBehalfOfNotice } from './transport/iroh.js';
 import { StatusCode, RpcError } from './status.js';
 import { loadNative, tryLoadNative } from './native.js';
 
@@ -136,6 +139,18 @@ export interface AsterServerOptions {
   /** Rust-enforced role policy for every topology baseline method. */
   topologyRequires?: import("./service.js").CapabilityRequirement;
   /**
+   * Accept (or refuse) calls a gateway makes on behalf of users, overriding
+   * `config.identity.acceptOnBehalfOf` (`ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF`).
+   * Off, a call carrying a user's token is refused with `PERMISSION_DENIED`.
+   */
+  acceptOnBehalfOf?: boolean;
+  /**
+   * Record every `aster.ops.NodeConfig` `set` and `clear` in this durable
+   * audit outbox (kinds `aster.node_config.set` / `aster.node_config.clear`).
+   * A change the outbox does not accept is refused.
+   */
+  auditOutbox?: AuditOutbox;
+  /**
    * Explicit generated metadata (output of `aster-gen`). When omitted,
    * `start()` auto-imports `./aster-rpc.generated.js` from the working
    * directory. Pass this only when the auto-import can't work (e.g.
@@ -202,6 +217,8 @@ export class AsterServer {
   private _serviceSummaries: ServiceSummary[] = [];
   private _registryNamespace = '';
   private _servePromise: Promise<void> | null = null;
+  private readonly _acceptOnBehalfOf: boolean | undefined;
+  private readonly _auditOutbox: AuditOutbox | undefined;
 
   constructor(opts: AsterServerOptions) {
     // Rust loaders (ASTER_* env); fields set in code win.
@@ -218,6 +235,8 @@ export class AsterServer {
     this._userInterceptors = opts.interceptors ?? [];
     this._builtinTopology = opts.builtinTopology ?? false;
     this._topologyRequires = opts.topologyRequires;
+    this._acceptOnBehalfOf = opts.acceptOnBehalfOf;
+    this._auditOutbox = opts.auditOutbox;
     this._pendingServices = opts.services;
     this._explicitGenerated = opts.generated;
   }
@@ -283,6 +302,16 @@ export class AsterServer {
   clearPeerRestriction(peer: string): boolean {
     if (!this._native) throw new Error('server is not serving');
     return this._native.clearPeerRestriction(peer);
+  }
+
+  /**
+   * This node's `aster.ops.NodeConfig` properties (name, tags, typed
+   * attributes) as handlers see them (`ctx.nodeProperties`). They describe
+   * the node and never authorise anything. Empty before `start()` or with
+   * NodeConfig off.
+   */
+  nodeProperties(): NodeProperties {
+    return this._rpcServer?.nodeProperties() ?? { generation: 0, name: '', tags: [], attributes: {} };
   }
 
   private get _native(): NativeDispatchServer | null {
@@ -389,6 +418,8 @@ export class AsterServer {
       registry: this.registry,
       builtinTopology: this._builtinTopology,
       topologyRequires: this._topologyRequires,
+      acceptOnBehalfOf: this._acceptOnBehalfOf,
+      auditOutbox: this._auditOutbox,
       codec: xlangCodec ?? createXlangCodec(),
       interceptors: [...(this._userInterceptors as Interceptor[])],
       logger: this.logger,
@@ -1180,8 +1211,14 @@ export class AsterClientWrapper {
       this._generated.buildAllTypes(fory, Type, codec);
     }
 
-    this.transport = new IrohTransport(client.rpcConnection(), codec);
+    const rpcConnection = client.rpcConnection();
+    this.transport = new IrohTransport(rpcConnection, codec);
     this._connected = true;
+    // With `[identity.publisher]`, every token this client forwards is
+    // noticed, so a rotated provider key is published at once.
+    if (await client.hasIdentityPublisher()) {
+      setOnBehalfOfNotice(rpcConnection, (token) => { void client.noticeToken(token); });
+    }
 
     // Service discovery: the server announces its contract registry in
     // `aster.ops.NodeInfo`. Best-effort: a server without the baseline
@@ -1239,6 +1276,57 @@ export class AsterClientWrapper {
       })().finally(() => { this._servicesPromise = null; });
     }
     return [...(await this._servicesPromise)];
+  }
+
+  /**
+   * Mint an edge token for a user (gateway identity; Rust
+   * `AsterClient::user_token_issuer` + `Issuer::mint_user_token`), signed with
+   * this node's key and bounded by the issuer delegation
+   * (`aster.identity.issuable_roles`) in the credential this client
+   * presents now. Send it as a call's `onBehalfOf`; this node needs
+   * `aster.gateway`. `amr` says how the user signed in (at least one, e.g.
+   * `AMR_WEBAUTHN`); `ttlSecs` 1–300. A role outside the delegation rejects.
+   */
+  async mintUserToken(sub: string, roles: readonly string[], amr: readonly string[], ttlSecs: number): Promise<string> {
+    const native = this._requireNative();
+    try {
+      return await native.mintUserToken(sub, [...roles], [...amr], ttlSecs);
+    } catch (e) {
+      throw new RpcError(StatusCode.INVALID_ARGUMENT, e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  /**
+   * Tell this client's issuer-key publisher (`[identity.publisher]`) that a
+   * token for `iss` carried `kid`: an unpublished kid refreshes that issuer
+   * at once (at most every `minRefreshSecs`). Calls sent `onBehalfOf` are
+   * noticed automatically. Returns whether this client runs a publisher.
+   */
+  async noticeKid(iss: string, kid: string): Promise<boolean> {
+    return this._requireNative().noticeKid(iss, kid);
+  }
+
+  /** As {@link noticeKid}, reading `iss` and `kid` from a JWT (a token that does not parse is ignored). */
+  async noticeToken(token: string): Promise<boolean> {
+    return this._requireNative().noticeToken(token);
+  }
+
+  /** What the issuer-key publisher last published, per issuer; `null` without `[identity.publisher]`. */
+  async identityPublisherStatus(): Promise<Record<string, IssuerPublishStatus> | null> {
+    return (await this._requireNative().identityPublisherStatus()) ?? null;
+  }
+
+  /**
+   * An `aster.ops.NodeConfig` admin client for the server this client is
+   * connected to. This node needs `aster.config-admin` in its credential.
+   */
+  nodeConfig(): NodeConfigClient {
+    return new NodeConfigClient(this._requireNative().rpcConnection());
+  }
+
+  private _requireNative(): NativeAsterClient {
+    if (!this._native) throw new Error('AsterClient is not connected');
+    return this._native;
   }
 
   /** Create a typed client proxy for a service class. */

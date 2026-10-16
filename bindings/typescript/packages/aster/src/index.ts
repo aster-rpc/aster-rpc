@@ -232,7 +232,31 @@ export {
   type Interceptor,
   type PeerAddr,
   type PeerProvenance,
+  type ForwardedIdentity,
+  type NodeAttribute,
+  type NodeProperties,
 } from './interceptors/base.js';
+
+// Gateway identity
+export {
+  ON_BEHALF_OF_METADATA,
+  GATEWAY_ROLE,
+  CONFIG_ADMIN_ROLE,
+  IDENTITY_PUBLISHER_ROLE,
+  ISSUABLE_ROLES_ATTRIBUTE,
+  AMR_WEBAUTHN,
+  AMR_PASSWORD,
+  AMR_API_KEY,
+  bearerToken,
+  NodeConfigClient,
+  type IdentityOverride,
+  type NodeConfigSetRequest,
+  type NodeConfigView,
+  type NodeConfigAck,
+  type NodeConfigOutstanding,
+  type NodeConfigCallOptions,
+  type EffectiveSetting,
+} from './identity.js';
 export { RetryInterceptor } from './interceptors/retry.js';
 export { RateLimitInterceptor, type RateLimitOptions } from './interceptors/rate-limit.js';
 export { AuthInterceptor } from './interceptors/auth.js';
@@ -519,6 +543,7 @@ export type {
   IrohConnection,
   IrohSendStream,
   IrohRecvStream,
+  IssuerPublishStatus,
   PathInfo,
   ProviderOutcome,
   RetireOutcome,
@@ -534,6 +559,10 @@ export {
   type EnrollmentConfig,
   type EnrollmentLimits,
   type EnrollmentRoles,
+  type IdentityConfig,
+  type IdentityPublisherConfig,
+  type TrustedIssuer,
+  type RemoteConfig,
   type PolicyConfig,
   type AsterIdentity,
   type IdentityPeer,

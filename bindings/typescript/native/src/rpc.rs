@@ -97,6 +97,48 @@ pub const FLAG_HAS_INBOUND_TRACE: u32 = 0x800;
 /// transport's caller id; `peer` is that principal and `transportPeer` the
 /// transport's id (C ABI `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`).
 pub const FLAG_HAS_PRINCIPAL: u32 = 0x1000;
+/// `flags` bit: a gateway forwarded the call on behalf of a user
+/// (`aster-on-behalf-of`; `HAS_PRINCIPAL` is set too). `onBehalfOf` holds
+/// the verified identity and `actor` the gateway (C ABI
+/// `ASTER_DISPATCH_FLAG_ON_BEHALF_OF`).
+pub const FLAG_ON_BEHALF_OF: u32 = 0x2000;
+
+/// The verified on-behalf-of identity of a forwarded call (Rust
+/// `ForwardedIdentity`).
+#[napi(object, object_from_js = false, js_name = "ForwardedIdentity")]
+pub struct JsForwardedIdentity {
+    /// `iss|sub`: the user, the call's principal.
+    pub principal: String,
+    /// The gateway that forwarded the call (its node id; the transport peer).
+    pub actor: String,
+    /// The token's issuer: a provider's URL, or the gateway's node id for an
+    /// edge-minted token.
+    pub issuer: String,
+    pub subject: String,
+    /// The roles the token granted (the call's `aster.role`).
+    pub roles: Vec<String>,
+    /// How the user signed in (`amr`, e.g. `webauthn`, `pwd`, `apikey`).
+    pub auth_methods: Vec<String>,
+    /// The token id (`jti`; empty when the token has none).
+    pub jti: String,
+    /// The token's expiry, Unix seconds.
+    pub expires_at: f64,
+}
+
+impl From<&aster::rpc::identity::ForwardedIdentity> for JsForwardedIdentity {
+    fn from(f: &aster::rpc::identity::ForwardedIdentity) -> Self {
+        Self {
+            principal: f.principal().to_string(),
+            actor: f.actor().to_string(),
+            issuer: f.issuer().to_string(),
+            subject: f.subject().to_string(),
+            roles: f.roles().to_vec(),
+            auth_methods: f.auth_methods().to_vec(),
+            jti: f.jti().to_string(),
+            expires_at: f.expires_at() as f64,
+        }
+    }
+}
 
 /// One dispatch event, flattened for JS. Fields that do not apply to the
 /// event's `kind` are `0` (numbers) or absent.
@@ -152,6 +194,10 @@ pub struct JsDispatchEvent {
     pub baggage: Option<String>,
     /// The caller's raw W3C `tracestate` header, when sent.
     pub tracestate: Option<String>,
+    /// For a call a gateway forwarded on behalf of a user
+    /// (`flags & ON_BEHALF_OF`): the verified identity. `peer` is then the
+    /// user's principal and `transportPeer` the gateway.
+    pub on_behalf_of: Option<JsForwardedIdentity>,
 }
 
 /// An event with every JS-irrelevant part dropped (call handle detached).
@@ -177,6 +223,7 @@ struct Ev {
     traceparent: Option<String>,
     baggage: Option<String>,
     tracestate: Option<String>,
+    forwarded: Option<Box<aster::rpc::identity::ForwardedIdentity>>,
 }
 
 impl Ev {
@@ -202,6 +249,7 @@ impl Ev {
             traceparent: None,
             baggage: None,
             tracestate: None,
+            forwarded: None,
         }
     }
 
@@ -228,6 +276,7 @@ impl Ev {
             traceparent: self.traceparent,
             baggage: self.baggage,
             tracestate: self.tracestate,
+            on_behalf_of: self.forwarded.as_deref().map(JsForwardedIdentity::from),
         }
     }
 }
@@ -288,6 +337,10 @@ impl Shared {
                 if call.transport_peer_id.is_some() {
                     flags |= FLAG_HAS_PRINCIPAL;
                 }
+                let forwarded = call.handle.on_behalf_of().map(|f| {
+                    flags |= FLAG_ON_BEHALF_OF;
+                    Box::new(f.clone())
+                });
                 let (baggage, tracestate) = match &call.inbound_trace {
                     Some(t) => {
                         flags |= FLAG_HAS_INBOUND_TRACE;
@@ -319,6 +372,7 @@ impl Shared {
                     traceparent,
                     baggage,
                     tracestate,
+                    forwarded,
                 }
             }
             DispatchEvent::Cancelled { call_id, reason } => Ev {
@@ -807,6 +861,9 @@ pub struct DispatchServerOptions {
     /// Cap on any handler, ms (default 300 000; 0 = no cap). A call's
     /// deadline is `min(header deadline, method timeout, this)`.
     pub handler_timeout_ms: Option<f64>,
+    /// `start` only: accept (or refuse) calls made on behalf of users,
+    /// overriding the config's `[identity] accept_on_behalf_of`.
+    pub accept_on_behalf_of: Option<bool>,
 }
 
 /// What `DispatchServer.drain` did. Calls count those admitted to a handler,
@@ -862,6 +919,8 @@ struct Owned {
     enrolled: bool,
     /// The served `aster.ops.NodeInfo` identity, when the baseline is on.
     identity: Option<aster::rpc::baseline::NodeIdentityHandle>,
+    /// `aster.ops.NodeConfig` (`None` with `[remote_config] enabled = false`).
+    node_config: Option<aster::rpc::NodeConfigHandle>,
 }
 
 pub(crate) enum Running {
@@ -899,6 +958,8 @@ pub struct DispatchServer {
     enrolled: bool,
     /// The served `aster.ops.NodeInfo` identity of a `start` server.
     node_identity: Option<aster::rpc::baseline::NodeIdentityHandle>,
+    /// `aster.ops.NodeConfig` of a `start` server.
+    node_config: Option<aster::rpc::NodeConfigHandle>,
     shared: Arc<Shared>,
     tsfn_sink: Option<Arc<TsfnSink>>,
     ring: Option<Arc<Ring>>,
@@ -1167,6 +1228,7 @@ impl Sinks {
             address: own.as_ref().map(|o| o.address.clone()).unwrap_or_default(),
             enrolled: own.as_ref().is_some_and(|o| o.enrolled),
             node_identity: own.as_ref().and_then(|o| o.identity.clone()),
+            node_config: own.as_ref().and_then(|o| o.node_config.clone()),
             own_node: own.map(|o| o.node),
             shared: self.shared,
             tsfn_sink: self.tsfn_sink,
@@ -1286,8 +1348,13 @@ impl DispatchServer {
 
     /// Start a node from `config` and serve `servicesJson` on it (see
     /// `serve`). `close()` shuts the node down too.
+    ///
+    /// The config's `[identity]` / `[remote_config]` apply as in Rust's
+    /// `AsterServer`: gateway identity, the issuer-key cache and publisher,
+    /// and `aster.ops.NodeConfig` behind `aster.config-admin`. `auditOutbox`
+    /// records every NodeConfig `set` and `clear` in that outbox.
     #[napi(
-        ts_args_type = "config: AsterConfig | undefined | null, servicesJson: string[], options?: DispatchServerOptions | undefined | null, onEvents?: ((events: DispatchEvent[]) => void) | undefined | null",
+        ts_args_type = "config: AsterConfig | undefined | null, servicesJson: string[], options?: DispatchServerOptions | undefined | null, onEvents?: ((events: DispatchEvent[]) => void) | undefined | null, auditOutbox?: NativeAuditOutbox | undefined | null",
         ts_return_type = "Promise<DispatchServer>"
     )]
     pub fn start<'env>(
@@ -1296,9 +1363,18 @@ impl DispatchServer {
         services_json: Vec<String>,
         options: Option<DispatchServerOptions>,
         on_events: Option<Function<'env, EvBatch, Unknown<'static>>>,
+        audit_outbox: Option<&crate::audit_outbox::NativeAuditOutbox>,
     ) -> Result<PromiseRaw<'env, DispatchServer>> {
-        let config = config.unwrap_or_default().to_rust()?;
+        let mut config = config.unwrap_or_default().to_rust()?;
         let options = options.unwrap_or_default();
+        if let Some(accept) = options.accept_on_behalf_of {
+            config.identity_accept_on_behalf_of = accept;
+            config.setting_sources.insert(
+                aster::SETTING_ACCEPT_ON_BEHALF_OF.into(),
+                aster::ConfigSource::Code,
+            );
+        }
+        let audit = audit_outbox.map(|o| o.outbox());
         let services = parse_services(&services_json)?;
         let timeout = handler_timeout(options.handler_timeout_ms)?;
         let sinks = Sinks::new(&options, on_events)?;
@@ -1330,6 +1406,9 @@ impl DispatchServer {
             if let Some(t) = timeout {
                 builder = builder.handler_timeout(t);
             }
+            if let Some(outbox) = audit {
+                builder = builder.audit_outbox(outbox);
+            }
             for svc in services {
                 builder = builder.dynamic_service(svc).map_err(aster_err)?;
             }
@@ -1350,6 +1429,7 @@ impl DispatchServer {
                 address,
                 enrolled: server.enrollment().is_some(),
                 identity: server.node_identity(),
+                node_config: server.node_config(),
             };
             Ok(sinks.finish(
                 Running::Own(Box::new(server)),
@@ -1519,6 +1599,36 @@ impl DispatchServer {
     }
 
     /// Number of live calls in the call table (0 once every call ended).
+    /// This node's `aster.ops.NodeConfig` properties as handlers see them now
+    /// (Rust `CallContext::node_properties`): `{generation, name, tags,
+    /// attributes: {k: {type: "bool"|"int"|"float"|"string", value}}}`. They
+    /// describe the node and never authorise anything. Empty (generation 0)
+    /// with NodeConfig off or on a `serve` server.
+    #[napi(
+        ts_return_type = "{ generation: number; name: string; tags: string[]; attributes: Record<string, { type: 'bool' | 'int' | 'float' | 'string'; value: boolean | number | string }> }"
+    )]
+    pub fn node_properties(&self) -> serde_json::Value {
+        let (generation, properties) = match &self.node_config {
+            Some(handle) => (handle.generation(), handle.properties()),
+            None => (0, Default::default()),
+        };
+        serde_json::json!({
+            "generation": generation,
+            "name": properties.name(),
+            "tags": properties.tags(),
+            "attributes": properties.attributes(),
+        })
+    }
+
+    /// The `aster.ops.NodeConfig` generation in effect (0: never changed, or
+    /// NodeConfig off), so callers can cache `nodeProperties()`.
+    #[napi]
+    pub fn node_config_generation(&self) -> f64 {
+        self.node_config
+            .as_ref()
+            .map_or(0.0, |handle| handle.generation() as f64)
+    }
+
     #[napi]
     pub fn live_calls(&self) -> u32 {
         self.table.len() as u32

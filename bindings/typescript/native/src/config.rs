@@ -61,6 +61,12 @@ pub struct JsAsterConfig {
     pub enrollment_credential_chain: Option<String>,
     /// The `[enrollment]` section (see `EnrollmentConfig`).
     pub enrollment: Option<JsEnrollmentConfig>,
+    /// The `[identity]` section: gateway identity (calls on behalf of users)
+    /// and `[identity.publisher]` (see `IdentityConfig`).
+    pub identity: Option<crate::identity_config::JsIdentityConfig>,
+    /// The `[remote_config]` section: `aster.ops.NodeConfig` (see
+    /// `RemoteConfig`).
+    pub remote_config: Option<crate::identity_config::JsRemoteConfig>,
     // ── Connect ──────────────────────────────────────────────────────────
     /// Producer address for consumer-side dialing. `ASTER_ENDPOINT_ADDR`.
     pub endpoint_addr: Option<String>,
@@ -287,7 +293,7 @@ pub struct JsEnrollmentConfig {
     pub synchronize: Option<bool>,
 }
 
-fn opt_u64(field: &str, value: &Option<U64Value>) -> Result<Option<u64>> {
+pub(crate) fn opt_u64(field: &str, value: &Option<U64Value>) -> Result<Option<u64>> {
     value.as_ref().map(|v| u64_in(field, v)).transpose()
 }
 
@@ -416,7 +422,7 @@ pub fn aster_config_is_enrollment_enabled(config: JsAsterConfig) -> Result<bool>
     Ok(config.to_rust()?.is_enrollment_enabled())
 }
 
-fn invalid(msg: impl Into<String>) -> Error {
+pub(crate) fn invalid(msg: impl Into<String>) -> Error {
     Error::new(Status::InvalidArg, msg.into())
 }
 
@@ -427,7 +433,7 @@ pub(crate) fn aster_err(e: aster::Error) -> Error {
     }
 }
 
-fn u64_in(field: &str, value: &U64Value) -> Result<u64> {
+pub(crate) fn u64_in(field: &str, value: &U64Value) -> Result<u64> {
     match value {
         Either::A(n) => {
             if !n.is_finite() || *n < 0.0 || n.fract() != 0.0 || *n > u64::MAX as f64 {
@@ -454,7 +460,7 @@ fn usize_in(field: &str, value: &U64Value) -> Result<usize> {
         .map_err(|_| invalid(format!("{field} is too large for this platform")))
 }
 
-fn u64_out(v: u64) -> U64Value {
+pub(crate) fn u64_out(v: u64) -> U64Value {
     if v <= MAX_SAFE_INTEGER {
         Either::A(v as f64)
     } else {
@@ -534,6 +540,12 @@ impl JsAsterConfig {
         c.enrollment_credential_chain = self.enrollment_credential_chain.clone();
         if let Some(e) = &self.enrollment {
             c.enrollment = e.to_rust()?;
+        }
+        if let Some(identity) = &self.identity {
+            identity.apply(&mut c)?;
+        }
+        if let Some(remote) = &self.remote_config {
+            remote.apply(&mut c);
         }
         c.endpoint_addr = self.endpoint_addr.clone();
         c.storage_path = self
@@ -718,6 +730,8 @@ impl JsAsterConfig {
             enrollment_credential_file: path(&c.enrollment_credential_file),
             enrollment_credential_chain: c.enrollment_credential_chain.clone(),
             enrollment: Some(JsEnrollmentConfig::from_rust(&c.enrollment)),
+            identity: Some(crate::identity_config::JsIdentityConfig::from_rust(c)),
+            remote_config: Some(crate::identity_config::JsRemoteConfig::from_rust(c)),
             endpoint_addr: c.endpoint_addr.clone(),
             storage_path: path(&c.storage_path),
             gc_interval_ms: Some(u64_out(

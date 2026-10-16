@@ -96,6 +96,37 @@ export declare class AsterClient {
    * attribute), which replaces the retired consumer-admission response.
    */
   describeServer(): Promise<ServerIdentity>
+  /**
+   * Mint an edge token for a user (Rust `AsterClient::user_token_issuer` +
+   * `Issuer::mint_user_token`): signed with this node's key, bounded by the
+   * issuer delegation (`aster.identity.issuable_roles`) in the credential
+   * this client presents now. Send it as a call's `onBehalfOf`; the node
+   * needs `aster.gateway`. `amr` needs at least one entry; `ttlSecs`
+   * 1..=300. A role outside the delegation, or no Enrollment, rejects.
+   */
+  mintUserToken(sub: string, roles: Array<string>, amr: Array<string>, ttlSecs: number): Promise<string>
+  /** Whether this client runs an issuer-key publisher (`[identity.publisher]`). */
+  hasIdentityPublisher(): Promise<boolean>
+  /**
+   * Tell the issuer-key publisher that a token for `iss` carried `kid`: a
+   * kid the last published set lacks refreshes that issuer at once (at
+   * most every `minRefreshSecs`). Rust `PublisherHandle::notice_kid`.
+   * Returns whether this client runs a publisher.
+   */
+  noticeKid(iss: string, kid: string): Promise<boolean>
+  /**
+   * As `noticeKid`, reading `iss` and `kid` from a compact JWT (unverified;
+   * a token that does not parse is ignored). Rust
+   * `PublisherHandle::notice_token`. Returns whether this client runs a
+   * publisher.
+   */
+  noticeToken(token: string): Promise<boolean>
+  /**
+   * What the publisher last published, per issuer: `{kids, fetchedAt
+   * (Unix s | null), publications, attempts, lastError}`; `null` without
+   * a publisher.
+   */
+  identityPublisherStatus(): Promise<Record<string, IssuerPublishStatus> | null>
   /** Stop renewing and shut the node down. Idempotent. */
   close(): Promise<void>
 }
@@ -429,8 +460,13 @@ export declare class DispatchServer {
   /**
    * Start a node from `config` and serve `servicesJson` on it (see
    * `serve`). `close()` shuts the node down too.
+   *
+   * The config's `[identity]` / `[remote_config]` apply as in Rust's
+   * `AsterServer`: gateway identity, the issuer-key cache and publisher,
+   * and `aster.ops.NodeConfig` behind `aster.config-admin`. `auditOutbox`
+   * records every NodeConfig `set` and `clear` in that outbox.
    */
-  static start(config: AsterConfig | undefined | null, servicesJson: string[], options?: DispatchServerOptions | undefined | null, onEvents?: ((events: DispatchEvent[]) => void) | undefined | null): Promise<DispatchServer>
+  static start(config: AsterConfig | undefined | null, servicesJson: string[], options?: DispatchServerOptions | undefined | null, onEvents?: ((events: DispatchEvent[]) => void) | undefined | null, auditOutbox?: NativeAuditOutbox | undefined | null): Promise<DispatchServer>
   /** Bind a listener with bounded, fail-closed per-RPC foreign authentication. */
   startHttp(options: HttpListenerOptions, upcalls: Upcalls): Promise<HttpListener>
   /** Bind an explicit anonymous listener. Session services are disabled by the dispatcher. */
@@ -455,129 +491,142 @@ export declare class DispatchServer {
    * Returns `false` when there is no identity to update.
    */
   setNodeAttribute(name: string, value?: string | undefined | null): boolean
-  /** Number of live calls in the call table (0 once every call ended). */
-  liveCalls(): number
   /**
-   * Attribute bridge (design §2.6): set the attributes Gate 3 checks
-   * `requires` against for `peer` (hex node id). `null` / empty clears
-   * the entry. For a peer with a live enrollment session the credential
-   * sets the maximum roles: `aster.role` here throws (use
-   * `restrictPeerRoles`), and the credential's attributes win on a clash.
+   * Number of live calls in the call table (0 once every call ended).
+   * This node's `aster.ops.NodeConfig` properties as handlers see them now
+   * (Rust `CallContext::node_properties`): `{generation, name, tags,
+   * attributes: {k: {type: "bool"|"int"|"float"|"string", value}}}`. They
+   * describe the node and never authorise anything. Empty (generation 0)
+   * with NodeConfig off or on a `serve` server.
    */
-  setPeerAttributes(peer: string, attributes?: Record<string, string> | undefined | null): void
-  /**
-   * Narrow an enrolled `peer`'s roles to `roles` intersected with its
-   * credential roles, from its next call. Throws without a live
-   * enrollment session.
-   */
-  restrictPeerRoles(peer: string, roles: Array<string>): void
-  /** Remove `peer`'s role restriction; returns whether one was set. */
-  clearPeerRestriction(peer: string): boolean
-  /** The attributes Gate 3 currently sees for `peer`. */
-  peerAttributes(peer: string): Record<string, string>
-  /**
-   * Take a non-RPC connection (`kind` 7 event) by its `connectionId`.
-   * `null` if already taken or unknown.
-   */
-  takeConnection(connectionId: number): IrohConnection | null
-  /**
-   * The selected QUIC path of an `aster/1` connection (by the call
-   * event's `connectionId`); `null` once it closed.
-   */
-  transportSnapshot(connectionId: number): TransportSnapshot | null
-  /**
-   * The `aster/1` connection a call arrived on (tunnels, path info);
-   * `null` once it closed.
-   */
-  connection(connectionId: number): IrohConnection | null
-  /**
-   * Diagnostics: `[liveCalls, queued, flag, tsfnCalls, tsfnCallbacks,
-   * tsfnFailures, lastFailureStatus, watchdogRescues]`. TSFN: `queued` =
-   * events waiting in the bounded TSFN ring, `flag` = a drain notification
-   * is outstanding. Ring: `queued` = events in the ring (-1 while a
-   * `nextBatch` holds it), `flag` = the pump stopped.
-   */
-  debugState(): Array<number>
-  /**
-   * Diagnostics: queue one extra drain notification (no-op for ring
-   * deliveries).
-   */
-  debugNudge(): void
-  /**
-   * Resolve with the next batch (at most `max`, default 256), waiting
-   * until there is one. Resolves `[]` once the server is closed.
-   */
-  nextBatch(max?: number | undefined | null): Promise<DispatchEvent[]>
-  /**
-   * Take whatever is ready now (at most `max`, default 256), without
-   * waiting. Returns `[]` while a `nextBatch` is pending.
-   */
-  pollBatch(max?: number | undefined | null): DispatchEvent[]
-  /**
-   * Unary / client-stream: one terminal response (data frame, omitted when
-   * `payload` is empty, plus trailer). `code` defaults to OK.
-   */
-  respond(callId: number, payload: Uint8Array, code?: number | undefined | null, message?: string | undefined | null, details?: Record<string, string> | undefined | null): number
-  /** Server-stream / bidi: one data frame (`payload` must not be empty). */
-  send(callId: number, payload: Uint8Array): number
-  /** End a stream with the trailer. `code` defaults to OK. */
-  finish(callId: number, code?: number | undefined | null, message?: string | undefined | null, details?: Record<string, string> | undefined | null): number
-  /**
-   * After a submit returned `n > 0`: resolve `true` once `n` bytes of
-   * response capacity are held (the retry will not be full), `false` if
-   * the call ended first.
-   */
-  waitWritable(callId: number, requiredLen: number): Promise<boolean>
-  /**
-   * Client-stream / bidi: the next request payload after the one in the
-   * call event; `null` at the end of the request stream (or for an
-   * unknown call).
-   */
-  recv(callId: number): Promise<Buffer | null>
-  /**
-   * Client-stream / bidi: the next request payloads, waiting for the
-   * first and then taking (without waiting) any others already received,
-   * up to `max` (default 64). `[]` at the end of the request stream (or
-   * for an unknown call). One crossing for a burst of requests.
-   */
-  recvBatch(callId: number, max?: number | undefined | null): Promise<Buffer[]>
-  /** The call's header metadata (also on the event when non-empty). */
-  metadata(callId: number): Record<string, string>
-  /**
-   * The caller's attributes as Gate 3 saw them (also on the event when
-   * non-empty).
-   */
-  attributes(callId: number): Record<string, string>
-  /**
-   * Whether the call was cancelled (peer, stream failure, deadline). An
-   * unknown call reads as cancelled.
-   */
-  isCancelled(callId: number): boolean
-  /**
-   * End the call with `INTERNAL "handler dropped call"` unless it already
-   * ended.
-   */
-  abandon(callId: number): void
-  /**
-   * Stop serving (and, for `start`, shut the node down). Releases the
-   * event callback and resolves any pending `nextBatch` with `[]`.
-   * Untaken non-RPC connections are closed.
-   * Drain the server (Rust `aster::rpc::drain`): refuse new connections
-   * (QUIC close `DRAIN_CLOSE_CODE`) and new calls (`UNAVAILABLE` with
-   * detail `aster.draining`), close connections as they go idle, let
-   * in-flight calls and calls on live sessions run until `graceMs`, then
-   * close what remains, which cancels it. A `start` server's Rust health
-   * listener reports not ready from the start of the drain.
-   *
-   * Serving stops refusing only at `close()`, which should follow. A call
-   * while a drain runs moves its deadline earlier when `graceMs` ends
-   * sooner and resolves with the same report; a call after it ended
-   * resolves with that report again. Rejects after `close()`.
-   */
-  drain(graceMs: number): Promise<DrainReport>
-  /** Whether `drain` has started. */
-  get isDraining(): boolean
-  close(): Promise<void>
+nodeProperties(): { generation: number; name: string; tags: string[]; attributes: Record<string, { type: 'bool' | 'int' | 'float' | 'string'; value: boolean | number | string }> }
+/**
+ * The `aster.ops.NodeConfig` generation in effect (0: never changed, or
+ * NodeConfig off), so callers can cache `nodeProperties()`.
+ */
+nodeConfigGeneration(): number
+liveCalls(): number
+/**
+ * Attribute bridge (design §2.6): set the attributes Gate 3 checks
+ * `requires` against for `peer` (hex node id). `null` / empty clears
+ * the entry. For a peer with a live enrollment session the credential
+ * sets the maximum roles: `aster.role` here throws (use
+ * `restrictPeerRoles`), and the credential's attributes win on a clash.
+ */
+setPeerAttributes(peer: string, attributes?: Record<string, string> | undefined | null): void
+/**
+ * Narrow an enrolled `peer`'s roles to `roles` intersected with its
+ * credential roles, from its next call. Throws without a live
+ * enrollment session.
+ */
+restrictPeerRoles(peer: string, roles: Array<string>): void
+/** Remove `peer`'s role restriction; returns whether one was set. */
+clearPeerRestriction(peer: string): boolean
+/** The attributes Gate 3 currently sees for `peer`. */
+peerAttributes(peer: string): Record<string, string>
+/**
+ * Take a non-RPC connection (`kind` 7 event) by its `connectionId`.
+ * `null` if already taken or unknown.
+ */
+takeConnection(connectionId: number): IrohConnection | null
+/**
+ * The selected QUIC path of an `aster/1` connection (by the call
+ * event's `connectionId`); `null` once it closed.
+ */
+transportSnapshot(connectionId: number): TransportSnapshot | null
+/**
+ * The `aster/1` connection a call arrived on (tunnels, path info);
+ * `null` once it closed.
+ */
+connection(connectionId: number): IrohConnection | null
+/**
+ * Diagnostics: `[liveCalls, queued, flag, tsfnCalls, tsfnCallbacks,
+ * tsfnFailures, lastFailureStatus, watchdogRescues]`. TSFN: `queued` =
+ * events waiting in the bounded TSFN ring, `flag` = a drain notification
+ * is outstanding. Ring: `queued` = events in the ring (-1 while a
+ * `nextBatch` holds it), `flag` = the pump stopped.
+ */
+debugState(): Array<number>
+/**
+ * Diagnostics: queue one extra drain notification (no-op for ring
+ * deliveries).
+ */
+debugNudge(): void
+/**
+ * Resolve with the next batch (at most `max`, default 256), waiting
+ * until there is one. Resolves `[]` once the server is closed.
+ */
+nextBatch(max?: number | undefined | null): Promise<DispatchEvent[]>
+/**
+ * Take whatever is ready now (at most `max`, default 256), without
+ * waiting. Returns `[]` while a `nextBatch` is pending.
+ */
+pollBatch(max?: number | undefined | null): DispatchEvent[]
+/**
+ * Unary / client-stream: one terminal response (data frame, omitted when
+ * `payload` is empty, plus trailer). `code` defaults to OK.
+ */
+respond(callId: number, payload: Uint8Array, code?: number | undefined | null, message?: string | undefined | null, details?: Record<string, string> | undefined | null): number
+/** Server-stream / bidi: one data frame (`payload` must not be empty). */
+send(callId: number, payload: Uint8Array): number
+/** End a stream with the trailer. `code` defaults to OK. */
+finish(callId: number, code?: number | undefined | null, message?: string | undefined | null, details?: Record<string, string> | undefined | null): number
+/**
+ * After a submit returned `n > 0`: resolve `true` once `n` bytes of
+ * response capacity are held (the retry will not be full), `false` if
+ * the call ended first.
+ */
+waitWritable(callId: number, requiredLen: number): Promise<boolean>
+/**
+ * Client-stream / bidi: the next request payload after the one in the
+ * call event; `null` at the end of the request stream (or for an
+ * unknown call).
+ */
+recv(callId: number): Promise<Buffer | null>
+/**
+ * Client-stream / bidi: the next request payloads, waiting for the
+ * first and then taking (without waiting) any others already received,
+ * up to `max` (default 64). `[]` at the end of the request stream (or
+ * for an unknown call). One crossing for a burst of requests.
+ */
+recvBatch(callId: number, max?: number | undefined | null): Promise<Buffer[]>
+/** The call's header metadata (also on the event when non-empty). */
+metadata(callId: number): Record<string, string>
+/**
+ * The caller's attributes as Gate 3 saw them (also on the event when
+ * non-empty).
+ */
+attributes(callId: number): Record<string, string>
+/**
+ * Whether the call was cancelled (peer, stream failure, deadline). An
+ * unknown call reads as cancelled.
+ */
+isCancelled(callId: number): boolean
+/**
+ * End the call with `INTERNAL "handler dropped call"` unless it already
+ * ended.
+ */
+abandon(callId: number): void
+/**
+ * Stop serving (and, for `start`, shut the node down). Releases the
+ * event callback and resolves any pending `nextBatch` with `[]`.
+ * Untaken non-RPC connections are closed.
+ * Drain the server (Rust `aster::rpc::drain`): refuse new connections
+ * (QUIC close `DRAIN_CLOSE_CODE`) and new calls (`UNAVAILABLE` with
+ * detail `aster.draining`), close connections as they go idle, let
+ * in-flight calls and calls on live sessions run until `graceMs`, then
+ * close what remains, which cancels it. A `start` server's Rust health
+ * listener reports not ready from the start of the drain.
+ *
+ * Serving stops refusing only at `close()`, which should follow. A call
+ * while a drain runs moves its deadline earlier when `graceMs` ends
+ * sooner and resolves with the same report; a call after it ended
+ * resolves with that report again. Rejects after `close()`.
+ */
+drain(graceMs: number): Promise<DrainReport>
+/** Whether `drain` has started. */
+get isDraining(): boolean
+close(): Promise<void>
 }
 
 /**
@@ -1732,6 +1781,16 @@ export interface AsterConfig {
   enrollmentCredentialChain?: string
   /** The `[enrollment]` section (see `EnrollmentConfig`). */
   enrollment?: JsEnrollmentConfig
+  /**
+   * The `[identity]` section: gateway identity (calls on behalf of users)
+   * and `[identity.publisher]` (see `IdentityConfig`).
+   */
+  identity?: JsIdentityConfig
+  /**
+   * The `[remote_config]` section: `aster.ops.NodeConfig` (see
+   * `RemoteConfig`).
+   */
+  remoteConfig?: JsRemoteConfig
   /** Producer address for consumer-side dialing. `ASTER_ENDPOINT_ADDR`. */
   endpointAddr?: string
   /**
@@ -2012,6 +2071,12 @@ export interface AuthorityReport {
   fingerprint: string
 }
 
+/**
+ * The token of an `Authorization: Bearer <token>` header value (Rust
+ * `rpc::bearer_token`); `null` for any other scheme or an empty token.
+ */
+export declare function bearerToken(authorization: string): string | null
+
 /** Blob local info. */
 export interface BlobLocalInfo {
   isComplete: boolean
@@ -2155,6 +2220,17 @@ export declare function computeContractIdFromJson(jsonStr: string): string
 
 /** BLAKE3 hash of input bytes -> 32-byte digest. */
 export declare function computeTypeHash(data: Buffer): Buffer
+
+/**
+ * Where a loaded setting came from, and its value then (JSON), so a value
+ * changed in code afterwards no longer claims that source.
+ */
+export interface ConfigSettingSource {
+  /** `file` or `env`. */
+  source: string
+  /** The setting's value when it was loaded, as JSON. */
+  value: string
+}
 
 /** One ACL row: a subject and its exact rights bits. */
 export interface CoordinationAclGrant {
@@ -2578,6 +2654,12 @@ export interface DispatchEvent {
   baggage?: string
   /** The caller's raw W3C `tracestate` header, when sent. */
   tracestate?: string
+  /**
+   * For a call a gateway forwarded on behalf of a user
+   * (`flags & ON_BEHALF_OF`): the verified identity. `peer` is then the
+   * user's principal and `transportPeer` the gateway.
+   */
+  onBehalfOf?: ForwardedIdentity
 }
 
 /** Options for [`DispatchServer::serve`] / [`DispatchServer::start`]. */
@@ -2611,6 +2693,11 @@ export interface DispatchServerOptions {
    * deadline is `min(header deadline, method timeout, this)`.
    */
   handlerTimeoutMs?: number
+  /**
+   * `start` only: accept (or refuse) calls made on behalf of users,
+   * overriding the config's `[identity] accept_on_behalf_of`.
+   */
+  acceptOnBehalfOf?: boolean
 }
 
 /** One document entry (metadata; read the value with `readEntryContent`). */
@@ -2975,6 +3062,31 @@ export const FLAG_ROW_SCHEMA: number
 /** Frame flag: trailing status frame (payload is an encoded `RpcStatus`). */
 export const FLAG_TRAILER: number
 
+/**
+ * The verified on-behalf-of identity of a forwarded call (Rust
+ * `ForwardedIdentity`).
+ */
+export interface ForwardedIdentity {
+  /** `iss|sub`: the user, the call's principal. */
+  principal: string
+  /** The gateway that forwarded the call (its node id; the transport peer). */
+  actor: string
+  /**
+   * The token's issuer: a provider's URL, or the gateway's node id for an
+   * edge-minted token.
+   */
+  issuer: string
+  subject: string
+  /** The roles the token granted (the call's `aster.role`). */
+  roles: Array<string>
+  /** How the user signed in (`amr`, e.g. `webauthn`, `pwd`, `apikey`). */
+  authMethods: Array<string>
+  /** The token id (`jti`; empty when the token has none). */
+  jti: string
+  /** The token's expiry, Unix seconds. */
+  expiresAt: number
+}
+
 /** The Gate-0 decision for a `(peer, alpn)` pair. */
 export interface GateDecision {
   allow: boolean
@@ -3153,6 +3265,43 @@ export interface HttpRelayHead {
   body: HttpRelayBody
 }
 
+/** The `[identity]` section (env `ASTER_IDENTITY_*`). */
+export interface IdentityConfig {
+  /**
+   * Accept calls made on behalf of a user (default false: a call carrying
+   * the entry is refused with `PERMISSION_DENIED`).
+   * `ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF`, `[identity] accept_on_behalf_of`.
+   */
+  acceptOnBehalfOf?: boolean
+  /**
+   * The providers whose tokens may be forwarded.
+   * `ASTER_IDENTITY_TRUSTED_ISSUERS` (JSON), `[[identity.trusted_issuers]]`.
+   */
+  trustedIssuers?: Array<TrustedIssuer>
+  /**
+   * Longest edge-minted token lifetime, 1..=300 s (default 300).
+   * `ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS`.
+   */
+  edgeTokenMaxLifetimeSecs?: U64Value
+  /**
+   * Clock leeway for `iat` / `nbf`, 0..=300 s (default 60).
+   * `ASTER_IDENTITY_CLOCK_LEEWAY_SECS`.
+   */
+  clockLeewaySecs?: U64Value
+  /**
+   * Oldest issuer key set trusted, 60..=2592000 s (default 172800).
+   * `ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS`.
+   */
+  maxKeySetAgeSecs?: U64Value
+  /** `[identity.publisher]` (`ASTER_IDENTITY_PUBLISHER`, JSON). */
+  publisher?: IdentityPublisherConfig
+  /**
+   * Filled by the loaders: where each overridable setting
+   * (`identity.accept_on_behalf_of`, …) came from. Leave it alone.
+   */
+  sources?: Record<string, ConfigSettingSource>
+}
+
 /** A `[[peers]]` entry selected from `.aster-identity`. */
 export interface IdentityPeer {
   name?: string
@@ -3170,6 +3319,27 @@ export interface IdentityPeer {
   publishedServices: any
 }
 
+/**
+ * `[identity.publisher]`: on the node that publishes issuer keys (normally
+ * the gateway). Fetches each issuer's JWK set over validated HTTPS and
+ * writes it into the fleet namespace. Needs Enrollment, a credential
+ * granting `aster.identity-publisher` and the root's sealed write grant.
+ */
+export interface IdentityPublisherConfig {
+  /** The issuers (`iss`) to publish keys for. */
+  issuers: Array<string>
+  /** Issuer → the `https` URL of its JWK set. */
+  jwksUrl?: Record<string, string>
+  /** Scheduled refresh, 60..=86400 s (default 3600). */
+  refreshSecs?: U64Value
+  /** Shortest gap between unknown-`kid` refreshes of one issuer, 1..=refreshSecs (default 60). */
+  minRefreshSecs?: U64Value
+  /** Extra PEM trust anchors (files) for the providers' TLS. */
+  caCerts?: Array<string>
+  /** Trust only `caCerts`, not the WebPKI roots. */
+  caOnly?: boolean
+}
+
 /** Free an instrument handle. `false` when it was already gone. */
 export declare function instrumentFree(handle: number): boolean
 
@@ -3182,6 +3352,23 @@ export declare function instrumentFree(handle: number): boolean
  * default.
  */
 export declare function instrumentNew(kind: number, name: string, description?: string | undefined | null, unit?: string | undefined | null, autoAttrs?: Array<string> | undefined | null, cardinalityLimit?: number | undefined | null, boundaries?: Array<number> | undefined | null): number
+
+/**
+ * What the issuer-key publisher last did for one issuer (Rust
+ * `IssuerPublishStatus`).
+ */
+export interface IssuerPublishStatus {
+  /** The key ids of the last published set; empty before the first. */
+  kids: Array<string>
+  /** `fetched_at` of the last published set, Unix seconds. */
+  fetchedAt?: number
+  /** Sets published so far. */
+  publications: number
+  /** Refresh attempts so far. */
+  attempts: number
+  /** Why the latest attempt did not publish; absent after a success. */
+  lastError?: string
+}
 
 /**
  * The fence rule against `row`: `null` when `writer` (the authenticated
@@ -3429,6 +3616,21 @@ export interface NativeStreamHeader {
   /** `0` = stateless shared-pool stream; non-zero = session-bound. */
   sessionId: number
 }
+
+/**
+ * Call `aster.ops.NodeConfig` `method` (`get` / `set` / `clear` / `ack`) on
+ * the server at the other end of `connection` (an `aster/1` connection),
+ * as Rust's `NodeConfigClient`. The caller needs `aster.config-admin` from
+ * its own Enrollment credential (Gate 3 checks it on every method).
+ *
+ * `requestJson` (snake_case, every field optional unless noted, plus
+ * `deadline_ms`): `get` `{}`; `set` `{expected_generation, name, tags,
+ * attributes: {k: {type, value}}, sections: {identity: {…}}}` (replaces
+ * the whole record); `clear` `{expected_generation}`; `ack` `{generation
+ * (required), timeout_ms}`. Resolves the view (`get`) or the
+ * acknowledgement as JSON; a refused call rejects with its RPC status.
+ */
+export declare function nodeConfigCall(connection: IrohConnection, method: string, requestJson: string): Promise<string>
 
 /**
  * Flush every signal of the running pipeline, waiting at most `timeoutMs`.
@@ -3739,6 +3941,24 @@ export interface RelayHttpStreamRequest {
   capacity?: number
 }
 
+/**
+ * The `[remote_config]` section: `aster.ops.NodeConfig`, remote overrides of
+ * overridable sections (`[identity]` today). Served by default behind
+ * `aster.config-admin`.
+ */
+export interface RemoteConfig {
+  /**
+   * `false` turns the service off (a stored record is then ignored).
+   * `ASTER_REMOTE_CONFIG_ENABLED`, `[remote_config] enabled` (default true).
+   */
+  enabled?: boolean
+  /**
+   * Sections that may not be overridden, e.g. `["identity"]`.
+   * `ASTER_REMOTE_CONFIG_LOCK` (comma-separated), `[remote_config] lock`.
+   */
+  lock?: Array<string>
+}
+
 /** The result of `retireLocalWriteAuthority`. */
 export interface RetireOutcome {
   /**
@@ -3910,6 +4130,29 @@ export interface TransportSnapshot {
    * measured.
    */
   rttMicros?: number
+}
+
+/**
+ * An identity provider whose tokens the server accepts in the
+ * `aster-on-behalf-of` entry (`[[identity.trusted_issuers]]`). Its keys come
+ * from the fleet namespace (written by a node holding
+ * `aster.identity-publisher`); this says whom to trust and how to map roles.
+ * Needs Enrollment.
+ */
+export interface TrustedIssuer {
+  /** The exact `iss` claim. */
+  iss: string
+  /** Accepted `aud` values (required). */
+  audiences: Array<string>
+  /**
+   * The claim roles are read from (an array of strings, or one
+   * space-separated string); unset: the tokens grant no roles.
+   */
+  rolesClaim?: string
+  /** Claim value → Aster role; unmapped values are dropped. */
+  roleMap?: Record<string, string>
+  /** Longest `exp - iat` accepted (default 900). */
+  maxTokenLifetimeSecs?: U64Value
 }
 
 /**

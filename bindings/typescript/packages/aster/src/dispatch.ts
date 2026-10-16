@@ -33,6 +33,7 @@ import type { ServiceInfo, MethodInfo } from './service.js';
 import { ServiceRegistry } from './service.js';
 import {
   type Interceptor,
+  type NodeProperties,
   CallContext,
   applyRequestInterceptors,
   applyResponseInterceptors,
@@ -129,8 +130,10 @@ class DispatchCallContext extends CallContext {
     native: NativeDispatchServer,
     connectionId: number,
     attributes: ((peer: string) => Record<string, string> | undefined) | undefined,
+    nodeProperties: () => NodeProperties,
   ) {
     super(init);
+    this._nodePropertiesLoader = nodeProperties;
     if (connectionId) this._transport = () => native.transportSnapshot(connectionId) as any;
     const principal = init.principal ?? init.peer;
     if (attributes && !init.attributes && principal) {
@@ -206,6 +209,9 @@ export class RpcServer {
   private loop: DispatchLoop | null = null;
   private native: NativeDispatchServer | null = null;
   private readonly httpListeners = new Set<HttpListener>();
+  /** `nodeProperties()` of the generation last read (handlers share it). */
+  private nodeProps: NodeProperties | undefined;
+  private readonly loadNodeProperties = (): NodeProperties => this.nodeProperties();
   private closedP: Promise<void> | null = null;
   private resolveClosed: (() => void) | null = null;
   private closing: Promise<void> | null = null;
@@ -226,6 +232,22 @@ export class RpcServer {
   /** The native dispatch server (after `start`). */
   get dispatchServer(): NativeDispatchServer | null {
     return this.native;
+  }
+
+  /**
+   * This node's `aster.ops.NodeConfig` properties now (what handlers read
+   * as `ctx.nodeProperties`), re-read only when the generation changes.
+   * They describe the node and never authorise anything.
+   */
+  nodeProperties(): NodeProperties {
+    const srv = this.native;
+    if (!srv) return { generation: 0, name: '', tags: [], attributes: {} };
+    const generation = srv.nodeConfigGeneration();
+    const cached = this.nodeProps;
+    if (cached && cached.generation === generation) return cached;
+    const props = srv.nodeProperties() as NodeProperties;
+    this.nodeProps = Object.freeze({ ...props, tags: Object.freeze([...props.tags]), attributes: Object.freeze({ ...props.attributes }) });
+    return this.nodeProps;
   }
 
   /** Calls Rust still tracks (in flight, unanswered). */
@@ -278,6 +300,8 @@ export class RpcServer {
       handlerTimeoutMs: this.opts.handlerTimeoutMs,
       ringCapacity: this.opts.ringCapacity,
       maxForeignInflight: this.opts.maxForeignInflight,
+      acceptOnBehalfOf: target.config ? this.opts.acceptOnBehalfOf : undefined,
+      auditOutbox: target.config ? this.opts.auditOutbox : undefined,
       gateAttributes: target.node ? this.opts.gateAttributes?.native : undefined,
       onCall: (ev, srv) => this.onCall(ev, srv),
       onEvent: (ev, srv) => this.onEvent(ev, srv),
@@ -466,6 +490,7 @@ export class RpcServer {
         peer: ev.transportPeer ?? ev.peer ?? undefined,
         principal: ev.peer ?? undefined,
         irohAuthenticated: !!(ev.flags & DispatchFlags.IrohAuthenticated),
+        onBehalfOf: ev.onBehalfOf ?? undefined,
         metadata: ev.metadata ?? {},
         attributes: ev.attributes ?? undefined,
         deadline: ev.deadlineMs ? ev.deadlineMs / 1000 : undefined,
@@ -477,6 +502,7 @@ export class RpcServer {
       srv,
       ev.connectionId,
       (ev.flags & DispatchFlags.IrohAuthenticated) ? this.opts.peerAttributes : undefined,
+      this.loadNodeProperties,
     );
     let run: Promise<void>;
     try {

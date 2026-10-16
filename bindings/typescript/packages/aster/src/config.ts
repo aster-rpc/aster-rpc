@@ -85,6 +85,18 @@ export interface AsterConfig {
    * {@link EnrollmentConfig}.
    */
   enrollment?: EnrollmentConfig;
+  /**
+   * Gateway identity (the `[identity]` section): whether this server accepts
+   * calls a gateway makes on behalf of users, which identity providers it
+   * trusts, and `[identity.publisher]`. See {@link IdentityConfig}.
+   */
+  identity?: IdentityConfig;
+  /**
+   * `aster.ops.NodeConfig` (the `[remote_config]` section): remote
+   * overrides of `[identity]`, on by default behind `aster.config-admin`.
+   * See {@link RemoteConfig}.
+   */
+  remoteConfig?: RemoteConfig;
 
   // ── Connect ────────────────────────────────────────────────────────────
   /** Producer address for consumer-side dialing. `ASTER_ENDPOINT_ADDR`. */
@@ -368,6 +380,94 @@ export interface EnrollmentConfig {
   synchronize?: boolean;
 }
 
+/**
+ * An identity provider whose tokens a server accepts in the
+ * `aster-on-behalf-of` entry (`[[identity.trusted_issuers]]`, Rust
+ * `aster::TrustedIssuer`). Its keys come from the fleet namespace, written by
+ * a node holding `aster.identity-publisher`; this says whom to trust and how
+ * to map roles. Needs Enrollment.
+ * @group Gateway identity
+ */
+export interface TrustedIssuer {
+  /** The exact `iss` claim. */
+  iss: string;
+  /** Accepted `aud` values (required). */
+  audiences: string[];
+  /** The claim roles are read from (an array of strings, or one space-separated string); unset: no roles. */
+  rolesClaim?: string;
+  /** Claim value → Aster role; unmapped values are dropped. */
+  roleMap?: Record<string, string>;
+  /** Longest `exp - iat` accepted, 1–86400 s (default 900). */
+  maxTokenLifetimeSecs?: number | bigint;
+}
+
+/**
+ * `[identity.publisher]` (Rust `aster::IdentityPublisherConfig`): on the node
+ * that publishes issuer keys, normally the gateway. It fetches each issuer's
+ * JWK set over validated HTTPS and writes it into the fleet namespace. Needs
+ * Enrollment, a credential granting `aster.identity-publisher` and the
+ * root's sealed write grant (`aster enroll identity-publisher`).
+ * @group Gateway identity
+ */
+export interface IdentityPublisherConfig {
+  issuers: string[];
+  /** Issuer → the `https` URL of its JWK set (required per issuer). */
+  jwksUrl?: Record<string, string>;
+  /** Scheduled refresh, 60–86400 s (default 3600). */
+  refreshSecs?: number | bigint;
+  /** Shortest gap between unknown-`kid` refreshes of one issuer (default 60). */
+  minRefreshSecs?: number | bigint;
+  /** Extra PEM trust anchor files for the providers' TLS. */
+  caCerts?: string[];
+  /** Trust only `caCerts`, not the WebPKI roots. */
+  caOnly?: boolean;
+}
+
+/**
+ * The `[identity]` section (env `ASTER_IDENTITY_*`). `AsterConfig.fromEnv`
+ * / `fromFile` fill it through the Rust loaders, with the same names,
+ * defaults and precedence as every binding.
+ * @group Gateway identity
+ */
+export interface IdentityConfig {
+  /**
+   * Accept calls made on behalf of a user (default false: a call carrying
+   * the entry is refused with `PERMISSION_DENIED`).
+   * `ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF`, `[identity] accept_on_behalf_of`.
+   */
+  acceptOnBehalfOf?: boolean;
+  /** Providers whose tokens may be forwarded. `ASTER_IDENTITY_TRUSTED_ISSUERS` (JSON), `[[identity.trusted_issuers]]`. */
+  trustedIssuers?: TrustedIssuer[];
+  /** Longest edge-minted token lifetime, 1–300 s (default 300). `ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS`. */
+  edgeTokenMaxLifetimeSecs?: number | bigint;
+  /** Leeway for `iat` / `nbf` (never `exp`), 0–300 s (default 60). `ASTER_IDENTITY_CLOCK_LEEWAY_SECS`. */
+  clockLeewaySecs?: number | bigint;
+  /** Oldest issuer key set trusted, 60–2592000 s (default 172800). `ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS`. */
+  maxKeySetAgeSecs?: number | bigint;
+  /** `[identity.publisher]` (`ASTER_IDENTITY_PUBLISHER`, JSON). */
+  publisher?: IdentityPublisherConfig;
+  /**
+   * Filled by the loaders: where each overridable setting came from (file
+   * or env) and its value then, so `aster.ops.NodeConfig` `get` reports it;
+   * a value changed in code since reports `code`. Leave it alone.
+   * @internal
+   */
+  sources?: Record<string, { source: string; value: string }>;
+}
+
+/**
+ * The `[remote_config]` section: `aster.ops.NodeConfig`, remote overrides
+ * of overridable sections (`[identity]` today), served by default behind
+ * `aster.config-admin`. A node without Enrollment refuses every change.
+ * @group Gateway identity
+ */
+export interface RemoteConfig {
+  /** `false` turns the service off; a stored record is then ignored. `ASTER_REMOTE_CONFIG_ENABLED`. */
+  enabled?: boolean;
+  /** Sections that may not be overridden, e.g. `['identity']`. `ASTER_REMOTE_CONFIG_LOCK`. */
+  lock?: string[];
+}
+
 function keyHex(value: KeyMaterial | undefined): string | undefined {
   if (value === undefined || value === null) return undefined;
   return typeof value === 'string' ? value : Buffer.from(value).toString('hex');
@@ -423,9 +523,9 @@ export const AsterConfig = {
 /**
  * Overlay `override` on `base` the way `AsterServer` / `AsterClient` resolve
  * their configuration (`{ ...AsterConfig.fromEnv(), ...opts.config }`), but
- * merging the `enrollment` section (and its `limits` / `roles`) field by
- * field, so setting one enrollment value in code keeps the rest from the
- * environment or file.
+ * merging the `enrollment` section (and its `limits` / `roles`), `identity`
+ * and `remoteConfig` field by field, so setting one value in code keeps the
+ * rest from the environment or file.
  */
 export function mergeConfig(base: AsterConfig, override: Partial<AsterConfig> = {}): AsterConfig {
   const out: AsterConfig = { ...base, ...override };
@@ -438,6 +538,12 @@ export function mergeConfig(base: AsterConfig, override: Partial<AsterConfig> = 
       ...(b.limits || o.limits ? { limits: { ...b.limits, ...o.limits } } : {}),
       ...(b.roles || o.roles ? { roles: { ...b.roles, ...o.roles } } : {}),
     };
+  }
+  if (base.identity && override.identity) {
+    out.identity = { ...base.identity, ...override.identity };
+  }
+  if (base.remoteConfig && override.remoteConfig) {
+    out.remoteConfig = { ...base.remoteConfig, ...override.remoteConfig };
   }
   return out;
 }

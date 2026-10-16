@@ -50,10 +50,33 @@ export function mapTransportError(e: unknown): RpcError {
   return new RpcError(StatusCode.UNKNOWN, msg);
 }
 
-function metadataList(metadata?: Record<string, string>): string[] | undefined {
+/** The call metadata entry carrying a user's JWT (Rust `ON_BEHALF_OF_METADATA`). */
+const ON_BEHALF_OF_METADATA = 'aster-on-behalf-of';
+
+/**
+ * Per connection: what to tell about each token sent `onBehalfOf` (the
+ * client's issuer-key publisher refreshes an issuer whose `kid` it has not
+ * published). Set by `AsterClientWrapper` when it runs a publisher.
+ */
+const _onBehalfOfNotice = new WeakMap<object, (token: string) => void>();
+
+/** @internal Notice every token `connection` sends on behalf of a user. */
+export function setOnBehalfOfNotice(connection: object, notice: ((token: string) => void) | undefined): void {
+  if (notice) _onBehalfOfNotice.set(connection, notice);
+  else _onBehalfOfNotice.delete(connection);
+}
+
+function metadataList(opts: CallOptions | undefined, connection: object): string[] | undefined {
   // The current trace context rides along as `traceparent` / `baggage`
   // (Rust parents the client span on it); explicit metadata wins.
-  const merged = { ...traceMetadata(), ...metadata };
+  const merged: Record<string, string> = { ...traceMetadata(), ...opts?.metadata };
+  const token = opts?.onBehalfOf;
+  if (token) {
+    merged[ON_BEHALF_OF_METADATA] = token;
+    try {
+      _onBehalfOfNotice.get(connection)?.(token);
+    } catch { /* a notice never fails the call */ }
+  }
   let out: string[] | undefined;
   for (const k in merged) {
     (out ??= []).push(k, String(merged[k]));
@@ -222,7 +245,7 @@ export class IrohTransport implements AsterTransport {
         opts?.version ?? 1,
         opts?.sessionId ?? this.sessionId,
         deadlineMs(opts),
-        metadataList(opts?.metadata),
+        metadataList(opts, this.conn),
         opts?.serializationMode,
         opts?.callId,
         payload,
@@ -250,7 +273,7 @@ export class IrohTransport implements AsterTransport {
         opts?.version ?? 1,
         opts?.sessionId ?? this.sessionId,
         deadlineMs(opts),
-        metadataList(opts?.metadata),
+        metadataList(opts, this.conn),
         opts?.serializationMode,
         opts?.callId,
         payload,
@@ -304,7 +327,7 @@ export class IrohTransport implements AsterTransport {
         opts?.version ?? 1,
         opts?.sessionId ?? this.sessionId,
         deadlineMs(opts),
-        metadataList(opts?.metadata),
+        metadataList(opts, this.conn),
         opts?.serializationMode,
         opts?.callId,
       );
@@ -415,7 +438,7 @@ export class IrohTransport implements AsterTransport {
         opts?.version ?? 1,
         opts?.sessionId ?? this.sessionId,
         deadlineMs(opts),
-        metadataList(opts?.metadata),
+        metadataList(opts, this.conn),
         opts?.serializationMode,
         opts?.callId,
       )

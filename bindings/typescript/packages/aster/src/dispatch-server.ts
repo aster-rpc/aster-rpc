@@ -25,6 +25,7 @@ import type {
   DispatchServer as NativeDispatchServer,
 } from '@aster-rpc/transport';
 import { loadNative } from './native.js';
+import { nativeOutbox, type AuditOutbox } from './audit-outbox.js';
 import type { CapabilityRequirement } from './service.js';
 import type { DynamicServiceSpec } from './lowering.js';
 
@@ -75,6 +76,8 @@ export const DispatchFlags = {
   HasAttributes: 0x200,
   /** An authenticator resolved a principal other than the transport peer (`transportPeer` is set). */
   HasPrincipal: 0x1000,
+  /** A gateway forwarded the call on behalf of a user (`onBehalfOf` is set). */
+  OnBehalfOf: 0x2000,
 } as const;
 
 /** Results of the native `respond` / `send` / `finish` (`> 0` = queue full, bytes needed). */
@@ -102,6 +105,18 @@ export interface DispatchServerTuning {
   ringCapacity?: number;
   /** Per-kind maximum for foreign calls, sessions, RPC connections, and non-RPC connections (default 4096). */
   maxForeignInflight?: number;
+  /**
+   * Own-node servers only: accept (or refuse) calls made on behalf of
+   * users, overriding the config's `identity.acceptOnBehalfOf`.
+   */
+  acceptOnBehalfOf?: boolean;
+  /**
+   * Own-node servers only: record every `aster.ops.NodeConfig` `set` and
+   * `clear` in this durable audit outbox (Rust
+   * `AsterServerBuilder::audit_outbox`). A change it does not accept is
+   * refused.
+   */
+  auditOutbox?: AuditOutbox;
 }
 
 export interface DispatchLoopOptions extends DispatchServerTuning {
@@ -176,13 +191,14 @@ export class DispatchLoop {
       handlerTimeoutMs: opts.handlerTimeoutMs,
       ringCapacity: opts.ringCapacity,
       maxForeignInflight: opts.maxForeignInflight,
+      acceptOnBehalfOf: opts.acceptOnBehalfOf,
     };
     const tsfn = delivery === 'tsfn' || delivery === 'tsfn-batched';
     const nativeOpts = { ...common, delivery: tsfn ? delivery : 'ring' };
     const onEvents = tsfn ? handle : undefined;
     const srv: NativeDispatchServer = opts.node
       ? await native.DispatchServer.serve(opts.node as any, json, nativeOpts, onEvents, opts.gateAttributes as any)
-      : await native.DispatchServer.start(opts.config, json, nativeOpts, onEvents);
+      : await native.DispatchServer.start(opts.config, json, nativeOpts, onEvents, nativeOutbox(opts.auditOutbox));
     loop = new DispatchLoop(srv, delivery);
     const held = early;
     early = [];

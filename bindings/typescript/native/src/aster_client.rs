@@ -52,6 +52,22 @@ pub struct ServerIdentity {
     pub attributes: std::collections::HashMap<String, String>,
 }
 
+/// What the issuer-key publisher last did for one issuer (Rust
+/// `IssuerPublishStatus`).
+#[napi(object)]
+pub struct IssuerPublishStatus {
+    /// The key ids of the last published set; empty before the first.
+    pub kids: Vec<String>,
+    /// `fetched_at` of the last published set, Unix seconds.
+    pub fetched_at: Option<f64>,
+    /// Sets published so far.
+    pub publications: f64,
+    /// Refresh attempts so far.
+    pub attempts: f64,
+    /// Why the latest attempt did not publish; absent after a success.
+    pub last_error: Option<String>,
+}
+
 /// A connected client: a node plus an RPC connection to one server, enrolled
 /// with it when the configuration enables enrollment.
 ///
@@ -210,6 +226,104 @@ impl AsterClient {
             roles: identity.roles,
             attributes,
         })
+    }
+
+    /// Mint an edge token for a user (Rust `AsterClient::user_token_issuer` +
+    /// `Issuer::mint_user_token`): signed with this node's key, bounded by the
+    /// issuer delegation (`aster.identity.issuable_roles`) in the credential
+    /// this client presents now. Send it as a call's `onBehalfOf`; the node
+    /// needs `aster.gateway`. `amr` needs at least one entry; `ttlSecs`
+    /// 1..=300. A role outside the delegation, or no Enrollment, rejects.
+    #[napi]
+    pub async fn mint_user_token(
+        &self,
+        sub: String,
+        roles: Vec<String>,
+        amr: Vec<String>,
+        ttl_secs: u32,
+    ) -> Result<String> {
+        let guard = self.inner.lock().await;
+        let client = guard
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("AsterClient is closed"))?;
+        let issuer = client.user_token_issuer().map_err(aster_err)?;
+        issuer
+            .mint_user_token(
+                &sub,
+                roles,
+                amr,
+                std::time::Duration::from_secs(u64::from(ttl_secs)),
+            )
+            .map_err(aster_err)
+    }
+
+    /// The `[identity.publisher]` this client runs, if any.
+    async fn publisher(&self) -> Option<aster::rpc::jwks_publisher::PublisherHandle> {
+        self.inner.lock().await.as_ref()?.identity_publisher()
+    }
+
+    /// Whether this client runs an issuer-key publisher (`[identity.publisher]`).
+    #[napi]
+    pub async fn has_identity_publisher(&self) -> bool {
+        self.publisher().await.is_some()
+    }
+
+    /// Tell the issuer-key publisher that a token for `iss` carried `kid`: a
+    /// kid the last published set lacks refreshes that issuer at once (at
+    /// most every `minRefreshSecs`). Rust `PublisherHandle::notice_kid`.
+    /// Returns whether this client runs a publisher.
+    #[napi]
+    pub async fn notice_kid(&self, iss: String, kid: String) -> bool {
+        match self.publisher().await {
+            Some(handle) => {
+                handle.notice_kid(&iss, &kid);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// As `noticeKid`, reading `iss` and `kid` from a compact JWT (unverified;
+    /// a token that does not parse is ignored). Rust
+    /// `PublisherHandle::notice_token`. Returns whether this client runs a
+    /// publisher.
+    #[napi]
+    pub async fn notice_token(&self, token: String) -> bool {
+        match self.publisher().await {
+            Some(handle) => {
+                handle.notice_token(&token);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// What the publisher last published, per issuer: `{kids, fetchedAt
+    /// (Unix s | null), publications, attempts, lastError}`; `null` without
+    /// a publisher.
+    #[napi]
+    pub async fn identity_publisher_status(
+        &self,
+    ) -> Option<std::collections::HashMap<String, IssuerPublishStatus>> {
+        let handle = self.publisher().await?;
+        Some(
+            handle
+                .status()
+                .into_iter()
+                .map(|(iss, s)| {
+                    (
+                        iss,
+                        IssuerPublishStatus {
+                            kids: s.kids.clone(),
+                            fetched_at: s.fetched_at.map(|t| t as f64),
+                            publications: s.publications as f64,
+                            attempts: s.attempts as f64,
+                            last_error: s.last_error.as_ref().map(ToString::to_string),
+                        },
+                    )
+                })
+                .collect(),
+        )
     }
 
     /// Stop renewing and shut the node down. Idempotent.

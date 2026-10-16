@@ -63,6 +63,13 @@ pub struct NativeAuditOutbox {
     inner: AuditOutbox,
 }
 
+impl NativeAuditOutbox {
+    /// The outbox, for a server that records into it (`DispatchServer.start`).
+    pub(crate) fn outbox(&self) -> AuditOutbox {
+        self.inner.clone()
+    }
+}
+
 #[napi]
 impl NativeAuditOutbox {
     #[napi]

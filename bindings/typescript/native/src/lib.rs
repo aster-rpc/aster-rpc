@@ -28,6 +28,8 @@ mod expose;
 mod gossip;
 mod grants;
 mod health;
+mod identity;
+mod identity_config;
 mod keys;
 mod lease;
 mod net;
