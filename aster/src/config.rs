@@ -29,6 +29,55 @@ pub enum RelayMode {
     Disabled,
 }
 
+/// How the node publishes its addresses and finds a peer from a bare node ID
+/// (`[network] discovery`, `ASTER_DISCOVERY`).
+///
+/// Only `Default` contacts n0 infrastructure (pkarr and DNS at `iroh.link`).
+/// Relays are configured separately: with [`RelayMode::Default`] a node still
+/// uses the n0 relays, so an air-gapped node also sets
+/// [`RelayMode::Custom`] or [`RelayMode::Disabled`].
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DiscoveryMode {
+    /// n0 pkarr publish/resolve and DNS lookup at `iroh.link`.
+    #[default]
+    Default,
+    /// No address lookup at all: peers are dialed by full address (node ID
+    /// plus direct address or relay URL).
+    None,
+    /// No global lookup; local-network mDNS only (turns
+    /// [`AsterConfig::local_discovery`] on).
+    Local,
+    /// Only [`AsterConfig::discovery_dns_origin`] and
+    /// [`AsterConfig::discovery_pkarr_relays`], e.g. a self-hosted
+    /// iroh-dns-server. Setting either selects this mode.
+    Custom,
+}
+
+impl DiscoveryMode {
+    /// The config spelling: `default`, `none`, `local` or `custom`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::None => "none",
+            Self::Local => "local",
+            Self::Custom => "custom",
+        }
+    }
+
+    /// Parse the config spelling (case-insensitive).
+    pub fn parse(value: &str) -> Result<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "default" => Ok(Self::Default),
+            "none" => Ok(Self::None),
+            "local" => Ok(Self::Local),
+            "custom" => Ok(Self::Custom),
+            other => Err(Error::InvalidArgument(format!(
+                "discovery: expected default, none, local or custom, got {other:?}"
+            ))),
+        }
+    }
+}
+
 /// Published service metadata loaded from `.aster-identity`.
 ///
 /// Values are JSON so callers can inspect token/contract metadata without
@@ -158,8 +207,65 @@ pub struct AsterConfig {
     pub secret_key_file: Option<PathBuf>,
     /// Relay mode for the endpoint.
     pub relay_mode: RelayMode,
-    /// Local bind address, e.g. `"0.0.0.0:9000"`.
+    /// Local bind address, e.g. `"0.0.0.0:9000"`. Pins one address family:
+    /// an IPv4 address pins the IPv4 socket (the IPv6 one keeps a random port
+    /// unless [`bind_addr_v6`](Self::bind_addr_v6) is set).
+    ///
+    /// Env: `ASTER_BIND_ADDR`; TOML: `[network] bind_addr`.
     pub bind_addr: Option<String>,
+    /// IPv6 bind address, e.g. `"[::]:7842"`: pins the IPv6 socket the way
+    /// [`bind_addr`](Self::bind_addr) pins the IPv4 one, so a default-deny
+    /// NetworkPolicy can allow one UDP port per family. Must be IPv6;
+    /// `bind_addr` must then be IPv4 (or unset). The bind is required: a host
+    /// without IPv6 fails to start with it set.
+    ///
+    /// Env: `ASTER_BIND_ADDR_V6`; TOML: `[network] bind_addr_v6`.
+    pub bind_addr_v6: Option<String>,
+    /// Extra direct addresses (`IP:port`) the node is reachable on but cannot
+    /// discover itself, such as a Kubernetes NodePort or a load balancer.
+    /// Published with the discovered addresses, in the node's address and
+    /// every discovery record, and tried by peers like any other.
+    ///
+    /// They are hints: a peer dialing this node still verifies its key in the
+    /// TLS handshake, so a wrong or reused address cannot reach another node.
+    /// Requires direct IP transports.
+    ///
+    /// Env: `ASTER_ADVERTISE_ADDRS` (comma-separated); TOML: `[network]
+    /// advertise_addrs = [..]`.
+    pub advertise_addrs: Vec<String>,
+    /// PEM files whose certificates are trusted for relay TLS, in addition to
+    /// the built-in WebPKI roots (or instead of them with
+    /// [`relay_ca_only`](Self::relay_ca_only)): for a self-hosted relay with a
+    /// private-CA certificate. Also used for custom discovery's pkarr relays.
+    /// This is transport security for the relay hop only; peers are still
+    /// authenticated by their node key end to end.
+    ///
+    /// Env: `ASTER_RELAY_CA_CERTS` (comma-separated paths); TOML: `[network]
+    /// relay_ca_certs = [..]`.
+    pub relay_ca_certs: Vec<PathBuf>,
+    /// Trust only [`relay_ca_certs`](Self::relay_ca_certs) for relay TLS, not
+    /// the WebPKI roots. Default `false`.
+    ///
+    /// Env: `ASTER_RELAY_CA_ONLY`; TOML: `[network] relay_ca_only`.
+    pub relay_ca_only: bool,
+    /// Address lookup for finding peers by bare node ID. Default
+    /// [`DiscoveryMode::Default`] (n0 at `iroh.link`).
+    ///
+    /// Env: `ASTER_DISCOVERY`; TOML: `[network] discovery`.
+    pub discovery: DiscoveryMode,
+    /// DNS origin for [`DiscoveryMode::Custom`], e.g.
+    /// `"dns.example.internal"`: peers are resolved from `_iroh.<id>.<origin>`
+    /// TXT records.
+    ///
+    /// Env: `ASTER_DISCOVERY_DNS_ORIGIN`; TOML: `[network]
+    /// discovery_dns_origin`.
+    pub discovery_dns_origin: Option<String>,
+    /// Pkarr relay URLs for [`DiscoveryMode::Custom`] (publish and resolve),
+    /// e.g. `"https://dns.example.internal/pkarr"`.
+    ///
+    /// Env: `ASTER_DISCOVERY_PKARR_RELAYS` (comma-separated); TOML:
+    /// `[network] discovery_pkarr_relays = [..]`.
+    pub discovery_pkarr_relays: Vec<String>,
     /// On a persistent node, re-bind the UDP ports the node last bound when
     /// they are still free. Default `true`.
     ///
@@ -411,6 +517,27 @@ impl AsterConfig {
             if let Some(value) = toml_string(network, "bind_addr", label)? {
                 self.bind_addr = Some(value);
             }
+            if let Some(value) = toml_string(network, "bind_addr_v6", label)? {
+                self.bind_addr_v6 = Some(value);
+            }
+            if let Some(value) = toml_string_list(network, "advertise_addrs", label)? {
+                self.advertise_addrs = non_empty(value);
+            }
+            if let Some(value) = toml_string_list(network, "relay_ca_certs", label)? {
+                self.relay_ca_certs = non_empty(value)
+                    .into_iter()
+                    .map(|p| expand_tilde(Path::new(&p)))
+                    .collect();
+            }
+            if let Some(value) = toml_bool(network, "relay_ca_only", label)? {
+                self.relay_ca_only = value;
+            }
+            self.apply_discovery(
+                toml_string(network, "discovery", label)?.as_deref(),
+                toml_string(network, "discovery_dns_origin", label)?,
+                toml_string_list(network, "discovery_pkarr_relays", label)?,
+                &format!("{label} [network]"),
+            )?;
             if let Some(value) = toml_bool(network, "reuse_last_port", label)? {
                 self.reuse_last_port = value;
             }
@@ -593,6 +720,27 @@ impl AsterConfig {
         if let Some(value) = env_string("ASTER_BIND_ADDR") {
             self.bind_addr = Some(value);
         }
+        if let Some(value) = env_string("ASTER_BIND_ADDR_V6") {
+            self.bind_addr_v6 = Some(value);
+        }
+        if let Some(value) = env_list("ASTER_ADVERTISE_ADDRS") {
+            self.advertise_addrs = value;
+        }
+        if let Some(value) = env_list("ASTER_RELAY_CA_CERTS") {
+            self.relay_ca_certs = value
+                .into_iter()
+                .map(|p| expand_tilde(Path::new(&p)))
+                .collect();
+        }
+        if let Some(value) = env_bool("ASTER_RELAY_CA_ONLY")? {
+            self.relay_ca_only = value;
+        }
+        self.apply_discovery(
+            env_string("ASTER_DISCOVERY").as_deref(),
+            env_string("ASTER_DISCOVERY_DNS_ORIGIN"),
+            env_list("ASTER_DISCOVERY_PKARR_RELAYS"),
+            "ASTER_DISCOVERY",
+        )?;
         if let Some(value) = env_bool("ASTER_REUSE_LAST_PORT")? {
             self.reuse_last_port = value;
         }
@@ -907,12 +1055,38 @@ impl AsterConfig {
             relay_urls,
             alpns: self.alpns.clone(),
             secret_key: self.secret_key.as_ref().map(|k| k.to_bytes().to_vec()),
-            enable_discovery: self.local_discovery,
+            enable_discovery: self.local_discovery || self.discovery == DiscoveryMode::Local,
             enable_monitoring: self.enable_monitoring,
             enable_hooks: self.enable_hooks,
             hook_timeout_ms: self.hook_timeout_ms,
             hook_failure_mode: self.hook_failure_mode,
             bind_addr: self.bind_addr.clone(),
+            bind_addr_v6: self.bind_addr_v6.clone(),
+            advertise_addrs: self.advertise_addrs.clone(),
+            relay_ca_cert_files: self
+                .relay_ca_certs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            relay_ca_only: self.relay_ca_only,
+            discovery: Some(
+                match self.discovery {
+                    DiscoveryMode::Local => "none",
+                    mode => mode.as_str(),
+                }
+                .into(),
+            ),
+            // Servers count only in custom mode, so a later source that sets
+            // `discovery = "none"` overrides servers an earlier one gave.
+            discovery_dns_origin: self
+                .discovery_dns_origin
+                .clone()
+                .filter(|_| self.discovery == DiscoveryMode::Custom),
+            discovery_pkarr_relays: if self.discovery == DiscoveryMode::Custom {
+                self.discovery_pkarr_relays.clone()
+            } else {
+                Vec::new()
+            },
             clear_ip_transports: self.clear_ip_transports,
             clear_relay_transports: self.clear_relay_transports,
             portmapper_config: self.portmapper_config.clone(),
@@ -945,6 +1119,42 @@ impl AsterConfig {
     #[doc(hidden)]
     pub fn core_endpoint_config(&self) -> CoreEndpointConfig {
         self.to_core_endpoint_config()
+    }
+
+    /// Apply a discovery mode and/or custom discovery servers from one source
+    /// (env or TOML). Servers alone select [`DiscoveryMode::Custom`]; with a
+    /// mode in the same source, the mode must be `custom`.
+    fn apply_discovery(
+        &mut self,
+        mode: Option<&str>,
+        dns_origin: Option<String>,
+        pkarr_relays: Option<Vec<String>>,
+        source: &str,
+    ) -> Result<()> {
+        let parsed = mode
+            .map(DiscoveryMode::parse)
+            .transpose()
+            .map_err(|e| Error::InvalidArgument(format!("{source}: {e}")))?;
+        let servers = dns_origin.is_some() || pkarr_relays.is_some();
+        if servers && parsed.is_some_and(|m| m != DiscoveryMode::Custom) {
+            return Err(Error::InvalidArgument(format!(
+                "{source}: discovery_dns_origin / discovery_pkarr_relays require discovery \"custom\", got {:?}",
+                mode.unwrap_or_default()
+            )));
+        }
+        if let Some(mode) = parsed {
+            self.discovery = mode;
+        }
+        if let Some(origin) = dns_origin {
+            self.discovery_dns_origin = Some(origin);
+        }
+        if let Some(relays) = pkarr_relays {
+            self.discovery_pkarr_relays = non_empty(relays);
+        }
+        if servers {
+            self.discovery = DiscoveryMode::Custom;
+        }
+        Ok(())
     }
 
     /// Apply a relay mode and/or relay URL list from one source (env or TOML).
@@ -1005,6 +1215,13 @@ impl Default for AsterConfig {
             secret_key_file: None,
             relay_mode: RelayMode::Default,
             bind_addr: None,
+            bind_addr_v6: None,
+            advertise_addrs: Vec::new(),
+            relay_ca_certs: Vec::new(),
+            relay_ca_only: false,
+            discovery: DiscoveryMode::Default,
+            discovery_dns_origin: None,
+            discovery_pkarr_relays: Vec::new(),
             reuse_last_port: true,
             local_discovery: false,
             enable_monitoring: false,
@@ -1145,6 +1362,56 @@ impl AsterConfigBuilder {
     /// Bind the endpoint to a specific socket address, e.g. `"0.0.0.0:9000"`.
     pub fn bind_addr(mut self, addr: impl Into<String>) -> Self {
         self.config.bind_addr = Some(addr.into());
+        self
+    }
+
+    /// Pin the IPv6 socket, e.g. `"[::]:7842"`. See
+    /// [`AsterConfig::bind_addr_v6`].
+    pub fn bind_addr_v6(mut self, addr: impl Into<String>) -> Self {
+        self.config.bind_addr_v6 = Some(addr.into());
+        self
+    }
+
+    /// Advertise an extra direct address (`IP:port`), e.g. a NodePort
+    /// (repeatable). See [`AsterConfig::advertise_addrs`].
+    pub fn advertise_addr(mut self, addr: impl Into<String>) -> Self {
+        self.config.advertise_addrs.push(addr.into());
+        self
+    }
+
+    /// Trust the CA certificates in this PEM file for relay TLS
+    /// (repeatable). See [`AsterConfig::relay_ca_certs`].
+    pub fn relay_ca_cert(mut self, path: impl Into<PathBuf>) -> Self {
+        self.config.relay_ca_certs.push(path.into());
+        self
+    }
+
+    /// Trust only the [`relay_ca_cert`](Self::relay_ca_cert) files for relay
+    /// TLS. See [`AsterConfig::relay_ca_only`].
+    pub fn relay_ca_only(mut self, yes: bool) -> Self {
+        self.config.relay_ca_only = yes;
+        self
+    }
+
+    /// Choose the address lookup. See [`DiscoveryMode`].
+    pub fn discovery_mode(mut self, mode: DiscoveryMode) -> Self {
+        self.config.discovery = mode;
+        self
+    }
+
+    /// Resolve peers from this DNS origin (selects
+    /// [`DiscoveryMode::Custom`]). See [`AsterConfig::discovery_dns_origin`].
+    pub fn discovery_dns_origin(mut self, origin: impl Into<String>) -> Self {
+        self.config.discovery_dns_origin = Some(origin.into());
+        self.config.discovery = DiscoveryMode::Custom;
+        self
+    }
+
+    /// Publish to and resolve from this pkarr relay (repeatable; selects
+    /// [`DiscoveryMode::Custom`]). See [`AsterConfig::discovery_pkarr_relays`].
+    pub fn discovery_pkarr_relay(mut self, url: impl Into<String>) -> Self {
+        self.config.discovery_pkarr_relays.push(url.into());
+        self.config.discovery = DiscoveryMode::Custom;
         self
     }
 
@@ -1394,6 +1661,23 @@ fn env_string(key: &str) -> Option<String> {
         let value = value.trim().to_string();
         (!value.is_empty()).then_some(value)
     })
+}
+
+/// A comma-separated list; empty items are dropped. `None` when unset or
+/// blank.
+fn env_list(key: &str) -> Option<Vec<String>> {
+    env_string(key).map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+}
+
+fn non_empty(values: Vec<String>) -> Vec<String> {
+    values.into_iter().filter(|v| !v.is_empty()).collect()
 }
 
 fn env_string_allow_empty(key: &str) -> Option<String> {
@@ -1905,6 +2189,13 @@ mod tests {
         "ASTER_SECRET_KEY",
         "ASTER_RELAY_MODE",
         "ASTER_BIND_ADDR",
+        "ASTER_BIND_ADDR_V6",
+        "ASTER_ADVERTISE_ADDRS",
+        "ASTER_RELAY_CA_CERTS",
+        "ASTER_RELAY_CA_ONLY",
+        "ASTER_DISCOVERY",
+        "ASTER_DISCOVERY_DNS_ORIGIN",
+        "ASTER_DISCOVERY_PKARR_RELAYS",
         "ASTER_REUSE_LAST_PORT",
         "ASTER_LOCAL_DISCOVERY",
         "ASTER_ENABLE_MONITORING",
@@ -2997,5 +3288,162 @@ mod root_pubkey_tests {
         assert!(rendered.contains(&key(7).to_hex()), "{rendered}");
         assert!(rendered.contains(&key(9).to_hex()), "{rendered}");
         assert!(rendered.contains("root.pub"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod cluster_network_tests {
+    //! Kasm A6: IPv6 bind pin, advertised addresses, relay CA trust and
+    //! discovery, from env, TOML and the builder down to the core config.
+    use super::*;
+    use std::sync::MutexGuard;
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        super::tests_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn defaults_keep_n0_discovery_and_webpki() {
+        let core = AsterConfig::default().to_core_endpoint_config();
+        assert_eq!(core.discovery.as_deref(), Some("default"));
+        assert!(core.bind_addr_v6.is_none() && core.advertise_addrs.is_empty());
+        assert!(core.relay_ca_cert_files.is_empty() && !core.relay_ca_only);
+        assert!(core.discovery_dns_origin.is_none() && core.discovery_pkarr_relays.is_empty());
+    }
+
+    #[test]
+    fn env_reads_cluster_settings() {
+        let _lock = lock_env();
+        let _env = super::tests_env_guard();
+        env::set_var("ASTER_BIND_ADDR", "0.0.0.0:7842");
+        env::set_var("ASTER_BIND_ADDR_V6", "[::]:7842");
+        env::set_var(
+            "ASTER_ADVERTISE_ADDRS",
+            " 203.0.113.10:31842 , [2001:db8::10]:31842 ,",
+        );
+        env::set_var(
+            "ASTER_RELAY_CA_CERTS",
+            "/etc/aster/ca.pem,/etc/aster/ca2.pem",
+        );
+        env::set_var("ASTER_RELAY_CA_ONLY", "true");
+        env::set_var(
+            "ASTER_DISCOVERY_PKARR_RELAYS",
+            "https://dns.example.internal/pkarr",
+        );
+        env::set_var("ASTER_DISCOVERY_DNS_ORIGIN", "dns.example.internal");
+        let cfg = AsterConfig::from_env().unwrap();
+        assert_eq!(cfg.bind_addr_v6.as_deref(), Some("[::]:7842"));
+        assert_eq!(
+            cfg.advertise_addrs,
+            ["203.0.113.10:31842", "[2001:db8::10]:31842"]
+        );
+        assert_eq!(cfg.relay_ca_certs.len(), 2);
+        assert!(cfg.relay_ca_only);
+        assert_eq!(cfg.discovery, DiscoveryMode::Custom);
+        let core = cfg.to_core_endpoint_config();
+        assert_eq!(core.bind_addr.as_deref(), Some("0.0.0.0:7842"));
+        assert_eq!(core.bind_addr_v6.as_deref(), Some("[::]:7842"));
+        assert_eq!(core.advertise_addrs.len(), 2);
+        assert_eq!(
+            core.relay_ca_cert_files,
+            ["/etc/aster/ca.pem", "/etc/aster/ca2.pem"]
+        );
+        assert_eq!(core.discovery.as_deref(), Some("custom"));
+        assert_eq!(
+            core.discovery_dns_origin.as_deref(),
+            Some("dns.example.internal")
+        );
+        assert_eq!(core.discovery_pkarr_relays.len(), 1);
+
+        env::set_var("ASTER_DISCOVERY", "none");
+        let err = AsterConfig::from_env().unwrap_err().to_string();
+        assert!(err.contains("require discovery \"custom\""), "{err}");
+        env::remove_var("ASTER_DISCOVERY_PKARR_RELAYS");
+        env::remove_var("ASTER_DISCOVERY_DNS_ORIGIN");
+        assert_eq!(
+            AsterConfig::from_env().unwrap().discovery,
+            DiscoveryMode::None
+        );
+        env::set_var("ASTER_DISCOVERY", "nope");
+        assert!(AsterConfig::from_env().is_err());
+        env::set_var("ASTER_DISCOVERY", "LOCAL");
+        let core = AsterConfig::from_env().unwrap().to_core_endpoint_config();
+        assert_eq!(core.discovery.as_deref(), Some("none"));
+        assert!(core.enable_discovery, "local = mDNS only");
+    }
+
+    #[test]
+    fn toml_reads_cluster_settings_and_env_overrides() {
+        let _lock = lock_env();
+        let _env = super::tests_env_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        fs::write(
+            &path,
+            r#"
+[network]
+relay_urls = ["https://relay.example.internal"]
+bind_addr = "0.0.0.0:7842"
+bind_addr_v6 = "[::]:7842"
+advertise_addrs = ["203.0.113.10:31842"]
+relay_ca_certs = ["/etc/aster/relay-ca.pem"]
+relay_ca_only = true
+discovery = "custom"
+discovery_pkarr_relays = ["https://dns.example.internal/pkarr"]
+discovery_dns_origin = "dns.example.internal"
+"#,
+        )
+        .unwrap();
+        let cfg = AsterConfig::from_file(&path).unwrap();
+        assert_eq!(cfg.bind_addr_v6.as_deref(), Some("[::]:7842"));
+        assert_eq!(cfg.advertise_addrs, ["203.0.113.10:31842"]);
+        assert_eq!(
+            cfg.relay_ca_certs,
+            [PathBuf::from("/etc/aster/relay-ca.pem")]
+        );
+        assert!(cfg.relay_ca_only);
+        assert_eq!(cfg.discovery, DiscoveryMode::Custom);
+        assert_eq!(cfg.discovery_pkarr_relays.len(), 1);
+
+        // A later source's `discovery = "none"` drops the file's servers.
+        env::set_var("ASTER_DISCOVERY", "none");
+        let core = AsterConfig::from_file(&path)
+            .unwrap()
+            .to_core_endpoint_config();
+        assert_eq!(core.discovery.as_deref(), Some("none"));
+        assert!(core.discovery_pkarr_relays.is_empty() && core.discovery_dns_origin.is_none());
+        env::remove_var("ASTER_DISCOVERY");
+
+        fs::write(
+            &path,
+            "[network]\ndiscovery = \"none\"\ndiscovery_dns_origin = \"x.example\"\n",
+        )
+        .unwrap();
+        assert!(AsterConfig::from_file(&path).is_err());
+        fs::write(&path, "[network]\nadvertise_addrs = \"203.0.113.10:1\"\n").unwrap();
+        assert!(AsterConfig::from_file(&path).is_err(), "must be a list");
+    }
+
+    #[test]
+    fn builder_sets_cluster_settings() {
+        let cfg = AsterConfig::builder()
+            .bind_addr("0.0.0.0:7842")
+            .bind_addr_v6("[::]:7842")
+            .advertise_addr("203.0.113.10:31842")
+            .relay_ca_cert("/etc/aster/relay-ca.pem")
+            .relay_ca_only(true)
+            .discovery_mode(DiscoveryMode::None)
+            .build();
+        let core = cfg.to_core_endpoint_config();
+        assert_eq!(core.bind_addr_v6.as_deref(), Some("[::]:7842"));
+        assert_eq!(core.advertise_addrs, ["203.0.113.10:31842"]);
+        assert!(core.relay_ca_only);
+        assert_eq!(core.discovery.as_deref(), Some("none"));
+        let custom = AsterConfig::builder()
+            .discovery_pkarr_relay("https://dns.example.internal/pkarr")
+            .build();
+        assert_eq!(custom.discovery, DiscoveryMode::Custom);
     }
 }

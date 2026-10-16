@@ -33,6 +33,7 @@ mod binding_support;
 mod blob_compression;
 mod blob_fetch_multi;
 mod blob_gc;
+mod cluster_network;
 mod connection;
 mod contract_defaults_vector;
 mod contract_types;
