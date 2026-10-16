@@ -22,7 +22,9 @@
 # retire a pooled blob connection whose provider stopped acknowledging (a restart
 # on a new port) and retry on a fresh one, instead of waiting out QUIC's idle
 # timeout. iroh-blobs 0.103.10 attributes each downloader attempt's payload and
-# compressed bytes to its provider, live while the attempt runs.
+# compressed bytes to its provider, live while the attempt runs. iroh-docs
+# 0.101.5-p2 re-pins its own patch block to this stack (iroh, noq, iroh-blobs,
+# iroh-gossip, iroh-util), with no source change, and its suite passes on it.
 #
 # Regenerate every upgrade cycle. See docs/iroh-patches.md for the patch ledger
 # and the full upgrade procedure.
@@ -76,8 +78,8 @@ crate_version = "0.103.10"
 [forks.iroh-docs]
 repo = "https://forge.emrul.dev/Aster/iroh-docs.git"
 upstream_base = "v0.101.0"
-tag = "aster-iroh-docs-v0.101.5-p1"
-commit = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678"
+tag = "aster-iroh-docs-v0.101.5-p2"
+commit = "85ec38b413f62ff8169151e4a60453de17c64ed3"
 branch = "upgrade/iroh-docs-v0.101"
 crates = ["iroh-docs"]
 registry_crates = ["iroh-docs"]
@@ -226,7 +228,7 @@ iroh        = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4
 iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "bcd00bb2a888f3d6990ac32d9fab1d8e2d9d73f4" }
-iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "ad88873ed57b1e7550ef8e091d0d7f0a947e3678" }
+iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "85ec38b413f62ff8169151e4a60453de17c64ed3" }
 iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
 noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
 noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
