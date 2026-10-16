@@ -50,12 +50,14 @@ check() {
       cargo clippy --locked -p aster --lib --all-targets \
         --no-default-features --features coordination -- -D warnings
       cargo clippy --locked -p aster --lib --all-targets \
-        --no-default-features --features coordination-client -- -D warnings ;;
+        --no-default-features --features coordination-client -- -D warnings
+      cargo clippy --locked -p aster --features coordination-testing,binding-support \
+        --tests -- -D warnings ;;
     # `binding-support` is off by default (BINDINGS_CATCHUP_PLAN.md R1; `otel`
     # and `health` since observability O2).
     clippy-binding-support)
       cargo clippy --locked -p aster --all-targets \
-        --features rpc,binding-support,otel,health -- -D warnings ;;
+        --features rpc,binding-support,otel,health,expose -- -D warnings ;;
     # `tests/coordination.rs` (C ABI 4.4) needs `coordination-fixture`.
     clippy-ffi-fixture)
       cargo clippy --locked -p aster_transport_ffi --all-targets \
@@ -70,7 +72,8 @@ check() {
     clippy-enrollment)
       cargo clippy --locked -p aster_transport_core --features enrollment --lib \
         --test enrollment --test enrollment_issuance --test enrollment_records \
-        --test enrollment_review_regressions -- -D warnings
+        --test enrollment_review_regressions --test delegation --test enrollment_issuers \
+        --test enrollment_namespaces --test enrollment_observations -- -D warnings
       cargo clippy --locked -p aster --no-default-features --features enrollment,docs \
         --test enrollment --test enrollment_bootstrap --test enrollment_review_regressions --test enrollment_admission_log -- -D warnings
       cargo clippy --locked -p aster --features identity-publisher --tests -- -D warnings ;;
