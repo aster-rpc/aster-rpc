@@ -1180,9 +1180,173 @@ pub fn scc_processing_order(
 
     dfs_post(start, &spanning_edges, &mut visited, &mut post_order);
 
-    // Reverse post-order = processing order (leaves first)
-    post_order.reverse();
+    // Post-order visits spanning-tree children before their parents, i.e.
+    // leaves first: exactly the order bottom-up hashing needs, because a
+    // parent's tree-edge REF embeds the child's hash. (Reversing it would put
+    // the root first, with no child hash available yet.) Matches the Python
+    // and Java producers.
     post_order
+}
+
+// ── Recursive type resolution (§11.3.4 Step 3) ───────────────────────────────
+
+/// A named type whose references to other named types are given by name, so
+/// the reference graph can contain cycles. Input to [`resolve_type_graph`].
+///
+/// `def` is the type's `TypeDef` with every *named* reference left
+/// unresolved: for each index `i`, `field_value_refs[i]` / `field_key_refs[i]`
+/// name the type field `i`'s value / map-key leaf refers to (`None` when that
+/// leaf is a primitive or an already-resolved `REF`), and `variant_refs[i]`
+/// names union variant `i`'s payload type. The resolver fills in the
+/// `type_kind`, `type_ref` and `self_ref_name` of those leaves.
+#[derive(Clone, Debug)]
+pub struct SymbolicTypeDef {
+    pub def: TypeDef,
+    pub field_value_refs: Vec<Option<String>>,
+    pub field_key_refs: Vec<Option<String>>,
+    pub variant_refs: Vec<Option<String>>,
+}
+
+impl SymbolicTypeDef {
+    /// The graph-node name (see [`type_def_fqn`]).
+    pub fn fqn(&self) -> String {
+        type_def_fqn(&self.def)
+    }
+
+    fn targets(&self) -> impl Iterator<Item = &String> {
+        self.field_value_refs
+            .iter()
+            .chain(&self.field_key_refs)
+            .chain(&self.variant_refs)
+            .flatten()
+    }
+}
+
+/// `package + "." + name`, or `name` when the package is empty: the type
+/// graph's node name and the `self_ref_name` written for a back-edge.
+pub fn type_def_fqn(td: &TypeDef) -> String {
+    if td.package.is_empty() {
+        td.name.clone()
+    } else {
+        format!("{}.{}", td.package, td.name)
+    }
+}
+
+fn nfc_codepoints(s: &str) -> Vec<u32> {
+    s.nfc().map(|c| c as u32).collect()
+}
+
+/// Resolve a closed graph of named types to hashed `TypeDef`s, breaking
+/// cycles per §11.3.4 Step 3: compute the SCCs, pick each cyclic SCC's
+/// spanning tree by DFS from its NFC-codepoint-smallest member, write every
+/// edge outside that tree as `SELF_REF` (`self_ref_name` = target FQN), and
+/// hash bottom-up so each tree-edge `REF` carries its target's hash.
+///
+/// `types` is keyed by [`SymbolicTypeDef::fqn`] and must contain every type a
+/// symbolic reference names. Returns each type's resolved `TypeDef` and hash.
+///
+/// # Errors
+///
+/// When a reference names a type missing from `types`, or when a union
+/// variant edge falls outside the spanning tree: `UnionVariantDef` has no
+/// `SELF_REF` form, so such a cycle cannot be given an identity.
+pub fn resolve_type_graph(
+    types: &HashMap<String, SymbolicTypeDef>,
+) -> Result<HashMap<String, (TypeDef, [u8; 32])>> {
+    let mut graph: HashMap<String, HashSet<String>> = HashMap::new();
+    for (fqn, sym) in types {
+        let mut edges = HashSet::new();
+        for target in sym.targets() {
+            if !types.contains_key(target) {
+                bail!("type {fqn} references {target}, which is not in the type graph");
+            }
+            edges.insert(target.clone());
+        }
+        graph.insert(fqn.clone(), edges);
+    }
+
+    let mut resolved: HashMap<String, (TypeDef, [u8; 32])> = HashMap::new();
+    for scc in tarjan_scc(&graph) {
+        let (back_edges, order) = if scc.len() == 1 {
+            let v = &scc[0];
+            let mut back = HashSet::new();
+            if graph[v].contains(v) {
+                back.insert((v.clone(), v.clone()));
+            }
+            (back, scc.clone())
+        } else {
+            let mut members = scc.clone();
+            members.sort_by_key(|m| nfc_codepoints(m));
+            let start = members[0].clone();
+            let back = spanning_tree_back_edges(&start, &members, &graph);
+            let order = scc_processing_order(&start, &members, &graph, &back);
+            (back, order)
+        };
+        for fqn in order {
+            let td = resolve_symbolic(&fqn, &types[&fqn], &back_edges, &resolved)?;
+            let hash = compute_type_hash(&canonical_xlang_bytes_type_def(&td));
+            resolved.insert(fqn, (td, hash));
+        }
+    }
+    Ok(resolved)
+}
+
+/// One leaf of a symbolic `TypeDef`: `SELF_REF` on a back-edge, else a `REF`
+/// to the (already hashed) target.
+fn resolve_leaf(
+    src: &str,
+    target: &str,
+    back_edges: &HashSet<(String, String)>,
+    resolved: &HashMap<String, (TypeDef, [u8; 32])>,
+) -> Result<(TypeKind, String, String)> {
+    if back_edges.contains(&(src.to_string(), target.to_string())) {
+        return Ok((TypeKind::SelfRef, String::new(), target.to_string()));
+    }
+    match resolved.get(target) {
+        Some((_, hash)) => Ok((TypeKind::Ref, hex::encode(hash), String::new())),
+        None => bail!("type {src}: {target} was not hashed before it (cycle resolution bug)"),
+    }
+}
+
+fn resolve_symbolic(
+    fqn: &str,
+    sym: &SymbolicTypeDef,
+    back_edges: &HashSet<(String, String)>,
+    resolved: &HashMap<String, (TypeDef, [u8; 32])>,
+) -> Result<TypeDef> {
+    let mut td = sym.def.clone();
+    for (i, field) in td.fields.iter_mut().enumerate() {
+        if let Some(Some(target)) = sym.field_value_refs.get(i) {
+            let (kind, type_ref, self_ref_name) = resolve_leaf(fqn, target, back_edges, resolved)?;
+            field.type_kind = kind;
+            field.type_primitive = String::new();
+            field.type_ref = type_ref;
+            field.self_ref_name = self_ref_name;
+        }
+        if let Some(Some(target)) = sym.field_key_refs.get(i) {
+            // A map key has no self_ref_name slot, so a back-edge key keeps
+            // only its kind (message keys are not legal map keys anyway).
+            let (kind, key_ref, _) = resolve_leaf(fqn, target, back_edges, resolved)?;
+            field.container_key_kind = kind;
+            field.container_key_primitive = String::new();
+            field.container_key_ref = key_ref;
+        }
+    }
+    for (i, variant) in td.union_variants.iter_mut().enumerate() {
+        if let Some(Some(target)) = sym.variant_refs.get(i) {
+            let (kind, type_ref, _) = resolve_leaf(fqn, target, back_edges, resolved)?;
+            if kind == TypeKind::SelfRef {
+                bail!(
+                    "union {fqn}: variant `{}` closes a reference cycle through {target}, and a \
+                     union variant has no SELF_REF form, so the cycle has no contract identity. \
+                     Close the cycle at a message field instead",
+                    variant.name
+                );
+            }
+            variant.type_ref = type_ref;
+        }
+    }
+    Ok(td)
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
@@ -1808,11 +1972,10 @@ mod tests {
         assert!(back.contains(&("Book".to_string(), "Author".to_string())));
 
         let order = scc_processing_order(start, &members, &graph, &back);
-        // Reverse post-order on spanning tree: Author is root, Book is leaf.
-        // Post-order = [Book, Author], reversed = [Author, Book].
-        // Author is the spanning tree root and comes first in reverse post-order.
-        assert_eq!(order[0], "Author");
-        assert_eq!(order[1], "Book");
+        // Post-order on the spanning tree: Author is the root, Book the leaf,
+        // so Book is hashed first and Author's REF can carry Book's hash.
+        assert_eq!(order[0], "Book");
+        assert_eq!(order[1], "Author");
     }
 
     // ---- NFC normalization tests ----
@@ -2359,5 +2522,135 @@ mod tests {
         write_list_header(&mut buf, 0);
         write_list_header(&mut buf, 0);
         assert!(decode_type_def_bytes(&buf).is_err());
+    }
+
+    // ---- resolve_type_graph: spec Appendix B ----
+
+    /// A message whose fields each reference one named type.
+    fn sym_message(package: &str, name: &str, refs: &[(&str, &str)]) -> SymbolicTypeDef {
+        let fields = refs
+            .iter()
+            .map(|(field, _)| FieldDef {
+                id: 0,
+                name: field.to_string(),
+                type_kind: TypeKind::Ref,
+                type_primitive: String::new(),
+                type_ref: String::new(),
+                self_ref_name: String::new(),
+                optional: false,
+                ref_tracked: false,
+                container: ContainerKind::None,
+                container_key_kind: TypeKind::Primitive,
+                container_key_primitive: String::new(),
+                container_key_ref: String::new(),
+                required: true,
+                default_value: String::new(),
+            })
+            .collect();
+        SymbolicTypeDef {
+            def: TypeDef {
+                kind: TypeDefKind::Message,
+                package: package.to_string(),
+                name: name.to_string(),
+                fields,
+                enum_values: vec![],
+                union_variants: vec![],
+            },
+            field_value_refs: refs.iter().map(|(_, t)| Some(t.to_string())).collect(),
+            field_key_refs: vec![None; refs.len()],
+            variant_refs: vec![],
+        }
+    }
+
+    fn graph_of(types: Vec<SymbolicTypeDef>) -> HashMap<String, SymbolicTypeDef> {
+        types.into_iter().map(|t| (t.fqn(), t)).collect()
+    }
+
+    /// `(type_kind, self_ref_name)` of `field` in the resolved `fqn`.
+    fn edge(
+        out: &HashMap<String, (TypeDef, [u8; 32])>,
+        fqn: &str,
+        field: &str,
+    ) -> (TypeKind, String) {
+        let f = out[fqn].0.fields.iter().find(|f| f.name == field).unwrap();
+        (f.type_kind, f.self_ref_name.clone())
+    }
+
+    #[test]
+    fn resolve_b1_direct_self_recursion() {
+        let out = resolve_type_graph(&graph_of(vec![sym_message(
+            "example",
+            "TreeNode",
+            &[("left", "example.TreeNode"), ("right", "example.TreeNode")],
+        )]))
+        .unwrap();
+        let self_ref = (TypeKind::SelfRef, "example.TreeNode".to_string());
+        assert_eq!(edge(&out, "example.TreeNode", "left"), self_ref);
+        assert_eq!(edge(&out, "example.TreeNode", "right"), self_ref);
+    }
+
+    #[test]
+    fn resolve_b2_mutual_recursion() {
+        let out = resolve_type_graph(&graph_of(vec![
+            sym_message("example", "Author", &[("books", "example.Book")]),
+            sym_message("example", "Book", &[("written_by", "example.Author")]),
+        ]))
+        .unwrap();
+        assert_eq!(
+            edge(&out, "example.Book", "written_by"),
+            (TypeKind::SelfRef, "example.Author".to_string())
+        );
+        let books = &out["example.Author"].0.fields[0];
+        assert_eq!(books.type_kind, TypeKind::Ref);
+        assert_eq!(books.type_ref, hex::encode(out["example.Book"].1));
+    }
+
+    #[test]
+    fn resolve_b3_three_cycle_and_b4_diamond() {
+        let out = resolve_type_graph(&graph_of(vec![
+            sym_message("example", "Alpha", &[("next", "example.Beta")]),
+            sym_message("example", "Beta", &[("next", "example.Gamma")]),
+            sym_message("example", "Gamma", &[("next", "example.Alpha")]),
+        ]))
+        .unwrap();
+        assert_eq!(edge(&out, "example.Alpha", "next").0, TypeKind::Ref);
+        assert_eq!(edge(&out, "example.Beta", "next").0, TypeKind::Ref);
+        assert_eq!(
+            edge(&out, "example.Gamma", "next"),
+            (TypeKind::SelfRef, "example.Alpha".to_string())
+        );
+
+        let out = resolve_type_graph(&graph_of(vec![
+            sym_message(
+                "example",
+                "A",
+                &[("b_field", "example.B"), ("c_field", "example.C")],
+            ),
+            sym_message("example", "B", &[("c_field", "example.C")]),
+            sym_message("example", "C", &[("a_field", "example.A")]),
+        ]))
+        .unwrap();
+        // Back-edges {C → A, A → C}; tree edges {A → B, B → C}.
+        assert_eq!(
+            edge(&out, "example.C", "a_field"),
+            (TypeKind::SelfRef, "example.A".to_string())
+        );
+        assert_eq!(
+            edge(&out, "example.A", "c_field"),
+            (TypeKind::SelfRef, "example.C".to_string())
+        );
+        assert_eq!(edge(&out, "example.A", "b_field").0, TypeKind::Ref);
+        assert_eq!(edge(&out, "example.B", "c_field").0, TypeKind::Ref);
+    }
+
+    #[test]
+    fn resolve_rejects_dangling_reference() {
+        let err = resolve_type_graph(&graph_of(vec![sym_message(
+            "p",
+            "A",
+            &[("x", "p.Missing")],
+        )]))
+        .unwrap_err();
+        assert!(err.to_string().contains("p.Missing"), "{err}");
     }
 }

@@ -284,6 +284,7 @@ dependencies = [
  "iroh-gossip",
  "iroh-tickets",
  "libc",
+ "num-bigint",
  "openraft",
  "portable-pty",
  "redb 4.1.0",

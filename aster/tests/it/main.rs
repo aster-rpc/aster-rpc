@@ -35,6 +35,7 @@ mod blob_fetch_multi;
 mod blob_gc;
 mod connection;
 mod contract_defaults_vector;
+mod contract_types;
 mod durable_docs;
 mod dynamic_dispatch;
 mod dynamic_payload_vector;

@@ -18,6 +18,12 @@
 //! - `#[aster(uint8_list)]` (field): keep a `Vec<u8>` / `VecDeque<u8>` as a Fory
 //!   list and publish it as `list<uint8>` instead of `binary`.
 //!
+//! Field types: scalars, `aster::rpc::{Timestamp, Date, Decimal}` (published as
+//! `timestamp` / `date` / `decimal`), other `AsterType`s, and `Option` / `Vec`
+//! / sets / maps of them. `Box<T>` is transparent. Types may be recursive or
+//! mutually recursive: identity follows the spec's SCC rule (§11.3.4 Step 3),
+//! resolved at runtime by `aster::rpc::resolve_type_def`.
+//!
 //! Byte fields: a byte buffer is published as `binary` (Python `bytes`, TS
 //! `Uint8Array`), so its Fory encoding must be BINARY too. `[u8; N]` already is;
 //! a `Vec<u8>` is only with `#[fory(bytes)]` (`list(element(bytes))` /
@@ -84,7 +90,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
         let optional = info.optional;
         let container = info.container;
         field_exprs.push(quote! {
-            ::aster::rpc::make_field(#fname, #leaf, #optional, #container, #key, #default_expr)
+            ::aster::rpc::shape_field(#fname, #leaf, #optional, #container, #key, #default_expr)
         });
         for child in child_types(&f.ty) {
             register_children.push(quote! {
@@ -99,7 +105,11 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
     Ok(quote! {
         impl ::aster::rpc::AsterType for #ident {
             fn aster_type_def() -> ::aster::rpc::TypeDef {
-                ::aster::rpc::message_type_def(
+                ::aster::rpc::resolve_type_def(<Self as ::aster::rpc::AsterType>::aster_type_shape)
+            }
+
+            fn aster_type_shape() -> ::aster::rpc::TypeShape {
+                ::aster::rpc::message_shape(
                     #package,
                     #type_name,
                     ::std::vec![ #(#field_exprs),* ],
@@ -109,7 +119,7 @@ fn expand(input: DeriveInput) -> syn::Result<TokenStream2> {
 
         impl ::aster::rpc::WireField for #ident {
             fn leaf() -> ::aster::rpc::Leaf {
-                ::aster::rpc::Leaf::reference(<Self as ::aster::rpc::AsterType>::aster_type_hash())
+                ::aster::rpc::Leaf::named(<Self as ::aster::rpc::AsterType>::aster_type_shape)
             }
 
             fn register_payload(__reg: &mut ::aster::rpc::PayloadRegistry) {
@@ -188,10 +198,10 @@ fn expand_union(
         let id = fory_variant_id(variant)?.unwrap_or(implicit_id);
         implicit_id += 1;
         variant_exprs.push(quote! {
-            ::aster::rpc::make_union_variant(
+            ::aster::rpc::shape_variant(
                 #vname,
                 #id,
-                <#payload as ::aster::rpc::AsterType>::aster_type_hash(),
+                ::aster::rpc::Leaf::named(<#payload as ::aster::rpc::AsterType>::aster_type_shape),
             )
         });
         register_children.push(quote! {
@@ -205,7 +215,11 @@ fn expand_union(
     Ok(quote! {
         impl ::aster::rpc::AsterType for #ident {
             fn aster_type_def() -> ::aster::rpc::TypeDef {
-                ::aster::rpc::union_type_def(
+                ::aster::rpc::resolve_type_def(<Self as ::aster::rpc::AsterType>::aster_type_shape)
+            }
+
+            fn aster_type_shape() -> ::aster::rpc::TypeShape {
+                ::aster::rpc::union_shape(
                     #package,
                     #type_name,
                     ::std::vec![ #(#variant_exprs),* ],
@@ -215,7 +229,7 @@ fn expand_union(
 
         impl ::aster::rpc::WireField for #ident {
             fn leaf() -> ::aster::rpc::Leaf {
-                ::aster::rpc::Leaf::reference(<Self as ::aster::rpc::AsterType>::aster_type_hash())
+                ::aster::rpc::Leaf::named(<Self as ::aster::rpc::AsterType>::aster_type_shape)
             }
 
             fn register_payload(__reg: &mut ::aster::rpc::PayloadRegistry) {
@@ -603,18 +617,29 @@ fn analyze_field(f: &syn::Field) -> syn::Result<FieldInfo> {
 }
 
 fn analyze_type(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<FieldInfo> {
+    let ty = &unbox(ty);
     if let Some((ident, args)) = path_segment(ty) {
         if ident == "Option" {
             if let Some(inner) = args.first() {
                 // `Option` is transparent to Fory's field config: the
                 // attributes apply to the inner type.
-                let mut info = analyze_inner(inner, fory, uint8_list)?;
+                let mut info = analyze_inner(&unbox(inner), fory, uint8_list)?;
                 info.optional = true;
                 return Ok(info);
             }
         }
     }
     analyze_inner(ty, fory, uint8_list)
+}
+
+/// Strip `Box<…>` layers: a box is transparent on the Fory wire and in the
+/// contract (it is how a struct holds itself, `Option<Box<Self>>`). Boxes in
+/// element / value / key position resolve through `WireField for Box<T>`.
+fn unbox(ty: &Type) -> Type {
+    match path_segment(ty) {
+        Some((ident, args)) if ident == "Box" && args.len() == 1 => unbox(&args[0]),
+        _ => ty.clone(),
+    }
 }
 
 fn analyze_inner(ty: &Type, fory: &ForyNode, uint8_list: bool) -> syn::Result<FieldInfo> {
@@ -723,7 +748,7 @@ fn child_types(ty: &Type) -> Vec<Type> {
     let not_bytes = |t: &Type| byte_shape(t).is_none();
     if let Some((ident, args)) = path_segment(ty) {
         match ident.as_str() {
-            "Option" => return args.first().map(child_types).unwrap_or_default(),
+            "Option" | "Box" => return args.first().map(child_types).unwrap_or_default(),
             "Vec" | "VecDeque" | "HashSet" | "BTreeSet" => {
                 return args.into_iter().take(1).filter(not_bytes).collect();
             }
@@ -1678,6 +1703,27 @@ mod tests {
         assert!(msg.contains("#[fory(bytes)]"), "{msg}");
         // Fully qualified paths are recognised too.
         err("data: ::std::vec::Vec<u8>");
+    }
+
+    #[test]
+    fn box_is_transparent() {
+        let boxed = field("next: Box<Node>").unwrap();
+        assert!(!boxed.optional);
+        assert_eq!(boxed.container, 0);
+        assert_eq!(leaf(&boxed), leaf(&field("next: Node").unwrap()));
+
+        let opt = field("next: Option<Box<Node>>").unwrap();
+        assert!(opt.optional);
+        assert_eq!(leaf(&opt), leaf(&field("next: Node").unwrap()));
+
+        let list = field("items: Box<Vec<Node>>").unwrap();
+        assert_eq!(list.container, 1);
+
+        // Boxed element types recurse into the boxed type for registration.
+        let ty: syn::Type = syn::parse_str("Option<Box<Node>>").unwrap();
+        let children = child_types(&ty);
+        assert_eq!(children.len(), 1);
+        assert_eq!(quote::quote!(#(#children)*).to_string(), "Node");
     }
 
     #[test]

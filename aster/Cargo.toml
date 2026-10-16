@@ -20,6 +20,7 @@ gossip = ["dep:iroh-gossip"]
 rpc = [
     "dep:fory-core",
     "dep:fory-derive",
+    "dep:num-bigint",
     "dep:async-trait",
     "dep:aster-macros",
     "dep:serde",
@@ -144,6 +145,9 @@ arc-swap = { version = "=1.9.1", optional = true }
 # emits `::fory_core::` paths, so both crates are direct deps.
 fory-core = { version = "=1.7.6", optional = true }
 fory-derive = { version = "=1.7.6", optional = true }
+# `aster::rpc::BigInt`, the unscaled value of a `Decimal` payload field. Already
+# in the graph through fory-core; pinned to the version the lock resolves.
+num-bigint = { version = "=0.4.6", optional = true }
 # Ergonomic async trait for the RPC service dispatcher (the `#[aster::service]`
 # macro will generate impls of it). Gated by the `rpc` feature.
 async-trait = { version = "0.1", optional = true }

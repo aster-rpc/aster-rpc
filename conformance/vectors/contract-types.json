@@ -1,0 +1,325 @@
+{
+  "description": "Contract-identity and wire vectors for the canonical timestamp / date / decimal types and for recursive types (Aster-ContractIdentity.md, 'Language-Native Default Mapping' Rust rows and §11.3.4 Step 3 / Appendix B). Produced by the Rust #[derive(AsterType)].",
+  "rules": {
+    "box": "Rust Box<T> is transparent in both the contract and the wire",
+    "date": "Fory xlang DATE (type id 39): varint64 days since 1970-01-01",
+    "decimal": "Fory xlang DECIMAL (type id 40): varint32 scale, then the unscaled value (zig-zag varint64 << 1, or a flagged little-endian magnitude)",
+    "self_ref": "an edge outside an SCC's spanning tree (DFS from the codepoint-smallest member, successors in codepoint order) is type_kind SELF_REF (2) with self_ref_name = the target's package.name; tree edges are REF (1) to the target's hash",
+    "timestamp": "Fory xlang TIMESTAMP (type id 38): int64 seconds + uint32 nanos since the Unix epoch, UTC"
+  },
+  "rust_source": "aster/tests/it/contract_types.rs",
+  "vector": {
+    "expected_contract_id": "269b6d809959aabe5b4f55cff9e804b491c854eb58f8adf2cd8f6f080dcb4d50",
+    "payloads": {
+      "author": {
+        "hex": "01ff1e001ab035e387144d2fe21ea6c1e225f2ba801302933ba24c167885ce54804815340c2001081e021c00310967c5e158e21ea6c1e225f2ba800f05ce504c15cd1359005a1eda289cc8dd87004254686520446973706f73736573736564ff1e01001a557273756c611a557273756c61",
+        "type": "types.v1.Author",
+        "value": {
+          "books": [
+            {
+              "title": "The Dispossessed",
+              "written_by": {
+                "books": [],
+                "name": "Ursula"
+              }
+            }
+          ],
+          "name": "Ursula"
+        }
+      },
+      "cycle": {
+        "hex": "01ff1e0013203e99fe169d77e11ea6c1e225f2ba8013816f38004a1e349798ff1e02120000f70806a56ae11ea6c1e225f2ba800f0493004a1e349798ff1e04148081253d67ab39e11ea6c1e225f2ba8013980c600048167834979801081e01fd",
+        "type": "types.v1.Alpha",
+        "value": {
+          "next": {
+            "next": {
+              "next": [
+                {
+                  "next": null
+                }
+              ]
+            }
+          }
+        }
+      },
+      "temporal_big_decimal": {
+        "hex": "01ff1e002fd03a73b5ea8844e51ea6c1e225f2ba801bcc8c7ba205804c28018ea3664426826044270c18501698011d129ba3805626b018093609801435d20a3f4eeee073c3f60fe98e0170cbe16500000000205e072f8eb502020c000000000000000000000000ffffffffffffffff18c69a3bff00f153650000000000000000",
+        "type": "types.v1.Temporal",
+        "value": {
+          "amount": "12345678901234567890.1234567890",
+          "at": "2024-03-01T12:34:56.789012Z",
+          "day": "2024-03-01",
+          "history": [
+            "1970-01-01T00:00:00.000000Z",
+            "1969-12-31T23:59:59.999999Z"
+          ],
+          "maybe_at": "2023-11-14T22:13:20.000000Z"
+        }
+      },
+      "temporal_small_decimal": {
+        "hex": "01ff1e002fd03a73b5ea8844e51ea6c1e225f2ba801bcc8c7ba205804c28018ea3664426826044270c18501698011d129ba3805626b0180936098008d2e8bceb0170cbe16500000000205e072f8eb502020c000000000000000000000000ffffffffffffffff18c69a3bfd",
+        "type": "types.v1.Temporal",
+        "value": {
+          "amount": "-12345.6789",
+          "at": "2024-03-01T12:34:56.789012Z",
+          "day": "2024-03-01",
+          "history": [
+            "1970-01-01T00:00:00.000000Z",
+            "1969-12-31T23:59:59.999999Z"
+          ],
+          "maybe_at": null
+        }
+      },
+      "tree": {
+        "hex": "01ff1e002030e6c039eea31ae21ea6c1e225f2ba801eda88824e70620054167888e858e246804c15d40ba10002081e0100066101081e01000a6231066212726f6f74",
+        "type": "types.v1.TreeNode",
+        "value": {
+          "children": [
+            {
+              "children": [],
+              "value": "a"
+            },
+            {
+              "children": [
+                {
+                  "children": [],
+                  "value": "b1"
+                }
+              ],
+              "value": "b"
+            }
+          ],
+          "value": "root"
+        }
+      }
+    },
+    "service": "Types v1, xlang, SHARED; unary methods echo_temporal(Temporal)->Temporal, plant(TreeNode)->Forest, author(Book)->Author, cycle(Alpha)->Gamma",
+    "types": {
+      "types.v1.Alpha": {
+        "expected_canonical_type_def_hex": "002274797065732e763116416c706861010c02126e6578740102206c199a9de7708ab660eb59810575e2a50328fe52012c9c686925e83370777efd020100000002000100000c000c",
+        "expected_type_hash": "51f81d6f3b7261f7eb13278fbb66f24fe13e52a75d9e1f3ea43675f083342876",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "next",
+            "optional": true,
+            "self_ref_name": "",
+            "type_kind": 1,
+            "type_primitive": "",
+            "type_ref": "6c199a9de7708ab660eb59810575e2a50328fe52012c9c686925e83370777efd"
+          }
+        ],
+        "name": "Alpha",
+        "package": "types.v1"
+      },
+      "types.v1.Author": {
+        "expected_canonical_type_def_hex": "002274797065732e76311a417574686f72020c0216626f6f6b7301022079cea8707dd41e76d32ab5f016ba5a903a61eeaf965be3573de4b566e9d2c90102000001000200010004126e616d65001a737472696e6700020000000002000100000c000c",
+        "expected_type_hash": "d58ae4b6c760294a6434623b819ae4361b0a2be2de0290a070ef35e673f05f07",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "name",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "string",
+            "type_ref": ""
+          },
+          {
+            "container": 1,
+            "name": "books",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 1,
+            "type_primitive": "",
+            "type_ref": "79cea8707dd41e76d32ab5f016ba5a903a61eeaf965be3573de4b566e9d2c901"
+          }
+        ],
+        "name": "Author",
+        "package": "types.v1"
+      },
+      "types.v1.Beta": {
+        "expected_canonical_type_def_hex": "002274797065732e76311242657461010c02126e657874010220a61660a836aab48f9aa7557bf6df403f04b3e3714082cda39272599a6664c8e9020100000002000100000c000c",
+        "expected_type_hash": "6c199a9de7708ab660eb59810575e2a50328fe52012c9c686925e83370777efd",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "next",
+            "optional": true,
+            "self_ref_name": "",
+            "type_kind": 1,
+            "type_primitive": "",
+            "type_ref": "a61660a836aab48f9aa7557bf6df403f04b3e3714082cda39272599a6664c8e9"
+          }
+        ],
+        "name": "Beta",
+        "package": "types.v1"
+      },
+      "types.v1.Book": {
+        "expected_canonical_type_def_hex": "002274797065732e763112426f6f6b020c02167469746c65001a737472696e6700020000000002000100042a7772697474656e5f62790202003e74797065732e76312e417574686f720100000002000100000c000c",
+        "expected_type_hash": "79cea8707dd41e76d32ab5f016ba5a903a61eeaf965be3573de4b566e9d2c901",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "title",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "string",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "written_by",
+            "optional": true,
+            "self_ref_name": "types.v1.Author",
+            "type_kind": 2,
+            "type_primitive": "",
+            "type_ref": ""
+          }
+        ],
+        "name": "Book",
+        "package": "types.v1"
+      },
+      "types.v1.Chain": {
+        "expected_canonical_type_def_hex": "002274797065732e763116436861696e020c02126e6578740202003a74797065732e76312e436861696e0100000002000100041676616c75650022766172696e74333200020000000002000100000c000c",
+        "expected_type_hash": "80bdf47b2ceec1b284df3f26bfe2c5dabf174e6760bc39cc86228f8ab8812898",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "value",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "varint32",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "next",
+            "optional": true,
+            "self_ref_name": "types.v1.Chain",
+            "type_kind": 2,
+            "type_primitive": "",
+            "type_ref": ""
+          }
+        ],
+        "name": "Chain",
+        "package": "types.v1"
+      },
+      "types.v1.Forest": {
+        "expected_canonical_type_def_hex": "002274797065732e76311a466f72657374010c02167472656573010220d3bc5d8fd700dc5632646382938153a2f273ec686cb0aff6d5705fdf51791ca4020000010002000100000c000c",
+        "expected_type_hash": "4352f4f460d7120668ce2c39cfba21cdf4383357d7440aa61a31a5f3cc7f52a2",
+        "fields_in_declaration_order": [
+          {
+            "container": 1,
+            "name": "trees",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 1,
+            "type_primitive": "",
+            "type_ref": "d3bc5d8fd700dc5632646382938153a2f273ec686cb0aff6d5705fdf51791ca4"
+          }
+        ],
+        "name": "Forest",
+        "package": "types.v1"
+      },
+      "types.v1.Gamma": {
+        "expected_canonical_type_def_hex": "002274797065732e76311647616d6d61010c02126e6578740202003a74797065732e76312e416c7068610000010002000100000c000c",
+        "expected_type_hash": "a61660a836aab48f9aa7557bf6df403f04b3e3714082cda39272599a6664c8e9",
+        "fields_in_declaration_order": [
+          {
+            "container": 1,
+            "name": "next",
+            "optional": false,
+            "self_ref_name": "types.v1.Alpha",
+            "type_kind": 2,
+            "type_primitive": "",
+            "type_ref": ""
+          }
+        ],
+        "name": "Gamma",
+        "package": "types.v1"
+      },
+      "types.v1.Temporal": {
+        "expected_canonical_type_def_hex": "002274797065732e76312254656d706f72616c050c021a616d6f756e74001e646563696d616c00020000000002000100040a6174002674696d657374616d7000020000000002000100060e64617900126461746500020000000002000100081e686973746f7279002674696d657374616d70000200000100020001000a226d617962655f6174002674696d657374616d7000020100000002000100000c000c",
+        "expected_type_hash": "15ef00fc09c5b3dd1b62ededdbbc1d8f191c44be75b90bcd4495d5344f093f65",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "at",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "timestamp",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "day",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "date",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "amount",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "decimal",
+            "type_ref": ""
+          },
+          {
+            "container": 0,
+            "name": "maybe_at",
+            "optional": true,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "timestamp",
+            "type_ref": ""
+          },
+          {
+            "container": 1,
+            "name": "history",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "timestamp",
+            "type_ref": ""
+          }
+        ],
+        "name": "Temporal",
+        "package": "types.v1"
+      },
+      "types.v1.TreeNode": {
+        "expected_canonical_type_def_hex": "002274797065732e763122547265654e6f6465020c02226368696c6472656e0202004674797065732e76312e547265654e6f64650000010002000100041676616c7565001a737472696e6700020000000002000100000c000c",
+        "expected_type_hash": "d3bc5d8fd700dc5632646382938153a2f273ec686cb0aff6d5705fdf51791ca4",
+        "fields_in_declaration_order": [
+          {
+            "container": 0,
+            "name": "value",
+            "optional": false,
+            "self_ref_name": "",
+            "type_kind": 0,
+            "type_primitive": "string",
+            "type_ref": ""
+          },
+          {
+            "container": 1,
+            "name": "children",
+            "optional": false,
+            "self_ref_name": "types.v1.TreeNode",
+            "type_kind": 2,
+            "type_primitive": "",
+            "type_ref": ""
+          }
+        ],
+        "name": "TreeNode",
+        "package": "types.v1"
+      }
+    }
+  }
+}

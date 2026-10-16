@@ -61,10 +61,12 @@ pub use codec::{
     SerializationMode, StreamHeader,
 };
 pub use contract::{
-    contract_id, encode_scalar_default, make_field, make_union_variant, message_type_def,
-    union_type_def, AsterType, ContractArtifacts, ContractManifest, Leaf, ManifestMethod,
-    MethodDef, MethodPattern, PayloadRegistry, ScalarDefault, ScopeKind, ServiceContract, TypeDef,
-    TypeDefSet, UnionVariantDef, WireField,
+    contract_id, encode_scalar_default, make_field, make_union_variant, message_shape,
+    message_type_def, resolve_type_def, shape_field, shape_variant, union_shape, union_type_def,
+    AsterType, BigInt, ContractArtifacts, ContractManifest, Date, Decimal, Leaf, ManifestMethod,
+    MethodDef, MethodPattern, PayloadRegistry, ScalarDefault, ScopeKind, ServiceContract,
+    ShapeField, ShapeFn, ShapeVariant, Timestamp, TypeDef, TypeDefSet, TypeShape, UnionVariantDef,
+    WireField,
 };
 pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationError};
 pub use empty::Empty;

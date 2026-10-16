@@ -14,6 +14,8 @@ Provides:
 from __future__ import annotations
 
 import dataclasses
+import datetime as _dt
+import decimal as _decimal
 import unicodedata
 import warnings
 from dataclasses import dataclass, field
@@ -568,6 +570,13 @@ def contract_id_from_service(service_cls: type) -> str:
 # it ``int64`` here would make the published TypeDef claim "fixed 8-byte
 # int" while pyfory's encoder writes a zigzag varint -- cross-binding
 # consumers would then read the wrong width. See xlang_type_mapping.md.
+#
+# ``datetime`` / ``date`` / ``Decimal`` are the types pyfory writes as the
+# Fory xlang TIMESTAMP (38) / DATE (39) / DECIMAL (40) -- the same wire types
+# Rust ``aster::rpc::{Timestamp, Date, Decimal}``, Java ``Instant`` /
+# ``LocalDate`` / ``BigDecimal`` and TypeScript ``Date`` use. Lookup is by
+# exact type, so ``datetime`` (a ``date`` subclass) is not mistaken for
+# ``date``. Vectors: conformance/vectors/contract-types.json.
 _PYTHON_TO_XLANG_PRIMITIVE: dict[type, str] = {
     str: "string",
     int: "varint64",
@@ -575,6 +584,9 @@ _PYTHON_TO_XLANG_PRIMITIVE: dict[type, str] = {
     bool: "bool",
     bytes: "binary",
     bytearray: "binary",
+    _dt.datetime: "timestamp",
+    _dt.date: "date",
+    _decimal.Decimal: "decimal",
 }
 
 

@@ -5,6 +5,8 @@ Golden vectors produced by Rust core / the ``aster`` crate, checked from Python.
 - ``conformance/vectors/compression.json``       -- zstd payload frames (§5.6)
 - ``conformance/vectors/contract-defaults.json`` -- contract defaults
   (Aster-ContractIdentity §11.3.2.3)
+- ``conformance/vectors/contract-types.json``    -- timestamp / date / decimal
+  and recursive types (identity and payload bytes)
 
 Python must produce the exact bytes / ids the Rust side does.
 """
@@ -12,6 +14,8 @@ Python must produce the exact bytes / ids the Rust side does.
 from __future__ import annotations
 
 import dataclasses
+import datetime
+import decimal
 import json
 import re
 from dataclasses import dataclass, field
@@ -285,3 +289,174 @@ def test_pyfory_matches_pinned_release_line():
     from aster.wire import FORY_VERSION
 
     assert pyfory.__version__.split(".")[:2] == FORY_VERSION.split(".")[:2]
+
+
+# ── Canonical temporal / decimal types and recursive types ──────────────────
+#
+# Python mirrors of ``aster/tests/it/contract_types.rs``. A Rust ``Box<T>`` is
+# transparent, so ``Option<Box<T>>`` mirrors as ``Optional[T]``.
+
+_TYPES = _load("contract-types.json")["vector"]
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+
+
+@wire_type("types.v1/Temporal")
+@dataclass
+class Temporal:
+    at: datetime.datetime = _EPOCH
+    day: datetime.date = datetime.date(1970, 1, 1)
+    amount: decimal.Decimal = decimal.Decimal(0)
+    maybe_at: Optional[datetime.datetime] = None
+    history: list[datetime.datetime] = field(default_factory=list)
+
+
+@wire_type("types.v1/TreeNode")
+@dataclass
+class TreeNode:
+    value: str = ""
+    children: list[TreeNode] = field(default_factory=list)
+
+
+@wire_type("types.v1/Chain")
+@dataclass
+class Chain:
+    value: pyfory.Int32 = 0
+    next: Optional[Chain] = None
+
+
+@wire_type("types.v1/Author")
+@dataclass
+class Author:
+    name: str = ""
+    books: list[Book] = field(default_factory=list)
+
+
+@wire_type("types.v1/Book")
+@dataclass
+class Book:
+    title: str = ""
+    written_by: Optional[Author] = None
+
+
+@wire_type("types.v1/Alpha")
+@dataclass
+class Alpha:
+    next: Optional[Beta] = None
+
+
+@wire_type("types.v1/Beta")
+@dataclass
+class Beta:
+    next: Optional[Gamma] = None
+
+
+@wire_type("types.v1/Gamma")
+@dataclass
+class Gamma:
+    next: list[Alpha] = field(default_factory=list)
+
+
+@wire_type("types.v1/Forest")
+@dataclass
+class Forest:
+    trees: list[TreeNode] = field(default_factory=list)
+
+
+_TYPE_CLASSES = [Temporal, TreeNode, Chain, Author, Book, Alpha, Beta, Gamma, Forest]
+
+
+def _types_type_defs():
+    from aster.contract.identity import build_type_graph, resolve_with_cycles
+
+    return resolve_with_cycles(build_type_graph(_TYPE_CLASSES))
+
+
+@pytest.mark.parametrize("fqn", sorted(_TYPES["types"]))
+def test_contract_types_type_hash_matches_rust(fqn):
+    from aster.contract.identity import canonical_xlang_bytes, compute_type_hash
+
+    td = _types_type_defs()[fqn]
+    exp = _TYPES["types"][fqn]
+    by_name = {f.name: f for f in td.fields}
+    for ef in exp["fields_in_declaration_order"]:
+        f = by_name[ef["name"]]
+        assert int(f.type_kind) == ef["type_kind"], ef["name"]
+        assert f.type_primitive == ef["type_primitive"], ef["name"]
+        assert f.type_ref.hex() == ef["type_ref"], ef["name"]
+        assert f.self_ref_name == ef["self_ref_name"], ef["name"]
+        assert f.optional == ef["optional"], ef["name"]
+        assert int(f.container) == ef["container"], ef["name"]
+    canonical = canonical_xlang_bytes(td)
+    assert canonical.hex() == exp["expected_canonical_type_def_hex"]
+    assert compute_type_hash(canonical).hex() == exp["expected_type_hash"]
+
+
+def test_contract_types_contract_id_matches_rust():
+    from aster import rpc, service
+    from aster.contract.identity import contract_id_from_service
+
+    @service(name="Types", version=1)
+    class TypesService:
+        @rpc
+        async def echo_temporal(self, req: Temporal) -> Temporal:
+            return req
+
+        @rpc
+        async def plant(self, req: TreeNode) -> Forest:
+            return Forest()
+
+        @rpc
+        async def author(self, req: Book) -> Author:
+            return Author()
+
+        @rpc
+        async def cycle(self, req: Alpha) -> Gamma:
+            return Gamma()
+
+    assert contract_id_from_service(TypesService) == _TYPES["expected_contract_id"]
+
+
+def _timestamp(s: str) -> datetime.datetime:
+    return datetime.datetime.strptime(s, "%Y-%m-%dT%H:%M:%S.%fZ").replace(
+        tzinfo=datetime.timezone.utc
+    )
+
+
+def _expected(cls: type, value):
+    """Build the Python value the vector's JSON ``value`` describes."""
+    if value is None:
+        return None
+    if cls is Temporal:
+        return Temporal(
+            at=_timestamp(value["at"]),
+            day=datetime.date.fromisoformat(value["day"]),
+            amount=decimal.Decimal(value["amount"]),
+            maybe_at=None if value["maybe_at"] is None else _timestamp(value["maybe_at"]),
+            history=[_timestamp(t) for t in value["history"]],
+        )
+    if cls is TreeNode:
+        return TreeNode(value["value"], [_expected(TreeNode, c) for c in value["children"]])
+    if cls is Author:
+        return Author(value["name"], [_expected(Book, b) for b in value["books"]])
+    if cls is Book:
+        return Book(value["title"], _expected(Author, value["written_by"]))
+    if cls is Alpha:
+        return Alpha(_expected(Beta, value["next"]))
+    if cls is Beta:
+        return Beta(_expected(Gamma, value["next"]))
+    if cls is Gamma:
+        return Gamma([_expected(Alpha, a) for a in value["next"]])
+    raise AssertionError(cls)
+
+
+@pytest.mark.parametrize("name", sorted(_TYPES["payloads"]))
+def test_contract_types_rust_payload_decodes(name):
+    from aster.codec import ForyCodec
+
+    case = _TYPES["payloads"][name]
+    cls = {f"types.v1.{c.__name__}": c for c in _TYPE_CLASSES}[case["type"]]
+    codec = ForyCodec(types=_TYPE_CLASSES)
+    got = codec.decode(bytes.fromhex(case["hex"]), cls)
+    assert got == _expected(cls, case["value"])
+    # And back: what Python writes decodes to the same value.
+    assert codec.decode(codec.encode(got), cls) == got

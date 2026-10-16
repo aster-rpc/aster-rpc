@@ -983,6 +983,8 @@ def _validate_xlang_tags_for_service(cls: type, service_info: Any, _caller_local
     """
     import dataclasses
 
+    checked: set[type] = set()
+
     def check_type(tp: Any, path: str) -> None:
         if tp is None or tp is inspect.Parameter.empty:
             return
@@ -1042,8 +1044,11 @@ def _validate_xlang_tags_for_service(cls: type, service_info: Any, _caller_local
         if not isinstance(tp, type):
             return
 
-        # Check if it's a dataclass
+        # Check if it's a dataclass (once: recursive types reach themselves)
         if dataclasses.is_dataclass(tp):
+            if tp in checked:
+                return
+            checked.add(tp)
             # Auto-apply wire identity if not explicitly set via @wire_type
             if not hasattr(tp, "__wire_type__"):
                 from .codec import _auto_apply_wire_type

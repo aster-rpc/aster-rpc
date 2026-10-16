@@ -23,6 +23,8 @@ Usage::
 from __future__ import annotations
 
 import dataclasses
+import datetime
+import decimal
 import logging
 import re
 from typing import Any
@@ -537,8 +539,10 @@ def _build_primitive_map() -> dict[str, Any]:
         "tagged_uint64": pyfory.TaggedUInt64,
         "float32": pyfory.Float32,
         "float64": pyfory.Float64,
-        # Timestamps are carried as varint64 millis in pyfory's xlang.
-        "timestamp": pyfory.Int64,
+        # pyfory writes these as Fory xlang TIMESTAMP / DATE / DECIMAL.
+        "timestamp": datetime.datetime,
+        "date": datetime.date,
+        "decimal": decimal.Decimal,
         "uuid": str,
     }
 
@@ -574,7 +578,9 @@ _PRIMITIVE_DEFAULTS: dict[str, Any] = {
     "tagged_uint64": 0,
     "float32": 0.0,
     "float64": 0.0,
-    "timestamp": 0,
+    "timestamp": datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc),
+    "date": datetime.date(1970, 1, 1),
+    "decimal": decimal.Decimal(0),
     "uuid": "",
 }
 
