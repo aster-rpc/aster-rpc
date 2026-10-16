@@ -856,7 +856,7 @@ class AsterServer:
             pass
 
     async def drain(self, grace_period: float = 10.0) -> "DrainReport | None":
-        """Take the server out of rotation gracefully (Rust
+        """Take the server out of rotation gracefully, then close it (Rust
         ``aster::AsterServer::drain``; semantics in ``aster::rpc::drain``).
 
         Sets the ops listener not ready, then refuses new connections (closed
@@ -869,20 +869,27 @@ class AsterServer:
         :class:`DrainReport` (``None`` when the server never started).
 
         A second call while a drain runs moves its deadline earlier when its
-        own grace ends sooner and returns the same report. The server keeps
-        refusing afterwards: follow with :meth:`close`. Fits Kubernetes
-        ``preStop`` hooks and SIGTERM handling.
+        own grace ends sooner and returns the same report. Once the drain
+        ends the server is closed (:meth:`close`: node, HTTP listeners, ops
+        listener), as in Rust, Go, .NET, Java and TypeScript; a drain after
+        that raises ``RuntimeError``. Fits Kubernetes ``preStop`` hooks and
+        SIGTERM handling.
 
         Args:
             grace_period: Seconds to let in-flight calls finish.
         """
+        if self._closed:
+            raise RuntimeError("server is closed")
         logger.info("Draining server (grace_period=%.1fs)...", grace_period)
         if self._health is not None:
             self._health.set_ready(False)  # probes stop routing first
         report = None
-        if self._server is not None:
-            report = await self._server.drain(grace_period)
-        logger.info("Drain complete: %r", report)
+        try:
+            if self._server is not None:
+                report = await self._server.drain(grace_period)
+            logger.info("Drain complete: %r", report)
+        finally:
+            await self.close()
         return report
 
     @property
@@ -895,9 +902,11 @@ class AsterServer:
         """Cancel serve loops and close the node. Safe to call multiple times."""
         if self._closed:
             return
+        # Set before the first await so a concurrent close (two drains ending
+        # together) does not run the teardown twice.
+        self._closed = True
         if self._server is not None:
             await self._server._close_http()
-        self._closed = True
 
         if self._health is not None:
             self._health.set_ready(False)  # not ready first, then drain

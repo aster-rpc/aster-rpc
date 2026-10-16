@@ -264,8 +264,9 @@ rest, which cancels what still runs. It returns a `DrainReport`
 (`calls_in_flight`, `calls_completed`, `calls_cancelled`, `calls_refused`,
 `connections_closed`, `connections_refused`, `deadline_reached`, `elapsed`).
 A client sees `RpcError.is_draining` and should reconnect to another replica.
-Follow the drain with `close()`; `server.is_draining` reports whether one has
-started.
+When the drain ends the server is closed (node, HTTP listeners, ops listener),
+as in the other bindings, so a later `drain()` raises `RuntimeError`;
+`server.is_draining` reports whether one has started.
 
 Clients (`create_client`, `AsterClient.client`, the proxies) call through the
 pooled Rust `RpcConnection` (`aster._aster.RpcClient`). A unary call is one

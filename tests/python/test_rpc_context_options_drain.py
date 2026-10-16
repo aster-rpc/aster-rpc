@@ -290,9 +290,39 @@ async def test_drain_lets_in_flight_finish_and_refuses_new_calls(pair):
     assert report.calls_refused >= 1
     assert report.deadline_reached is False
     assert report.elapsed > 0
-    # A later drain returns the same report.
-    again = await server.drain(1.0)
-    assert again.calls_completed == report.calls_completed
+    await _assert_closed_after_drain(server, client, svc)
+
+
+async def _assert_closed_after_drain(server, client, svc) -> None:
+    """drain() closes the server, as Rust/Go/.NET/Java/TS do: no further
+    drain, and the address no longer serves. A server left up after its drain
+    would accept a fresh connection and refuse it as draining."""
+    with pytest.raises(RuntimeError, match="closed"):
+        await server.drain(1.0)
+    # The existing connection was closed by the drain (the client reports
+    # that close as draining).
+    with pytest.raises(BaseException):
+        await asyncio.wait_for(svc.who(Req()), 15)
+
+
+    async def fresh_call() -> None:
+        async with AsterClient(endpoint_addr=server.endpoint_addr_b64) as fresh:
+            fresh_svc = await fresh.client(MirrorCtx)
+            await fresh_svc.who(Req())
+
+    with pytest.raises(Exception) as e:
+        await asyncio.wait_for(fresh_call(), 30)
+    assert not (isinstance(e.value, RpcError) and e.value.is_draining), e.value
+
+
+@pytest.mark.timeout(60)
+async def test_concurrent_drains_share_one_report_and_close_once(pair):
+    server, client = pair
+    first = asyncio.ensure_future(server.drain(10.0))
+    second = asyncio.ensure_future(server.drain(10.0))
+    a, b = await asyncio.wait_for(asyncio.gather(first, second), 30)
+    assert a.calls_completed == b.calls_completed
+    assert a.calls_refused == b.calls_refused
 
 
 @pytest.mark.timeout(60)
@@ -311,6 +341,7 @@ async def test_drain_deadline_cancels_stuck_handlers(pair):
     if isinstance(e.value, RpcError):
         assert e.value.is_draining
     GATE.release.set()
+    await _assert_closed_after_drain(server, client, svc)
 
 
 def test_rpc_error_is_draining():

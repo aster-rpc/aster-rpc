@@ -14,6 +14,12 @@ calls still running at the deadline are cancelled. It returns a
 `DrainReport` instead of `None`. `server.is_draining`, `DRAIN_CLOSE_CODE` and
 `DRAINING_DETAIL_KEY` are new.
 
+Once the drain ends, `drain()` closes the server (node, HTTP listeners, ops
+listener), as Rust, Go, .NET, Java and TypeScript do: a process that only
+drains no longer stays bound and answering draining refusals. A `drain()` after
+that raises `RuntimeError`; a concurrent second `drain()` still returns the
+same report.
+
 ### Changed: `CallContext.peer` is the transport peer; `principal` is new
 
 On the server, `ctx.peer` is the transport's caller id and `ctx.principal` the
