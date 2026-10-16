@@ -35,6 +35,12 @@ type AuditOutboxConfig struct {
 	Destination      AuditDestination `json:"destination"`
 	MaxRetainedBytes uint64           `json:"max_retained_bytes,omitempty"`
 	MaxEventBytes    uint64           `json:"max_event_bytes,omitempty"`
+	// AcknowledgementLogMaxEntries bounds the acknowledgement log (see
+	// Acknowledgements). Nil selects 100,000; 0 disables the log; at most 1,000,000.
+	AcknowledgementLogMaxEntries *uint64 `json:"acknowledgement_log_max_entries,omitempty"`
+	// AcknowledgementLogMaxAgeMS prunes entries acknowledged longer ago.
+	// Nil selects 7 days; 0 removes the age bound.
+	AcknowledgementLogMaxAgeMS *uint64 `json:"acknowledgement_log_max_age_ms,omitempty"`
 }
 
 // AuditEvent is an explicit durable intent, not a diagnostic log record.
@@ -212,7 +218,8 @@ func OpenAuditOutbox(ctx context.Context, rt *Runtime, config AuditOutboxConfig)
 	if limit == 0 {
 		limit = auditDefaultEventBytes
 	}
-	if limit < 256 || limit > auditMaxEventBytes || (config.MaxRetainedBytes != 0 && config.MaxRetainedBytes < 256) {
+	if limit < 256 || limit > auditMaxEventBytes || (config.MaxRetainedBytes != 0 && config.MaxRetainedBytes < 256) ||
+		(config.AcknowledgementLogMaxEntries != nil && *config.AcknowledgementLogMaxEntries > 1_000_000) {
 		return nil, auditInvalid(AuditInvalidConfig, "invalid audit storage/event limits")
 	}
 	payload, err := auditJSON("config", config, auditConfigJSONLimit, AuditInvalidConfig)

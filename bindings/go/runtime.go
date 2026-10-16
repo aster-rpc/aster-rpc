@@ -585,9 +585,10 @@ func Version() (major, minor, patch uint32) {
 
 // ABIMinorRequired is the lowest ABI minor version (within ABIVersionMajor)
 // this binding runs against. ABI 7.0 swapped aster_hook_failure_mode_t so
-// 0 = FAIL_CLOSED (6.0 grew aster_config_t to 288 bytes); this binding needs
-// native ABI 7.0 or a later 7.x.
-const ABIMinorRequired = uint32(0)
+// 0 = FAIL_CLOSED (6.0 grew aster_config_t to 288 bytes); 7.1 added the audit
+// outbox acknowledgement log (aster_audit_outbox_acknowledgements). This binding needs
+// native ABI 7.1 or a later 7.x.
+const ABIMinorRequired = uint32(1)
 
 var (
 	abiOnce sync.Once
