@@ -421,3 +421,22 @@ func (p *testIdP) token(t *testing.T, claims map[string]any) string {
 	s.FillBytes(sig[32:])
 	return input + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
+
+// A call whose identity read finds it over (NOT_FOUND) is dropped: its
+// transport peer is not the principal, so neither the transport peer nor a
+// forwarded call's actor reports the user (FFI-5).
+func TestResolveTransportPeer_CallOverIsNotThePrincipal(t *testing.T) {
+	read := func(p string, ok bool) func() (string, bool) {
+		return func() (string, bool) { return p, ok }
+	}
+	if p, live := resolveTransportPeer("https://idp|alice", true, read("gateway-node", true)); !live || p != "gateway-node" {
+		t.Fatalf("live call: got %q live=%v, want gateway-node", p, live)
+	}
+	if p, live := resolveTransportPeer("https://idp|alice", true, read("", false)); live || p == "https://idp|alice" {
+		t.Fatalf("call over: got %q live=%v, want dropped (not the principal)", p, live)
+	}
+	called := false
+	if p, live := resolveTransportPeer("node-a", false, func() (string, bool) { called = true; return "", false }); !live || p != "node-a" || called {
+		t.Fatalf("no principal: got %q live=%v read=%v, want node-a without a read", p, live, called)
+	}
+}

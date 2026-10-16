@@ -449,6 +449,18 @@ public class Abi7Tests
     }
 
     [Fact]
+    public void Transport_Peer_Of_A_Call_Already_Over_Is_Not_The_Principal()
+    {
+        // HAS_PRINCIPAL and aster_dispatch_identity read the transport peer: the call is dispatched with it.
+        Assert.Equal("gateway-node", AsterServer.ResolveTransportPeer(true, "https://idp|alice", "gateway-node"));
+        // NOT_FOUND (the call is over): no transport peer, so the call is dropped rather than reporting
+        // the user as the transport peer and, on a forwarded call, as the actor.
+        Assert.Null(AsterServer.ResolveTransportPeer(true, "https://idp|alice", null));
+        // Without HAS_PRINCIPAL the event's peer is the transport peer.
+        Assert.Equal("node-a", AsterServer.ResolveTransportPeer(false, "node-a", null));
+    }
+
+    [Fact]
     public void Drain_Grace_Rounds_Up_To_Whole_Milliseconds()
     {
         Assert.Equal(0u, AsterServer.DrainMillis(TimeSpan.Zero));

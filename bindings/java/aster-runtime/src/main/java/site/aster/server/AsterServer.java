@@ -580,17 +580,20 @@ public final class AsterServer implements AutoCloseable {
     int wireCallId = ev.get(ValueLayout.JAVA_INT, Dispatch.OFFSET_WIRE_CALL_ID);
     byte[] request = bytes(ev, Dispatch.OFFSET_REQUEST_PTR, Dispatch.OFFSET_REQUEST_LEN);
     // peer_ptr is the principal (ABI 7.5); with HAS_PRINCIPAL the transport peer differs and is
-    // read now, while the call is live (NOT_FOUND = already over: fall back to the principal).
+    // read now, while the call is live.
     String peer =
         new String(
             bytes(ev, Dispatch.OFFSET_PEER_PTR, Dispatch.OFFSET_PEER_LEN), StandardCharsets.UTF_8);
     dispatch.bufferRelease(ev.get(ValueLayout.JAVA_LONG, Dispatch.OFFSET_BUFFER));
-    String transportPeer = peer;
-    if ((flags & Dispatch.FLAG_HAS_PRINCIPAL) != 0) {
-      Dispatch.Identity identity = dispatch.identity(callId);
-      if (identity != null && !identity.peer().isEmpty()) {
-        transportPeer = identity.peer();
-      }
+    String transportPeer =
+        resolveTransportPeer(
+            flags,
+            peer,
+            (flags & Dispatch.FLAG_HAS_PRINCIPAL) != 0 ? dispatch.identity(callId) : null);
+    if (transportPeer == null) {
+      // NOT_FOUND: the call left Rust's table (cancelled or past its deadline) before this read,
+      // and Rust already answered it. Nothing runs for it.
+      return;
     }
     // A forwarded call (ABI 7.7): the gateway is the transport peer, the actor.
     String actor = (flags & Dispatch.FLAG_ON_BEHALF_OF) != 0 ? transportPeer : null;
@@ -626,6 +629,22 @@ public final class AsterServer implements AutoCloseable {
             connectionHandle,
             new AtomicBoolean());
     callExecutor.execute(() -> dispatchCall(call));
+  }
+
+  /**
+   * A call's transport peer: {@code peer} (the event's) without {@code HAS_PRINCIPAL}, else the one
+   * {@code aster_dispatch_identity} read. {@code null} when that read found the call over ({@code
+   * NOT_FOUND}): the call is dropped rather than reporting the principal (the user, on a forwarded
+   * call) as the transport peer and the actor.
+   */
+  static String resolveTransportPeer(int flags, String peer, Dispatch.Identity identity) {
+    if ((flags & Dispatch.FLAG_HAS_PRINCIPAL) == 0) {
+      return peer;
+    }
+    if (identity == null) {
+      return null;
+    }
+    return identity.peer().isEmpty() ? peer : identity.peer();
   }
 
   private void trackSession(long connectionId, long sessionKey, int sessionId) {

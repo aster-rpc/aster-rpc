@@ -520,16 +520,18 @@ func (s *AsterServer) onCall(ev *C.aster_dispatch_event_t) {
 		peer, cached = s.peers[in.connID]
 	}
 	if !cached {
-		peer = principal
-		known := !hasPrincipal
-		if hasPrincipal {
-			// The call may already be over (NOT_FOUND): fall back to the
-			// principal for this call only, uncached.
-			if p, ok := s.ds.transportPeer(in.callID); ok {
-				peer, known = p, true
-			}
+		var live bool
+		peer, live = resolveTransportPeer(principal, hasPrincipal, func() (string, bool) {
+			return s.ds.transportPeer(in.callID)
+		})
+		if !live {
+			// NOT_FOUND: the call left Rust's table (cancelled or past its
+			// deadline) before this read, and Rust already answered it.
+			// Nothing runs for it.
+			s.ds.releaseBuffer(ev.buffer)
+			return
 		}
-		if iroh && known {
+		if iroh {
 			s.peers[in.connID] = peer
 		}
 	}
@@ -576,6 +578,18 @@ func (s *AsterServer) onCall(ev *C.aster_dispatch_event_t) {
 	s.mu.Unlock()
 	s.calls.Add(1)
 	go s.serve(in)
+}
+
+// resolveTransportPeer is a call's transport peer: the event's peer
+// (principal) without HAS_PRINCIPAL, else the one aster_dispatch_identity
+// reads. live is false when that read finds the call over (NOT_FOUND): the
+// call is then dropped rather than reporting the principal (the user, on a
+// forwarded call) as the transport peer and the actor.
+func resolveTransportPeer(principal string, hasPrincipal bool, read func() (string, bool)) (peer string, live bool) {
+	if !hasPrincipal {
+		return principal, true
+	}
+	return read()
 }
 
 // callCancel ends one live call's handler context.

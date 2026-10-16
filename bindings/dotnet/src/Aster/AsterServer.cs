@@ -440,8 +440,14 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
         }
         _dispatch.BufferRelease(ev.buffer);
         // peer_ptr is the principal; with HAS_PRINCIPAL the transport peer comes from
-        // aster_dispatch_identity while the call is live (NOT_FOUND = already over: fall back).
-        string transportPeer = hasPrincipal ? _dispatch.TransportPeer(callId) ?? peer : peer;
+        // aster_dispatch_identity while the call is live.
+        string? transportPeer = ResolveTransportPeer(hasPrincipal, peer, hasPrincipal ? _dispatch.TransportPeer(callId) : null);
+        if (transportPeer is null)
+        {
+            // NOT_FOUND: the call left Rust's table (cancelled or past its deadline) before this
+            // thread read it, and Rust already answered it. Nothing runs for it.
+            return;
+        }
 
         ServiceDefinition? svc = ev.service_idx < _byIndex.Length ? _byIndex[ev.service_idx] : null;
         if (svc is null || ev.method_idx >= svc.OrderedMethods.Length)
@@ -466,6 +472,15 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
         Interlocked.Increment(ref _inFlight);
         ThreadPool.UnsafeQueueUserWorkItem(static s => _ = s.server.DispatchAsync(s.call), (server: this, call: inbound), preferLocal: false);
     }
+
+    /// <summary>
+    /// A call's transport peer: <paramref name=peer/> (the event's peer) without HAS_PRINCIPAL, else
+    /// <paramref name=identityPeer/> from <c>aster_dispatch_identity</c>. Null when that read found the
+    /// call over (<c>NOT_FOUND</c>): the caller drops the call rather than report the principal (the user,
+    /// on a forwarded call) as the transport peer and the actor.
+    /// </summary>
+    internal static string? ResolveTransportPeer(bool hasPrincipal, string peer, string? identityPeer)
+        => hasPrincipal ? identityPeer : peer;
 
     private async Task DispatchAsync(Inbound inbound)
     {
