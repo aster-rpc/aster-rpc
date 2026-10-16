@@ -181,7 +181,9 @@ public final class TypeGraphWalker {
     if (Number.class.isAssignableFrom(cls) || cls == Boolean.class || cls == Character.class) {
       return false;
     }
-    if (cls.getName().startsWith("java.time.")) {
+    if (cls.getName().startsWith("java.time.")
+        || cls == java.util.UUID.class
+        || cls == site.aster.codec.Ulid.class) {
       return false;
     }
     if (CALL_CONTEXT_FQN.equals(cls.getName())) {

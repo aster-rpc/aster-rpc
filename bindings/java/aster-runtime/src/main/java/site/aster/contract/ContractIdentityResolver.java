@@ -266,6 +266,8 @@ public final class ContractIdentityResolver {
               idx,
               f.type(),
               f.contractDefault(),
+              f.fixedDecimal(),
+              f.nullable(),
               backEdges,
               typeHashes,
               sccMembers));
@@ -275,7 +277,21 @@ public final class ContractIdentityResolver {
         TypeDefKind.MESSAGE, id.packageName(), id.name(), fields, List.of(), List.of());
   }
 
-  private record RecordOrClassField(String name, Type type, ContractDefault contractDefault) {}
+  private record RecordOrClassField(
+      String name,
+      Type type,
+      ContractDefault contractDefault,
+      FixedDecimal fixedDecimal,
+      boolean nullable) {}
+
+  /**
+   * A field is optional when its type is {@code Optional<T>} or carries Fory's type-use {@link
+   * org.apache.fory.annotation.Nullable} (which is what makes Fory xlang write it nullable; Fory
+   * does not serialize {@code Optional} in xlang mode).
+   */
+  private static boolean foryNullable(java.lang.reflect.AnnotatedType t) {
+    return t != null && t.isAnnotationPresent(org.apache.fory.annotation.Nullable.class);
+  }
 
   private static List<RecordOrClassField> fieldsOf(Class<?> cls) {
     List<RecordOrClassField> out = new ArrayList<>();
@@ -283,7 +299,11 @@ public final class ContractIdentityResolver {
       for (RecordComponent rc : cls.getRecordComponents()) {
         out.add(
             new RecordOrClassField(
-                rc.getName(), rc.getGenericType(), rc.getAnnotation(ContractDefault.class)));
+                rc.getName(),
+                rc.getGenericType(),
+                rc.getAnnotation(ContractDefault.class),
+                rc.getAnnotation(FixedDecimal.class),
+                foryNullable(rc.getAnnotatedType())));
       }
       return out;
     }
@@ -293,7 +313,11 @@ public final class ContractIdentityResolver {
       }
       out.add(
           new RecordOrClassField(
-              f.getName(), f.getGenericType(), f.getAnnotation(ContractDefault.class)));
+              f.getName(),
+              f.getGenericType(),
+              f.getAnnotation(ContractDefault.class),
+              f.getAnnotation(FixedDecimal.class),
+              foryNullable(f.getAnnotatedType())));
     }
     return out;
   }
@@ -304,11 +328,13 @@ public final class ContractIdentityResolver {
       int id,
       Type t,
       ContractDefault contractDefault,
+      FixedDecimal fixedDecimal,
+      boolean nullable,
       Set<String> backEdges,
       Map<String, String> typeHashes,
       Set<String> sccMembers) {
-    // Unwrap Optional<X>.
-    boolean optional = false;
+    // Unwrap Optional<X>; a Fory @Nullable field is optional too.
+    boolean optional = nullable;
     Type inner = t;
     if (t instanceof ParameterizedType pt
         && pt.getRawType() instanceof Class<?> rawCls
@@ -344,6 +370,15 @@ public final class ContractIdentityResolver {
     }
 
     ResolvedType resolved = resolveType(valueType, backEdges, typeHashes, sccMembers);
+    if (fixedDecimal != null) {
+      if (!"decimal".equals(resolved.primitive)) {
+        throw new IllegalArgumentException(
+            owner + "." + name + ": @FixedDecimal needs a BigDecimal field (or elements)");
+      }
+      resolved =
+          new ResolvedType(
+              TypeKind.PRIMITIVE, fixedDecimalPrimitive(owner + "." + name, fixedDecimal), "", "");
+    }
 
     // §11.3.2.3: required=false plus the canonical default bytes iff the field declares a contract
     // default; a plain Java initializer / record component is never one.
@@ -373,6 +408,23 @@ public final class ContractIdentityResolver {
         defaultValue);
   }
 
+  /**
+   * The {@code type_primitive} of a {@code decimal(p,s)} field: {@code decimal(<p>,<s>)} in ASCII,
+   * no spaces, no leading zeros (Aster-ContractIdentity.md).
+   */
+  static String fixedDecimalPrimitive(String where, FixedDecimal d) {
+    if (d.precision() < 1 || d.precision() > 1000 || d.scale() < 0 || d.scale() > d.precision()) {
+      throw new IllegalArgumentException(
+          where
+              + ": decimal("
+              + d.precision()
+              + ","
+              + d.scale()
+              + ") needs 1 <= precision <= 1000 and 0 <= scale <= precision");
+    }
+    return "decimal(" + d.precision() + "," + d.scale() + ")";
+  }
+
   private record ResolvedType(
       TypeKind kind, String primitive, String typeRefHex, String selfRefName) {}
 
@@ -398,6 +450,12 @@ public final class ContractIdentityResolver {
     m.put(Float.class, "float32");
     m.put(double.class, "float64");
     m.put(Double.class, "float64");
+    // Canonical scalar types (Aster-ContractIdentity.md, "Time, UUID, and Decimal").
+    m.put(java.time.Instant.class, "timestamp");
+    m.put(java.time.LocalDate.class, "date");
+    m.put(java.math.BigDecimal.class, "decimal");
+    m.put(java.util.UUID.class, "uuid");
+    m.put(site.aster.codec.Ulid.class, "ulid");
     return Map.copyOf(m);
   }
 

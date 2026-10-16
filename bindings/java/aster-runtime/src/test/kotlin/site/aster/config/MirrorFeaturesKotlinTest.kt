@@ -31,6 +31,17 @@ class MirrorFeaturesKotlinTest {
         } }
     }
 
+    @Test fun contractScalarsFromKotlin() {
+        val ulid = site.aster.codec.Ulid.parse("01ARZ3NDEKTSV4RRFFQ69G5FAV")
+        assertEquals("01ARZ3NDEKTSV4RRFFQ69G5FAV", ulid.toString())
+        assertEquals(16, ulid.toBytes().size)
+        assertThrows(IllegalArgumentException::class.java) {
+            site.aster.codec.ContractValues.rescale(java.math.BigDecimal("1.23456"), 18, 4, "price")
+        }
+        assertEquals("1.5000",
+            site.aster.codec.ContractValues.rescale(java.math.BigDecimal("1.5"), 18, 4, "price").toPlainString())
+    }
+
     @Test fun handlerContextFromKotlin() {
         val ctx = CallContext.builder("svc", "m").peer("transport").principal("alice").build()
         assertEquals("transport", ctx.peer())

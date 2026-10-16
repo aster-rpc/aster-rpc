@@ -18,6 +18,12 @@ import org.apache.fory.config.ForyBuilder;
  * <p>See {@code docs/_internal/java-fory-threading.md} for why the pool (not {@code
  * ThreadLocalFory}) is used under virtual threads.
  *
+ * <p>The contract scalars (Aster-ContractIdentity.md, "Time, UUID, and Decimal") map to Fory's
+ * xlang types: {@link java.time.Instant} is TIMESTAMP, {@link java.time.LocalDate} DATE, {@link
+ * java.math.BigDecimal} DECIMAL, and {@link java.util.UUID} / {@link Ulid} 16-byte BINARY ({@link
+ * ContractScalars}). {@link site.aster.contract.FixedDecimal} fields are checked and rescaled on
+ * encode and decode ({@link ContractValues}).
+ *
  * <p>Type registration is the caller's responsibility — call {@link #fory()} to reach the
  * underlying {@link BaseFory} and register your types there. Registrations propagate to every
  * pooled {@code Fory} instance via Fory's {@code SharedRegistry}, so new pool slots created after
@@ -36,6 +42,7 @@ public final class ForyCodec implements Codec {
     int cpu = Math.max(Runtime.getRuntime().availableProcessors(), 2);
     int poolSize = Math.max((cpu + 1) / 2, 2);
     this.fory = newBuilder().buildThreadSafeForyPool(poolSize);
+    this.fory.registerCallback(ContractScalars::install);
   }
 
   /**
@@ -51,8 +58,10 @@ public final class ForyCodec implements Codec {
         .requireClassRegistration(true);
   }
 
+  /** Wrap an existing pool; {@code uuid} / {@code ulid} are bound to BINARY in each instance. */
   public ForyCodec(ThreadSafeFory fory) {
     this.fory = fory;
+    this.fory.registerCallback(ContractScalars::install);
   }
 
   /**
@@ -74,7 +83,8 @@ public final class ForyCodec implements Codec {
     if (value == null) {
       return new byte[0];
     }
-    return fory.serialize(value);
+    // decimal(p,s) fields go out at scale s; a value that does not fit is refused.
+    return fory.serialize(ContractValues.normalize(value));
   }
 
   @Override
@@ -82,6 +92,6 @@ public final class ForyCodec implements Codec {
     if (payload == null || payload.length == 0) {
       return null;
     }
-    return fory.deserialize(payload);
+    return ContractValues.normalize(fory.deserialize(payload));
   }
 }
