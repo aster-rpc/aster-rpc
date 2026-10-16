@@ -127,7 +127,7 @@ class RuntimeGates(unittest.TestCase):
         for job in dependencies:
             ancestors(job)
         self.assertEqual(dependencies['typescript'], {'rust-tests', 'test'})
-        for job in ('build-linux-arm64-wheel', 'build-windows-wheel', 'ffi-release-linux', 'ffi-natives-cross', 'npm-native-linux-x64', 'npm-native-cross', 'npm-native-darwin', 'mobile-ios', 'mobile-android', 'nightly-sanitize', 'nightly-miri'):
+        for job in ('build-linux-arm64-wheel', 'build-windows-wheel', 'ffi-release-linux', 'ffi-natives-cross', 'npm-native-linux-x64', 'npm-native-cross', 'npm-native-darwin', 'relay-image', 'mobile-ios', 'mobile-android', 'nightly-sanitize', 'nightly-miri'):
             self.assertTrue({'rust-tests', 'test', 'typescript'} <= ancestors(job), job)
         ts = blocks['typescript']
         self.assertIn('--features coordination-fixture,test-hooks --bin aster-coordination-fixture', ts)

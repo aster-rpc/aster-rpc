@@ -635,7 +635,7 @@ def materialize(candidate: Path) -> None:
         shutil.rmtree(ROOT / "mobile")
     for prefix, destination in (("aster-python-", "dist/python"), ("ffi-tarballs-", "dist/ffi"),
                                 ("dotnet-nupkg-", "dist/nuget"), ("maven-packages-", "dist/maven"),
-                                ("java-classifier-", "jars")):
+                                ("java-classifier-", "jars"), ("relay-image-", "dist/relay")):
         target = ROOT / destination
         target.mkdir(parents=True, exist_ok=True)
         for name in manifest["artifacts"]:

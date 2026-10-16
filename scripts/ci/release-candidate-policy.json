@@ -20,7 +20,8 @@
     "npm-native-linux-x64",
     "npm-native-cross",
     "npm-native-darwin",
-    "npm-stage"
+    "npm-stage",
+    "relay-image"
   ],
   "required_artifacts": {
     "aster-python-linux": {
@@ -109,6 +110,10 @@
     },
     "npm-packages": {
       "job": "npm-stage",
+      "matrix": {}
+    },
+    "relay-image": {
+      "job": "relay-image",
       "matrix": {}
     }
   },

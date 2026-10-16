@@ -391,9 +391,9 @@ class CandidateTests(unittest.TestCase):
             self.assertIn("needs.lint.outputs.assurance_profile == 'full'", block)
             self.assertIn("lint", re.search(r"needs: (.*)", block).group(1))
         self.assertIn("if: always() && forgejo.event_name", workflow[workflow.index("  candidate:"):])
-        self.assertEqual(len(policy["required_jobs"]), 20)
-        self.assertEqual(len(C.artifact_policy(policy)), 20)
-        self.assertEqual(len(C.artifact_policy({**policy, "assurance_profile": "full"})), 22)
+        self.assertEqual(len(policy["required_jobs"]), 21)
+        self.assertEqual(len(C.artifact_policy(policy)), 21)
+        self.assertEqual(len(C.artifact_policy({**policy, "assurance_profile": "full"})), 23)
         promotion = (C.ROOT / ".forgejo/workflows/release.yml").read_text()
         self.assertIn("Retain promoted mobile artifacts\n        if: env.ASTER_ASSURANCE_PROFILE == 'full'", promotion)
         with self.assertRaises(ValueError):
@@ -786,6 +786,10 @@ class FullPolicyHandoffTests(unittest.TestCase):
                     write("AsterTransport.xcframework/Info.plist", b"xcframework metadata")
                     write("AsterTransport.xcframework/ios-arm64/libaster_transport_ffi.a", b"device library")
                     write("AsterTransport.xcframework/ios-arm64_x86_64-simulator/libaster_transport_ffi.a", b"simulator library")
+                elif name == "relay-image":
+                    write("staged/relay/aster-relay-0.3.776.oci.tar", b"exact assembled OCI layout")
+                    write("staged/relay/aster-relay-0.3.776.json", '{"index_digest": "sha256:fixture"}')
+                    write("staged/relay/sbom-linux-amd64.cdx.json", "{}")
                 elif name == "android-libs":
                     for abi in ("arm64-v8a", "armeabi-v7a", "x86", "x86_64"):
                         write("android-libs/" + abi + "/libaster_transport_ffi.so", abi)
@@ -833,6 +837,7 @@ class FullPolicyHandoffTests(unittest.TestCase):
             self.assertEqual(len(list((release / "jars").iterdir())), 2)
             self.assertEqual((release / "dist/nuget/Aster.0.3.776.nupkg").read_bytes(), b"exact tested NuGet archive")
             self.assertEqual((release / "dist/maven/aster-runtime-0.3.776.jar").read_bytes(), b"exact tested JVM bytecode")
+            self.assertEqual(C.file_map(release / "dist/relay"), manifest["artifacts"]["relay-image" + suffix]["files"])
             self.assertEqual((release / "publish-order").read_text().splitlines(), ["artifacts/npm-" + platform for platform in platforms])
             self.assertEqual(C.file_map(release / "artifacts"), manifest["artifacts"]["npm-packages-27"]["files"])
             self.assertFalse((release / "mobile/stale").exists())
