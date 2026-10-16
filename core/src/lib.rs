@@ -1161,6 +1161,8 @@ pub struct CoreMonitor {
     /// clone, so it must die with the last monitor handle or it would keep
     /// the endpoint alive after a plain drop (no explicit close()).
     sampler_guard: Arc<std::sync::Mutex<Option<AbortOnDrop>>>,
+    /// QUIC bytes by locality level, banked when a peer changes level.
+    level_ledger: Arc<std::sync::Mutex<topology::LevelTrafficLedger>>,
 }
 
 /// Hook portion of the monitor — installed on the endpoint builder.
@@ -1197,6 +1199,7 @@ impl CoreMonitor {
             tx,
             _task: Arc::new(abort_handle),
             sampler_guard: Arc::new(std::sync::Mutex::new(None)),
+            level_ledger: Default::default(),
         };
         (hook, monitor)
     }
@@ -1352,6 +1355,19 @@ impl CoreMonitor {
             .iter()
             .filter_map(|(id, entry)| entry.view(id))
             .collect()
+    }
+
+    /// QUIC bytes by locality level, with `views` giving each peer's level
+    /// now. A peer's bytes stay under the level they were read at: when its
+    /// level changes they are banked there, so no level's total ever drops.
+    pub fn quic_traffic_by_level(
+        &self,
+        views: &[CorePeerView],
+    ) -> std::collections::BTreeMap<CoreLadderLevel, CoreQuicTraffic> {
+        self.level_ledger
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(views)
     }
 
     /// Start the topology sampler: every [`topology::SAMPLE_INTERVAL`] it
@@ -2664,6 +2680,20 @@ impl CoreNode {
             .into_iter()
             .map(|view| self.with_declarations(view))
             .collect()
+    }
+
+    /// QUIC bytes exchanged with peers, by the locality level of
+    /// [`Self::peer_views`] (declarations included). Each level's totals only
+    /// grow: a peer that changes level leaves the bytes read so far under its
+    /// old level and counts only later bytes under the new one. Empty when
+    /// monitoring is disabled.
+    pub fn quic_traffic_by_level(
+        &self,
+    ) -> std::collections::BTreeMap<CoreLadderLevel, CoreQuicTraffic> {
+        let Some(monitor) = self.inner.monitor.as_ref() else {
+            return Default::default();
+        };
+        monitor.quic_traffic_by_level(&self.peer_views())
     }
 
     /// Blob transfer counters for the whole node, since it started. The same

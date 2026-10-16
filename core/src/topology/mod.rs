@@ -191,6 +191,117 @@ impl CoreQuicTraffic {
         };
         slot.add(sent, received);
     }
+
+    fn add_all(&mut self, other: &Self) {
+        for (family, b) in other.iter() {
+            self.add(family, b.quic_bytes_sent, b.quic_bytes_received);
+        }
+    }
+
+    /// Per protocol, `self` minus `base` (never below zero).
+    fn since(&self, base: &Self) -> Self {
+        let mut out = Self::default();
+        for (family, b) in self.iter() {
+            let from = base.get(family);
+            out.add(
+                family,
+                b.quic_bytes_sent.saturating_sub(from.quic_bytes_sent),
+                b.quic_bytes_received
+                    .saturating_sub(from.quic_bytes_received),
+            );
+        }
+        out
+    }
+
+    /// Per protocol, the larger of `self` and `other`.
+    fn max(&self, other: &Self) -> Self {
+        let mut out = Self::default();
+        for (family, b) in self.iter() {
+            let o = other.get(family);
+            out.add(
+                family,
+                b.quic_bytes_sent.max(o.quic_bytes_sent),
+                b.quic_bytes_received.max(o.quic_bytes_received),
+            );
+        }
+        out
+    }
+}
+
+/// One peer in a [`LevelTrafficLedger`]: the level its bytes are counted
+/// under, its traffic when it entered that level, and the latest traffic read.
+#[derive(Debug)]
+struct LedgerPeer {
+    level: CoreLadderLevel,
+    base: CoreQuicTraffic,
+    last: CoreQuicTraffic,
+}
+
+/// QUIC bytes grouped by locality level, each level's total only ever growing.
+///
+/// A peer's bytes count under the level it had when they were read. When a
+/// peer changes level, or leaves the views, the bytes it accumulated under its
+/// old level are banked there, and only its later bytes count under the new
+/// one. Summing current peer views by level instead would move a peer's whole
+/// history between levels, so the old level's total would drop.
+#[derive(Debug, Default)]
+pub(crate) struct LevelTrafficLedger {
+    banked: std::collections::BTreeMap<CoreLadderLevel, CoreQuicTraffic>,
+    peers: std::collections::HashMap<String, LedgerPeer>,
+}
+
+impl LevelTrafficLedger {
+    /// Fold the current views in and return every level's totals.
+    pub(crate) fn observe(
+        &mut self,
+        views: &[CorePeerView],
+    ) -> std::collections::BTreeMap<CoreLadderLevel, CoreQuicTraffic> {
+        let mut seen = std::collections::HashSet::with_capacity(views.len());
+        for view in views {
+            seen.insert(view.node_id.as_str());
+            match self.peers.get_mut(&view.node_id) {
+                None => {
+                    self.peers.insert(
+                        view.node_id.clone(),
+                        LedgerPeer {
+                            level: view.level,
+                            base: CoreQuicTraffic::default(),
+                            last: view.quic_traffic,
+                        },
+                    );
+                }
+                Some(peer) => {
+                    if peer.level != view.level {
+                        self.banked
+                            .entry(peer.level)
+                            .or_default()
+                            .add_all(&peer.last.since(&peer.base));
+                        peer.level = view.level;
+                        peer.base = peer.last;
+                    }
+                    peer.last = peer.last.max(&view.quic_traffic);
+                }
+            }
+        }
+        let banked = &mut self.banked;
+        self.peers.retain(|id, peer| {
+            let keep = seen.contains(id.as_str());
+            if !keep {
+                banked
+                    .entry(peer.level)
+                    .or_default()
+                    .add_all(&peer.last.since(&peer.base));
+            }
+            keep
+        });
+        let mut out = self.banked.clone();
+        for peer in self.peers.values() {
+            out.entry(peer.level)
+                .or_default()
+                .add_all(&peer.last.since(&peer.base));
+        }
+        out
+    }
 }
 
 /// Classification of a direct path's remote IP.
@@ -648,6 +759,104 @@ mod tests {
 
     fn direct(addr: &str) -> TransportAddr {
         TransportAddr::Ip(addr.parse().unwrap())
+    }
+
+    /// A view of `id` at `level` that has received `blobs` and sent `rpc`.
+    fn traffic_view(id: &str, level: CoreLadderLevel, blobs: u64, rpc: u64) -> CorePeerView {
+        let mut quic_traffic = CoreQuicTraffic::default();
+        quic_traffic.add(CoreProtocolFamily::Blobs, 0, blobs);
+        quic_traffic.add(CoreProtocolFamily::Rpc, rpc, 0);
+        CorePeerView {
+            node_id: id.to_string(),
+            level,
+            level_reason: String::new(),
+            rtt_us: None,
+            jitter_us: None,
+            loss_ppm: 0,
+            throughput_bps: 0,
+            cwnd_ceiling_bps: 0,
+            direct: true,
+            relay_url: None,
+            remote_addr: None,
+            congestion_events: 0,
+            samples: 1,
+            confidence_ppm: 0,
+            last_measured_unix_ms: 0,
+            cluster_held_since_unix_ms: 0,
+            is_connected: true,
+            level_source: locality::CoreLevelSource::Measured,
+            declared_region: None,
+            declared_zone: None,
+            quic_traffic,
+            blob_transfer: crate::CorePeerBlobStats::default(),
+        }
+    }
+
+    /// Every (level, protocol, direction) series of one ledger read.
+    fn series(
+        totals: &std::collections::BTreeMap<CoreLadderLevel, CoreQuicTraffic>,
+    ) -> std::collections::BTreeMap<(CoreLadderLevel, &'static str, bool), u64> {
+        let mut out = std::collections::BTreeMap::new();
+        for (level, traffic) in totals {
+            for (family, b) in traffic.iter() {
+                out.insert((*level, family.as_str(), true), b.quic_bytes_sent);
+                out.insert((*level, family.as_str(), false), b.quic_bytes_received);
+            }
+        }
+        out
+    }
+
+    /// TM-3: `aster.peer.bytes` grouped by level is an observable counter, so
+    /// no level series may drop. A peer moving level (and back), and a peer
+    /// leaving the views, must leave its bytes where they were counted.
+    #[test]
+    fn level_traffic_never_decreases_when_a_peer_changes_level() {
+        use CoreLadderLevel::{Far, SameLan, SameSite};
+        let mut ledger = LevelTrafficLedger::default();
+        let steps: Vec<Vec<CorePeerView>> = vec![
+            vec![
+                traffic_view("p", SameLan, 1_000, 10),
+                traffic_view("q", SameLan, 500, 0),
+            ],
+            vec![
+                traffic_view("p", SameLan, 4_000, 20),
+                traffic_view("q", SameLan, 600, 0),
+            ],
+            // p re-estimated: its 4 000 bytes so far stay under same_lan.
+            vec![
+                traffic_view("p", SameSite, 4_100, 25),
+                traffic_view("q", SameLan, 700, 0),
+            ],
+            vec![
+                traffic_view("p", Far, 4_200, 25),
+                traffic_view("q", SameLan, 700, 0),
+            ],
+            // Back to same_lan, then q leaves the views (expired).
+            vec![traffic_view("p", SameLan, 4_500, 30)],
+            vec![traffic_view("p", SameLan, 5_000, 30)],
+        ];
+        let mut prev = std::collections::BTreeMap::new();
+        for (i, views) in steps.iter().enumerate() {
+            let now = series(&ledger.observe(views));
+            for (key, before) in &prev {
+                let after = now.get(key).copied().unwrap_or(0);
+                assert!(
+                    after >= *before,
+                    "step {i}: series {key:?} fell {before} -> {after}"
+                );
+            }
+            prev = now;
+        }
+        // Nothing lost or double counted: the levels sum to the peers' totals.
+        let total: u64 = prev
+            .iter()
+            .filter(|((_, family, sent), _)| *family == "blobs" && !sent)
+            .map(|(_, n)| n)
+            .sum();
+        assert_eq!(total, 5_000 + 700);
+        assert_eq!(prev[&(SameLan, "blobs", false)], 4_000 + 700 + 800);
+        assert_eq!(prev[&(SameSite, "blobs", false)], 100);
+        assert_eq!(prev[&(Far, "blobs", false)], 100);
     }
 
     #[test]

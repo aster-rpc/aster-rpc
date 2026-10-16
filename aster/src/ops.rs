@@ -34,8 +34,9 @@
 //! (`aster.peer.bytes` by `aster.direction` sent/received and
 //! `aster.protocol`, grouped by `aster.locality.level`, or per peer as
 //! `aster.peer` with [`HealthConfig::peer_label_cap`]; needs monitoring).
-//! A level series is a sum over the peers currently at that level, so a peer
-//! changing level moves its bytes between series.
+//! Every series only grows: when a peer changes level, the bytes it exchanged
+//! so far stay under its old level and only its later bytes count under the
+//! new one.
 //!
 //! ```no_run
 //! # async fn run(node: aster::Node) -> aster::Result<()> {
@@ -499,35 +500,43 @@ type PeerSeries = (&'static str, String, &'static str, &'static str);
 
 /// `aster.peer.bytes` grouped into series. The group is the peer's locality
 /// level, or with peer labels its id (or [`OTHER_PEER`] past the cap).
+///
+/// Every series only grows. A level series comes from the node's level
+/// ledger, which leaves a peer's bytes under the level they were read at when
+/// the peer changes level, rather than summing the peers at each level now.
 fn peer_bytes(nodes: &[(Node, Option<usize>)]) -> BTreeMap<PeerSeries, u64> {
     let mut out = BTreeMap::new();
-    for (node, cap) in nodes {
-        for view in node.core().peer_views() {
-            let (key, group) = match cap {
-                None => ("aster.locality.level", view.level.as_str().to_string()),
-                Some(cap) => {
-                    let mut series = peer_series().lock().unwrap_or_else(|e| e.into_inner());
-                    let own = series.contains(&view.node_id)
-                        || (series.len() < *cap && series.insert(view.node_id.clone()));
-                    let group = if own {
-                        view.node_id.clone()
-                    } else {
-                        OTHER_PEER.to_string()
-                    };
-                    ("aster.peer", group)
-                }
-            };
-            for (family, bytes) in view.quic_traffic.iter() {
-                for (direction, n) in [
-                    ("sent", bytes.quic_bytes_sent),
-                    ("received", bytes.quic_bytes_received),
-                ] {
-                    if n > 0 {
-                        *out.entry((key, group.clone(), family.as_str(), direction))
-                            .or_default() += n;
-                    }
+    let mut add = |key, group: &str, traffic: &aster_transport_core::CoreQuicTraffic| {
+        for (family, bytes) in traffic.iter() {
+            for (direction, n) in [
+                ("sent", bytes.quic_bytes_sent),
+                ("received", bytes.quic_bytes_received),
+            ] {
+                if n > 0 {
+                    *out.entry((key, group.to_string(), family.as_str(), direction))
+                        .or_default() += n;
                 }
             }
+        }
+    };
+    for (node, cap) in nodes {
+        let Some(cap) = cap else {
+            for (level, traffic) in node.core().quic_traffic_by_level() {
+                add("aster.locality.level", level.as_str(), &traffic);
+            }
+            continue;
+        };
+        for view in node.core().peer_views() {
+            let mut series = peer_series().lock().unwrap_or_else(|e| e.into_inner());
+            let own = series.contains(&view.node_id)
+                || (series.len() < *cap && series.insert(view.node_id.clone()));
+            drop(series);
+            let group = if own {
+                view.node_id.as_str()
+            } else {
+                OTHER_PEER
+            };
+            add("aster.peer", group, &view.quic_traffic);
         }
     }
     out
