@@ -25,7 +25,6 @@ import inspect
 import json
 import logging
 import sys
-import time
 from typing import Any, AsyncIterator, Callable
 
 from aster._aster import DispatchServer, ServerCall
@@ -92,16 +91,39 @@ class ServerCallContext(CallContext):
         wire_id = call.wire_call_id
         d["call_id"] = str(wire_id) if wire_id else str(call.call_id)
         d["session_id"] = str(call.session_key) if call.session_key else None
-        d["peer"] = call.peer
+        d["principal"] = call.peer
         d["iroh_authenticated"] = bool(call.flags & FLAG_IROH_AUTHENTICATED)
-        secs = call.deadline_secs
-        d["deadline"] = time.time() + secs if secs > 0 else None
+        # The deadline Rust enforces (caller's, method timeout, handler
+        # timeout: the earliest), as Rust's `CallContext::deadline`.
+        ms = call.deadline_ms
+        d["deadline"] = ms / 1000.0 if ms > 0 else None
         d["is_streaming"] = method.streaming
         d["pattern"] = method.pattern
         d["idempotent"] = method.idempotent
         d["attempt"] = 1
         d["_call"] = call
         d["_gate"] = gate
+
+    @property  # type: ignore[override]
+    def peer(self) -> str | None:
+        """The transport's caller id (Rust ``CallContext::peer``): the
+        connection's remote endpoint id on Iroh, else the principal."""
+        d = self.__dict__
+        try:
+            return d["_peer"]
+        except KeyError:
+            v = d["_peer"] = d["_call"].transport_peer or d["principal"]
+            return v
+
+    @peer.setter
+    def peer(self, value: str | None) -> None:
+        self.__dict__["_peer"] = value
+
+    def is_cancelled(self) -> bool:  # noqa: D102 -- see CallContext
+        ev = self.__dict__.get("_cancel")
+        if ev is not None and ev.is_set():
+            return True
+        return self.expired or self.__dict__["_call"].cancelled
 
     def _lazy(self, key: str, make: Callable[[], Any]) -> Any:
         d = self.__dict__
@@ -139,7 +161,7 @@ class ServerCallContext(CallContext):
     def attributes(self) -> dict[str, str]:
         def make() -> dict[str, str]:
             gate = self.__dict__["_gate"]
-            peer = self.__dict__["peer"]
+            peer = self.__dict__["principal"]
             attrs = self.__dict__["_call"].attributes()
             if gate is not None and peer and self.__dict__["iroh_authenticated"]:
                 attrs.update(gate.attributes(peer))
@@ -191,7 +213,8 @@ class ServerCallContext(CallContext):
     def __repr__(self) -> str:
         return (
             f"ServerCallContext(service={self.service!r}, method={self.method!r}, "
-            f"call_id={self.call_id!r}, peer={self.peer!r}, pattern={self.pattern!r})"
+            f"call_id={self.call_id!r}, peer={self.peer!r}, "
+            f"principal={self.principal!r}, pattern={self.pattern!r})"
         )
 
 
@@ -292,6 +315,9 @@ class Dispatcher:
                 m.run = runners.get(m.pattern, self._unary)
             self._table.append(svc.methods)
         self._tasks: dict[int, asyncio.Task] = {}
+        # call_id -> the call's context while its handler runs, so a cancel
+        # event wakes `CallContext.cancelled()` waiters.
+        self._ctxs: dict[int, CallContext] = {}
         # Mirror of Rust's per-connection session accounting, from the
         # NEW_SESSION / SessionClosed / ConnectionClosed events (read by the
         # test-only `AsterServer.debug_connection_snapshot`):
@@ -368,15 +394,24 @@ class Dispatcher:
     def close(self) -> None:
         if self._server is not None:
             self._server.close()
+        for ctx in list(self._ctxs.values()):
+            ctx._mark_cancelled()
+        self._ctxs.clear()
         for task in list(self._tasks.values()):
             task.cancel()
 
-    async def drain(self, grace_period: float) -> None:
-        deadline = time.monotonic() + grace_period
-        while self._tasks and time.monotonic() < deadline:
-            await asyncio.sleep(0.05)
-        for task in list(self._tasks.values()):
-            task.cancel()
+    async def drain(self, grace_period: float) -> Any:
+        """Rust's server drain (`aster::rpc::ServerHandle::drain`); returns the
+        `DrainReport`, or `None` when the server never started. Calls still
+        running at the deadline are cancelled by Rust closing their
+        connection, which reaches their tasks as a peer cancel."""
+        if self._server is None:
+            return None
+        return await self._server.drain(max(0.0, float(grace_period)))
+
+    @property
+    def is_draining(self) -> bool:
+        return self._server is not None and self._server.is_draining
 
     # -- events ---------------------------------------------------------------
 
@@ -394,6 +429,9 @@ class Dispatcher:
     def _on_event(self, ev: tuple) -> None:
         kind = ev[0]
         if kind == EV_CANCELLED:
+            ctx = self._ctxs.pop(ev[1], None)
+            if ctx is not None:
+                ctx._mark_cancelled()
             task = self._tasks.get(ev[1])
             if task is not None:
                 task.cancel()
@@ -535,6 +573,7 @@ class Dispatcher:
                 self._fail(call, _INVALID_ARGUMENT, f"request does not decode: {e}")
                 return
             ctx = ServerCallContext(call, m, self._gate)
+            self._ctxs[call.call_id] = ctx
             interceptors = svc.interceptors
             if interceptors:
                 request = await apply_request_interceptors(interceptors, ctx, request)
@@ -558,10 +597,12 @@ class Dispatcher:
             self._fail_exc(call, e, "unary")
         finally:
             self._tasks.pop(call.call_id, None)
+            self._ctxs.pop(call.call_id, None)
 
     async def _server_stream(self, call: ServerCall, m: _Method) -> None:
         svc = m.service
         ctx = ServerCallContext(call, m, self._gate)
+        self._ctxs[call.call_id] = ctx
         interceptors = svc.interceptors
         token = None
         try:
@@ -595,10 +636,12 @@ class Dispatcher:
             if token is not None:
                 CallContext._current.reset(token)
             self._tasks.pop(call.call_id, None)
+            self._ctxs.pop(call.call_id, None)
 
     async def _client_stream(self, call: ServerCall, m: _Method) -> None:
         svc = m.service
         ctx = ServerCallContext(call, m, self._gate)
+        self._ctxs[call.call_id] = ctx
         interceptors = svc.interceptors
         token = None
         try:
@@ -622,10 +665,12 @@ class Dispatcher:
             if token is not None:
                 CallContext._current.reset(token)
             self._tasks.pop(call.call_id, None)
+            self._ctxs.pop(call.call_id, None)
 
     async def _bidi_stream(self, call: ServerCall, m: _Method) -> None:
         svc = m.service
         ctx = ServerCallContext(call, m, self._gate)
+        self._ctxs[call.call_id] = ctx
         interceptors = svc.interceptors
         token = None
         try:
@@ -653,6 +698,7 @@ class Dispatcher:
             if token is not None:
                 CallContext._current.reset(token)
             self._tasks.pop(call.call_id, None)
+            self._ctxs.pop(call.call_id, None)
 
     async def _stream_error(
         self, call: ServerCall, ctx: Any, interceptors: list[Any], exc: BaseException, where: str

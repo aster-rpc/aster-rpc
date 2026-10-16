@@ -19,9 +19,9 @@ use pyo3::types::PyTuple;
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use aster::topology::{
-    ClusterView as RsClusterView, LadderLevel, PeerView as RsPeerView, SeparationVerdict,
-    TopoConfig, Topology as RsTopology, TopologySnapshot as RsTopologySnapshot,
-    TopologySwarmOptions,
+    ClusterView as RsClusterView, LadderLevel, PeerBlobStats, PeerView as RsPeerView, QuicBytes,
+    QuicTraffic, SeparationVerdict, TopoConfig, Topology as RsTopology,
+    TopologySnapshot as RsTopologySnapshot, TopologySwarmOptions,
 };
 use aster::{NamespaceSecret, NodeId};
 
@@ -72,6 +72,40 @@ fn peer_out<'py>(py: Python<'py>, p: RsPeerView) -> PyResult<Bound<'py, PyAny>> 
         last_measured_unix_ms: p.last_measured_unix_ms,
         cluster_held_since_unix_ms: p.cluster_held_since_unix_ms,
         is_connected: p.is_connected,
+        quic_traffic: quic_traffic_out(py, &p.quic_traffic)?,
+        blob_transfer: peer_blob_stats_out(py, &p.blob_transfer)?,
+    })
+}
+
+fn quic_bytes_out(py: Python<'_>, b: QuicBytes) -> PyResult<Bound<'_, PyAny>> {
+    py_value!(py, "aster.topology", "QuicBytes" {
+        quic_bytes_sent: b.quic_bytes_sent,
+        quic_bytes_received: b.quic_bytes_received,
+    })
+}
+
+fn quic_traffic_out<'py>(py: Python<'py>, t: &QuicTraffic) -> PyResult<Bound<'py, PyAny>> {
+    py_value!(py, "aster.topology", "QuicTraffic" {
+        blobs: quic_bytes_out(py, t.blobs)?,
+        blobs_zstd: quic_bytes_out(py, t.blobs_zstd)?,
+        docs: quic_bytes_out(py, t.docs)?,
+        gossip: quic_bytes_out(py, t.gossip)?,
+        rpc: quic_bytes_out(py, t.rpc)?,
+        other: quic_bytes_out(py, t.other)?,
+    })
+}
+
+fn peer_blob_stats_out<'py>(py: Python<'py>, b: &PeerBlobStats) -> PyResult<Bound<'py, PyAny>> {
+    py_value!(py, "aster.topology", "PeerBlobStats" {
+        fetched_payload_bytes: b.fetched_payload_bytes,
+        fetched_zstd_payload_bytes: b.fetched_zstd_payload_bytes,
+        fetched_wire_bytes: b.fetched_wire_bytes,
+        fetched_plain_bytes: b.fetched_plain_bytes,
+        served_payload_bytes: b.served_payload_bytes,
+        served_zstd_payload_bytes: b.served_zstd_payload_bytes,
+        served_wire_bytes: b.served_wire_bytes,
+        served_plain_bytes: b.served_plain_bytes,
+        plain_fallbacks: b.plain_fallbacks,
     })
 }
 

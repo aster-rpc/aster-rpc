@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import asyncio
 
+import copy
 import inspect
+import math
 import time
-from typing import TYPE_CHECKING, Any, AsyncIterator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, AsyncIterator, Mapping
 
 from aster.codec import ForyCodec, ForyConfig
 from aster.interceptors.base import (
@@ -49,6 +52,57 @@ class ClientTimeoutError(ClientError):
     pass
 
 
+# ── Per-call options ─────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class CallOptions:
+    """Per-call options (Rust ``aster::rpc::CallOptions``), for every pattern.
+
+    Pass one per call (``await svc.get_status(req, options=opts)``) or bind
+    defaults to a client (``svc.with_options(opts)``, also on
+    :class:`aster.ProxyClient`). Explicit ``timeout=`` / ``metadata=``
+    arguments of a call win over its options, which win over the client's.
+
+    Attributes:
+        timeout: Relative deadline in seconds (sub-second values are kept);
+            ``None`` = no deadline. It travels in the stream header, and the
+            server enforces it with its method and handler timeouts.
+        metadata: Key/value headers sent with the call (merged over the
+            client's; the call's value wins for a shared key).
+        serialization_mode: Overrides the negotiated serialization mode.
+    """
+
+    timeout: float | None = None
+    metadata: Mapping[str, str] | None = None
+    serialization_mode: SerializationMode | None = None
+
+    def __post_init__(self) -> None:
+        t = self.timeout
+        if t is not None and (isinstance(t, bool) or not math.isfinite(float(t)) or t < 0):
+            raise ValueError(f"timeout must be a finite number of seconds >= 0, got {t!r}")
+
+    def merged(self, over: "CallOptions | None") -> "CallOptions":
+        """These options with ``over``'s set values on top (metadata merged)."""
+        if over is None:
+            return self
+        metadata: Mapping[str, str] | None = self.metadata
+        if over.metadata:
+            metadata = {**(self.metadata or {}), **over.metadata}
+        return CallOptions(
+            timeout=over.timeout if over.timeout is not None else self.timeout,
+            metadata=metadata,
+            serialization_mode=(
+                over.serialization_mode
+                if over.serialization_mode is not None
+                else self.serialization_mode
+            ),
+        )
+
+
+_NO_OPTIONS = CallOptions()
+
+
 # ── Client Stub Base ─────────────────────────────────────────────────────────
 
 
@@ -72,6 +126,36 @@ class ServiceClient:
         self._interceptors = list(interceptors) if interceptors else []
         self._request_cleanup_tasks: set[asyncio.Future[Any]] = set()
 
+    def with_options(self, options: CallOptions) -> "ServiceClient":
+        """A view of this client whose calls use ``options`` (merged over this
+        client's) by default. Shares the transport, codec and interceptors;
+        closing either closes the connection for both."""
+        view = copy.copy(self)
+        view._options = self._options.merged(options)
+        return view
+
+    @property
+    def options(self) -> CallOptions:
+        """The default :class:`CallOptions` of this client's calls."""
+        return self._options
+
+    def _resolve(
+        self,
+        metadata: dict[str, str] | None,
+        timeout: float | None,
+        serialization_override: SerializationMode | None,
+        options: CallOptions | None,
+    ) -> tuple[dict[str, str] | None, float, SerializationMode | None]:
+        """Effective (metadata, deadline seconds, serialization override):
+        explicit arguments > ``options`` > the client's options."""
+        o = self._options.merged(options)
+        if metadata is not None or timeout is not None or serialization_override is not None:
+            o = o.merged(CallOptions(
+                timeout=timeout, metadata=metadata, serialization_mode=serialization_override,
+            ))
+        md = dict(o.metadata) if o.metadata else None
+        return md, self._get_deadline(o.timeout), o.serialization_mode
+
     async def close(self) -> None:
         """Close the underlying transport if it exposes resources."""
         await self._transport.close()
@@ -86,17 +170,21 @@ class ServiceClient:
         """The service version."""
         return self._service_info.version
 
+    # Default call options (`with_options` sets a per-view copy).
+    _options: CallOptions = _NO_OPTIONS
+
     # Default set of modes the client can handle.  Covers all standard modes.
     _CLIENT_SUPPORTED_MODES: set[SerializationMode] = {
         SerializationMode.XLANG,
         SerializationMode.NATIVE,
     }
 
-    def _get_deadline(self, timeout: float | None) -> int:
-        """Convert a timeout (seconds) to relative deadline (seconds)."""
+    def _get_deadline(self, timeout: float | None) -> float:
+        """A timeout (seconds) as the transport's relative deadline (seconds,
+        sub-second kept; ``0`` = none)."""
         if timeout is None:
             return 0
-        return max(1, int(timeout))
+        return max(0.0, float(timeout))
 
     def _resolve_serialization_mode(
         self,
@@ -125,7 +213,7 @@ class ServiceClient:
         method_info: MethodInfo,
         *,
         metadata: dict[str, str] | None,
-        deadline_secs: int,
+        deadline_secs: float,
     ) -> CallContext:
         is_streaming = method_info.pattern != RpcPattern.UNARY
         return build_call_context(
@@ -243,9 +331,12 @@ class ServiceClient:
         metadata: dict[str, str] | None = None,
         timeout: float | None = None,
         serialization_override: SerializationMode | None = None,
+        options: CallOptions | None = None,
     ) -> Any:
         """Make a unary RPC call."""
-        deadline = self._get_deadline(timeout)
+        metadata, deadline, serialization_override = self._resolve(
+            metadata, timeout, serialization_override, options
+        )
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
@@ -269,9 +360,12 @@ class ServiceClient:
         metadata: dict[str, str] | None = None,
         timeout: float | None = None,
         serialization_override: SerializationMode | None = None,
+        options: CallOptions | None = None,
     ) -> AsyncIterator[Any]:
         """Make a server-streaming RPC call."""
-        deadline = self._get_deadline(timeout)
+        metadata, deadline, serialization_override = self._resolve(
+            metadata, timeout, serialization_override, options
+        )
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
@@ -304,9 +398,12 @@ class ServiceClient:
         metadata: dict[str, str] | None = None,
         timeout: float | None = None,
         serialization_override: SerializationMode | None = None,
+        options: CallOptions | None = None,
     ) -> Any:
         """Make one client-streaming attempt. Arbitrary AsyncIterator sources cannot be replayed safely."""
-        deadline = self._get_deadline(timeout)
+        metadata, deadline, serialization_override = self._resolve(
+            metadata, timeout, serialization_override, options
+        )
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
@@ -357,9 +454,12 @@ class ServiceClient:
         metadata: dict[str, str] | None = None,
         timeout: float | None = None,
         serialization_override: SerializationMode | None = None,
+        options: CallOptions | None = None,
     ) -> BidiChannel:
         """Make a bidirectional-streaming RPC call."""
-        deadline = self._get_deadline(timeout)
+        metadata, deadline, serialization_override = self._resolve(
+            metadata, timeout, serialization_override, options
+        )
         serialization_mode = self._resolve_serialization_mode(method_info, serialization_override)
 
         ctx = self._build_context(method_info, metadata=metadata, deadline_secs=deadline)
@@ -657,6 +757,7 @@ def _add_method_stub(
             metadata: dict[str, str] | None = None,
             timeout: float | None = None,
             serialization: SerializationMode | None = None,
+            options: CallOptions | None = None,
         ) -> Any:
             """Unary RPC call."""
             return await self._call_unary(
@@ -665,6 +766,7 @@ def _add_method_stub(
                 metadata=metadata,
                 timeout=timeout,
                 serialization_override=serialization,
+                options=options,
             )
 
     elif method_info.pattern == RpcPattern.SERVER_STREAM:
@@ -675,6 +777,7 @@ def _add_method_stub(
             metadata: dict[str, str] | None = None,
             timeout: float | None = None,
             serialization: SerializationMode | None = None,
+            options: CallOptions | None = None,
         ) -> AsyncIterator[Any]:
             """Server-streaming RPC call."""
             return self._call_server_stream(
@@ -683,6 +786,7 @@ def _add_method_stub(
                 metadata=metadata,
                 timeout=timeout,
                 serialization_override=serialization,
+                options=options,
             )
 
     elif method_info.pattern == RpcPattern.CLIENT_STREAM:
@@ -693,6 +797,7 @@ def _add_method_stub(
             metadata: dict[str, str] | None = None,
             timeout: float | None = None,
             serialization: SerializationMode | None = None,
+            options: CallOptions | None = None,
         ) -> Any:
             """Client-streaming RPC call."""
             return await self._call_client_stream(
@@ -701,6 +806,7 @@ def _add_method_stub(
                 metadata=metadata,
                 timeout=timeout,
                 serialization_override=serialization,
+                options=options,
             )
 
     elif method_info.pattern == RpcPattern.BIDI_STREAM:
@@ -710,6 +816,7 @@ def _add_method_stub(
             metadata: dict[str, str] | None = None,
             timeout: float | None = None,
             serialization: SerializationMode | None = None,
+            options: CallOptions | None = None,
         ) -> BidiChannel:
             """Bidirectional-streaming RPC call."""
             return self._call_bidi_stream(
@@ -717,6 +824,7 @@ def _add_method_stub(
                 metadata=metadata,
                 timeout=timeout,
                 serialization_override=serialization,
+                options=options,
             )
 
     else:

@@ -137,7 +137,7 @@ class IrohTransport(Transport):
         request: Any,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_secs: int = 0,
+        deadline_secs: float = 0,
         serialization_mode: int | None = None,
     ) -> Any:
         response = await self._client.unary(
@@ -165,7 +165,7 @@ class IrohTransport(Transport):
         request: Any,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_secs: int = 0,
+        deadline_secs: float = 0,
         serialization_mode: int | None = None,
     ) -> AsyncIterator[Any]:
         return self._server_stream_impl(
@@ -179,7 +179,7 @@ class IrohTransport(Transport):
         method: str,
         request: Any,
         metadata: dict[str, str] | None,
-        deadline_secs: int,
+        deadline_secs: float,
         serialization_mode: int,
     ) -> AsyncIterator[Any]:
         stream = await self._client.server_stream(
@@ -213,7 +213,7 @@ class IrohTransport(Transport):
         requests: AsyncIterator[Any],
         *,
         metadata: dict[str, str] | None = None,
-        deadline_secs: int = 0,
+        deadline_secs: float = 0,
         serialization_mode: int | None = None,
     ) -> Any:
         """Send incrementally; native completion never waits for an arbitrary source.
@@ -363,7 +363,7 @@ class IrohTransport(Transport):
         method: str,
         *,
         metadata: dict[str, str] | None = None,
-        deadline_secs: int = 0,
+        deadline_secs: float = 0,
         serialization_mode: int | None = None,
     ) -> BidiChannel:
         return IrohBidiChannel(
@@ -387,7 +387,7 @@ class IrohBidiChannel(BidiChannel):
         service: str,
         method: str,
         metadata: dict[str, str] | None,
-        deadline_secs: int,
+        deadline_secs: float,
         serialization_mode: int,
     ) -> None:
         self._transport = transport

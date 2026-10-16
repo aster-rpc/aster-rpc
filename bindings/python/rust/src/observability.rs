@@ -653,17 +653,20 @@ async fn stop_owned_health(
 
 #[pymethods]
 impl HealthServer {
-    /// `await HealthServer.start(node, host="127.0.0.1", port=0)`. Port `0`
-    /// binds an ephemeral port (see `port`). Joins, or starts from the
-    /// environment, the observability pipeline and gives it the Prometheus
-    /// pull reader.
+    /// `await HealthServer.start(node, host="127.0.0.1", port=0, peer_label_cap=None)`.
+    /// Port `0` binds an ephemeral port (see `port`). Joins, or starts from
+    /// the environment, the observability pipeline and gives it the
+    /// Prometheus pull reader. `peer_label_cap` labels `aster.peer.bytes` per
+    /// peer for the first `cap` peers (`[metrics] peer_labels`); `None`
+    /// groups by locality level.
     #[staticmethod]
-    #[pyo3(signature = (node, host="127.0.0.1".to_string(), port=0))]
+    #[pyo3(signature = (node, host="127.0.0.1".to_string(), port=0, peer_label_cap=None))]
     fn start<'py>(
         py: Python<'py>,
         node: PyRef<'py, Node>,
         host: String,
         port: u16,
+        peer_label_cap: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
         ensure_tokio_runtime();
         // Python's own start (log bridge on, exporters per OTEL_*) first, so a
@@ -674,7 +677,11 @@ impl HealthServer {
             .call_method0("ensure_started")?;
         let node = node.inner.clone();
         future_into_py(py, async move {
-            aster::ops::HealthServer::start(&node, HealthConfig::new(host, port))
+            let mut config = HealthConfig::new(host, port);
+            if let Some(cap) = peer_label_cap {
+                config = config.with_peer_labels(cap);
+            }
+            aster::ops::HealthServer::start(&node, config)
                 .await
                 .map(|s| HealthServer {
                     state: s.state(),

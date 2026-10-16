@@ -9,7 +9,13 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import json
 from os import PathLike
-from typing import Any
+from typing import Any, AsyncIterator
+
+from ._aster import AUDIT_ACK_PAGE_MAX
+
+#: How long one :meth:`AuditOutbox.watch_acknowledgements` wait lasts before
+#: it asks again (the iterator itself never ends on a quiet log).
+_WATCH_WAIT_S = 30.0
 
 
 class AuditOutboxError(Exception):
@@ -33,6 +39,11 @@ class AuditOutboxConfig:
     destination: AuditDestination
     max_retained_bytes: int = 256 * 1024 * 1024
     max_event_bytes: int = 64 * 1024
+    #: Most acknowledgement-log entries retained (oldest pruned first); 0
+    #: disables the log.
+    acknowledgement_log_max_entries: int = 100_000
+    #: Entries acknowledged longer ago are pruned; 0 removes the age bound.
+    acknowledgement_log_max_age_ms: int = 7 * 24 * 60 * 60 * 1000
 
 
 @dataclass(frozen=True)
@@ -92,6 +103,21 @@ class AuditDispositionReceipt:
 
 
 @dataclass(frozen=True)
+class AuditAcknowledgement:
+    """One receiver acknowledgement, recorded in the same durable transaction
+    that deleted the acknowledged record. ``cursor`` increases with each
+    entry and is never reused: resume after the last one seen."""
+
+    cursor: int
+    event_id: str
+    sequence: int
+    #: The batch digest the receiver echoed in its durable acknowledgement.
+    batch_id: str
+    #: Local Unix milliseconds when the acknowledgement was committed.
+    acknowledged_at_ms: int
+
+
+@dataclass(frozen=True)
 class AuditQuarantineExport:
     event_id: str
     envelope_base64: str
@@ -110,6 +136,10 @@ def _json(value: Any) -> str:
 
 def _delivery(value: dict | None) -> AuditDeliveryError | None:
     return AuditDeliveryError(**value) if value is not None else None
+
+
+def _acks(text: str) -> list[AuditAcknowledgement]:
+    return [AuditAcknowledgement(**value) for value in json.loads(text)]
 
 
 class AuditOutbox:
@@ -159,6 +189,38 @@ class AuditOutbox:
             receipts.append(AuditDispositionReceipt(**receipt))
         value["receipts"] = tuple(receipts)
         return AuditQuarantineExport(**value)
+
+    async def acknowledgements(
+        self, after: int = 0, limit: int = 100
+    ) -> list[AuditAcknowledgement]:
+        """Up to ``limit`` (1..``AUDIT_ACK_PAGE_MAX``) acknowledgement-log
+        entries with a cursor greater than ``after``, oldest first. Pass 0 to
+        start from the oldest retained entry and the last ``cursor`` to
+        continue. Entries are pruned by count and age; a consumer that falls
+        behind sees a gap in cursors, never a reordering."""
+        return _acks(await self._native.acknowledgements(after, limit))
+
+    async def wait_acknowledgements(
+        self, after: int = 0, limit: int = 100, timeout: float = 30.0
+    ) -> list[AuditAcknowledgement]:
+        """:meth:`acknowledgements`, but when nothing follows ``after`` yet,
+        wait up to ``timeout`` seconds for the next committed one. Returns an
+        empty list on timeout."""
+        return _acks(await self._native.wait_acknowledgements(after, limit, timeout))
+
+    async def watch_acknowledgements(
+        self, after: int = 0
+    ) -> AsyncIterator[AuditAcknowledgement]:
+        """Every acknowledgement with a cursor greater than ``after``, as it is
+        committed: a lossless live feed (``async for ack in
+        outbox.watch_acknowledgements(last_cursor)``). Ends with
+        :class:`AuditOutboxError` when the outbox fails or closes; stop by
+        breaking out or cancelling the task."""
+        while True:
+            page = await self.wait_acknowledgements(after, AUDIT_ACK_PAGE_MAX, _WATCH_WAIT_S)
+            for ack in page:
+                after = ack.cursor
+                yield ack
 
     async def replay(self, event_id: str) -> None:
         await self._native.replay(event_id)

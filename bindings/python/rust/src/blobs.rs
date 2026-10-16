@@ -212,14 +212,39 @@ pub struct ProviderOutcome {
     /// Requests it carried to completion.
     #[pyo3(get)]
     completed_requests: u32,
+    /// Requests mid-attempt when the report was taken (0 in a finished
+    /// fetch's report).
+    #[pyo3(get)]
+    in_flight: u32,
+    /// Attempts that went over plain transport because the provider does not
+    /// serve zstd. A capability, not a failure.
+    #[pyo3(get)]
+    plain_fallbacks: u32,
+    /// Payload bytes this provider carried (failed attempts included). Summed
+    /// over all providers, this is the report's `bytes_transferred`.
+    #[pyo3(get)]
+    bytes_transferred: u64,
+    /// Compressed bytes received from it over zstd; `None` when every attempt
+    /// went over plain transport.
+    #[pyo3(get)]
+    wire_bytes: Option<u64>,
 }
 
 #[pymethods]
 impl ProviderOutcome {
     fn __repr__(&self) -> String {
         format!(
-            "ProviderOutcome(node_id='{}', attempts={}, failures={}, completed_requests={})",
-            self.node_id.hex, self.attempts, self.failures, self.completed_requests
+            "ProviderOutcome(node_id='{}', attempts={}, failures={}, completed_requests={}, \
+             in_flight={}, plain_fallbacks={}, bytes_transferred={}, wire_bytes={})",
+            self.node_id.hex,
+            self.attempts,
+            self.failures,
+            self.completed_requests,
+            self.in_flight,
+            self.plain_fallbacks,
+            self.bytes_transferred,
+            self.wire_bytes
+                .map_or_else(|| "None".to_string(), |w| w.to_string())
         )
     }
 }
@@ -244,6 +269,10 @@ impl From<aster::FetchReport> for FetchReport {
                     attempts: p.attempts(),
                     failures: p.failures(),
                     completed_requests: p.completed_requests(),
+                    in_flight: p.in_flight(),
+                    plain_fallbacks: p.plain_fallbacks(),
+                    bytes_transferred: p.bytes_transferred(),
+                    wire_bytes: p.wire_bytes(),
                 })
                 .collect(),
             bytes_transferred: r.bytes_transferred(),
@@ -282,11 +311,155 @@ impl FetchReport {
             .collect()
     }
 
+    /// Providers mid-attempt when the report was taken (empty for a finished
+    /// fetch).
+    fn in_flight(&self) -> Vec<NodeId> {
+        self.providers
+            .iter()
+            .filter(|p| p.in_flight > 0)
+            .map(|p| p.node_id.clone())
+            .collect()
+    }
+
+    /// Providers that do not serve zstd and were fetched from (or tried) over
+    /// plain transport. Cache them as plain-only rather than ranking them down.
+    fn plain_only(&self) -> Vec<NodeId> {
+        self.providers
+            .iter()
+            .filter(|p| p.plain_fallbacks > 0)
+            .map(|p| p.node_id.clone())
+            .collect()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "FetchReport(providers={}, bytes_transferred={})",
             self.providers.len(),
             self.bytes_transferred
+        )
+    }
+}
+
+/// Finished blob transfers by encoding and result
+/// (`aster::BlobTransferCounts`).
+#[pyclass(frozen, skip_from_py_object, module = "aster._aster")]
+#[derive(Clone, Copy)]
+pub struct BlobTransferCounts {
+    #[pyo3(get)]
+    plain_ok: u64,
+    #[pyo3(get)]
+    plain_failed: u64,
+    #[pyo3(get)]
+    zstd_ok: u64,
+    #[pyo3(get)]
+    zstd_failed: u64,
+}
+
+impl From<aster::BlobTransferCounts> for BlobTransferCounts {
+    fn from(c: aster::BlobTransferCounts) -> Self {
+        Self {
+            plain_ok: c.plain_ok,
+            plain_failed: c.plain_failed,
+            zstd_ok: c.zstd_ok,
+            zstd_failed: c.zstd_failed,
+        }
+    }
+}
+
+#[pymethods]
+impl BlobTransferCounts {
+    fn __repr__(&self) -> String {
+        format!(
+            "BlobTransferCounts(plain_ok={}, plain_failed={}, zstd_ok={}, zstd_failed={})",
+            self.plain_ok, self.plain_failed, self.zstd_ok, self.zstd_failed
+        )
+    }
+}
+
+/// Node-wide blob transfer counters since the node started, both directions
+/// (`aster::BlobTransferStats`). Monotonic. Payload is blob content as
+/// decoded; compression coverage is `*_zstd_payload_bytes / *_payload_bytes`
+/// and its saving `*_plain_bytes - *_wire_bytes`.
+#[pyclass(frozen, skip_from_py_object, module = "aster._aster")]
+#[derive(Clone, Copy)]
+pub struct BlobTransferStats {
+    /// Payload bytes fetched, plain and zstd.
+    #[pyo3(get)]
+    fetched_payload_bytes: u64,
+    /// The part of `fetched_payload_bytes` that came over zstd.
+    #[pyo3(get)]
+    fetched_zstd_payload_bytes: u64,
+    /// Compressed bytes received while fetching over zstd.
+    #[pyo3(get)]
+    fetched_wire_bytes: u64,
+    /// Protocol bytes those decompressed to.
+    #[pyo3(get)]
+    fetched_plain_bytes: u64,
+    /// Payload bytes served, plain and zstd.
+    #[pyo3(get)]
+    served_payload_bytes: u64,
+    /// The part of `served_payload_bytes` that went out over zstd.
+    #[pyo3(get)]
+    served_zstd_payload_bytes: u64,
+    /// Compressed bytes sent while serving over zstd.
+    #[pyo3(get)]
+    served_wire_bytes: u64,
+    /// Protocol bytes those were compressed from.
+    #[pyo3(get)]
+    served_plain_bytes: u64,
+    /// Fetch attempts that went plain because the provider has no zstd.
+    #[pyo3(get)]
+    plain_fallbacks: u64,
+    /// Requests served over plain transport.
+    #[pyo3(get)]
+    plain_serves: u64,
+    /// Fetch attempts by encoding and result.
+    #[pyo3(get)]
+    fetch_transfers: BlobTransferCounts,
+    /// Served requests by encoding and result.
+    #[pyo3(get)]
+    serve_transfers: BlobTransferCounts,
+    /// Fetched zstd streams that failed on malformed zstd data.
+    #[pyo3(get)]
+    fetch_decode_errors: u64,
+    /// Served zstd streams that failed the same way.
+    #[pyo3(get)]
+    serve_decode_errors: u64,
+}
+
+impl From<aster::BlobTransferStats> for BlobTransferStats {
+    fn from(s: aster::BlobTransferStats) -> Self {
+        Self {
+            fetched_payload_bytes: s.fetched_payload_bytes,
+            fetched_zstd_payload_bytes: s.fetched_zstd_payload_bytes,
+            fetched_wire_bytes: s.fetched_wire_bytes,
+            fetched_plain_bytes: s.fetched_plain_bytes,
+            served_payload_bytes: s.served_payload_bytes,
+            served_zstd_payload_bytes: s.served_zstd_payload_bytes,
+            served_wire_bytes: s.served_wire_bytes,
+            served_plain_bytes: s.served_plain_bytes,
+            plain_fallbacks: s.plain_fallbacks,
+            plain_serves: s.plain_serves,
+            fetch_transfers: s.fetch_transfers.into(),
+            serve_transfers: s.serve_transfers.into(),
+            fetch_decode_errors: s.fetch_decode_errors,
+            serve_decode_errors: s.serve_decode_errors,
+        }
+    }
+}
+
+#[pymethods]
+impl BlobTransferStats {
+    fn __repr__(&self) -> String {
+        format!(
+            "BlobTransferStats(fetched_payload_bytes={}, served_payload_bytes={}, \
+             fetched_wire_bytes={}, served_wire_bytes={}, plain_fallbacks={}, plain_serves={})",
+            self.fetched_payload_bytes,
+            self.served_payload_bytes,
+            self.fetched_wire_bytes,
+            self.served_wire_bytes,
+            self.plain_fallbacks,
+            self.plain_serves
         )
     }
 }
@@ -312,6 +485,12 @@ pub struct BlobsClient {
 
 #[pymethods]
 impl BlobsClient {
+    /// Node-wide blob transfer counters (fetch and serve side, plain and
+    /// zstd) since the node started: `aster::Blobs::transfer_stats`.
+    fn transfer_stats(&self) -> BlobTransferStats {
+        self.sdk.transfer_stats().into()
+    }
+
     /// Store bytes and return the BLAKE3 hash as a hex string.
     fn add_bytes<'py>(&self, py: Python<'py>, data: Vec<u8>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.inner.clone();
@@ -853,6 +1032,8 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<FetchStrategy>()?;
     m.add_class::<FetchReport>()?;
     m.add_class::<ProviderOutcome>()?;
+    m.add_class::<BlobTransferStats>()?;
+    m.add_class::<BlobTransferCounts>()?;
     m.add_function(wrap_pyfunction!(blobs_client, m)?)?;
     Ok(())
 }

@@ -207,7 +207,7 @@ def _build_ctx(conn, *, flags=0):
     from aster._dispatch import ServerCallContext
 
     call = SimpleNamespace(
-        wire_call_id=0, call_id=1, session_key=0, peer="peer", deadline_secs=0,
+        wire_call_id=0, call_id=1, session_key=0, peer="peer", deadline_ms=0,
         flags=flags, connection=lambda: conn,
     )
     method = SimpleNamespace(

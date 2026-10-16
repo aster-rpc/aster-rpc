@@ -342,13 +342,17 @@ class Server:
             self._serve_task = None
             self._shutdown_event.set()
 
-    async def drain(self, grace_period: float = 10.0) -> None:
-        """Gracefully drain the server: wait up to ``grace_period`` seconds
-        for in-flight handlers, then cancel the rest."""
+    async def drain(self, grace_period: float = 10.0) -> Any:
+        """Gracefully drain the server (Rust `aster::rpc::ServerHandle::drain`):
+        refuse new connections and calls, let in-flight calls (and calls on
+        live sessions) finish for up to ``grace_period`` seconds, then cancel
+        the rest. Returns the `DrainReport` (`None` if never started)."""
         logger.info("Draining server (grace period: %.1fs)", grace_period)
+        report = None
         if self._dispatcher is not None:
-            await self._dispatcher.drain(grace_period)
-        logger.info("Drain complete")
+            report = await self._dispatcher.drain(grace_period)
+        logger.info("Drain complete: %r", report)
+        return report
 
     async def close(self) -> None:
         """Stop serving and cancel in-flight handlers."""

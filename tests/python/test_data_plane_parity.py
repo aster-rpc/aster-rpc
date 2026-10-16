@@ -23,6 +23,8 @@ from aster import (
     AuthorityFingerprint,
     AuthorityReport,
     BlobFormat,
+    BlobTransferCounts,
+    BlobTransferStats,
     DownloadPolicy,
     FetchReport,
     FetchStrategy,
@@ -138,10 +140,79 @@ async def test_download_hash_from_returns_fetch_report(pair):
     assert outcome.node_id == a.id
     assert outcome.attempts >= 1 and outcome.failures == 0
     assert outcome.completed_requests >= 1
+    # Per-provider bytes (Rust ProviderOutcome): the sole provider carried
+    # the whole transfer; a finished fetch has nothing in flight.
+    assert outcome.bytes_transferred == report.bytes_transferred
+    assert outcome.in_flight == 0
+    assert report.in_flight() == []
+    # Both nodes serve zstd by default, so the wire bytes are reported.
+    assert outcome.plain_fallbacks == 0 and report.plain_only() == []
+    assert outcome.wire_bytes is not None and outcome.wire_bytes > 0
 
     # Already resident: nothing re-fetched.
     report2 = await dst.download_hash_to_store_from(h, [a.node_id()])
     assert report2.bytes_transferred == 0
+
+
+@pytest.mark.asyncio
+async def test_transfer_stats_count_both_sides(pair):
+    a, b = pair
+    src, dst = blobs_client(a), blobs_client(b)
+    before = dst.transfer_stats()
+    assert isinstance(before, BlobTransferStats)
+    data = os.urandom(50_000)
+    h = await src.add_bytes(data)
+    await dst.download_hash_from(h, [a.id])
+    fetched = dst.transfer_stats()
+    assert fetched.fetched_payload_bytes - before.fetched_payload_bytes >= len(data)
+    assert fetched.fetched_zstd_payload_bytes >= len(data)
+    assert fetched.fetched_wire_bytes > 0
+    assert isinstance(fetched.fetch_transfers, BlobTransferCounts)
+    assert fetched.fetch_transfers.zstd_ok >= 1
+    assert fetched.fetch_decode_errors == 0
+    served = src.transfer_stats()
+    assert served.served_payload_bytes >= len(data)
+    assert served.serve_transfers.zstd_ok >= 1
+
+
+@pytest.mark.asyncio
+async def test_peer_view_traffic_and_blob_transfer():
+    from aster import AsterConfig, PeerBlobStats, QuicTraffic
+
+    cfg = AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0", enable_monitoring=True)
+    a = await Node.start(cfg)
+    b = await Node.start(cfg)
+    try:
+        for _ in range(200):
+            if a.node_addr_info().direct_addresses and b.node_addr_info().direct_addresses:
+                break
+            await asyncio.sleep(0.01)
+        a.add_node_addr(b)
+        b.add_node_addr(a)
+        data = os.urandom(40_000)
+        h = await blobs_client(a).add_bytes(data)
+        await blobs_client(b).download_hash_from(h, [a.id])
+
+        async def until_counted():
+            while True:
+                view = b.topology().peer(a.id)
+                if (
+                    view is not None
+                    and view.blob_transfer.fetched_payload_bytes >= len(data)
+                    and view.quic_traffic.blobs_zstd.quic_bytes_received > 0
+                ):
+                    return view
+                await asyncio.sleep(0.05)
+
+        view = await asyncio.wait_for(until_counted(), 20)
+        assert isinstance(view.quic_traffic, QuicTraffic)
+        assert isinstance(view.blob_transfer, PeerBlobStats)
+        assert view.blob_transfer.fetched_wire_bytes > 0
+        total = view.quic_traffic.total()
+        assert total.quic_bytes_received >= view.quic_traffic.blobs_zstd.quic_bytes_received
+    finally:
+        await a.shutdown()
+        await b.shutdown()
 
 
 @pytest.mark.asyncio

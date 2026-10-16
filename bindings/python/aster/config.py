@@ -118,6 +118,8 @@ def _toml_section(name: str) -> str:
         return "[identity]"
     if name.startswith("health_"):
         return "[health]"
+    if name.startswith("metrics_"):
+        return "[metrics]"
     return "[network]"
 
 
@@ -343,6 +345,43 @@ class AsterConfig:
     relay_mode: str = "default"
     relay_urls: tuple[str, ...] = ()
     bind_addr: str | None = None
+    """IPv4 (or any-family) UDP bind address, e.g. ``"0.0.0.0:7842"``
+    (``ASTER_BIND_ADDR``)."""
+    bind_addr_v6: str | None = None
+    """IPv6 UDP bind address, e.g. ``"[::]:7842"`` (``ASTER_BIND_ADDR_V6``,
+    TOML ``[network] bind_addr_v6``): pins the IPv6 socket as ``bind_addr``
+    pins the IPv4 one, so a default-deny NetworkPolicy can allow one UDP port
+    per family. ``bind_addr`` must then be IPv4 (or unset); a host without
+    IPv6 fails to start with it set."""
+    advertise_addrs: tuple[str, ...] = ()
+    """Extra direct ``IP:port`` addresses the node is reachable on but cannot
+    discover itself (a Kubernetes NodePort, a load balancer), published with
+    the discovered ones (``ASTER_ADVERTISE_ADDRS``, comma-separated; TOML
+    ``[network] advertise_addrs``). Hints only: peers still verify the node
+    key in the TLS handshake. Requires direct IP transports."""
+    relay_ca_certs: tuple[str, ...] = ()
+    """PEM files trusted for relay TLS (and custom discovery's pkarr relays)
+    beside the WebPKI roots: for a self-hosted relay with a private-CA
+    certificate (``ASTER_RELAY_CA_CERTS``, comma-separated; TOML ``[network]
+    relay_ca_certs``). Transport security for the relay hop only."""
+    relay_ca_only: bool = False
+    """Trust only ``relay_ca_certs`` for relay TLS, not the WebPKI roots
+    (``ASTER_RELAY_CA_ONLY``)."""
+    discovery: str = "default"
+    """Address lookup for finding peers by bare node ID (``ASTER_DISCOVERY``,
+    TOML ``[network] discovery``): ``"default"`` (n0 pkarr + DNS at
+    ``iroh.link``, the only mode that contacts n0), ``"none"`` (dial by full
+    address only), ``"local"`` (mDNS only; turns ``local_discovery`` on) or
+    ``"custom"`` (only ``discovery_dns_origin`` / ``discovery_pkarr_relays``).
+    Setting either server selects ``"custom"``. Relays are separate: an
+    air-gapped node also sets ``relay_mode``."""
+    discovery_dns_origin: str | None = None
+    """DNS origin for custom discovery, e.g. ``"dns.example.internal"``
+    (``ASTER_DISCOVERY_DNS_ORIGIN``)."""
+    discovery_pkarr_relays: tuple[str, ...] = ()
+    """Pkarr relay URLs for custom discovery, e.g.
+    ``"https://dns.example.internal/pkarr"`` (``ASTER_DISCOVERY_PKARR_RELAYS``,
+    comma-separated)."""
     reuse_last_port: bool = True
     """On a persistent node, re-bind the UDP ports it last bound when they are
     still free (``ASTER_REUSE_LAST_PORT``, TOML ``[network] reuse_last_port``).
@@ -388,6 +427,18 @@ class AsterConfig:
     health_enabled: bool | None = None
     """Force the listener on or off; ``None`` enables it when ``health_port != 0``."""
 
+    # -- Metrics ([metrics]) ---------------------------------------------------
+    metrics_peer_labels: bool = False
+    """Label ``aster.peer.bytes`` per peer (``aster.peer``) instead of by
+    locality level (``ASTER_METRICS_PEER_LABELS``, TOML ``[metrics]
+    peer_labels``). For small fleets and debugging: the first
+    ``metrics_peer_label_cap`` peers keep their own series for the life of
+    the process, later peers count under ``_OTHER``. Applied by the ops
+    listener."""
+    metrics_peer_label_cap: int = 64
+    """How many peers get their own series with ``metrics_peer_labels``
+    (``ASTER_METRICS_PEER_LABEL_CAP``, TOML ``[metrics] peer_label_cap``)."""
+
     # -- Credentials ---------------------------------------------------------
     identity_file: str | None = None
     """``.aster-identity`` credential file (default: ``./.aster-identity``)."""
@@ -414,6 +465,11 @@ class AsterConfig:
             "secret_key_file", "identity_file",
         ):
             raw[name] = _path_or_none(raw[name])
+        for name in ("advertise_addrs", "relay_ca_certs", "discovery_pkarr_relays"):
+            value = raw[name]
+            if value is None or isinstance(value, str):
+                continue
+            raw[name] = [os.fspath(v) for v in value]
         if isinstance(raw["relay_urls"], str):
             raw["relay_urls"] = [raw["relay_urls"]]
         raw["relay_urls"] = list(raw["relay_urls"] or ())
@@ -439,7 +495,10 @@ class AsterConfig:
     def _adopt(self, native: NativeAsterConfig) -> None:
         """Set every field to the canonical value of the Rust config."""
         for name, value in native.to_dict().items():
-            if name in ("relay_urls", "alpns", "root_rotations"):
+            if name in (
+                "relay_urls", "alpns", "root_rotations", "advertise_addrs",
+                "relay_ca_certs", "discovery_pkarr_relays",
+            ):
                 value = tuple(value)
             elif name == "enrollment":
                 value = EnrollmentConfig._from_native(value)
@@ -605,6 +664,16 @@ class AsterConfig:
                 ("relay_mode", self.relay_mode),
                 ("relay_urls", ", ".join(self.relay_urls) or "<none>"),
                 ("bind_addr", self.bind_addr or "<any>"),
+                ("bind_addr_v6", self.bind_addr_v6 or "<any>"),
+                ("advertise_addrs", ", ".join(self.advertise_addrs) or "<none>"),
+                ("relay_ca_certs", ", ".join(self.relay_ca_certs) or "<none>"),
+                ("relay_ca_only", self.relay_ca_only),
+                ("discovery", self.discovery),
+                ("discovery_dns_origin", self.discovery_dns_origin or "<not set>"),
+                (
+                    "discovery_pkarr_relays",
+                    ", ".join(self.discovery_pkarr_relays) or "<none>",
+                ),
                 ("reuse_last_port", self.reuse_last_port),
                 ("local_discovery", self.local_discovery),
                 ("enable_monitoring", self.enable_monitoring),
@@ -616,6 +685,10 @@ class AsterConfig:
                     "transport_enable_segmentation_offload",
                     _or(self.transport_enable_segmentation_offload, "<default>"),
                 ),
+            ],
+            "metrics": [
+                ("metrics_peer_labels", self.metrics_peer_labels),
+                ("metrics_peer_label_cap", self.metrics_peer_label_cap),
             ],
             "storage": [
                 ("path", self.storage_path or "<in-memory>"),

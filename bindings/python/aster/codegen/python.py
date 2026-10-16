@@ -579,7 +579,7 @@ def _gen_service_client(
                 else:
                     sig_parts.append(f"{pname}: {ptype}")
             sig_parts.append("*")
-            sig_parts.append("timeout: float | None = None")
+            sig_parts.append("timeout: float | None = None, metadata: dict[str, str] | None = None, options: CallOptions | None = None")
             sig = ", ".join(sig_parts)
             # Body: construct the synthesized request object
             kwargs = ", ".join(f"{ip.get('name', 'arg')}={ip.get('name', 'arg')}" for ip in inline_params)
@@ -599,16 +599,20 @@ def _gen_service_client(
                 lines.append(f"            method_info=self._mi_{mname},")
                 lines.append(f"            request={ctor},")
                 lines.append(f"            timeout=timeout,")
+                lines.append(f"            metadata=metadata,")
+                lines.append(f"            options=options,")
                 lines.append(f"        )")
             else:
                 lines.append(f"    async def {mname}(")
-                lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None")
+                lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None, metadata: dict[str, str] | None = None, options: CallOptions | None = None")
                 lines.append(f"    ) -> {resp_cls}:")
                 lines.extend(doc_lines)
                 lines.append(f"        return await self._call_unary(")
                 lines.append(f"            method_info=self._mi_{mname},")
                 lines.append(f"            request=request,")
                 lines.append(f"            timeout=timeout,")
+                lines.append(f"            metadata=metadata,")
+                lines.append(f"            options=options,")
                 lines.append(f"        )")
 
         elif pattern == "server_stream":
@@ -622,37 +626,45 @@ def _gen_service_client(
                 lines.append(f"            method_info=self._mi_{mname},")
                 lines.append(f"            request={ctor},")
                 lines.append(f"            timeout=timeout,")
+                lines.append(f"            metadata=metadata,")
+                lines.append(f"            options=options,")
                 lines.append(f"        )")
             else:
                 lines.append(f"    def {mname}(")
-                lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None")
+                lines.append(f"        self, request: {req_cls}, *, timeout: float | None = None, metadata: dict[str, str] | None = None, options: CallOptions | None = None")
                 lines.append(f"    ) -> AsyncIterator[{resp_cls}]:")
                 lines.extend(doc_lines)
                 lines.append(f"        return self._call_server_stream(")
                 lines.append(f"            method_info=self._mi_{mname},")
                 lines.append(f"            request=request,")
                 lines.append(f"            timeout=timeout,")
+                lines.append(f"            metadata=metadata,")
+                lines.append(f"            options=options,")
                 lines.append(f"        )")
 
         elif pattern == "client_stream":
             lines.append(f"    async def {mname}(")
-            lines.append(f"        self, requests: AsyncIterator[{req_cls}], *, timeout: float | None = None")
+            lines.append(f"        self, requests: AsyncIterator[{req_cls}], *, timeout: float | None = None, metadata: dict[str, str] | None = None, options: CallOptions | None = None")
             lines.append(f"    ) -> {resp_cls}:")
             lines.extend(doc_lines)
             lines.append(f"        return await self._call_client_stream(")
             lines.append(f"            method_info=self._mi_{mname},")
             lines.append(f"            requests=requests,")
             lines.append(f"            timeout=timeout,")
+            lines.append(f"            metadata=metadata,")
+            lines.append(f"            options=options,")
             lines.append(f"        )")
 
         elif pattern == "bidi_stream":
             lines.append(f"    def {mname}(")
-            lines.append(f"        self, *, timeout: float | None = None")
+            lines.append(f"        self, *, timeout: float | None = None, metadata: dict[str, str] | None = None, options: CallOptions | None = None")
             lines.append(f"    ) -> BidiChannel:")
             lines.extend(doc_lines)
             lines.append(f"        return self._call_bidi_stream(")
             lines.append(f"            method_info=self._mi_{mname},")
             lines.append(f"            timeout=timeout,")
+            lines.append(f"            metadata=metadata,")
+            lines.append(f"            options=options,")
             lines.append(f"        )")
 
     return "\n".join(lines)
@@ -749,7 +761,7 @@ def generate_python_clients(
         content += "\nfrom __future__ import annotations\n\n"
         content += "from collections.abc import AsyncIterator\n"
         content += "from typing import TYPE_CHECKING\n\n"
-        content += "from aster.client import ServiceClient\n"
+        content += "from aster.client import CallOptions, ServiceClient\n"
         content += "from aster.service import MethodInfo\n"
         content += "from aster.transport.base import BidiChannel\n\n"
         content += "if TYPE_CHECKING:\n"

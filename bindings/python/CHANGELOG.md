@@ -5,6 +5,42 @@ the repository; entries under **Unreleased** ship with the next tag.
 
 ## Unreleased
 
+### Changed: `AsterServer.drain` is the Rust drain and returns a `DrainReport`
+
+`drain(grace_period)` now runs `aster::AsterServer::drain`: the ops listener
+goes not ready, new connections and calls are refused (`UNAVAILABLE` with the
+`aster.draining` detail, `RpcError.is_draining`), idle connections close, and
+calls still running at the deadline are cancelled. It returns a
+`DrainReport` instead of `None`. `server.is_draining`, `DRAIN_CLOSE_CODE` and
+`DRAINING_DETAIL_KEY` are new.
+
+### Changed: `CallContext.peer` is the transport peer; `principal` is new
+
+On the server, `ctx.peer` is the transport's caller id and `ctx.principal` the
+authenticator's resolved caller (else the peer), as in Rust. `provenance`,
+`is_cancelled()` and `await ctx.cancelled()` are new, and `ctx.deadline` is
+the effective deadline Rust enforces (the caller's, the method timeout and the
+handler timeout, whichever is first).
+
+### Added: `CallOptions` on every client pattern
+
+`CallOptions(timeout, metadata, serialization_mode)` per call (`options=`) or
+per client (`with_options`, also on `ProxyClient`); generated clients take
+`metadata=` and `options=`. Timeouts below one second are no longer rounded up
+to a whole second on the client.
+
+### Added: transfer metrics, network settings, acknowledgement log
+
+`BlobsClient.transfer_stats()` (`BlobTransferStats`); per-provider
+`bytes_transferred`, `wire_bytes`, `in_flight`, `plain_fallbacks` on
+`ProviderOutcome`, and `FetchReport.in_flight()` / `plain_only()`;
+`PeerView.quic_traffic` / `blob_transfer`. `AsterConfig` gains `bind_addr_v6`,
+`advertise_addrs`, `relay_ca_certs`, `relay_ca_only`, `discovery`,
+`discovery_dns_origin`, `discovery_pkarr_relays`, `metrics_peer_labels` and
+`metrics_peer_label_cap` (env and TOML values were dropped before).
+`AuditOutbox.acknowledgements` / `wait_acknowledgements` /
+`watch_acknowledgements` read the acknowledgement log.
+
 ### Added: `blob_zstd_level` and `reuse_last_port` in `AsterConfig`
 
 `AsterConfig` gains `blob_zstd_level` (default `3`; `0`, `None` or `"off"`

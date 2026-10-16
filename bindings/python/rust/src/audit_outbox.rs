@@ -133,6 +133,47 @@ impl NativeAuditOutbox {
         })
     }
 
+    /// `AuditOutbox::acknowledgements(after, limit)` as a JSON list.
+    fn acknowledgements<'py>(
+        &self,
+        py: Python<'py>,
+        after: u64,
+        limit: usize,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            serde_json::to_string(
+                &inner
+                    .acknowledgements(after, limit)
+                    .await
+                    .map_err(native_error)?,
+            )
+            .map_err(invalid)
+        })
+    }
+
+    /// `AuditOutbox::wait_acknowledgements(after, limit, timeout)` as a JSON
+    /// list (empty on timeout).
+    fn wait_acknowledgements<'py>(
+        &self,
+        py: Python<'py>,
+        after: u64,
+        limit: usize,
+        timeout: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let timeout = Duration::try_from_secs_f64(timeout).map_err(invalid)?;
+        let inner = self.inner.clone();
+        future_into_py(py, async move {
+            serde_json::to_string(
+                &inner
+                    .wait_acknowledgements(after, limit, timeout)
+                    .await
+                    .map_err(native_error)?,
+            )
+            .map_err(invalid)
+        })
+    }
+
     fn replay<'py>(&self, py: Python<'py>, event_id: String) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         future_into_py(py, async move {
@@ -142,5 +183,6 @@ impl NativeAuditOutbox {
 }
 
 pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("AUDIT_ACK_PAGE_MAX", aster::audit_outbox::MAX_ACK_PAGE)?;
     m.add_class::<NativeAuditOutbox>()
 }

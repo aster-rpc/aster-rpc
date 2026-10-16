@@ -56,7 +56,10 @@ __all__ = [
     "AdmittedFilter",
     "ClusterView",
     "LadderLevel",
+    "PeerBlobStats",
     "PeerView",
+    "QuicBytes",
+    "QuicTraffic",
     "SeparationVerdict",
     "Topology",
     "TopologySnapshot",
@@ -69,6 +72,68 @@ LadderLevel = Literal["same_host", "same_lan", "same_site", "same_region", "far"
 #: ``separated()`` verdict. ``unknown`` is a real answer, never evidence of
 #: distance.
 SeparationVerdict = Literal["unknown", "connected", "separated"]
+
+
+@dataclass(frozen=True)
+class QuicBytes:
+    """QUIC-level bytes on a peer's connections: UDP datagram payload, so QUIC
+    headers, ACKs and retransmits are included (reads somewhat above the
+    application payload)."""
+
+    quic_bytes_sent: int = 0
+    quic_bytes_received: int = 0
+
+
+@dataclass(frozen=True)
+class QuicTraffic:
+    """A peer's QUIC bytes by protocol (one connection per ALPN), cumulative
+    since this node started and across reconnects. Monotonic."""
+
+    #: Plain blobs transfers, including docs entry content.
+    blobs: QuicBytes = QuicBytes()
+    #: zstd blobs transfers.
+    blobs_zstd: QuicBytes = QuicBytes()
+    #: The docs sync protocol (entries, not their content).
+    docs: QuicBytes = QuicBytes()
+    gossip: QuicBytes = QuicBytes()
+    #: Aster RPC (``aster/1``), every service on one connection.
+    rpc: QuicBytes = QuicBytes()
+    #: Anything else: admission, enrollment, custom ALPNs.
+    other: QuicBytes = QuicBytes()
+
+    def total(self) -> QuicBytes:
+        """The sum over every protocol."""
+        parts = (self.blobs, self.blobs_zstd, self.docs, self.gossip, self.rpc, self.other)
+        return QuicBytes(
+            quic_bytes_sent=sum(p.quic_bytes_sent for p in parts),
+            quic_bytes_received=sum(p.quic_bytes_received for p in parts),
+        )
+
+
+@dataclass(frozen=True)
+class PeerBlobStats:
+    """Exact blob payload (and zstd wire) bytes exchanged with one peer, since
+    this node started and across reconnects. Monotonic. Fetch figures are
+    counted when each attempt ends."""
+
+    #: Payload bytes fetched from this peer, plain and zstd.
+    fetched_payload_bytes: int = 0
+    #: The part of ``fetched_payload_bytes`` that came over zstd.
+    fetched_zstd_payload_bytes: int = 0
+    #: Compressed bytes received from this peer while fetching over zstd.
+    fetched_wire_bytes: int = 0
+    #: Protocol bytes those decompressed to.
+    fetched_plain_bytes: int = 0
+    #: Payload bytes served to this peer, plain and zstd.
+    served_payload_bytes: int = 0
+    #: The part of ``served_payload_bytes`` that went out over zstd.
+    served_zstd_payload_bytes: int = 0
+    #: Compressed bytes sent to this peer while serving over zstd.
+    served_wire_bytes: int = 0
+    #: Protocol bytes those were compressed from.
+    served_plain_bytes: int = 0
+    #: Fetch attempts against this peer that fell back to plain transport.
+    plain_fallbacks: int = 0
 
 
 @dataclass(frozen=True)
@@ -104,6 +169,10 @@ class PeerView:
     #: Since when RTT has held under the cluster threshold (``None`` = not held).
     cluster_held_since: Optional[_dt.datetime]
     is_connected: bool
+    #: QUIC bytes on this peer's connections, by protocol.
+    quic_traffic: QuicTraffic = QuicTraffic()
+    #: Blob payload / wire bytes exchanged with this peer.
+    blob_transfer: PeerBlobStats = PeerBlobStats()
 
 
 def _utc_ms(ms: int) -> _dt.datetime:

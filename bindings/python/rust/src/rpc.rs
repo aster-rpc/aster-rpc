@@ -336,6 +336,45 @@ impl DispatchServer {
         self.table.len()
     }
 
+    /// `await drain(grace)`: `aster::rpc::ServerHandle::drain` (semantics in
+    /// `aster::rpc::drain`). Refuses new connections (closed after the
+    /// handshake with `DRAIN_CLOSE_CODE`) and new calls (`UNAVAILABLE`,
+    /// detail `aster.draining`; calls on an existing session still run),
+    /// closes each connection once idle, and after `grace` seconds closes the
+    /// rest, which cancels what still runs (handlers see a peer cancel).
+    /// Resolves to a `DrainReport`. A second call while a drain runs moves
+    /// its deadline earlier when its grace ends sooner and returns the same
+    /// report. The server keeps refusing afterwards: follow with `close()`.
+    fn drain<'py>(&self, py: Python<'py>, grace: f64) -> PyResult<Bound<'py, PyAny>> {
+        if !grace.is_finite() || grace < 0.0 {
+            return Err(PyValueError::new_err(
+                "grace must be a non-negative number of seconds",
+            ));
+        }
+        let drainer = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(ServerHandle::drainer)
+            .ok_or_else(|| PyRuntimeError::new_err("server is closed"))?;
+        future_into_py(py, async move {
+            Ok(DrainReport::from(
+                drainer.drain(Duration::from_secs_f64(grace)).await,
+            ))
+        })
+    }
+
+    /// Whether a drain has started.
+    #[getter]
+    fn is_draining(&self) -> bool {
+        self.handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(ServerHandle::is_draining)
+    }
+
     /// Bind an authenticated PEM listener over these registered services.
     #[pyo3(signature = (authenticator, bind_addr, cert_pem, key_pem, *, webtransport=false, max_pending_auth=256, max_auth_payload_bytes=65536))]
     #[allow(clippy::too_many_arguments)]
@@ -431,6 +470,77 @@ impl Drop for DispatchServer {
         if let Some(handle) = self.handle.get_mut().ok().and_then(Option::take) {
             handle.abort();
         }
+    }
+}
+
+/// What a server drain did (`aster::rpc::DrainReport`). Calls count those
+/// admitted to a handler, not those refused at routing.
+#[pyclass(frozen, skip_from_py_object, module = "aster._aster")]
+#[derive(Clone)]
+pub struct DrainReport {
+    /// Calls in flight when the drain started.
+    #[pyo3(get)]
+    calls_in_flight: u64,
+    /// Calls that finished before the deadline (those in flight at the start,
+    /// and calls on existing sessions admitted during the drain).
+    #[pyo3(get)]
+    calls_completed: u64,
+    /// Calls still running at the deadline, cancelled by closing their
+    /// connection.
+    #[pyo3(get)]
+    calls_cancelled: u64,
+    /// New calls answered `UNAVAILABLE` (draining) during the drain.
+    #[pyo3(get)]
+    calls_refused: u64,
+    /// Connections the drain closed with `DRAIN_CLOSE_CODE`.
+    #[pyo3(get)]
+    connections_closed: u64,
+    /// New connections refused at accept during the drain.
+    #[pyo3(get)]
+    connections_refused: u64,
+    /// Whether the deadline passed with work outstanding.
+    #[pyo3(get)]
+    deadline_reached: bool,
+    /// How long the drain took, in seconds.
+    #[pyo3(get)]
+    elapsed: f64,
+}
+
+impl From<aster::rpc::DrainReport> for DrainReport {
+    fn from(r: aster::rpc::DrainReport) -> Self {
+        Self {
+            calls_in_flight: r.calls_in_flight,
+            calls_completed: r.calls_completed,
+            calls_cancelled: r.calls_cancelled,
+            calls_refused: r.calls_refused,
+            connections_closed: r.connections_closed,
+            connections_refused: r.connections_refused,
+            deadline_reached: r.deadline_reached,
+            elapsed: r.elapsed.as_secs_f64(),
+        }
+    }
+}
+
+#[pymethods]
+impl DrainReport {
+    fn __repr__(&self) -> String {
+        format!(
+            "DrainReport(calls_in_flight={}, calls_completed={}, calls_cancelled={}, \
+             calls_refused={}, connections_closed={}, connections_refused={}, \
+             deadline_reached={}, elapsed={:.3})",
+            self.calls_in_flight,
+            self.calls_completed,
+            self.calls_cancelled,
+            self.calls_refused,
+            self.connections_closed,
+            self.connections_refused,
+            if self.deadline_reached {
+                "True"
+            } else {
+                "False"
+            },
+            self.elapsed
+        )
     }
 }
 
@@ -676,6 +786,15 @@ impl ServerCall {
             }
             Ok(BytesList(out))
         })
+    }
+
+    /// The transport's caller id: the connection's remote endpoint id (hex)
+    /// on Iroh, `None` for transports without a connection (HTTP), where
+    /// `peer` is all there is. `peer` is the principal (`aster::rpc::
+    /// CallContext::principal`); this is `CallContext::peer`.
+    #[getter]
+    fn transport_peer(&self) -> Option<String> {
+        self.connection.as_ref().map(CoreConnection::remote_id)
     }
 
     /// Whether the peer cancelled, the stream failed, or the deadline passed.
@@ -1181,6 +1300,12 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     crate::http::register(m)?;
     m.add_function(wrap_pyfunction!(dynamic_service_contract_id, m)?)?;
     m.add_class::<DispatchServer>()?;
+    m.add_class::<DrainReport>()?;
+    m.add("DRAIN_CLOSE_CODE", aster::rpc::drain::DRAIN_CLOSE_CODE)?;
+    m.add(
+        "DRAINING_DETAIL_KEY",
+        aster::rpc::drain::DRAINING_DETAIL_KEY,
+    )?;
     m.add_class::<ServerCall>()?;
     m.add_class::<RpcClient>()?;
     m.add_class::<ClientResponseStream>()?;

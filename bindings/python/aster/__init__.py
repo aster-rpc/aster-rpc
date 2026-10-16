@@ -76,6 +76,8 @@ try:
         FetchStrategy,
         FetchReport,
         ProviderOutcome,
+        BlobTransferStats,
+        BlobTransferCounts,
         BlobStatusResult,
         BlobObserveResult,
         BlobLocalInfo,
@@ -162,7 +164,7 @@ from .provisioning import (
 from .audit_outbox import (
     AuditDestination, AuditOutboxConfig, AuditEvent, AuditOutbox,
     AuditOutboxError, AuditOutboxStatus, AuditDeliveryError,
-    AuditDispositionReceipt, AuditQuarantineExport,
+    AuditDispositionReceipt, AuditQuarantineExport, AuditAcknowledgement,
 )
 
 # -- Sealed grants, leases, topology (plan P7) --
@@ -208,7 +210,10 @@ from .lease import (
 from .topology import (
     AdmittedFilter,
     ClusterView,
+    PeerBlobStats,
     PeerView,
+    QuicBytes,
+    QuicTraffic,
     Topology,
     TopologySnapshot,
     TopologyTiming,
@@ -338,10 +343,11 @@ from .client import (
     create_local_client,
     ClientError,
     ClientTimeoutError,
+    CallOptions,
 )
 from .runtime import AsterServer, AsterClient, ClientSession, AdmissionDeniedError, RPC_ALPN
 from .capabilities import any_of, all_of
-from ._aster import HealthServer
+from ._aster import HealthServer, DrainReport, DRAIN_CLOSE_CODE, DRAINING_DETAIL_KEY
 from . import metrics, tracing, observability
 from .interceptors import (
     CallContext,
@@ -369,7 +375,7 @@ __all__ = [
     "verify_certificate_binding",
     "AuditDestination", "AuditOutboxConfig", "AuditEvent", "AuditOutbox",
     "AuditOutboxError", "AuditOutboxStatus", "AuditDeliveryError",
-    "AuditDispositionReceipt", "AuditQuarantineExport",
+    "AuditDispositionReceipt", "AuditQuarantineExport", "AuditAcknowledgement",
     "VERSION",
     "__version__",
     # ── Iroh native bindings ──
@@ -389,6 +395,8 @@ __all__ = [
     "FetchStrategy",
     "FetchReport",
     "ProviderOutcome",
+    "BlobTransferStats",
+    "BlobTransferCounts",
     "BlobStatusResult",
     "BlobObserveResult",
     "BlobLocalInfo",
@@ -485,7 +493,10 @@ __all__ = [
     "lease_transition",
     "AdmittedFilter",
     "ClusterView",
+    "PeerBlobStats",
     "PeerView",
+    "QuicBytes",
+    "QuicTraffic",
     "Topology",
     "TopologySnapshot",
     "TopologyTiming",
@@ -596,6 +607,7 @@ __all__ = [
     "create_local_client",
     "ClientError",
     "ClientTimeoutError",
+    "CallOptions",
     "CallContext",
     "Interceptor",
     "DeadlineInterceptor",
@@ -605,6 +617,9 @@ __all__ = [
     "AuditLogInterceptor",
     # ── Observability (Rust pipeline; see aster.observability) ──
     "HealthServer",
+    "DrainReport",
+    "DRAIN_CLOSE_CODE",
+    "DRAINING_DETAIL_KEY",
     "metrics",
     "tracing",
     "observability",

@@ -59,14 +59,14 @@ from . import (
     docs_client,
     gossip_client, AsterConfig,
 )
-from .client import ServiceClient, create_client
+from .client import CallOptions, ServiceClient, create_client
 from .transport.iroh import IrohTransport
 from .contract.identity import contract_id_from_service
 from .registry.models import ServiceSummary
 from .rpc_types import RpcScope, SerializationMode
 from .server import Server
 from .http import HTTPListener
-from ._aster import ENROLLMENT_ALPN, EnrollmentPlan
+from ._aster import ENROLLMENT_ALPN, DrainReport, EnrollmentPlan
 
 __all__ = ["AsterServer", "AsterClient", "AdmissionDeniedError", "RPC_ALPN"]
 
@@ -835,19 +835,41 @@ class AsterServer:
         except Exception:  # noqa: BLE001
             pass
 
-    async def drain(self, grace_period: float = 10.0) -> None:
-        """Graceful shutdown: stop accepting new connections, drain existing ones.
+    async def drain(self, grace_period: float = 10.0) -> "DrainReport | None":
+        """Take the server out of rotation gracefully (Rust
+        ``aster::AsterServer::drain``; semantics in ``aster::rpc::drain``).
 
-        Compatible with Kubernetes ``preStop`` hooks and SIGTERM handling.
-        After drain completes, call ``close()`` to shut down the node.
+        Sets the ops listener not ready, then refuses new connections (closed
+        after the handshake with :data:`DRAIN_CLOSE_CODE`) and new calls
+        (``UNAVAILABLE`` with the ``aster.draining`` detail, which a client
+        sees as :attr:`RpcError.is_draining`); calls on a session that already
+        exists still run. Each connection is closed once idle; after
+        ``grace_period`` seconds the rest are closed, which cancels the calls
+        still running (handlers see a peer cancel). Returns the
+        :class:`DrainReport` (``None`` when the server never started).
+
+        A second call while a drain runs moves its deadline earlier when its
+        own grace ends sooner and returns the same report. The server keeps
+        refusing afterwards: follow with :meth:`close`. Fits Kubernetes
+        ``preStop`` hooks and SIGTERM handling.
 
         Args:
-            grace_period: Seconds to wait for in-flight requests to complete.
+            grace_period: Seconds to let in-flight calls finish.
         """
         logger.info("Draining server (grace_period=%.1fs)...", grace_period)
+        if self._health is not None:
+            self._health.set_ready(False)  # probes stop routing first
+        report = None
         if self._server is not None:
-            await self._server.drain(grace_period)
-        logger.info("Drain complete")
+            report = await self._server.drain(grace_period)
+        logger.info("Drain complete: %r", report)
+        return report
+
+    @property
+    def is_draining(self) -> bool:
+        """Whether :meth:`drain` has started."""
+        dispatcher = self._server._dispatcher if self._server is not None else None
+        return dispatcher is not None and dispatcher.is_draining
 
     async def close(self) -> None:
         """Cancel serve loops and close the node. Safe to call multiple times."""
@@ -895,7 +917,12 @@ class AsterServer:
             return
         from aster import HealthServer
 
-        self._health = await HealthServer.start(self._node, cfg.health_host, cfg.health_port)
+        self._health = await HealthServer.start(
+            self._node,
+            cfg.health_host,
+            cfg.health_port,
+            peer_label_cap=cfg.metrics_peer_label_cap if cfg.metrics_peer_labels else None,
+        )
         self._health.set_services(len(getattr(self, "_services_in", ()) or ()))
         logger.info("ops endpoints listening on %s", self._health.addr)
 
@@ -2655,6 +2682,29 @@ class ProxyClient:
         self._factory = factory
         self._method_map: dict[str, dict[str, Any]] = method_map or {}
         self._method_cache: dict[str, "_ProxyMethod"] = {}
+        self._options: CallOptions = CallOptions()
+
+    def with_options(self, options: CallOptions) -> "ProxyClient":
+        """A view of this proxy whose calls use ``options`` (deadline,
+        metadata, serialization mode; merged over this proxy's) on every
+        pattern. Shares the connection and dynamic codec once resolved."""
+        view = ProxyClient.__new__(ProxyClient)
+        view.__dict__.update(self.__dict__)
+        view._method_cache = {}
+        view._options = self._options.merged(options)
+        return view
+
+    def _call_kwargs(self) -> dict[str, Any]:
+        """The transport keyword arguments for this proxy's options."""
+        o = self._options
+        out: dict[str, Any] = {}
+        if o.metadata:
+            out["metadata"] = dict(o.metadata)
+        if o.timeout is not None:
+            out["deadline_secs"] = float(o.timeout)
+        if o.serialization_mode is not None:
+            out["serialization_mode"] = int(o.serialization_mode)
+        return out
 
     def _wrap_request(self, method_name: str, payload: Any) -> Any:
         """If this proxy is backed by a DynamicTypeFactory + Fory codec,
@@ -2759,6 +2809,7 @@ class _ProxyMethod:
                 proxy._service_name,
                 self._method_name,
                 wrapped_stream,
+                **proxy._call_kwargs(),
             )
             if _is_dataclass_instance(result):
                 return _dataclasses_asdict(result)
@@ -2780,6 +2831,7 @@ class _ProxyMethod:
                 proxy._service_name,
                 self._method_name,
                 wire_payload,
+                **proxy._call_kwargs(),
             )
         except Exception as exc:
             # When the user calls a server-streaming method via the unary
@@ -2827,6 +2879,7 @@ class _ProxyMethod:
             self._proxy._service_name,
             self._method_name,
             wire_payload,
+            **self._proxy._call_kwargs(),
         ):
             import dataclasses
             if dataclasses.is_dataclass(item) and not isinstance(item, type):
@@ -2863,6 +2916,7 @@ class _ProxyBidiChannel:
         self._channel = self._proxy._transport.bidi_stream(
             self._proxy._service_name,
             self._method_name,
+            **self._proxy._call_kwargs(),
         )
 
     async def send(self, payload: dict) -> None:

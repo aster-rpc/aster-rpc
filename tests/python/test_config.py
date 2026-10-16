@@ -63,6 +63,16 @@ KNOBS = [
     ("transport_datagram_send_buffer_size", 20, "20", "transport_datagram_send_buffer_size = 20"),
     ("transport_send_fairness", False, "false", "transport_send_fairness = false"),
     ("transport_enable_segmentation_offload", False, "0", "transport_enable_segmentation_offload = false"),
+    ("bind_addr_v6", "[::]:7842", "[::]:7842", 'bind_addr_v6 = "[::]:7842"'),
+    (
+        "advertise_addrs",
+        ("203.0.113.10:31842", "203.0.113.11:1"),
+        "203.0.113.10:31842, 203.0.113.11:1",
+        'advertise_addrs = ["203.0.113.10:31842", "203.0.113.11:1"]',
+    ),
+    ("relay_ca_certs", ("/ca/a.pem", "/ca/b.pem"), "/ca/a.pem,/ca/b.pem", 'relay_ca_certs = ["/ca/a.pem", "/ca/b.pem"]'),
+    ("relay_ca_only", True, "true", "relay_ca_only = true"),
+    ("discovery", "none", "none", 'discovery = "none"'),
 ]
 # Non-[network] knobs: (field, python value, env var, env value, section, toml line).
 OTHER_KNOBS = [
@@ -80,6 +90,8 @@ OTHER_KNOBS = [
     ("log_format", "json", "ASTER_LOG_FORMAT", "JSON", "logging", 'format = "json"'),
     ("log_level", "debug", "ASTER_LOG_LEVEL", "debug", "logging", 'level = "debug"'),
     ("log_mask", False, "ASTER_LOG_MASK", "false", "logging", "mask = false"),
+    ("metrics_peer_labels", True, "ASTER_METRICS_PEER_LABELS", "true", "metrics", "peer_labels = true"),
+    ("metrics_peer_label_cap", 8, "ASTER_METRICS_PEER_LABEL_CAP", "8", "metrics", "peer_label_cap = 8"),
 ]
 
 
@@ -635,3 +647,66 @@ def test_retired_consumer_admission_env_is_refused(monkeypatch):
     monkeypatch.setenv("ASTER_ALLOW_ALL_CONSUMERS", "true")
     with pytest.raises(Exception, match="ASTER_ALLOW_ALL_CONSUMERS"):
         AsterConfig.from_env()
+
+
+# ---------------------------------------------------------------------------
+# Cluster network settings: discovery presets and custom servers
+# ---------------------------------------------------------------------------
+
+def test_network_defaults():
+    cfg = AsterConfig()
+    assert cfg.bind_addr_v6 is None and cfg.advertise_addrs == ()
+    assert cfg.relay_ca_certs == () and cfg.relay_ca_only is False
+    assert cfg.discovery == "default"
+    assert cfg.discovery_dns_origin is None and cfg.discovery_pkarr_relays == ()
+    assert cfg.metrics_peer_labels is False and cfg.metrics_peer_label_cap == 64
+
+
+@pytest.mark.parametrize("mode", ["default", "none", "local", "custom", "NONE"])
+def test_discovery_modes(mode):
+    assert AsterConfig(discovery=mode).discovery == mode.lower()
+
+
+def test_discovery_servers_select_custom():
+    cfg = AsterConfig(
+        discovery_dns_origin="dns.example.internal",
+        discovery_pkarr_relays=("https://dns.example.internal/pkarr",),
+    )
+    assert cfg.discovery == "custom"
+    assert _rust(cfg)["discovery"] == "custom"
+    assert cfg.discovery_pkarr_relays == ("https://dns.example.internal/pkarr",)
+    # Rebuilding from the resolved view is the identity.
+    assert AsterConfig(**cfg.to_dict()) == cfg
+    with pytest.raises(ValueError, match="custom"):
+        AsterConfig(discovery="none", discovery_dns_origin="dns.example.internal")
+    with pytest.raises(ValueError):
+        AsterConfig(discovery="sometimes")
+
+
+def test_discovery_servers_env_and_toml(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASTER_DISCOVERY_DNS_ORIGIN", "dns.example.internal")
+    monkeypatch.setenv("ASTER_DISCOVERY_PKARR_RELAYS", "https://a.example/pkarr, https://b.example/pkarr")
+    cfg = AsterConfig.from_env()
+    assert cfg.discovery == "custom"
+    assert cfg.discovery_dns_origin == "dns.example.internal"
+    assert cfg.discovery_pkarr_relays == ("https://a.example/pkarr", "https://b.example/pkarr")
+    monkeypatch.delenv("ASTER_DISCOVERY_DNS_ORIGIN")
+    monkeypatch.delenv("ASTER_DISCOVERY_PKARR_RELAYS")
+    p = _write(tmp_path, "aster.toml", """
+        [network]
+        discovery_dns_origin = "dns.example.internal"
+        bind_addr_v6 = "[::]:7842"
+        [metrics]
+        peer_labels = true
+    """)
+    cfg = AsterConfig.from_file(p)
+    assert cfg.discovery == "custom" and cfg.discovery_dns_origin == "dns.example.internal"
+    assert cfg.bind_addr_v6 == "[::]:7842"
+    assert cfg.metrics_peer_labels is True
+    assert cfg._sources["metrics_peer_labels"] == f"{p} [metrics]"
+
+
+def test_print_config_shows_network_and_metrics(capsys):
+    cfg = AsterConfig(advertise_addrs=("203.0.113.10:1",), metrics_peer_labels=True)
+    text = cfg.print_config()
+    assert "203.0.113.10:1" in text and "[metrics]" in text

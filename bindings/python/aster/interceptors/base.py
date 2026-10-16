@@ -27,12 +27,19 @@ class CallContext:
         service: The service name (e.g., ``"MissionControl"``).
         method: The method name (e.g., ``"getStatus"``).
         call_id: Unique ID for this call (auto-generated UUID).
-        peer: Remote peer identifier (endpoint ID hex).
+        peer: The transport's caller id (Iroh: the remote endpoint ID hex;
+            HTTP: what the front end supplied). See ``provenance``.
+        principal: The verified caller: the authenticator's resolved
+            principal when one resolved it, else ``peer`` (Rust
+            ``CallContext::principal``).
         iroh_authenticated: Whether Iroh authenticated the remote node key.
             HTTP/WT principals keep this false after application authentication.
         metadata: Key/value headers sent with the call.
         attributes: Enrollment attributes from the consumer's credential.
-        deadline: Absolute deadline as epoch timestamp, or ``None``.
+        deadline: Absolute deadline as epoch timestamp, or ``None``. On the
+            server this is the effective deadline Rust enforces: the minimum of
+            the caller's deadline, the method timeout and the server's
+            handler timeout.
         is_streaming: ``True`` for streaming RPC patterns.
         pattern: RPC pattern (``"unary"``, ``"server_stream"``, etc.).
         idempotent: ``True`` if the method is safe to retry.
@@ -66,6 +73,8 @@ class CallContext:
     relay_url: str | None = None
     rtt_micros: int | None = None
     iroh_authenticated: bool = False
+    principal: str | None = None
+    _cancel: Any = field(default=None, init=False, repr=False, compare=False)
 
     _current: ClassVar[contextvars.ContextVar["CallContext | None"]] = (
         contextvars.ContextVar("aster_call_context", default=None)
@@ -78,6 +87,55 @@ class CallContext:
         Returns ``None`` when called outside an RPC handler invocation.
         """
         return cls._current.get()
+
+    def __post_init__(self) -> None:
+        if self.principal is None:
+            self.principal = self.peer
+
+    @property
+    def provenance(self) -> str:
+        """How the transport learned ``peer``: ``"iroh_authenticated"`` (an
+        Iroh QUIC remote node id, proven by the handshake) or ``"other"`` (a
+        hint, never an authority)."""
+        return "iroh_authenticated" if self.iroh_authenticated else "other"
+
+    def _cancel_event(self) -> asyncio.Event:
+        ev = self.__dict__.get("_cancel")
+        if ev is None:
+            ev = self.__dict__["_cancel"] = asyncio.Event()
+        return ev
+
+    def _mark_cancelled(self) -> None:
+        """The dispatcher ended the call (peer cancel, stream failure or a
+        drain closing the connection): flag it and wake every waiter."""
+        self._cancel_event().set()
+
+    def is_cancelled(self) -> bool:
+        """Whether the call is over before the handler finished: the peer
+        cancelled it, the stream failed under it, or its deadline passed."""
+        ev = self.__dict__.get("_cancel")
+        return (ev is not None and ev.is_set()) or self.expired
+
+    async def cancelled(self) -> None:
+        """Resolve once :meth:`is_cancelled` becomes true.
+
+        The dispatcher cancels a handler's task when its call is cancelled, so
+        inside the handler this serves early exits raced against other work
+        (``asyncio.wait`` / ``TaskGroup``); a task the handler spawned with
+        this context sees it resolve too. Never resolves for a call that
+        completes normally before its deadline.
+        """
+        if self.is_cancelled():
+            return
+        ev = self._cancel_event()
+        remaining = self.remaining_seconds
+        if remaining is None:
+            await ev.wait()
+            return
+        try:
+            await asyncio.wait_for(ev.wait(), remaining)
+        except asyncio.TimeoutError:
+            return
 
     @property
     def remaining_seconds(self) -> float | None:
@@ -104,7 +162,7 @@ class Interceptor(ABC):
         return error
 
 
-def deadline_from_relative_secs(deadline_secs: int) -> float | None:
+def deadline_from_relative_secs(deadline_secs: float) -> float | None:
     if deadline_secs <= 0:
         return None
     return time.time() + deadline_secs
@@ -115,7 +173,7 @@ def build_call_context(
     service: str,
     method: str,
     metadata: dict[str, str] | None = None,
-    deadline_secs: int = 0,
+    deadline_secs: float = 0,
     peer: str | None = None,
     is_streaming: bool = False,
     pattern: str | None = None,

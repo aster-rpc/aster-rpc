@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from enum import IntEnum
 
+from ._aster import DRAINING_DETAIL_KEY
+
 
 class StatusCode(IntEnum):
     """RPC status codes.
@@ -101,6 +103,14 @@ class RpcError(Exception):
         self.message = message
         self.details: dict[str, str] = details or {}
         super().__init__(f"[{code.name}] {message}")
+
+    @property
+    def is_draining(self) -> bool:
+        """Whether the server refused or ended this call because it is
+        draining (``UNAVAILABLE`` with the ``aster.draining`` detail; Rust
+        ``Error::is_draining``). Retrying on the same connection cannot
+        succeed: reconnect to another replica."""
+        return self.code == StatusCode.UNAVAILABLE and DRAINING_DETAIL_KEY in self.details
 
     def __repr__(self) -> str:
         return (

@@ -8,7 +8,14 @@ from pathlib import Path
 
 import pytest
 
-from aster import AuditDestination, AuditEvent, AuditOutbox, AuditOutboxConfig, AuditOutboxError
+from aster import (
+    AuditAcknowledgement,
+    AuditDestination,
+    AuditEvent,
+    AuditOutbox,
+    AuditOutboxConfig,
+    AuditOutboxError,
+)
 
 _spec = importlib.util.spec_from_file_location(
     "audit_receiver", Path(__file__).parents[1] / "audit_outbox" / "receiver.py"
@@ -149,4 +156,35 @@ async def test_cancel_open_releases_directory_and_invalid_duration(tmp_path, rec
             assert caught.value.kind == "invalid_event"
         with pytest.raises(AuditOutboxError) as caught:
             await outbox.submit(AuditEvent(1, "invalid", {"value": float("nan")}))
+        assert caught.value.kind == "invalid_event"
+
+
+async def test_acknowledgement_log_page_wait_and_watch(tmp_path, receiver):
+    cfg = config(tmp_path, receiver)
+    async with await AuditOutbox.open(cfg) as outbox:
+        assert await outbox.acknowledgements() == []
+        # Nothing acknowledged yet: a short wait times out empty.
+        assert await outbox.wait_acknowledgements(0, 10, 0.05) == []
+        watched: list[AuditAcknowledgement] = []
+
+        async def watch(want: int) -> None:
+            async for ack in outbox.watch_acknowledgements(0):
+                watched.append(ack)
+                if len(watched) == want:
+                    return
+
+        watcher = asyncio.create_task(watch(2))
+        first = await outbox.submit(AuditEvent(1, "a", {}))
+        second = await outbox.submit(AuditEvent(2, "b", {}))
+        await outbox.flush(10)
+        await asyncio.wait_for(watcher, 10)
+        page = await outbox.acknowledgements(0, 100)
+        assert [a.event_id for a in page] == [first, second]
+        assert all(isinstance(a, AuditAcknowledgement) for a in page)
+        assert page[0].cursor < page[1].cursor
+        assert page[0].batch_id and page[0].acknowledged_at_ms > 0
+        assert [a.cursor for a in watched] == [a.cursor for a in page]
+        assert await outbox.acknowledgements(page[0].cursor, 100) == page[1:]
+        with pytest.raises(AuditOutboxError) as caught:
+            await outbox.acknowledgements(0, 0)
         assert caught.value.kind == "invalid_event"

@@ -24,7 +24,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 
 use aster::{
-    AsterConfig, EnrollmentConfig, EnrollmentLimits, HookFailureMode, RelayMode, RoleMappingConfig,
+    AsterConfig, DiscoveryMode, EnrollmentConfig, EnrollmentLimits, HookFailureMode, RelayMode,
+    RoleMappingConfig,
 };
 
 use crate::error::aster_err_to_py;
@@ -48,6 +49,13 @@ pub(crate) const FIELDS: &[&str] = &[
     "relay_mode",
     "relay_urls",
     "bind_addr",
+    "bind_addr_v6",
+    "advertise_addrs",
+    "relay_ca_certs",
+    "relay_ca_only",
+    "discovery",
+    "discovery_dns_origin",
+    "discovery_pkarr_relays",
     "reuse_last_port",
     "local_discovery",
     "enable_monitoring",
@@ -77,6 +85,8 @@ pub(crate) const FIELDS: &[&str] = &[
     "health_port",
     "health_host",
     "health_enabled",
+    "metrics_peer_labels",
+    "metrics_peer_label_cap",
     "identity_file",
     "alpns",
     "enrollment",
@@ -115,6 +125,24 @@ fn opt_path(v: &Bound<'_, PyAny>) -> PyResult<Option<PathBuf>> {
 
 fn opt_str(v: &Bound<'_, PyAny>) -> PyResult<Option<String>> {
     Ok(opt::<String>(v)?.filter(|s| !s.trim().is_empty()))
+}
+
+/// A list of strings from a list/tuple, or one comma-separated string (the env
+/// spelling). Items are trimmed; empty items are dropped.
+fn str_list(v: &Bound<'_, PyAny>) -> PyResult<Vec<String>> {
+    if v.is_none() {
+        return Ok(Vec::new());
+    }
+    let items: Vec<String> = if let Ok(text) = v.extract::<String>() {
+        text.split(',').map(str::to_string).collect()
+    } else {
+        v.extract()?
+    };
+    Ok(items
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect())
 }
 
 fn strict_bool(name: &str, v: &Bound<'_, PyAny>) -> PyResult<bool> {
@@ -220,6 +248,32 @@ fn relay_from(mode: Option<String>, urls: Vec<String>) -> PyResult<RelayMode> {
     }
 }
 
+/// `discovery` plus the custom discovery servers, with the C ABI / builder
+/// rule: servers with `discovery` unset or `"default"` select `"custom"`;
+/// servers with `"none"` or `"local"` raise `ValueError`.
+fn discovery_from(
+    mode: Option<String>,
+    dns_origin: Option<String>,
+    pkarr_relays: Vec<String>,
+) -> PyResult<(DiscoveryMode, Option<String>, Vec<String>)> {
+    let parsed = match mode.as_deref() {
+        None => DiscoveryMode::Default,
+        Some(m) => DiscoveryMode::parse(m).map_err(aster_err_to_py)?,
+    };
+    let servers = dns_origin.is_some() || !pkarr_relays.is_empty();
+    let mode = match (parsed, servers) {
+        (DiscoveryMode::Default, true) => DiscoveryMode::Custom,
+        (m @ (DiscoveryMode::None | DiscoveryMode::Local), true) => {
+            return Err(PyValueError::new_err(format!(
+                "discovery_dns_origin / discovery_pkarr_relays require discovery \"custom\", got {:?}",
+                m.as_str()
+            )))
+        }
+        (m, _) => m,
+    };
+    Ok((mode, dns_origin, pkarr_relays))
+}
+
 fn apply_field(c: &mut AsterConfig, key: &str, v: &Bound<'_, PyAny>) -> PyResult<()> {
     match key {
         "root_pubkey" => {
@@ -272,6 +326,28 @@ fn apply_field(c: &mut AsterConfig, key: &str, v: &Bound<'_, PyAny>) -> PyResult
         // relay_mode / relay_urls are combined by the caller.
         "relay_mode" | "relay_urls" => {}
         "bind_addr" => c.bind_addr = opt_str(v)?,
+        "bind_addr_v6" => c.bind_addr_v6 = opt_str(v)?,
+        "advertise_addrs" => c.advertise_addrs = str_list(v)?,
+        "relay_ca_certs" => {
+            c.relay_ca_certs = if v.is_none() {
+                Vec::new()
+            } else if v.extract::<String>().is_ok() {
+                str_list(v)?.into_iter().map(PathBuf::from).collect()
+            } else {
+                let mut out = Vec::new();
+                for item in v.try_iter()? {
+                    let p: PathBuf = item?.extract()?;
+                    if !p.as_os_str().is_empty() {
+                        out.push(p);
+                    }
+                }
+                out
+            }
+        }
+        "relay_ca_only" => c.relay_ca_only = strict_bool(key, v)?,
+        // discovery / discovery_dns_origin / discovery_pkarr_relays are
+        // combined by the caller.
+        "discovery" | "discovery_dns_origin" | "discovery_pkarr_relays" => {}
         "local_discovery" => c.local_discovery = strict_bool(key, v)?,
         "enable_monitoring" => c.enable_monitoring = strict_bool(key, v)?,
         "enable_hooks" => c.enable_hooks = strict_bool(key, v)?,
@@ -324,6 +400,11 @@ fn apply_field(c: &mut AsterConfig, key: &str, v: &Bound<'_, PyAny>) -> PyResult
         "health_port" => c.health_port = v.extract()?,
         "health_host" => c.health_host = opt_str(v)?.unwrap_or_else(|| "127.0.0.1".to_string()),
         "health_enabled" => c.health_enabled = opt_bool(key, v)?,
+        "metrics_peer_labels" => c.metrics_peer_labels = strict_bool(key, v)?,
+        "metrics_peer_label_cap" => {
+            c.metrics_peer_label_cap =
+                opt::<usize>(v)?.unwrap_or(aster::DEFAULT_METRICS_PEER_LABEL_CAP)
+        }
         "identity_file" => c.identity_file = opt_path(v)?,
         "alpns" => {
             let mut out: Vec<Vec<u8>> = Vec::new();
@@ -554,6 +635,9 @@ impl NativeAsterConfig {
         let mut c = AsterConfig::default();
         let mut relay_mode: Option<String> = None;
         let mut relay_urls: Vec<String> = Vec::new();
+        let mut discovery: Option<String> = None;
+        let mut dns_origin: Option<String> = None;
+        let mut pkarr_relays: Vec<String> = Vec::new();
         if let Some(kwargs) = kwargs {
             for (k, v) in kwargs.iter() {
                 let key: String = k.extract()?;
@@ -570,12 +654,25 @@ impl NativeAsterConfig {
                                 .collect()
                         }
                     }
+                    "discovery" => {
+                        discovery = opt_str(&v).map_err(|e| prefix_err(k.py(), &key, e))?
+                    }
+                    "discovery_dns_origin" => {
+                        dns_origin = opt_str(&v).map_err(|e| prefix_err(k.py(), &key, e))?
+                    }
+                    "discovery_pkarr_relays" => {
+                        pkarr_relays = str_list(&v).map_err(|e| prefix_err(k.py(), &key, e))?
+                    }
                     _ => {}
                 }
                 apply_field(&mut c, &key, &v).map_err(|e| prefix_err(k.py(), &key, e))?;
             }
         }
         c.relay_mode = relay_from(relay_mode, relay_urls)?;
+        let (mode, dns_origin, pkarr_relays) = discovery_from(discovery, dns_origin, pkarr_relays)?;
+        c.discovery = mode;
+        c.discovery_dns_origin = dns_origin;
+        c.discovery_pkarr_relays = pkarr_relays;
         Ok(c)
     }
 }
@@ -685,6 +782,19 @@ impl NativeAsterConfig {
         d.set_item("relay_mode", mode)?;
         d.set_item("relay_urls", urls)?;
         d.set_item("bind_addr", c.bind_addr.clone())?;
+        d.set_item("bind_addr_v6", c.bind_addr_v6.clone())?;
+        d.set_item("advertise_addrs", c.advertise_addrs.clone())?;
+        d.set_item(
+            "relay_ca_certs",
+            c.relay_ca_certs
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+        )?;
+        d.set_item("relay_ca_only", c.relay_ca_only)?;
+        d.set_item("discovery", c.discovery.as_str())?;
+        d.set_item("discovery_dns_origin", c.discovery_dns_origin.clone())?;
+        d.set_item("discovery_pkarr_relays", c.discovery_pkarr_relays.clone())?;
         d.set_item("local_discovery", c.local_discovery)?;
         d.set_item("enable_monitoring", c.enable_monitoring)?;
         d.set_item("enable_hooks", c.enable_hooks)?;
@@ -740,6 +850,8 @@ impl NativeAsterConfig {
         d.set_item("health_port", c.health_port)?;
         d.set_item("health_host", c.health_host.clone())?;
         d.set_item("health_enabled", c.health_enabled)?;
+        d.set_item("metrics_peer_labels", c.metrics_peer_labels)?;
+        d.set_item("metrics_peer_label_cap", c.metrics_peer_label_cap)?;
         d.set_item("identity_file", path_str(&c.identity_file))?;
         let alpns = PyList::empty(py);
         for a in &c.alpns {
