@@ -44,7 +44,8 @@
 //! a publisher that stops refreshing cannot keep a removed key alive. Keys of an issuer
 //! that is not in `[[identity.trusted_issuers]]` are kept but never used, so
 //! a NodeConfig override that adds an issuer takes effect as soon as it is
-//! acknowledged. A token whose `kid` is not in its issuer's newest set is
+//! acknowledged: storing new settings triggers a rebuild (the unlisted-issuer
+//! quota depends on them), and `set` / `ack` answer once it has run. A token whose `kid` is not in its issuer's newest set is
 //! refused with `UNAUTHENTICATED`; nothing is fetched. A key removed from the
 //! newest set stops verifying when that set arrives. The cache is rebuilt on
 //! changes to the namespace, a burst of events coalesced into one rebuild
@@ -116,6 +117,9 @@ pub(crate) type KidNotice = Arc<dyn Fn(&str, &str) + Send + Sync>;
 pub(crate) struct IssuerKeys {
     sets: arc_swap::ArcSwap<BTreeMap<String, Arc<Accepted>>>,
     generation: tokio::sync::watch::Sender<u64>,
+    /// The [`LiveIdentity`](super::identity::LiveIdentity) generation the
+    /// last rebuild read its settings at.
+    built_for: tokio::sync::watch::Sender<u64>,
     notice: std::sync::RwLock<Option<KidNotice>>,
     /// Publisher-evidence verifications run so far (the costly step).
     evidence_checks: std::sync::atomic::AtomicU64,
@@ -134,6 +138,7 @@ impl Default for IssuerKeys {
         Self {
             sets: arc_swap::ArcSwap::default(),
             generation: tokio::sync::watch::Sender::new(0),
+            built_for: tokio::sync::watch::Sender::new(0),
             notice: std::sync::RwLock::new(None),
             evidence_checks: std::sync::atomic::AtomicU64::new(0),
         }
@@ -174,9 +179,24 @@ impl IssuerKeys {
     }
 
     #[cfg_attr(not(all(feature = "enrollment", feature = "docs")), allow(dead_code))]
-    fn replace(&self, sets: BTreeMap<String, Arc<Accepted>>) {
+    fn replace(&self, sets: BTreeMap<String, Arc<Accepted>>, built_for: u64) {
         self.sets.store(Arc::new(sets));
+        self.built_for.send_replace(built_for);
         self.generation.send_modify(|generation| *generation += 1);
+    }
+
+    /// The identity-settings generation the held sets were built under.
+    #[cfg_attr(not(feature = "docs"), allow(dead_code))]
+    pub(crate) fn built_for(&self) -> u64 {
+        *self.built_for.borrow()
+    }
+
+    /// Wait until a rebuild under identity-settings generation `target` (or
+    /// a later one) has completed.
+    #[cfg_attr(not(feature = "docs"), allow(dead_code))]
+    pub(crate) async fn wait_built_for(&self, target: u64) {
+        let mut built = self.built_for.subscribe();
+        let _ = built.wait_for(|built| *built >= target).await;
     }
 }
 
@@ -333,6 +353,7 @@ mod watch {
     ) -> Result<IssuerKeysWatch> {
         // Subscribed before the first read, so no rotation falls between.
         let mut roots = enrollment.root_changes();
+        let mut settings = identity.changes();
         let mut namespace = enrollment.fleet_namespace();
         // Subscribed before the first scan, so no change falls between them.
         let (doc, mut events) = open(node, namespace).await?;
@@ -373,6 +394,14 @@ mod watch {
                             break;
                         }
                         scanner.standing.clear();
+                        true
+                    }
+                    // New identity settings change which sets are kept
+                    // (trusted issuers, the unlisted quota, key-set age).
+                    changed = settings.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
                         true
                     }
                     _ = interval.tick() => {
@@ -561,6 +590,8 @@ mod watch {
         /// a bounded amount and never displaces another publisher's sets.
         async fn rebuild(&mut self) {
             let now = unix_now();
+            // Read before the settings, so they are at least this new.
+            let built_for = self.identity.generation();
             let settings = self.identity.load();
             let leeway = settings.clock_leeway_secs;
             let trusted: BTreeSet<Vec<u8>> = settings
@@ -687,7 +718,7 @@ mod watch {
                     "issuer keys held"
                 );
             }
-            self.keys.replace(best);
+            self.keys.replace(best, built_for);
         }
     }
 

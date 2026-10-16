@@ -968,6 +968,12 @@ mod service {
                     "not-in-effect",
                     "the [identity] settings in force differ from the record's",
                 ));
+            } else if !self.inner.identity.keys_current() {
+                out.push(outstanding(
+                    IDENTITY_SECTION,
+                    "not-in-effect",
+                    "the issuer keys have not yet been rebuilt under the [identity] settings",
+                ));
             }
             if *self.inner.properties.load() != effect.properties {
                 out.push(outstanding(
@@ -1019,9 +1025,14 @@ mod service {
 
         async fn ack(&self, generation: u64, timeout: Duration) -> Result<NodeConfigAck> {
             let mut applied = self.inner.applied.subscribe();
-            // A condition wait: the watch wakes on every apply. Timing out is
-            // an answer (reported below), not an error.
-            let _ = tokio::time::timeout(timeout, applied.wait_for(|g| *g >= generation)).await;
+            // A condition wait: the watch wakes on every apply, then on the
+            // issuer-key rebuild under the applied settings. Timing out is an
+            // answer (reported below), not an error.
+            let _ = tokio::time::timeout(timeout, async {
+                let _ = applied.wait_for(|g| *g >= generation).await;
+                self.inner.identity.keys_settled().await;
+            })
+            .await;
             self.report(generation).await
         }
 
@@ -1111,6 +1122,10 @@ mod service {
             self.inner.store.write(&record).await?;
             let generation = record.generation;
             self.apply(Some(record));
+            // The issuer keys follow the settings (GI-3): answer once they
+            // are rebuilt, or report them outstanding.
+            let _ =
+                tokio::time::timeout(DEFAULT_ACK_TIMEOUT, self.inner.identity.keys_settled()).await;
             self.report(generation).await
         }
 

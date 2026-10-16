@@ -386,13 +386,29 @@ pub(crate) fn publisher_plan(
 /// The [`IdentitySettings`] every dispatcher of one server reads, per call.
 /// Swapped atomically by `aster.ops.NodeConfig`: a call routed after
 /// [`store`](Self::store) returns sees the new settings, with no restart.
-#[derive(Debug, Default)]
+/// The issuer keys depend on them too (which unlisted issuers' sets are
+/// kept): each store bumps a generation the issuer-key watcher rebuilds on,
+/// and [`keys_settled`](Self::keys_settled) waits for that rebuild.
+#[derive(Debug)]
 pub(crate) struct LiveIdentity {
     current: arc_swap::ArcSwap<IdentitySettings>,
+    /// Bumped by every [`store`](Self::store).
+    generation: tokio::sync::watch::Sender<u64>,
     /// The issuer keys from the fleet namespace, when the server has
     /// Enrollment.
     #[cfg(feature = "delegation")]
     keys: arc_swap::ArcSwapOption<super::issuer_keys::IssuerKeys>,
+}
+
+impl Default for LiveIdentity {
+    fn default() -> Self {
+        Self {
+            current: arc_swap::ArcSwap::default(),
+            generation: tokio::sync::watch::Sender::new(0),
+            #[cfg(feature = "delegation")]
+            keys: arc_swap::ArcSwapOption::default(),
+        }
+    }
 }
 
 impl LiveIdentity {
@@ -402,6 +418,42 @@ impl LiveIdentity {
 
     pub(crate) fn store(&self, settings: IdentitySettings) {
         self.current.store(Arc::new(settings));
+        self.generation.send_modify(|generation| *generation += 1);
+    }
+
+    /// How many times the settings have been stored. Read it before
+    /// [`load`](Self::load): the settings loaded are at least that new.
+    #[cfg_attr(not(all(feature = "enrollment", feature = "docs")), allow(dead_code))]
+    pub(crate) fn generation(&self) -> u64 {
+        *self.generation.borrow()
+    }
+
+    /// A receiver that changes on every [`store`](Self::store).
+    #[cfg(all(feature = "enrollment", feature = "docs"))]
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.generation.subscribe()
+    }
+
+    /// Whether the issuer keys (if this server holds any) were built under
+    /// the settings in force.
+    #[cfg_attr(not(feature = "docs"), allow(dead_code))]
+    pub(crate) fn keys_current(&self) -> bool {
+        #[cfg(feature = "delegation")]
+        if let Some(keys) = self.keys.load_full() {
+            return keys.built_for() >= self.generation();
+        }
+        true
+    }
+
+    /// Wait until [`keys_current`](Self::keys_current) holds for the
+    /// settings stored now.
+    #[cfg_attr(not(feature = "docs"), allow(dead_code))]
+    pub(crate) async fn keys_settled(&self) {
+        #[cfg(feature = "delegation")]
+        if let Some(keys) = self.keys.load_full() {
+            let target = self.generation();
+            keys.wait_built_for(target).await;
+        }
     }
 
     #[cfg(all(feature = "enrollment", feature = "docs"))]

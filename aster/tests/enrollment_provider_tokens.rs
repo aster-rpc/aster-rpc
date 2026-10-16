@@ -885,3 +885,68 @@ async fn a_burst_of_junk_is_coalesced_and_checked_once_per_author() {
     .await
     .expect("test timed out");
 }
+
+/// GI-3: trusting an issuer through NodeConfig takes effect when `set`
+/// answers, even when its key set was over the unlisted-issuer quota at the
+/// last rebuild and nothing changes in the namespace afterwards.
+#[tokio::test]
+async fn trusting_an_over_quota_issuer_takes_effect_when_set_answers() {
+    tokio::time::timeout(Duration::from_secs(180), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let server = start_server(&root, files.path()).await;
+        let keys = server.issuer_keys().unwrap();
+        let edge = connect(&root, &server, EDGE, Some(GATEWAY_ROLE)).await;
+        let publisher =
+            Publisher::start(&root, &server, PUBLISHER, Some(IDENTITY_PUBLISHER_ROLE)).await;
+
+        // One more unlisted issuer than the quota for one trusted issuer.
+        let quota = aster::rpc::issuer_keys::unlisted_issuer_quota(1);
+        let issuers: Vec<(String, IdpKey)> = (0..=quota)
+            .map(|n| (format!("https://idp-u{n}.example.com"), IdpKey::es256()))
+            .collect();
+        for (iss, key) in &issuers {
+            publisher
+                .publish(&server, iss, jwks(&[(key, "u")]), now())
+                .await;
+            wait_entry(&server, &root.fleet, PUBLISHER, iss).await;
+        }
+        // A rebuild after every set arrived: the trusted issuer's set.
+        let a1 = IdpKey::es256();
+        publisher
+            .publish(&server, ISS_A, jwks(&[(&a1, "a1")]), now())
+            .await;
+        wait_keys(&keys, |k| kids(k, ISS_A) == ["a1"]).await;
+        let skipped: Vec<&(String, IdpKey)> = issuers
+            .iter()
+            .filter(|(iss, _)| keys.key_set(iss).is_none())
+            .collect();
+        assert_eq!(skipped.len(), 1, "exactly one set is over the quota");
+        let (iss, key) = skipped[0];
+
+        let admin = connect(&root, &server, ADMIN, Some(CONFIG_ADMIN_ROLE)).await;
+        let api = NodeConfigClient::new(admin.rpc()).with_options(options());
+        let trusted = TrustedIssuer::new(iss.as_str(), [AUD])
+            .roles_claim("groups")
+            .map_role("data-readers", "data.read");
+        let rebuilds = keys.rebuilds();
+        let ack = api
+            .set(NodeConfigSetRequest::new().identity(IdentityOverride {
+                trusted_issuers: Some(vec![issuer_a(), trusted]),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        assert!(ack.complete, "{ack:?}");
+        // No namespace event since: the settings change itself rebuilt.
+        assert!(keys.rebuilds() > rebuilds);
+        assert!(keys.key_set(iss).is_some(), "{iss} held once acknowledged");
+        let user = data(&edge, &key.token("u", user_claims(iss)))
+            .read()
+            .await
+            .unwrap();
+        assert_eq!(user.principal, format!("{iss}|alice"));
+    })
+    .await
+    .expect("test timed out");
+}
