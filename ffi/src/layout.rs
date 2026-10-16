@@ -312,7 +312,8 @@ mod lp64 {
         discovery_pkarr_relays = 80,
     });
 
-    // ABI 7.4: [metrics] settings beside aster_config_t (config_metrics.rs).
+    // ABI 7.7: [identity] / [remote_config] settings beside aster_config_t
+    // (config_identity.rs).
     assert_layout!(aster_identity_config_t, size = 96, align = 8, {
         struct_size = 0,
         set = 4,
@@ -327,6 +328,7 @@ mod lp64 {
         sources = 88,
     });
 
+    // ABI 7.4: [metrics] settings beside aster_config_t (config_metrics.rs).
     assert_layout!(aster_metrics_config_t, size = 16, align = 4, {
         struct_size = 0,
         peer_labels = 4,

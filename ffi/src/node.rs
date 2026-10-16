@@ -786,8 +786,9 @@ pub unsafe extern "C" fn aster_config_from_toml(
 }
 
 /// Free the storage of a config filled by `aster_config_from_env` /
-/// `aster_config_from_toml` (or given network settings by
-/// `aster_config_set_network`, ABI 7.3) and zero its pointers. No-op when
+/// `aster_config_from_toml` (or given settings beside it by
+/// `aster_config_set_network` (ABI 7.3), `aster_config_set_metrics` (7.4) or
+/// `aster_config_set_identity` (7.7)) and zero its pointers. No-op when
 /// `storage` is NULL (caller-built or `aster_config_init` configs). Call once
 /// per filled struct.
 #[no_mangle]

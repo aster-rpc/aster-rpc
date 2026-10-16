@@ -233,6 +233,17 @@ pub mod upcall;
 //   `aster_dispatch_identity` now sets `ASTER_DISPATCH_IDENTITY_ACTOR` and fills
 //   the `actor` slot reserved in 7.5 (the gateway), with `principal` the user.
 //   Layouts unchanged. See `ffi/RENAME_MAP.md` "7.6".
+// - 7.7.0 (additive): gateway identity on the config-driven path.
+//   `[identity]`, `[identity.publisher]` and `[remote_config]` beside
+//   `aster_config_t` (`aster_identity_config_t`, `aster_config_set_identity`,
+//   `aster_config_identity`; `config_identity.rs`), read by
+//   `aster_config_from_env` / `_from_toml`; `ASTER_DISPATCH_FLAG_ON_BEHALF_OF`,
+//   `aster_dispatch_on_behalf_of`, `aster_server_node_properties`,
+//   `aster_server_node_config_generation`, `aster_server_set_audit_outbox`,
+//   `aster_node_config_call` (`ASTER_EVENT_NODE_CONFIG_RESULT` = 129),
+//   `aster_enrollment_mint_user_token` and the issuer-key publisher accessors
+//   (`aster_enrollment_publisher_*`). No existing layout changes. See
+//   `ffi/RENAME_MAP.md` "7.7".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
 pub const ASTER_ABI_VERSION_MINOR: u32 = 7;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
