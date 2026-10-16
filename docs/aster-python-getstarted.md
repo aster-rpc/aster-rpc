@@ -90,6 +90,38 @@ The low-level `EndpointConfig` takes the same two keyword arguments.
 endpoint serves no blobs and records no ports, so on an endpoint these
 settings are only passed through to its config.
 
+Cluster network settings are the Rust `AsterConfig` fields of the same names
+(env `ASTER_<NAME>`, TOML `[network]`); list values also take one
+comma-separated string, the env spelling:
+
+- `bind_addr_v6` (e.g. `"[::]:7842"`) pins the IPv6 UDP socket as `bind_addr`
+  pins the IPv4 one, so a default-deny NetworkPolicy can allow one port per
+  family.
+- `advertise_addrs` adds `IP:port` addresses the node cannot discover itself
+  (a NodePort, a load balancer) to its published addresses. Peers still check
+  the node key in the handshake.
+- `relay_ca_certs` / `relay_ca_only` trust a private CA for relay TLS (and for
+  custom discovery's pkarr relays), beside or instead of the WebPKI roots.
+- `discovery` is `"default"` (n0 at `iroh.link`), `"none"`, `"local"` (mDNS
+  only) or `"custom"`. Setting `discovery_dns_origin` or
+  `discovery_pkarr_relays` selects `"custom"`; combining either one with
+  `"none"` or `"local"` is a `ValueError`. Relays are separate: an air-gapped
+  node also sets `relay_mode`.
+
+`metrics_peer_labels` / `metrics_peer_label_cap` (`[metrics] peer_labels` /
+`peer_label_cap`, `ASTER_METRICS_PEER_LABELS` / `_CAP`) label
+`aster.peer.bytes` per peer for the first `cap` peers (default 64) instead of
+by locality level. The ops listener that `AsterServer` starts from `[health]`
+applies them.
+
+```python
+config = AsterConfig(
+    bind_addr="0.0.0.0:7842", bind_addr_v6="[::]:7842",
+    advertise_addrs=["203.0.113.10:31842"],
+    discovery_dns_origin="dns.example.internal",   # discovery == "custom"
+)
+```
+
 Invalid values raise when the config is built: `ValueError` for a bad value,
 `TypeError` for a wrong type or an unknown field, and `FileNotFoundError` when
 `from_file` cannot find its file. `config.print_config()` prints the resolved
@@ -190,9 +222,50 @@ in Rust (`aster::rpc::Server` with dynamic dispatch):
   connection closes.
 - **Interceptors** run in Python as before: request, handler, response, and
   for streams also error.
+- **Handler context.** A handler that declares a `ctx: CallContext` parameter
+  gets the call's context; any code in the handler's task can read it with
+  `CallContext.current()`. It mirrors Rust's `aster::rpc::CallContext`:
+  `peer` (the transport's caller id) and `principal` (the authenticator's
+  resolved caller, else `peer`), `provenance` (`"iroh_authenticated"` or
+  `"other"`), `attributes` (what Gate 3 checked), `metadata`, `service`,
+  `method`, `call_id`, `session_id`, `deadline` / `remaining_seconds` (the
+  effective deadline above), `is_cancelled()` and `await ctx.cancelled()`.
+  A peer cancel (or a drain's deadline) cancels the handler's task, so
+  `cancelled()` serves early exits raced against other work, and tasks the
+  handler spawned with the context see it resolve.
 - **Baseline services.** The node also serves `aster.ops.NodeInfo`, from
   Rust; its `aster.services` / `aster.registry_namespace` attributes tell an
   `AsterClient` which services the server offers.
+
+Per-call options (`aster.CallOptions`, Rust `CallOptions`) set the deadline
+(`timeout`, seconds; sub-second values are enforced on the client, the header
+rounds up to whole seconds), metadata and serialization mode on every pattern:
+
+```python
+svc = await client.client(MissionControl)
+fast = svc.with_options(CallOptions(timeout=0.5, metadata={"tenant": "t1"}))
+await fast.getStatus(req)                                   # unary
+async for entry in fast.tailLogs(req): ...                  # server stream
+await svc.ingestMetrics(points(), options=CallOptions(timeout=5))
+channel = fast.runCommand()                                 # bidi
+mc = (await client.proxy("MissionControl")).with_options(CallOptions(timeout=2))
+```
+
+A call's explicit `timeout=` / `metadata=` win over its `options=`, which win
+over the client's `with_options`. Generated clients (`aster contract
+gen-client`) take the same `metadata=` and `options=` keywords.
+
+**Draining.** `report = await server.drain(grace_period)` is Rust's
+`AsterServer::drain`: it sets the ops listener not ready, refuses new
+connections (closed with `DRAIN_CLOSE_CODE`, 503) and new calls (`UNAVAILABLE`
+with the `aster.draining` detail; calls on an existing session still run),
+closes each connection once idle, and after `grace_period` seconds closes the
+rest, which cancels what still runs. It returns a `DrainReport`
+(`calls_in_flight`, `calls_completed`, `calls_cancelled`, `calls_refused`,
+`connections_closed`, `connections_refused`, `deadline_reached`, `elapsed`).
+A client sees `RpcError.is_draining` and should reconnect to another replica.
+Follow the drain with `close()`; `server.is_draining` reports whether one has
+started.
 
 Clients (`create_client`, `AsterClient.client`, the proxies) call through the
 pooled Rust `RpcConnection` (`aster._aster.RpcClient`). A unary call is one
@@ -291,8 +364,21 @@ Blobs (`blobs_client(node)`):
 only what is still missing. `FetchStrategy.SPLIT_CHILDREN` fetches each child
 of a HashSeq as its own request and needs `BlobFormat.HASH_SEQ`. A
 `FetchReport` has `providers` (`ProviderOutcome`: `node_id`, `attempts`,
-`failures`, `completed_requests`), `attempted()`, `failed()`, `served()` and
-`bytes_transferred`. `format` also accepts `"raw"` / `"hash_seq"`.
+`failures`, `completed_requests`, `in_flight`, `plain_fallbacks`, and the bytes
+it carried: `bytes_transferred`, plus `wire_bytes`, the compressed bytes over
+zstd, `None` when every attempt was plain), `attempted()`, `failed()`,
+`served()`, `in_flight()`, `plain_only()` (providers without zstd: cache them
+as plain-only rather than ranking them down) and `bytes_transferred`. `format`
+also accepts `"raw"` / `"hash_seq"`.
+
+`blobs.transfer_stats()` returns the node's `BlobTransferStats` since start
+(monotonic, both directions): payload, zstd payload, wire and plain bytes for
+fetching and serving, `plain_fallbacks`, `plain_serves`, `fetch_transfers` /
+`serve_transfers` (`BlobTransferCounts`: `plain_ok`, `plain_failed`,
+`zstd_ok`, `zstd_failed`) and the zstd decode errors. Per peer, a monitored
+node's `node.topology().peer(id)` carries `quic_traffic` (`QuicTraffic`: QUIC
+bytes sent and received for `blobs`, `blobs_zstd`, `docs`, `gossip`, `rpc` and
+`other`, plus `total()`) and `blob_transfer` (`PeerBlobStats`).
 
 Docs (`docs_client(node)` and its `DocHandle`s):
 

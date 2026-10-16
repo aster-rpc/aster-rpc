@@ -143,9 +143,10 @@ Live consumers wait for the next acknowledgement instead of polling:
 | --- | --- | --- |
 | Rust | `outbox.acknowledgements(after, limit)` | `outbox.wait_acknowledgements(after, limit, timeout)` |
 | Go | `outbox.Acknowledgements(ctx, after, limit)` | `WaitAcknowledgements(ctx, after, limit, wait)`; `WatchAcknowledgements(ctx, after)` returns a channel |
+| Python | `await outbox.acknowledgements(after, limit)` | `await outbox.wait_acknowledgements(after, limit, timeout)`; `async for ack in outbox.watch_acknowledgements(after)` |
 | C ABI 7.1 | `aster_audit_outbox_acknowledgements` with `wait_ms` 0 | the same call with `wait_ms` > 0 |
 
-Python, TypeScript, Java and .NET do not expose the log yet. The log records
+TypeScript, Java and .NET do not expose the log yet. The log records
 receiver acknowledgements only. Quarantine is a disposition, not an
 acknowledgement, and remains visible through `export`.
 
