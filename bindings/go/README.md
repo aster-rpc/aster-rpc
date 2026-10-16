@@ -48,6 +48,32 @@ the 7.0 header and library together.
   untagged, Fory Go writes them as `list<uint8>`, not the `binary` every other
   binding uses (the contract builder refuses an untagged `[]byte`; use
   `aster:"uint8_list"` to mean `list<uint8>`).
+- **Contract types** (`scalars.go`, spec "Time, UUID, and Decimal"):
+  `time.Time` → `timestamp` (truncated to whole microseconds on encode,
+  decoded in UTC), `aster.Date` → `date`, `aster.Decimal` → `decimal`
+  (`aster:"decimal(18,4)"` → `decimal(18,4)`: zero-padded to the scale on
+  encode; a value that needs rounding or has too many digits is refused on
+  encode and decode), `aster.UUID` → `uuid`, `aster.ULID` → `ulid` (or a
+  `[16]byte` tagged `aster:"uuid"` / `aster:"ulid"`). `Date` and `Decimal`
+  are Fory Go's own types; `ParseDecimal`, `FormatDecimal`,
+  `RescaleDecimal`, `ParseUUID`, `ParseULID` and `DateOf` convert. A uuid /
+  ulid needs a Fory bytes hint where the id sits (`fory:"type=bytes"`,
+  `fory:"type=list(element=bytes(nullable=false))"`,
+  `fory:"type=map(key=bytes(nullable=false),value=_(nullable=false))"`);
+  the contract builder refuses one without. Recursive types (direct, mutual,
+  longer cycles) get `SELF_REF` back-edges like Rust and Python
+  (`contract_graph.go`). The Rust golden vectors
+  (`conformance/vectors/contract-types.json`) pass: type hashes, both contract
+  ids, every payload decodes, re-encodes to Rust's bytes, and the refusals.
+- **Matching Rust's bytes:** Fory Go marks list elements and map keys / values
+  nullable; Rust does not. With `type=list(element=_(nullable=false))` (and
+  the map form) on those fields a Go type's Fory metadata equals Rust's, so
+  Go writes Rust's exact bytes. Fory Go 1.7.6 needs that for `list<uuid>` /
+  `map<uuid, _>` fields: from metadata that differs from the local type it
+  refuses such a list and panics building such a map (the codec turns the
+  panic into an error). Other fields decode across the difference. Field
+  names are Fory's snake_case of the Go name, so `ID` is `i_d`: name the
+  field `Id` to get `id`.
 - **Envelope / compression:** AEv1 `StreamHeader` / `CallHeader` / `RpcStatus`
   and zstd come from the C ABI (`EncodeStreamHeader`, `DecodeRpcStatus`,
   `ZstdMaybeCompress`, `EncodePayloadFrame`, ...); `conformance/vectors/
@@ -194,7 +220,13 @@ the 7.0 header and library together.
   slices) and re-checks the context between slices. Requests of client-stream / bidi calls are
   sent as the iterator yields them (ping-pong works). Sessions:
   `RpcConnection.NewSessionID` (the connection's shared counter) +
-  `WithSession`; `WithMetadata`, `WithVersion`. Consumer admission is not
+  `WithSession`; `WithMetadata`, `WithVersion`. **Per-call options** (Rust's
+  `CallOptions`): every pattern (`Call`, `CallServerStream`,
+  `CallClientStream`, `CallBidiStream`, `OpenBidiStream`) takes
+  `WithDeadline(t)` / `WithTimeout(d)` (the earliest of those and ctx's
+  deadline applies), `WithMetadata`, `WithSession`. There is no generated
+  client yet (`aster contract gen-client` emits Python and TypeScript only);
+  the generic `Call*` functions are the typed client path. Consumer admission is not
   performed (open gate / admitted peers only, as for .NET and Java).
 - **Errors:** `errors.Is` against `ErrNotFound`, `ErrInvalidArgument`,
   `ErrVerificationFailed`, ... (status codes) and `ErrRpcNotFound`,
@@ -501,6 +533,8 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `envelope.go` | AEv1 envelope, zstd, framing (via the C ABI) |
 | `codec.go` | `Codec`, `ForyCodec` (Fory 1.7.6), `WireTyped` |
 | `contract.go` | Contract identity: TypeDef / ServiceContract JSON → Rust hash |
+| `contract_graph.go` | Type-graph resolution: Tarjan SCCs, `SELF_REF` back-edges for recursive types |
+| `scalars.go` | `Date`, `Decimal`, `decimal(p,s)`, `UUID`, `ULID` and the codec's timestamp / decimal(p,s) normalisation (plain Go, no cgo) |
 | `rpc_service.go` | `Service` / `NewSessionService`, `Unary` / `ServerStream` / `ClientStream` / `BidiStream`, `Requires`, `CallInfo`, `DynamicServiceJSON` |
 | `observability_pure.go` | Observability, plain Go (no cgo): attribute and `traceparent` / baggage codecs, `context.Context` carrier, `TraceHandler`, Rust-record-to-slog mapping |
 | `observability.go`, `metrics.go`, `tracing.go`, `health.go` | ABI 4.6 pipeline init / shutdown and the log poller; metric instruments; spans; `HealthServer` |
@@ -535,6 +569,7 @@ this one); `tests/interop/run.py` builds it with an rpath to the debug library.
 | `enrollment_test.go` | Enrollment through `StartServer` / `StartClient` (mirrors `aster/tests/enrollment_aster_server.rs`): roles reach `Requires`, a missing role is refused, no credential cannot connect, root revocation, config-driven issuer renewal, fail-closed misconfiguration; the root is `internal/testroot` |
 | `lease_grantor_test.go` | The lease grantor over a Go serializer and the in-memory one |
 | `rpc_test.go`, `node_test.go`, `dataplane_test.go`, `vectors_test.go` | RPC (4 patterns, errors, deadlines, gate, interceptors, QUEUE_FULL), config/node/gate/admission, data plane, conformance vectors |
+| `contract_types_test.go`, `scalars_test.go`, `rpc_call_options_test.go` | Contract-type golden vectors (hashes, contract ids, payload bytes, refusals); scalar string forms and the decimal(p,s) rule (also `CGO_ENABLED=0`); per-call deadline and metadata on all four patterns |
 
 ## Architecture
 
