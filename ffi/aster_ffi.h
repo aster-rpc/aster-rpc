@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 7
 
-#define ASTER_ABI_VERSION_MINOR 0
+#define ASTER_ABI_VERSION_MINOR 1
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -23,6 +23,11 @@
  * This is the value `aster_abi_version()` returns.
  */
 #define ASTER_ABI_VERSION (((ASTER_ABI_VERSION_MAJOR << 16) | (ASTER_ABI_VERSION_MINOR << 8)) | ASTER_ABI_VERSION_PATCH)
+
+/**
+ * Largest `wait_ms` an acknowledgement query accepts (one hour).
+ */
+#define ASTER_AUDIT_OUTBOX_MAX_ACK_WAIT_MS 3600000
 
 /**
  * Version of all audit outbox JSON request/status/export wrappers.
@@ -607,6 +612,11 @@ typedef enum aster_event_kind_t {
    * the enrollment it ran on.
    */
   ASTER_EVENT_ENROLLMENT_RESULT = 127,
+  /**
+   * ABI 7.1: `aster_audit_outbox_acknowledgements`: versioned JSON page of
+   * acknowledgement-log entries; `handle` = the outbox.
+   */
+  ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS = 128,
 } aster_event_kind_t;
 
 /**
@@ -3942,6 +3952,22 @@ int32_t aster_registry_acl_list_writers(aster_runtime_t runtime,
                                         uint64_t doc,
                                         uint64_t user_data,
                                         aster_operation_t *out_operation);
+
+/**
+ * Read the acknowledgement log, JSON v1
+ * `{ "version":1, "after":<cursor>, "limit":1..=1000, "wait_ms":<ms> }`.
+ * `after` (default 0) is exclusive: pass the last returned `cursor` to continue.
+ * With `wait_ms` > 0 and nothing after `after`, completion waits up to that
+ * long for the next acknowledgement, then returns an empty page. Emits
+ * `ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS` with `{ "version":1,
+ * "acknowledgements":[{ "cursor", "event_id", "sequence", "batch_id",
+ * "acknowledged_at_ms" }] }`, oldest first. Cancelling a waiting query is safe.
+ */
+int32_t aster_audit_outbox_acknowledgements(aster_runtime_t runtime,
+                                            aster_audit_outbox_t outbox,
+                                            struct aster_bytes_t json,
+                                            uint64_t user_data,
+                                            aster_operation_t *out_operation);
 
 /**
  * Open JSON v1 `{ "version":1, "config":{...} }`; configuration and storage

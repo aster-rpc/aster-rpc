@@ -1,4 +1,18 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.0)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.1)
+
+## New in 7.1 (audit outbox acknowledgement log; additive)
+
+The durable audit outbox now records each event the receiver acknowledged, in
+the same storage transaction that deletes it, and the C ABI reads that log.
+
+| Item | Role |
+|---|---|
+| `aster_audit_outbox_acknowledgements(rt, outbox, json, ud, *op)` | JSON v1 `{version, after, limit, wait_ms}`; completes with the page below. `after` is an exclusive cursor, `limit` 1–1000, `wait_ms` waits (at most `ASTER_AUDIT_OUTBOX_MAX_ACK_WAIT_MS`) for the next acknowledgement when none follows `after`. |
+| `ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS` = 128 | `handle` = the outbox; payload `{"version":1,"acknowledgements":[{cursor, event_id, sequence, batch_id, acknowledged_at_ms}]}`. |
+| Open config `acknowledgement_log_max_entries`, `acknowledgement_log_max_age_ms` | Optional JSON fields; defaults 100,000 entries and 7 days. |
+
+No struct layout changes. Go requires 7.1 (`ABIMinorRequired = 1`).
+See `ffi_spec/Aster-audit-outbox-spec.md`.
 
 ## 7.0 (breaking: `aster_hook_failure_mode_t` values swap so zero fails closed)
 

@@ -57,7 +57,7 @@ pub enum aster_audit_outbox_error_t {
 }
 
 pub(crate) struct OutboxState {
-    outbox: AuditOutbox,
+    pub(crate) outbox: AuditOutbox,
     max_event_bytes: usize,
 }
 
@@ -101,7 +101,10 @@ struct QuarantineAction {
 
 /// Validate length BEFORE constructing a foreign slice, let alone copying/parsing.
 /// No parser error details are returned: they may contain caller payload/credentials.
-unsafe fn request<T: DeserializeOwned>(bytes: aster_bytes_t, limit: usize) -> Result<T, i32> {
+pub(crate) unsafe fn request<T: DeserializeOwned>(
+    bytes: aster_bytes_t,
+    limit: usize,
+) -> Result<T, i32> {
     if bytes.len > limit {
         return Err(invalid("audit outbox JSON exceeds its encoded input limit"));
     }
@@ -109,7 +112,7 @@ unsafe fn request<T: DeserializeOwned>(bytes: aster_bytes_t, limit: usize) -> Re
     serde_json::from_slice(bytes).map_err(|_| invalid("invalid audit outbox JSON request"))
 }
 
-fn version(version: u32) -> Result<(), i32> {
+pub(crate) fn version(version: u32) -> Result<(), i32> {
     if version == ASTER_AUDIT_OUTBOX_JSON_VERSION {
         Ok(())
     } else {
@@ -125,7 +128,7 @@ fn id(id: &str) -> Result<(), i32> {
     }
 }
 
-fn outbox_for(bridge: &BridgeRuntime, handle: u64) -> Result<Arc<OutboxState>, i32> {
+pub(crate) fn outbox_for(bridge: &BridgeRuntime, handle: u64) -> Result<Arc<OutboxState>, i32> {
     bridge
         .audit_outboxes
         .get(handle)
@@ -166,7 +169,7 @@ fn closed() -> OpError {
     }
 }
 
-fn error(error: AuditError) -> OpError {
+pub(crate) fn error(error: AuditError) -> OpError {
     use aster_audit_outbox_error_t::*;
     use aster_status_t::*;
     let (code, status) = match error.kind() {
@@ -234,7 +237,7 @@ fn error(error: AuditError) -> OpError {
     }
 }
 
-fn output(value: serde_json::Value) -> Result<Vec<u8>, OpError> {
+pub(crate) fn output(value: serde_json::Value) -> Result<Vec<u8>, OpError> {
     serde_json::to_vec(&value).map_err(|_| OpError {
         status: aster_status_t::ASTER_STATUS_INTERNAL,
         code: aster_audit_outbox_error_t::ASTER_AUDIT_OUTBOX_ERROR_WORKER_FAILED as i32,

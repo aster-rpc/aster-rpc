@@ -460,7 +460,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 0); /* 7.0: hook failure mode 0 = FAIL_CLOSED */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 1); /* 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
     {
         /* A 5.x caller (280-byte aster_config_t, no 6.x handshake) is refused
          * cleanly and nothing is written past, or into, its struct. This runs
@@ -512,6 +512,15 @@ static void test_abi_version(void) {
     CHECK(sizeof(aster_audit_outbox_t) == 8);
     CHECK(ASTER_EVENT_AUDIT_OUTBOX_OPENED == 114);
     CHECK(ASTER_EVENT_AUDIT_OUTBOX_EXPORTED == 117);
+    CHECK(ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS == 128);
+    CHECK(ASTER_AUDIT_OUTBOX_MAX_ACK_WAIT_MS == 3600000);
+    {
+        aster_operation_t ack_op = 9;
+        aster_bytes_t ack_req = {(const uint8_t *)"{\"version\":1,\"limit\":1}", 23};
+        CHECK(aster_audit_outbox_acknowledgements(0, 0, ack_req, 0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+        CHECK(aster_audit_outbox_acknowledgements(0, 0, ack_req, 0, &ack_op) != ASTER_STATUS_OK);
+        CHECK(ack_op == 0);
+    }
     CHECK(aster_version() != NULL && strlen(aster_version()) > 0);
 }
 

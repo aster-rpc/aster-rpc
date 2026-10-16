@@ -20,6 +20,7 @@ use anyhow::Result;
 
 use aster_transport_core::*;
 
+pub mod audit_acknowledgements;
 pub mod audit_outbox;
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
@@ -197,8 +198,12 @@ pub mod upcall;
 //   caller's literal 0/1 would mean the opposite mode, so it is refused at
 //   the handshake (`aster_runtime_new(6, ...)` / `aster_abi_accept(6)`). See
 //   `ffi/RENAME_MAP.md` "7.0".
+// - 7.1.0 (additive): the audit outbox acknowledgement log
+//   (`aster_audit_outbox_acknowledgements`,
+//   `ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS` = 128,
+//   `audit_acknowledgements.rs`). See `ffi/RENAME_MAP.md` "7.1".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 0;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 1;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -470,6 +475,9 @@ pub enum aster_event_kind_t {
     /// ABI 5.1: an Enrollment operation's JSON result (payload); `handle` =
     /// the enrollment it ran on.
     ASTER_EVENT_ENROLLMENT_RESULT = 127,
+    /// ABI 7.1: `aster_audit_outbox_acknowledgements`: versioned JSON page of
+    /// acknowledgement-log entries; `handle` = the outbox.
+    ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS = 128,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and
