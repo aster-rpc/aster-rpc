@@ -27,8 +27,15 @@
 //! - `create_reactor`: returns a handle + feeder. The caller owns the accept
 //!   loop and feeds RPC connections via `ReactorFeeder::feed`
 //!   (`aster::expose` and the transport-level tests).
+//!
+//! Draining: `start_reactor_with_control` shares a [`ReactorControl`] with
+//! the server above it. Once draining, the accept loop closes every new
+//! connection with [`DRAIN_CLOSE_CODE`], and the control lists the live
+//! connections with their in-flight call counts so the server can close the
+//! idle ones (and, at its deadline, the rest).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -511,6 +518,195 @@ pub enum ReactorEvent {
 /// to higher-level handlers.
 pub const RPC_ALPN: &[u8] = b"aster/1";
 
+/// QUIC application close code a draining server closes connections with:
+/// new connections at accept, idle ones while it drains, and the rest at its
+/// deadline. It means "this server is going away; reconnect to another
+/// replica". Clients surface it as `UNAVAILABLE` with the
+/// [`DRAINING_DETAIL_KEY`] detail rather than as a generic transport error.
+/// (503, after HTTP's Service Unavailable; refusals use 403.)
+pub const DRAIN_CLOSE_CODE: u64 = 503;
+
+/// The close reason sent with [`DRAIN_CLOSE_CODE`].
+pub const DRAIN_CLOSE_REASON: &[u8] = b"aster: server draining; reconnect elsewhere";
+
+/// `RpcStatus` detail key a draining server sets (value `"true"`) on the
+/// `UNAVAILABLE` it answers new calls with, and that clients set on the
+/// error for a connection closed with [`DRAIN_CLOSE_CODE`].
+pub const DRAINING_DETAIL_KEY: &str = "aster.draining";
+
+/// Whether `info` is a close with [`DRAIN_CLOSE_CODE`].
+pub fn is_drain_close(info: &CoreClosedInfo) -> bool {
+    info.code == Some(DRAIN_CLOSE_CODE)
+}
+
+/// Shared between a reactor that owns its accept loop and the server above
+/// it: the drain switch, the live `aster/1` connections and their in-flight
+/// call counts. See [`start_reactor_with_control`].
+#[derive(Default)]
+pub struct ReactorControl {
+    draining: AtomicBool,
+    connections: Mutex<HashMap<u64, LiveConnection>>,
+    refused: AtomicU64,
+    changed: Notify,
+}
+
+struct LiveConnection {
+    conn: CoreConnection,
+    gone: Arc<ConnectionGone>,
+    /// Closed by [`ReactorControl::close_draining`] (counted once).
+    drained: bool,
+}
+
+/// One live connection as [`ReactorControl::connections`] reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveConnectionInfo {
+    pub connection_id: u64,
+    /// Calls delivered on it whose response has not finished.
+    pub active_calls: usize,
+    /// How long it has had no call in flight (zero while it has one): since
+    /// its last call's response was handed to QUIC, or since it opened.
+    pub idle_for: Duration,
+    /// The selected path's round-trip time (zero before it is measured).
+    pub rtt: Duration,
+}
+
+/// Process-wide reference instant for the per-connection idle clocks.
+fn epoch() -> std::time::Instant {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    *EPOCH.get_or_init(std::time::Instant::now)
+}
+
+fn micros_since_epoch() -> u64 {
+    u64::try_from(epoch().elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+impl ReactorControl {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Refuse new connections from now on (closed at accept with
+    /// [`DRAIN_CLOSE_CODE`]). One-way.
+    pub fn start_draining(&self) {
+        self.draining.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    pub fn is_draining(&self) -> bool {
+        self.draining.load(Ordering::Acquire)
+    }
+
+    /// Connections refused at accept since draining started.
+    pub fn refused_connections(&self) -> u64 {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    /// The live `aster/1` connections not yet closed by
+    /// [`close_draining`](Self::close_draining).
+    pub fn connections(&self) -> Vec<LiveConnectionInfo> {
+        self.connections
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, c)| !c.drained)
+            .map(|(&connection_id, c)| {
+                let active_calls = c.gone.active.load(Ordering::Acquire);
+                let idle_for = if active_calls == 0 {
+                    let since = c.gone.idle_since_us.load(Ordering::Acquire);
+                    Duration::from_micros(micros_since_epoch().saturating_sub(since))
+                } else {
+                    Duration::ZERO
+                };
+                LiveConnectionInfo {
+                    connection_id,
+                    active_calls,
+                    idle_for,
+                    rtt: Duration::from_secs_f64(c.conn.rtt_ms().max(0.0) / 1000.0),
+                }
+            })
+            .collect()
+    }
+
+    /// Live connections, including those closed by the drain whose
+    /// connection loop has not finished yet.
+    pub fn live_connections(&self) -> usize {
+        self.connections.lock().unwrap().len()
+    }
+
+    /// Close connection `connection_id` with [`DRAIN_CLOSE_CODE`]. Returns
+    /// whether it was live and not already closed this way.
+    pub fn close_draining(&self, connection_id: u64) -> bool {
+        let conn = {
+            let mut conns = self.connections.lock().unwrap();
+            match conns.get_mut(&connection_id) {
+                Some(c) if !c.drained => {
+                    c.drained = true;
+                    c.conn.clone()
+                }
+                _ => return false,
+            }
+        };
+        let _ = conn.close(DRAIN_CLOSE_CODE, DRAIN_CLOSE_REASON.to_vec());
+        true
+    }
+
+    /// Resolves at the next change worth re-checking while draining: a call
+    /// ended or a connection closed. Enable it before checking state.
+    pub fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
+
+    fn register(&self, connection_id: u64, conn: CoreConnection, gone: Arc<ConnectionGone>) {
+        gone.idle_since_us
+            .store(micros_since_epoch(), Ordering::Release);
+        self.connections.lock().unwrap().insert(
+            connection_id,
+            LiveConnection {
+                conn,
+                gone,
+                drained: false,
+            },
+        );
+    }
+
+    fn unregister(&self, connection_id: u64) {
+        self.connections.lock().unwrap().remove(&connection_id);
+        self.changed.notify_waiters();
+    }
+
+    fn call_ended(&self) {
+        if self.is_draining() {
+            self.changed.notify_waiters();
+        }
+    }
+}
+
+/// Counts one delivered call as in flight on its connection until dropped.
+struct ActiveCall<'a>(&'a ConnectionGone);
+
+impl<'a> ActiveCall<'a> {
+    fn enter(gone: &'a ConnectionGone) -> Self {
+        gone.active.fetch_add(1, Ordering::AcqRel);
+        Self(gone)
+    }
+}
+
+impl Drop for ActiveCall<'_> {
+    fn drop(&mut self) {
+        if let Some(control) = &self.0.control {
+            // Stamped before the count drops, so an idle connection never
+            // reads a stale stamp.
+            self.0
+                .idle_since_us
+                .store(micros_since_epoch(), Ordering::Release);
+            self.0.active.fetch_sub(1, Ordering::AcqRel);
+            control.call_ended();
+        } else {
+            self.0.active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 pub struct ReactorHandle {
     event_rx: mpsc::Receiver<ReactorEvent>,
     /// Non-rpc accept queue. Populated by `accept_loop` when a connection
@@ -552,7 +748,7 @@ impl ReactorFeeder {
     pub fn feed(&self, conn: CoreConnection) {
         let tx = self.event_tx.clone();
         self.rt_handle
-            .spawn(connection_loop(conn, tx, self.resolve.clone()));
+            .spawn(connection_loop(conn, tx, self.resolve.clone(), None));
     }
 
     /// Install the per-method body-frame cap resolver. Without one every
@@ -599,9 +795,20 @@ pub fn start_reactor_with_limits(
     channel_capacity: usize,
     resolve: Option<FrameLimitResolver>,
 ) -> ReactorHandle {
+    start_reactor_with_control(node, channel_capacity, resolve, ReactorControl::new())
+}
+
+/// [`start_reactor_with_limits`] sharing `control`, through which the caller
+/// drains: new connections refused, live ones listed and closed.
+pub fn start_reactor_with_control(
+    node: CoreNode,
+    channel_capacity: usize,
+    resolve: Option<FrameLimitResolver>,
+    control: Arc<ReactorControl>,
+) -> ReactorHandle {
     let (event_tx, event_rx) = mpsc::channel(channel_capacity);
     let (non_rpc_tx, non_rpc_rx) = mpsc::channel(channel_capacity);
-    tokio::spawn(accept_loop(node, event_tx, non_rpc_tx, resolve));
+    tokio::spawn(accept_loop(node, event_tx, non_rpc_tx, resolve, control));
     ReactorHandle {
         event_rx,
         non_rpc_rx,
@@ -614,9 +821,21 @@ async fn accept_loop(
     event_tx: mpsc::Sender<ReactorEvent>,
     non_rpc_tx: mpsc::Sender<(Vec<u8>, CoreConnection)>,
     resolve: Option<FrameLimitResolver>,
+    control: Arc<ReactorControl>,
 ) {
     loop {
         match node.accept_aster().await {
+            Ok((_, conn)) if control.is_draining() => {
+                // Draining: every new connection, RPC or not, is told to go
+                // elsewhere. The handshake has completed, so the peer sees
+                // an application close with the drain code and reason.
+                control.refused.fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(
+                    peer = conn.remote_id().as_str(),
+                    "draining: new connection refused"
+                );
+                let _ = conn.close(DRAIN_CLOSE_CODE, DRAIN_CLOSE_REASON.to_vec());
+            }
             Ok((alpn, conn)) => {
                 // Filter by ALPN: aster/1 → RPC pipeline, everything else →
                 // non-rpc queue for the binding to dispatch (admission, etc.).
@@ -625,7 +844,12 @@ async fn accept_loop(
                 // silently dropped the handshake. See task #31.
                 if alpn == RPC_ALPN {
                     let tx = event_tx.clone();
-                    tokio::spawn(connection_loop(conn, tx, resolve.clone()));
+                    tokio::spawn(connection_loop(
+                        conn,
+                        tx,
+                        resolve.clone(),
+                        Some(control.clone()),
+                    ));
                 } else if non_rpc_tx.send((alpn, conn)).await.is_err() {
                     // Binding dropped the non-rpc receiver. That means nothing
                     // is listening — drop the connection. The peer will see a
@@ -660,6 +884,13 @@ struct ConnectionGone {
     /// close, and the server would admit state for that connection (foreign
     /// admission, a session) that no later event reaps.
     publish: Mutex<()>,
+    /// Calls delivered on the connection whose response has not finished.
+    active: AtomicUsize,
+    /// The owning reactor's control, told when a call ends.
+    control: Option<Arc<ReactorControl>>,
+    /// When the connection last had no call in flight (microseconds since
+    /// [`epoch`]); only kept with a control.
+    idle_since_us: AtomicU64,
 }
 
 impl ConnectionGone {
@@ -699,10 +930,17 @@ async fn connection_loop(
     conn: CoreConnection,
     event_tx: mpsc::Sender<ReactorEvent>,
     resolve: Option<FrameLimitResolver>,
+    control: Option<Arc<ReactorControl>>,
 ) {
     let peer_id = conn.remote_id();
     let connection_id = next_connection_id();
-    let gone = Arc::new(ConnectionGone::default());
+    let gone = Arc::new(ConnectionGone {
+        control: control.clone(),
+        ..ConnectionGone::default()
+    });
+    if let Some(control) = &control {
+        control.register(connection_id, conn.clone(), gone.clone());
+    }
 
     // `accept_aster_bi` transparently dispatches `FLAG_TUNNEL` streams
     // via the per-connection tunnel registry, so the reactor only ever
@@ -724,6 +962,9 @@ async fn connection_loop(
     }
 
     gone.set();
+    if let Some(control) = &control {
+        control.unregister(connection_id);
+    }
 
     // Connection closed or accept_bi returned an error — emit a
     // ConnectionClosed event so the binding can reap per-connection
@@ -1467,6 +1708,9 @@ async fn dispatch_one_call(
         // binding never saw it, so there is nothing to reap. End the stream.
         return Ok(CallOutcome::Cancelled);
     }
+    // In flight on this connection until this function returns, whatever
+    // the outcome (a draining server closes only idle connections).
+    let _active = ActiveCall::enter(gone);
 
     // The response writer runs in its OWN task, owning `resp_rx` and a clone of
     // the send half.
@@ -1820,7 +2064,13 @@ mod accept_shutdown_tests {
         node.close().await;
         let (event_tx, mut event_rx) = mpsc::channel(1);
         let (non_rpc_tx, mut non_rpc_rx) = mpsc::channel(1);
-        let task = tokio::spawn(accept_loop(node, event_tx, non_rpc_tx, None));
+        let task = tokio::spawn(accept_loop(
+            node,
+            event_tx,
+            non_rpc_tx,
+            None,
+            ReactorControl::new(),
+        ));
         let ended = tokio::time::timeout(Duration::from_secs(2), event_rx.recv()).await;
         // Also clean up the old retry-loop implementation on assertion failure:
         // closing the receiver lets it notice terminal shutdown on its next lap.

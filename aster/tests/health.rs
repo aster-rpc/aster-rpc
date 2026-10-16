@@ -1006,6 +1006,96 @@ async fn deferred_surface_readiness_follows_activation() {
     srv.shutdown().await;
 }
 
+/// Holds every call until the test releases it; counts calls started.
+struct Held {
+    gate: std::sync::Arc<tokio::sync::Semaphore>,
+    started: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[aster::rpc::async_trait]
+impl ServiceDispatch for Held {
+    fn name(&self) -> &str {
+        "Held"
+    }
+    fn version(&self) -> i32 {
+        1
+    }
+    fn methods(&self) -> &[&str] {
+        &["hold"]
+    }
+    async fn dispatch(&self, _method: &str, call: Call) {
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.gate.acquire().await.unwrap().forget();
+        let _ = call.respond(vec![1], &RpcStatus::ok()).await;
+    }
+}
+
+/// Poll `cond` until it holds (generous bound).
+async fn eventually(what: &str, mut cond: impl AsyncFnMut() -> bool) {
+    for _ in 0..400 {
+        if cond().await {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+/// `AsterServer::drain` reports not ready first and stays not ready while
+/// in-flight work finishes; the listener is released when it ends.
+#[tokio::test]
+async fn drain_reports_not_ready_while_in_flight_work_finishes() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .service(Held {
+            gate: gate.clone(),
+            started: started.clone(),
+        })
+        .health(HealthConfig::new("127.0.0.1", 0))
+        .start()
+        .await
+        .unwrap();
+    let addr = srv.health().unwrap().addr();
+    let state = srv.health().unwrap().state();
+    assert_eq!(get(addr, "/readyz").await.status, 200);
+    let client = client_of(&srv).await;
+    let conn = client.rpc_connect(&srv.id()).await.unwrap();
+    let held = tokio::spawn(async move { conn.unary(&probe("Held", "hold"), vec![0]).await });
+    eventually("the call in its handler", async || {
+        started.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    let drain = tokio::spawn(srv.drain(Duration::from_secs(30)));
+    eventually("readiness off", async || {
+        get(addr, "/readyz").await.status == 503
+    })
+    .await;
+    assert!(!state.is_ready());
+    assert!(!drain.is_finished(), "the held call keeps the drain open");
+
+    gate.add_permits(1);
+    let reply = timeout(Duration::from_secs(20), held)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.unwrap(), vec![1]);
+    let report = timeout(Duration::from_secs(20), drain)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!report.deadline_reached, "{report:?}");
+    assert_eq!(report.calls_in_flight, 1, "{report:?}");
+    assert_eq!(report.calls_completed, 1, "{report:?}");
+    assert!(TcpStream::connect(addr).await.is_err(), "listener released");
+    client.shutdown().await;
+}
+
 #[test]
 fn prometheus_parser_rejects_garbage() {
     let ok = parse_prometheus(

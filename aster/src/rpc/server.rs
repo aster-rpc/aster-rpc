@@ -41,6 +41,7 @@ use super::codec::{
 };
 use super::context::{CallContext, CallContextParts};
 use super::deadline::DeadlineQueue;
+use super::drain::{DrainShared, DrainTicket};
 use super::dynamic::DynamicService;
 use super::foreign::{
     DispatchAdmission, DispatchEvent, DispatchPermit, DispatchSendError, DispatchSink, Foreign,
@@ -229,6 +230,8 @@ pub struct Server {
     telemetry: Telemetry,
     /// Late-bound services (deferred `AsterServer`); `None` = none expected.
     late: Option<Arc<LateSlot>>,
+    /// Drain state, shared by every dispatcher and the serve handle.
+    drain: Arc<DrainShared>,
 }
 
 /// The default cap on how long any handler may run: Python's
@@ -255,6 +258,7 @@ impl Server {
             foreign: OnceLock::new(),
             telemetry: Telemetry::default(),
             late: None,
+            drain: Arc::default(),
         }
     }
 
@@ -510,6 +514,7 @@ impl Server {
             foreign: self.foreign(),
             telemetry: self.telemetry.clone(),
             late: self.late.clone(),
+            drain: self.drain.clone(),
         }
     }
 
@@ -521,7 +526,14 @@ impl Server {
         let dispatcher = self.dispatcher();
         let resolver = dispatcher.frame_limit_resolver();
         let foreign = dispatcher.foreign.clone();
-        let handle = reactor::start_reactor_with_limits(self.core, 256, Some(resolver));
+        let handle = reactor::start_reactor_with_control(
+            self.core,
+            256,
+            Some(resolver),
+            self.drain.reactor(),
+        );
+        let drain = self.drain.clone();
+        let sessions = dispatcher.sessions.clone();
         let (mut event_rx, mut non_rpc_rx) = handle.into_parts();
 
         // RPC pipeline: dispatch each `aster/1` call.
@@ -655,6 +667,8 @@ impl Server {
         ServerHandle {
             rpc_join,
             route_join,
+            drain,
+            sessions,
         }
     }
 }
@@ -689,6 +703,9 @@ pub struct Dispatcher {
     /// Late-bound services, shared by every clone (so an HTTP transport sees
     /// an activation too).
     late: Option<Arc<LateSlot>>,
+    /// The server's drain state: refuses new calls while draining and counts
+    /// admitted ones.
+    drain: Arc<DrainShared>,
 }
 
 impl Dispatcher {
@@ -831,6 +848,17 @@ impl Dispatcher {
         }
 
         let key = (header.service.clone(), header.version);
+        // Draining: only calls on a session that already exists run (so the
+        // session can finish); everything else is told to go elsewhere.
+        if self.drain.is_draining() {
+            let on_live_session = header.session_id != 0
+                && parts
+                    .connection_id
+                    .is_some_and(|conn| self.sessions.has_session(conn, &key, header.session_id));
+            if !on_live_session {
+                return Route::Reject(self.drain.refuse());
+            }
+        }
         let (meta, factory, foreign) = if let Some(s) = self.services.get(&key) {
             (s.clone(), None, None)
         } else if let (Some(probe), Some(f)) = (
@@ -1015,6 +1043,7 @@ impl Dispatcher {
             deadline,
             session_scoped,
             call_admission,
+            drain: Some(self.drain.admit()),
         };
         if self.authenticator.is_some() {
             return Route::Authenticate(routed);
@@ -1492,6 +1521,8 @@ impl CallParts {
 pub struct ServerHandle {
     rpc_join: tokio::task::JoinHandle<()>,
     route_join: tokio::task::JoinHandle<()>,
+    drain: Arc<DrainShared>,
+    sessions: Arc<SessionStore>,
 }
 
 impl ServerHandle {
@@ -1507,6 +1538,54 @@ impl ServerHandle {
         let _ = self.rpc_join.await;
         self.route_join.abort();
         let _ = self.route_join.await;
+    }
+
+    /// Drain the server (see [`drain`](super::drain)): refuse new connections
+    /// and calls, close connections as they become idle, let in-flight calls
+    /// (and calls on live sessions) run until `grace`, then close every
+    /// remaining connection, which cancels what still runs. Returns what it
+    /// did. The loops keep running (refusing) and the node stays up: follow
+    /// with [`abort`](ServerHandle::abort) and the node's shutdown.
+    ///
+    /// A call while a drain runs moves its deadline earlier when `grace` ends
+    /// sooner, then returns the same report; a call after it ended returns
+    /// that report.
+    pub async fn drain(&self, grace: Duration) -> super::DrainReport {
+        self.drain.drain(grace, &self.sessions).await
+    }
+
+    /// Whether [`drain`](ServerHandle::drain) has started.
+    pub fn is_draining(&self) -> bool {
+        self.drain.is_draining()
+    }
+
+    /// A cloneable handle that drains this server, for a caller that cannot
+    /// borrow the `ServerHandle` across the drain (it runs for up to its grace).
+    pub fn drainer(&self) -> ServerDrainer {
+        ServerDrainer {
+            drain: self.drain.clone(),
+            sessions: self.sessions.clone(),
+        }
+    }
+}
+
+/// Drains the server it came from ([`ServerHandle::drainer`]); the same
+/// drain as [`ServerHandle::drain`].
+#[derive(Clone)]
+pub struct ServerDrainer {
+    drain: Arc<DrainShared>,
+    sessions: Arc<SessionStore>,
+}
+
+impl ServerDrainer {
+    /// See [`ServerHandle::drain`].
+    pub async fn drain(&self, grace: Duration) -> super::DrainReport {
+        self.drain.drain(grace, &self.sessions).await
+    }
+
+    /// Whether the drain has started.
+    pub fn is_draining(&self) -> bool {
+        self.drain.is_draining()
     }
 }
 
@@ -1550,6 +1629,9 @@ pub struct Routed {
     /// The target is a session-scoped service (the call carries a session id).
     session_scoped: bool,
     call_admission: Option<DispatchPermit>,
+    /// Counts the call in flight for a drain; moved into its telemetry when
+    /// the call is opened, so it ends exactly when the call does.
+    drain: Option<DrainTicket>,
 }
 
 impl Routed {
@@ -1645,6 +1727,9 @@ fn open_routed(obs: &mut CallObs, routed: &mut Routed, peer: &str) {
     #[cfg(not(feature = "otel"))]
     let pattern = None;
     obs.open(&mut routed.header, peer, pattern);
+    if let Some(ticket) = routed.drain.take() {
+        obs.hold_drain_ticket(ticket);
+    }
 }
 
 /// Finish the telemetry of a call refused before any handler ran. The header

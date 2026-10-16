@@ -147,6 +147,29 @@ impl SessionStore {
         Ok(inst)
     }
 
+    /// Whether session `session_id` of `service` is live on `connection_id`.
+    pub(crate) fn has_session(
+        &self,
+        connection_id: u64,
+        service: &ServiceKey,
+        session_id: i32,
+    ) -> bool {
+        self.connections
+            .lock()
+            .unwrap()
+            .get(&connection_id)
+            .is_some_and(|state| state.active.contains_key(&(session_id, service.clone())))
+    }
+
+    /// Whether any session is live on `connection_id`.
+    pub(crate) fn has_connection_sessions(&self, connection_id: u64) -> bool {
+        self.connections
+            .lock()
+            .unwrap()
+            .get(&connection_id)
+            .is_some_and(|state| !state.active.is_empty())
+    }
+
     /// Lookup-or-create for an HTTP-style call: string id, scoped to
     /// `principal`. No graveyard, no cap (see the module docs).
     pub(crate) fn resolve_http(

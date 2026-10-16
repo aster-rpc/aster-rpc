@@ -59,6 +59,7 @@ impl Telemetry {
             otel,
             #[cfg(feature = "otel")]
             pass: None,
+            drain: None,
         }
     }
 
@@ -116,9 +117,16 @@ pub(crate) struct CallObs {
     /// pipeline, traces off, or the `rpc` span filtered out).
     #[cfg(feature = "otel")]
     pass: Option<otel::Pass>,
+    /// Counts the call in flight for a server drain until this drops.
+    drain: Option<super::drain::DrainTicket>,
 }
 
 impl CallObs {
+    /// Hold the call's drain ticket for the rest of its life.
+    pub(crate) fn hold_drain_ticket(&mut self, ticket: super::drain::DrainTicket) {
+        self.drain = Some(ticket);
+    }
+
     /// The header is decoded: create the `rpc` span (with OTel tracing on, at
     /// INFO with its remote parent from the metadata, which then loses its
     /// reserved trace keys, design §5.1/§5.2), and count the call as started

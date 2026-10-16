@@ -67,6 +67,23 @@ impl Error {
         }
     }
 
+    /// Whether this is a draining server's answer: `UNAVAILABLE` with the
+    /// `aster.draining` detail, for a call it refused or a connection it
+    /// closed with [`DRAIN_CLOSE_CODE`](crate::rpc::drain::DRAIN_CLOSE_CODE).
+    /// Retrying on the same connection cannot succeed; reconnect to another
+    /// replica.
+    pub fn is_draining(&self) -> bool {
+        match self {
+            Error::Rpc { code, details, .. } => {
+                *code == crate::rpc::StatusCode::Unavailable.as_i32()
+                    && details
+                        .iter()
+                        .any(|(k, _)| k == crate::rpc::drain::DRAINING_DETAIL_KEY)
+            }
+            _ => false,
+        }
+    }
+
     /// The status code of an [`Error::Rpc`] (unrecognised codes map to
     /// `Unknown`); `None` for every other variant.
     pub fn rpc_code(&self) -> Option<crate::rpc::StatusCode> {

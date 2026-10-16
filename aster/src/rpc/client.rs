@@ -282,6 +282,13 @@ impl RpcConnection {
         r
     }
 
+    /// Whether the server closed this connection because it is draining
+    /// ([`DRAIN_CLOSE_CODE`](super::drain::DRAIN_CLOSE_CODE)): reconnect to
+    /// another replica. `false` while the connection is open.
+    pub fn is_drained(&self) -> bool {
+        drained(&self.inner)
+    }
+
     /// The pipeline (or the bare transport) for one unary call.
     async fn unary_attempts(
         &self,
@@ -318,6 +325,16 @@ impl RpcConnection {
     /// One pooled round trip (no pipeline, no deadline): header + request in
     /// one write, read to the trailer, return the stream to the pool.
     async fn transport_unary(&self, header: &StreamHeader, request: Vec<u8>) -> Result<Vec<u8>> {
+        self.transport_unary_inner(header, request)
+            .await
+            .map_err(|e| surface_drain(&self.inner, e))
+    }
+
+    async fn transport_unary_inner(
+        &self,
+        header: &StreamHeader,
+        request: Vec<u8>,
+    ) -> Result<Vec<u8>> {
         let mut pair = encode_frame(&encode_stream_header(header)?, FLAG_HEADER)?;
         pair.extend_from_slice(&encode_payload_frame(&request, FLAG_END_STREAM)?);
         let handle = self
@@ -576,11 +593,13 @@ impl RpcConnection {
             Ok((send, recv, header_frame))
         }
         .await;
+        let opened = opened.map_err(|e| surface_drain(&self.inner, e));
         if opened.is_err() {
             obs.finish(client_status(&opened));
         }
         let (send, recv, header_frame) = opened?;
         let ctl = Arc::new(CallCtl {
+            conn: self.inner.clone(),
             send,
             recv,
             deadline: at.zip(deadline),
@@ -802,6 +821,8 @@ const CANCELLED: u8 = 2;
 /// Shared state of one streaming call: both stream halves, the deadline, and
 /// whether the call is still open. Held by the call's sink and response side.
 struct CallCtl {
+    /// The call's connection, to tell a drain close from other failures.
+    conn: CoreConnection,
     send: CoreSendStream,
     recv: CoreRecvStream,
     /// Absolute deadline plus the budget it came from (for the error message).
@@ -868,6 +889,7 @@ impl CallCtl {
         if out.is_err() && self.state.load(Ordering::Acquire) == CANCELLED {
             return Err(self.closed_error());
         }
+        let out = out.map_err(|e| surface_drain(&self.conn, e));
         if let Err(Error::Rpc { code, .. }) = &out {
             if *code == StatusCode::DeadlineExceeded.as_i32() {
                 self.observe(StatusCode::DeadlineExceeded);
@@ -1123,8 +1145,11 @@ impl ResponseStream {
                     // this is a failure, not a clean end (mirrors the Python
                     // transport, which errors on EOF-before-trailer).
                     self.done = true;
-                    let err = Error::Connection(
-                        "RPC stream closed before trailer (incomplete response)".into(),
+                    let err = surface_drain(
+                        &self.ctl.conn,
+                        Error::Connection(
+                            "RPC stream closed before trailer (incomplete response)".into(),
+                        ),
                     );
                     self.ctl.observe(error_status(&err));
                     self.ctl.cancel().await;
@@ -1314,6 +1339,39 @@ fn deadline_exceeded(d: Duration) -> Error {
 /// Decode a trailer payload and convert a non-OK status into an error. An empty
 /// trailer frame is a clean OK (as for streams and the bindings): a missing
 /// trailer is detected separately, by EOF before one arrived.
+/// Whether `conn` was closed by a draining server.
+fn drained(conn: &CoreConnection) -> bool {
+    conn.close_info()
+        .is_some_and(|info| aster_transport_core::reactor::is_drain_close(&info))
+}
+
+/// A call that failed because its connection was closed by a draining server
+/// becomes `UNAVAILABLE` with the `aster.draining` detail, as a call the
+/// draining server refused does: either way the answer is another replica.
+/// Statuses the server sent are kept, except the transport-shaped ones
+/// (`UNAVAILABLE`, `CANCELLED`, `UNKNOWN`) the client makes from a lost
+/// connection.
+fn surface_drain(conn: &CoreConnection, e: Error) -> Error {
+    if e.is_draining() {
+        return e;
+    }
+    let transport_shaped = match &e {
+        Error::Rpc { code, .. } => [
+            StatusCode::Unavailable,
+            StatusCode::Cancelled,
+            StatusCode::Unknown,
+        ]
+        .iter()
+        .any(|s| s.as_i32() == *code),
+        _ => true,
+    };
+    if transport_shaped && drained(conn) {
+        super::status::status_to_error(super::drain::draining_status())
+    } else {
+        e
+    }
+}
+
 fn check_trailer(trailer_payload: &[u8]) -> Result<()> {
     if trailer_payload.is_empty() {
         return Ok(());

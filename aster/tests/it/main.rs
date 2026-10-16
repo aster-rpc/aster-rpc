@@ -63,6 +63,7 @@ mod rpc_client;
 mod rpc_client_options;
 mod rpc_contract;
 mod rpc_deadline;
+mod rpc_drain;
 mod rpc_dynamic_proxy;
 mod rpc_error_mapping;
 mod rpc_expose_coexist;

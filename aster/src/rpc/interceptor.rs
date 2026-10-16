@@ -76,7 +76,12 @@ impl RetryPolicy {
         }
     }
 
+    /// A draining server's answer is never retried: the connection it came
+    /// on cannot succeed, so the caller must go to another replica.
     fn is_retryable(&self, error: &Error) -> bool {
+        if error.is_draining() {
+            return false;
+        }
         match error {
             Error::Rpc { code, .. } => self.retryable.iter().any(|s| s.as_i32() == *code),
             _ => false,

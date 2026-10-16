@@ -29,6 +29,7 @@ pub mod codec;
 pub mod context;
 pub mod contract;
 mod deadline;
+pub mod drain;
 pub mod dynamic;
 pub mod empty;
 pub(crate) mod foreign;
@@ -71,6 +72,7 @@ pub use contract::{
     ShapeField, ShapeFn, ShapeVariant, Timestamp, TypeDef, TypeDefSet, TypeShape, UnionVariantDef,
     WireField,
 };
+pub use drain::{draining_status, DrainReport, DRAINING_DETAIL_KEY, DRAIN_CLOSE_CODE};
 pub use dynamic::{DynamicService, MethodDesc, MethodLimits, TypeRef, ValidationError};
 pub use empty::Empty;
 pub use interceptor::{CircuitBreaker, ClientCallContext, Interceptor, Pipeline, RetryPolicy};
@@ -86,7 +88,7 @@ pub use runtime::{AsterServer, AsterServerBuilder};
 pub use scalars::{rescale_decimal, FixedDecimal, ScalarError, Ulid, Uuid, MAX_DECIMAL_PRECISION};
 pub use server::{
     AlpnHandler, Call, CallParts, Dispatcher, HttpTransport, PeerProvenance, Route, Routed, Server,
-    ServerHandle, ServiceDispatch, DEFAULT_HANDLER_TIMEOUT, RPC_ALPN,
+    ServerDrainer, ServerHandle, ServiceDispatch, DEFAULT_HANDLER_TIMEOUT, RPC_ALPN,
 };
 pub use surface::{
     ManifestPublication, PublishedService, RpcSurface, RpcSurfaceBuilder, SurfaceActivation,

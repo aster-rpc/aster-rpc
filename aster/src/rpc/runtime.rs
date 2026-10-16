@@ -1134,6 +1134,45 @@ impl AsterServer {
             .map(crate::coordination::Coordination::of)
     }
 
+    /// Drain, then [`shutdown`](Self::shutdown): the graceful way to take a
+    /// replica out of rotation (a rolling restart, a scale-in).
+    ///
+    /// 1. Readiness goes false on the health listener, if enabled (`/readyz`
+    ///    answers 503, so a load balancer or Kubernetes stops routing here).
+    /// 2. New connections are closed right after their handshake with
+    ///    [`DRAIN_CLOSE_CODE`](super::drain::DRAIN_CLOSE_CODE); new calls on
+    ///    existing connections get `UNAVAILABLE` with the `aster.draining`
+    ///    detail. Calls on sessions that already exist still run.
+    /// 3. Each connection is closed with the drain code as soon as it has no
+    ///    call in flight and no live session.
+    /// 4. In-flight calls (every pattern) run until `grace`; at the deadline
+    ///    every remaining connection is closed with the drain code, which
+    ///    cancels them, and the drain waits up to
+    ///    [`CANCEL_WAIT`](super::drain::CANCEL_WAIT) for them to end.
+    /// 5. The server shuts down as [`shutdown`](Self::shutdown) does (an
+    ///    active surface's registry entries are retracted there).
+    ///
+    /// Clients see a drain as [`Error::is_draining`](crate::Error::is_draining).
+    /// This server publishes no endpoint leases itself; an application that
+    /// publishes them should renew its lease with the `draining` health
+    /// status before calling this.
+    ///
+    /// ```no_run
+    /// # async fn f(srv: aster::rpc::AsterServer) {
+    /// let report = srv.drain(std::time::Duration::from_secs(30)).await;
+    /// println!("completed {} cancelled {}", report.calls_completed, report.calls_cancelled);
+    /// # }
+    /// ```
+    pub async fn drain(self, grace: std::time::Duration) -> super::DrainReport {
+        #[cfg(feature = "health")]
+        if let Some(health) = &self.health {
+            health.set_ready(false);
+        }
+        let report = self.handle.drain(grace).await;
+        self.shutdown().await;
+        report
+    }
+
     /// Stop serving and cleanly shut the node down, flushing persistent state.
     ///
     /// §7.6's cancellation runs first and is the strict reverse of
