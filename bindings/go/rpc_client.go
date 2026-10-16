@@ -25,9 +25,12 @@ import (
 	"unsafe"
 )
 
-// CallOption configures one RPC call. The deadline comes from the context:
-// Rust enforces it client-side (DEADLINE_EXCEEDED) and sends it rounded up
-// to whole seconds.
+// CallOption configures one RPC call (Rust's CallOptions: deadline,
+// metadata, session id). The deadline is the earliest of ctx's deadline and
+// any WithDeadline / WithTimeout: Rust enforces it client-side
+// (DEADLINE_EXCEEDED) and sends it rounded up to whole seconds. Every
+// pattern takes them: Call, CallServerStream, CallClientStream,
+// CallBidiStream and OpenBidiStream.
 type CallOption func(*callOptions)
 
 type callOptions struct {
@@ -36,6 +39,43 @@ type callOptions struct {
 	version      int32
 	interceptors []Interceptor
 	idempotent   *bool
+	deadline     time.Time      // zero: none
+	timeout      *time.Duration // nil: none; measured from the call's start
+}
+
+// WithDeadline ends the call at t (DEADLINE_EXCEEDED) unless ctx ends it
+// sooner. The earliest of several deadlines applies.
+func WithDeadline(t time.Time) CallOption {
+	return func(o *callOptions) {
+		if o.deadline.IsZero() || t.Before(o.deadline) {
+			o.deadline = t
+		}
+	}
+}
+
+// WithTimeout ends the call d after it starts (DEADLINE_EXCEEDED) unless ctx
+// ends it sooner. The smallest of several timeouts applies.
+func WithTimeout(d time.Duration) CallOption {
+	return func(o *callOptions) {
+		if o.timeout == nil || d < *o.timeout {
+			o.timeout = &d
+		}
+	}
+}
+
+// callContext derives the call's context from ctx and the options'
+// deadline / timeout. The cancel func is never nil.
+func (o *callOptions) callContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	d := o.deadline
+	if o.timeout != nil {
+		if t := time.Now().Add(*o.timeout); d.IsZero() || t.Before(d) {
+			d = t
+		}
+	}
+	if d.IsZero() {
+		return ctx, func() {}
+	}
+	return context.WithDeadline(ctx, d)
 }
 
 // WithMetadata adds a request-metadata pair to the stream header.
@@ -480,6 +520,8 @@ func (rc *RpcConnection) unary(ctx context.Context, opts nativeOptions, req []by
 // context's deadline is enforced natively.
 func Call[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, opts ...CallOption) (*Resp, error) {
 	o := buildOptions(opts)
+	ctx, cancel := o.callContext(ctx)
+	defer cancel()
 	if ch := rc.chain(o); ch != nil {
 		return callUnaryIntercepted[Req, Resp](ctx, rc, ch, service, method, req, o)
 	}
@@ -695,10 +737,16 @@ func (c *rpcCall) recv() ([]byte, error) {
 // element. Breaking out early cancels the call.
 func CallServerStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, req *Req, opts ...CallOption) iter.Seq2[*Resp, error] {
 	o := buildOptions(opts)
-	if ch := rc.chain(o); ch != nil {
-		return callServerStreamIntercepted[Req, Resp](ctx, rc, ch, service, method, req, o)
+	return func(yield func(*Resp, error) bool) {
+		// A WithTimeout runs from the start of the iteration.
+		ctx, cancel := o.callContext(ctx)
+		defer cancel()
+		if ch := rc.chain(o); ch != nil {
+			callServerStreamIntercepted[Req, Resp](ctx, rc, ch, service, method, req, o)(yield)
+			return
+		}
+		callServerStream[Req, Resp](ctx, rc, service, method, req, o)(yield)
 	}
-	return callServerStream[Req, Resp](ctx, rc, service, method, req, o)
 }
 
 // callServerStream is a server-streaming call without interceptors.
@@ -745,6 +793,8 @@ func callServerStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 // that finishes without yielding a request returns ErrRpcInvalidArgument.
 func CallClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, reqs iter.Seq[*Req], opts ...CallOption) (*Resp, error) {
 	o := buildOptions(opts)
+	ctx, cancel := o.callContext(ctx)
+	defer cancel()
 	if ch := rc.chain(o); ch != nil {
 		return callClientStreamIntercepted[Req, Resp](ctx, rc, ch, service, method, reqs, o)
 	}
@@ -850,19 +900,23 @@ func callClientStream[Req, Resp any](ctx context.Context, rc *RpcConnection, ser
 // different goroutines (one sender, one receiver). Close it when done
 // (an unfinished call is cancelled).
 type BidiCall[Req, Resp any] struct {
-	c     *rpcCall
-	codec Codec
-	ic    *bidiIntercept // nil without interceptors
+	c      *rpcCall
+	codec  Codec
+	ic     *bidiIntercept // nil without interceptors
+	cancel context.CancelFunc
 }
 
-// OpenBidiStream opens a bidi-streaming call. Cancelling ctx cancels it.
+// OpenBidiStream opens a bidi-streaming call. Cancelling ctx cancels it; a
+// WithDeadline / WithTimeout ends it with DEADLINE_EXCEEDED.
 func OpenBidiStream[Req, Resp any](ctx context.Context, rc *RpcConnection, service, method string, opts ...CallOption) (*BidiCall[Req, Resp], error) {
 	o := buildOptions(opts)
+	ctx, cancel := o.callContext(ctx)
 	c, err := openCall(ctx, rc, PatternBidiStream, service, method, o)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	b := &BidiCall[Req, Resp]{c: c, codec: rc.codec}
+	b := &BidiCall[Req, Resp]{c: c, codec: rc.codec, cancel: cancel}
 	if ch := rc.chain(o); ch != nil {
 		b.ic = ch.newBidi(ctx, rc, service, method, o)
 	}
@@ -920,7 +974,10 @@ func (b *BidiCall[Req, Resp]) Recv() (*Resp, error) {
 func (b *BidiCall[Req, Resp]) Cancel() { b.c.cancel() }
 
 // Close releases the call, cancelling it if unfinished.
-func (b *BidiCall[Req, Resp]) Close() { b.c.release() }
+func (b *BidiCall[Req, Resp]) Close() {
+	b.c.release()
+	b.cancel()
+}
 
 // CallBidiStream makes a bidi-streaming call: each request from reqs is
 // sent as soon as the iterator yields it (on its own goroutine) while
@@ -946,7 +1003,7 @@ func CallBidiStream[Req, Resp any](ctx context.Context, rc *RpcConnection, servi
 					return
 				}
 			}
-			if ctx.Err() != nil { // ended while producing: cancel, don't half-close
+			if b.c.ctx.Err() != nil { // ended while producing: cancel, don't half-close
 				b.Cancel()
 				sendErr <- nil
 				return
