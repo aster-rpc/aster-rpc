@@ -156,6 +156,12 @@ pub const ASTER_DISPATCH_FLAG_HAS_INBOUND_TRACE: u32 = 0x800;
 /// transport's peer id. `peer_ptr` is then that principal; the transport
 /// peer id comes from `aster_dispatch_identity`. Clear: `peer_ptr` is both.
 pub const ASTER_DISPATCH_FLAG_HAS_PRINCIPAL: u32 = 0x1000;
+/// ABI 7.7: a gateway forwarded the call on behalf of a user
+/// (`aster-on-behalf-of`; `HAS_PRINCIPAL` is set too). The user's issuer,
+/// subject, token id, expiry and sign-in methods (`amr`) come from
+/// `aster_dispatch_on_behalf_of`; the gateway is `aster_dispatch_identity`'s
+/// `actor`.
+pub const ASTER_DISPATCH_FLAG_ON_BEHALF_OF: u32 = 0x2000;
 
 /// `aster_dispatch_identity_t.flags`: `principal` differs from `peer` (an
 /// `Authenticator` resolved it). Matches `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`.
@@ -298,8 +304,14 @@ struct BuilderSpec {
     max_sessions: Option<usize>,
     handler_timeout: Option<Option<Duration>>,
     max_foreign_inflight: usize,
-    /// ABI 7.6: `ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF`.
-    accept_on_behalf_of: bool,
+    /// ABI 7.6: `ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF`; `None` = the
+    /// node config's `[identity] accept_on_behalf_of` (ABI 7.7).
+    accept_on_behalf_of: Option<bool>,
+    /// ABI 7.7: the node config's `[identity]` / `[remote_config]`,
+    /// validated at `aster_server_builder_new`.
+    identity: Option<aster::binding_support::identity::IdentityPlan>,
+    /// ABI 7.7: `aster_server_set_audit_outbox`.
+    audit: Option<aster::audit_outbox::AuditOutbox>,
     health: Option<HealthState>,
     /// ABI 5.1: the Enrollment the node was started with
     /// (`aster_node_start_enrolled`), wired at start.
@@ -413,6 +425,9 @@ pub(crate) struct ServerState {
     /// The served `aster.ops.NodeInfo` identity (ABI 5.1,
     /// `aster_server_set_node_attribute`); `None` with the baseline off.
     node_identity: Option<aster::rpc::baseline::NodeIdentityHandle>,
+    /// ABI 7.7: gateway identity and `aster.ops.NodeConfig` (properties for
+    /// handlers, the issuer-key watcher and publisher).
+    gateway_identity: Option<aster::binding_support::identity::ServerIdentity>,
 }
 
 #[derive(Default)]
@@ -433,6 +448,27 @@ fn status(s: aster_status_t) -> i32 {
 fn fail(s: aster_status_t, msg: impl ToString) -> i32 {
     set_last_error(msg);
     s as i32
+}
+
+/// Run `fut` to completion on the bridge runtime from a synchronous ABI
+/// call. On a thread that is itself inside a tokio runtime (a host calling
+/// from async code) the wait happens on a helper thread, so the call never
+/// nests `block_on`.
+fn run_blocking<F>(bridge: &BridgeRuntime, fut: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| bridge.runtime.block_on(fut))
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        })
+    } else {
+        bridge.runtime.block_on(fut)
+    }
 }
 
 unsafe fn bytes_in<'a>(p: *const u8, len: u32) -> &'a [u8] {
@@ -536,6 +572,15 @@ pub unsafe extern "C" fn aster_server_builder_new(
         Ok(enrollment) => enrollment,
         Err(code) => return code,
     };
+    // `[identity]` / `[remote_config]` from the node's config, validated as
+    // a whole now (as `AsterServer` does before it starts anything).
+    let identity = match aster::binding_support::identity::plan(
+        &crate::identity::node_identity(node),
+        enrollment.is_some(),
+    ) {
+        Ok(plan) => plan,
+        Err(e) => return fail(aster_status_t::ASTER_STATUS_INVALID_ARGUMENT, e),
+    };
     let id = BUILDERS.insert(BuilderState {
         spec: Mutex::new(Some(BuilderSpec {
             node: (*core).clone(),
@@ -546,7 +591,9 @@ pub unsafe extern "C" fn aster_server_builder_new(
             max_sessions: None,
             handler_timeout: None,
             max_foreign_inflight: aster::binding_support::dispatch::DEFAULT_MAX_FOREIGN_INFLIGHT,
-            accept_on_behalf_of: false,
+            accept_on_behalf_of: None,
+            identity: Some(identity),
+            audit: None,
             health: None,
             enrollment,
             lease_grantor: None,
@@ -705,7 +752,7 @@ pub extern "C" fn aster_server_set_option(
         }
         NODE_INFO => spec.node_info = value == 1,
         TOPOLOGY => spec.topology = value == 1,
-        ON_BEHALF_OF => spec.accept_on_behalf_of = value == 1,
+        ON_BEHALF_OF => spec.accept_on_behalf_of = Some(value == 1),
         MAX_SESSIONS => {
             if value == 0 || value > u32::MAX as u64 {
                 return fail(
@@ -793,13 +840,32 @@ pub unsafe extern "C" fn aster_server_start(
     let (sink, consumer) = RingSink::new_on_with_limit(&rt, capacity, spec.max_foreign_inflight);
     let mut server = Server::new(&node)
         .attributes(attributes.clone())
-        .accept_on_behalf_of(spec.accept_on_behalf_of)
         .dispatch_sink(sink);
     if let Some(max) = spec.max_sessions {
         server = server.max_sessions_per_connection(max);
     }
     if let Some(timeout) = spec.handler_timeout {
         server = server.handler_timeout(timeout);
+    }
+    // Gateway identity and `aster.ops.NodeConfig` before anything else is
+    // registered (a stored record applies before the first call), as
+    // `AsterServer` orders it.
+    let enrolled_parts = spec.enrollment.as_ref().map(|e| (&e.enrollment, &e.plan));
+    let mut pending_identity = None;
+    if let Some(mut plan) = spec.identity {
+        if let Some(accept) = spec.accept_on_behalf_of {
+            plan.set_accept_on_behalf_of(accept);
+        }
+        if let Some(outbox) = spec.audit {
+            plan.audit_outbox(outbox);
+        }
+        match run_blocking(&bridge, plan.apply(server, &node, enrolled_parts)) {
+            Ok((with_identity, pending)) => {
+                server = with_identity;
+                pending_identity = Some(pending);
+            }
+            Err(e) => return fail(aster_status_t::ASTER_STATUS_INVALID_ARGUMENT, e),
+        }
     }
     let mut node_identity = None;
     if spec.node_info {
@@ -833,11 +899,31 @@ pub unsafe extern "C" fn aster_server_start(
     // The acceptor runs: hold or synchronize the fleet namespace, then renew
     // (design §15.4 steps 5 and 6). Blocks up to `sync_timeout_ms` with
     // replicas; a failure stops the server (the binding closes the node).
+    drop(_enter);
     if let Some(enrollment) = &spec.enrollment {
-        drop(_enter);
         if let Err(error) = bridge.runtime.block_on(enrollment.attach_server()) {
             handle.abort();
             return fail(aster_status_t::ASTER_STATUS_INVALID_ARGUMENT, error);
+        }
+    }
+    // Then the issuer-key publisher (to the policy replicas) and watcher.
+    let mut gateway_identity = None;
+    if let Some(pending) = pending_identity {
+        match run_blocking(&bridge, pending.attach(&node, enrolled_parts)) {
+            Ok(identity) => {
+                if let Some(enrollment) = &spec.enrollment {
+                    enrollment
+                        .publisher
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .set_server(identity.publisher());
+                }
+                gateway_identity = Some(identity);
+            }
+            Err(error) => {
+                handle.abort();
+                return fail(aster_status_t::ASTER_STATUS_INVALID_ARGUMENT, error);
+            }
         }
     }
 
@@ -857,6 +943,7 @@ pub unsafe extern "C" fn aster_server_start(
         health: spec.health.clone(),
         _enrollment_stop: enrollment_stop,
         node_identity,
+        gateway_identity,
     };
     let mut tracked = bridge
         .server_handles
@@ -911,6 +998,52 @@ pub extern "C" fn aster_server_attach_health(
 
 /// Parse an optional `CapabilityRequirement` JSON (`aster_server_set_topology`
 /// format): an empty span keeps `default`, JSON `null` is none.
+/// ABI 7.7: record every `aster.ops.NodeConfig` `set` and `clear` in the
+/// durable audit outbox `outbox` (`aster_audit_outbox_open`; kinds
+/// `aster.node_config.set` / `aster.node_config.clear`, with the caller, the
+/// generation and the change), as Rust's `AsterServerBuilder::audit_outbox`.
+/// A change the outbox does not accept is refused. `NOT_FOUND` for an
+/// unknown builder or outbox; `ALREADY_CLOSED` once started; `UNSUPPORTED`
+/// when the node config turns NodeConfig off (`[remote_config] enabled =
+/// false`).
+#[no_mangle]
+pub extern "C" fn aster_server_set_audit_outbox(
+    runtime: aster_runtime_t,
+    builder: aster_server_builder_t,
+    outbox: u64,
+) -> i32 {
+    let bridge = match load_runtime(runtime) {
+        Ok(b) => b,
+        Err(s) => return status(s),
+    };
+    let outbox = match crate::audit_outbox::outbox_for(&bridge, outbox) {
+        Ok(state) => state.outbox.clone(),
+        Err(code) => return code,
+    };
+    let Some(state) = BUILDERS.get(builder) else {
+        return status(aster_status_t::ASTER_STATUS_NOT_FOUND);
+    };
+    let mut guard = state.spec.lock().unwrap();
+    let Some(spec) = guard.as_mut() else {
+        return fail(
+            aster_status_t::ASTER_STATUS_ALREADY_CLOSED,
+            "builder already started",
+        );
+    };
+    if !spec
+        .identity
+        .as_ref()
+        .is_some_and(|plan| plan.serves_node_config())
+    {
+        return fail(
+            aster_status_t::ASTER_STATUS_UNSUPPORTED,
+            "aster.ops.NodeConfig is off ([remote_config] enabled = false)",
+        );
+    }
+    spec.audit = Some(outbox);
+    status(aster_status_t::ASTER_STATUS_OK)
+}
+
 unsafe fn requirement_arg(
     json: &aster_bytes_t,
     what: &str,
@@ -1415,6 +1548,9 @@ fn lower_call(
         inbound_trace,
         ..
     } = call;
+    if handle.on_behalf_of().is_some() {
+        flags |= ASTER_DISPATCH_FLAG_ON_BEHALF_OF;
+    }
     // Answered by id from now on.
     handle.detach();
     if transport_peer_id.is_some() {
@@ -1877,6 +2013,103 @@ pub unsafe extern "C" fn aster_dispatch_identity(
     // SAFETY: checked non-null; the caller sized it.
     unsafe { ptr::write(out, ident) };
     status(aster_status_t::ASTER_STATUS_OK)
+}
+
+/// ABI 7.7: the forwarded identity of a call a gateway made on behalf of a
+/// user (`ASTER_DISPATCH_FLAG_ON_BEHALF_OF`), as a k/v list in this order:
+/// `iss` (the token's issuer: a provider's URL, or the gateway's node id for
+/// an edge-minted token), `sub`, `jti` (empty when the token has none),
+/// `exp` (Unix seconds, decimal), then one `amr` entry per sign-in method
+/// (Rust `CallContext::auth_methods`, e.g. `webauthn`; none for a provider
+/// token without `amr`). The user's roles are the call's attributes
+/// (`aster_dispatch_attributes`); the principal is `iss|sub` and the actor the
+/// transport peer (`aster_dispatch_identity`). A call that was not forwarded
+/// yields an empty list (`*out_buffer` 0). `NOT_FOUND` once the call is over.
+/// Valid until `aster_dispatch_buffer_release`.
+#[no_mangle]
+pub unsafe extern "C" fn aster_dispatch_on_behalf_of(
+    runtime: aster_runtime_t,
+    server_h: aster_server_t,
+    call_id: u64,
+    out_ptr: *mut *const u8,
+    out_len: *mut u32,
+    out_buffer: *mut aster_buffer_t,
+) -> i32 {
+    let _ = runtime;
+    // SAFETY: forwarded caller pointers.
+    unsafe {
+        kv_out(server_h, call_id, out_ptr, out_len, out_buffer, |call| {
+            let Some(f) = call.on_behalf_of() else {
+                return Vec::new();
+            };
+            let exp = f.expires_at().to_string();
+            let fixed = [
+                ("iss", f.issuer()),
+                ("sub", f.subject()),
+                ("jti", f.jti()),
+                ("exp", exp.as_str()),
+            ];
+            encode_kv(
+                fixed
+                    .into_iter()
+                    .chain(f.auth_methods().iter().map(|m| ("amr", m.as_str()))),
+            )
+        })
+    }
+}
+
+/// ABI 7.7: the server's `aster.ops.NodeConfig` properties as handlers see
+/// them now (Rust `CallContext::node_properties`), as owned JSON
+/// (`aster_string_release`): `{"generation": n, "name": "…", "tags": ["…"],
+/// "attributes": {"k": {"type": "bool"|"int"|"float"|"string", "value": …}}}`.
+/// Attributes describe the node and never authorise anything. With NodeConfig
+/// off the properties are empty (generation 0). `NOT_FOUND` for an unknown
+/// server.
+///
+/// # Safety
+/// `out_json` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn aster_server_node_properties(
+    server_h: aster_server_t,
+    out_json: *mut aster_bytes_t,
+) -> i32 {
+    if out_json.is_null() {
+        return fail(
+            aster_status_t::ASTER_STATUS_INVALID_ARGUMENT,
+            "aster_server_node_properties: out_json is NULL",
+        );
+    }
+    ptr::write(
+        out_json,
+        aster_bytes_t {
+            ptr: ptr::null(),
+            len: 0,
+        },
+    );
+    let state = match server(server_h) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let json = match &state.gateway_identity {
+        Some(identity) => {
+            crate::identity::properties_json(identity.generation(), &identity.node_properties())
+        }
+        None => crate::identity::properties_json(0, &Default::default()),
+    };
+    ptr::write(out_json, crate::alloc_owned_bytes(json));
+    status(aster_status_t::ASTER_STATUS_OK)
+}
+
+/// ABI 7.7: the `aster.ops.NodeConfig` generation in effect (0: never
+/// changed, or NodeConfig off), so a binding can cache
+/// `aster_server_node_properties` and re-read it only when this changes.
+/// 0 for an unknown server.
+#[no_mangle]
+pub extern "C" fn aster_server_node_config_generation(server_h: aster_server_t) -> u64 {
+    SERVERS
+        .get(server_h)
+        .and_then(|state| state.gateway_identity.as_ref().map(|i| i.generation()))
+        .unwrap_or(0)
 }
 
 /// The server span context of a live call (design §5.2), for the binding's

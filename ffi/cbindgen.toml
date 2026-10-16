@@ -63,4 +63,6 @@ include = [
   "aster_topology_separation_t",
   "aster_enrollment_error_t",
   "aster_enrollment_side_t",
+  "aster_config_source_t",
+  "aster_node_config_method_t",
 ]

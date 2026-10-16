@@ -13,6 +13,7 @@
 use crate::audit_outbox::aster_audit_outbox_error_t;
 use core::mem::{align_of, offset_of, size_of};
 
+use crate::config_identity::aster_identity_config_t;
 use crate::config_metrics::aster_metrics_config_t;
 use crate::config_network::aster_network_config_t;
 use crate::coordination::{
@@ -312,6 +313,20 @@ mod lp64 {
     });
 
     // ABI 7.4: [metrics] settings beside aster_config_t (config_metrics.rs).
+    assert_layout!(aster_identity_config_t, size = 96, align = 8, {
+        struct_size = 0,
+        set = 4,
+        accept_on_behalf_of = 8,
+        remote_config_disabled = 12,
+        edge_token_max_lifetime_secs = 16,
+        clock_leeway_secs = 24,
+        max_key_set_age_secs = 32,
+        trusted_issuers_json = 40,
+        publisher_json = 56,
+        remote_config_lock = 72,
+        sources = 88,
+    });
+
     assert_layout!(aster_metrics_config_t, size = 16, align = 4, {
         struct_size = 0,
         peer_labels = 4,

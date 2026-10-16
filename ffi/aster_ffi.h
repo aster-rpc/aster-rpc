@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 7
 
-#define ASTER_ABI_VERSION_MINOR 6
+#define ASTER_ABI_VERSION_MINOR 7
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -49,6 +49,49 @@
  * Raw input whitespace/escaping also counts; native envelope validation remains authoritative.
  */
 #define ASTER_AUDIT_OUTBOX_EVENT_JSON_OVERHEAD 1024
+
+/**
+ * `aster_identity_config_t.set`: `edge_token_max_lifetime_secs` is set
+ * (clear: the default, 300).
+ */
+#define ASTER_IDENTITY_SET_EDGE_TOKEN_MAX_LIFETIME 1
+
+/**
+ * `aster_identity_config_t.set`: `clock_leeway_secs` is set (clear: 60).
+ */
+#define ASTER_IDENTITY_SET_CLOCK_LEEWAY 2
+
+/**
+ * `aster_identity_config_t.set`: `max_key_set_age_secs` is set (clear:
+ * 172800).
+ */
+#define ASTER_IDENTITY_SET_MAX_KEY_SET_AGE 4
+
+/**
+ * Index into `aster_identity_config_t.sources`: `accept_on_behalf_of`.
+ */
+#define ASTER_IDENTITY_SETTING_ACCEPT_ON_BEHALF_OF 0
+
+/**
+ * Index into `aster_identity_config_t.sources`: `trusted_issuers`.
+ */
+#define ASTER_IDENTITY_SETTING_TRUSTED_ISSUERS 1
+
+/**
+ * Index into `aster_identity_config_t.sources`:
+ * `edge_token_max_lifetime_secs`.
+ */
+#define ASTER_IDENTITY_SETTING_EDGE_TOKEN_MAX_LIFETIME 2
+
+/**
+ * Index into `aster_identity_config_t.sources`: `clock_leeway_secs`.
+ */
+#define ASTER_IDENTITY_SETTING_CLOCK_LEEWAY 3
+
+/**
+ * Index into `aster_identity_config_t.sources`: `max_key_set_age_secs`.
+ */
+#define ASTER_IDENTITY_SETTING_MAX_KEY_SET_AGE 4
 
 /**
  * The default `peer_label_cap` (64).
@@ -381,6 +424,15 @@
 #define ASTER_DISPATCH_FLAG_HAS_PRINCIPAL 4096
 
 /**
+ * ABI 7.7: a gateway forwarded the call on behalf of a user
+ * (`aster-on-behalf-of`; `HAS_PRINCIPAL` is set too). The user's issuer,
+ * subject, token id, expiry and sign-in methods (`amr`) come from
+ * `aster_dispatch_on_behalf_of`; the gateway is `aster_dispatch_identity`'s
+ * `actor`.
+ */
+#define ASTER_DISPATCH_FLAG_ON_BEHALF_OF 8192
+
+/**
  * `aster_dispatch_identity_t.flags`: `principal` differs from `peer` (an
  * `Authenticator` resolved it). Matches `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`.
  */
@@ -680,6 +732,11 @@ typedef enum aster_event_kind_t {
    * acknowledgement-log entries; `handle` = the outbox.
    */
   ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS = 128,
+  /**
+   * ABI 7.7: `aster_node_config_call`: JSON `{"code": 0, "result": …}` or
+   * `{"code": <RPC status>, "message": "…"}`; `handle` = the connection.
+   */
+  ASTER_EVENT_NODE_CONFIG_RESULT = 129,
 } aster_event_kind_t;
 
 /**
@@ -1636,6 +1693,33 @@ typedef enum aster_enrollment_side_t {
   ASTER_ENROLLMENT_SIDE_CLIENT = 1,
 } aster_enrollment_side_t;
 
+/**
+ * `aster_identity_config_t.sources[i]`: where an overridable setting came
+ * from (`aster::config::ConfigSource`), as `aster.ops.NodeConfig` `get`
+ * reports it.
+ */
+typedef enum aster_config_source_t {
+  /**
+   * Not recorded: reported as `default` when the value is the default,
+   * else `code`.
+   */
+  ASTER_CONFIG_SOURCE_UNSET = 0,
+  ASTER_CONFIG_SOURCE_DEFAULT = 1,
+  ASTER_CONFIG_SOURCE_FILE = 2,
+  ASTER_CONFIG_SOURCE_ENV = 3,
+  ASTER_CONFIG_SOURCE_CODE = 4,
+} aster_config_source_t;
+
+/**
+ * `method` of `aster_node_config_call`.
+ */
+typedef enum aster_node_config_method_t {
+  ASTER_NODE_CONFIG_GET = 0,
+  ASTER_NODE_CONFIG_SET = 1,
+  ASTER_NODE_CONFIG_CLEAR = 2,
+  ASTER_NODE_CONFIG_ACK = 3,
+} aster_node_config_method_t;
+
 typedef struct aster_runtime_config_t {
   uint32_t struct_size;
   uint32_t worker_threads;
@@ -1935,6 +2019,65 @@ typedef struct aster_config_t {
    */
   uint32_t reuse_last_port;
 } aster_config_t;
+
+/**
+ * `[identity]`, `[identity.publisher]` and `[remote_config]` of a node config
+ * (ABI 7.7), next to `aster_config_t`; see `aster_config_set_identity`. 96
+ * bytes (LP64). A zeroed struct with `struct_size` set is "nothing
+ * configured": on-behalf-of refused, no trusted issuers, default limits, no
+ * publisher, `aster.ops.NodeConfig` served with nothing locked.
+ */
+typedef struct aster_identity_config_t {
+  /**
+   * `sizeof(aster_identity_config_t)`, set by the caller.
+   */
+  uint32_t struct_size;
+  /**
+   * `ASTER_IDENTITY_SET_*`: which of the three limits below are set.
+   */
+  uint32_t set;
+  /**
+   * `[identity] accept_on_behalf_of`, 0/1 (default 0).
+   */
+  uint32_t accept_on_behalf_of;
+  /**
+   * 1 = `[remote_config] enabled = false`: `aster.ops.NodeConfig` is not
+   * served and a stored record is ignored. 0 = served (the default).
+   */
+  uint32_t remote_config_disabled;
+  /**
+   * `[identity] edge_token_max_lifetime_secs`, 1..=300.
+   */
+  uint64_t edge_token_max_lifetime_secs;
+  /**
+   * `[identity] clock_leeway_secs`, 0..=300.
+   */
+  uint64_t clock_leeway_secs;
+  /**
+   * `[identity] max_key_set_age_secs`, 60..=2592000.
+   */
+  uint64_t max_key_set_age_secs;
+  /**
+   * `[[identity.trusted_issuers]]` as a JSON array (the
+   * `ASTER_IDENTITY_TRUSTED_ISSUERS` form); empty = none.
+   */
+  struct aster_bytes_t trusted_issuers_json;
+  /**
+   * `[identity.publisher]` as a JSON object (the `ASTER_IDENTITY_PUBLISHER`
+   * form); empty = no publisher.
+   */
+  struct aster_bytes_t publisher_json;
+  /**
+   * `[remote_config] lock`: section names that may not be overridden.
+   */
+  struct aster_bytes_list_t remote_config_lock;
+  /**
+   * `aster_config_source_t` per `ASTER_IDENTITY_SETTING_*` index; 0 = not
+   * recorded. Filled configs carry what the file / environment set; a
+   * caller may leave them 0.
+   */
+  uint8_t sources[8];
+} aster_identity_config_t;
 
 /**
  * `[metrics]` settings of a node config (ABI 7.4), next to `aster_config_t`;
@@ -4412,6 +4555,40 @@ int32_t aster_call_discard(aster_runtime_t runtime, aster_call_t call);
 int32_t aster_call_buffer_release(aster_runtime_t runtime, aster_buffer_t buffer);
 
 /**
+ * Set (or, with `identity` NULL, clear) the `[identity]`,
+ * `[identity.publisher]` and `[remote_config]` settings of `config` (ABI
+ * 7.7). They are parsed and copied into the config's library-owned
+ * `storage`, which this allocates for a caller-built config: release such a
+ * config with `aster_config_release` once it has been passed to
+ * `aster_node_start` (or is no longer needed). Views from an earlier
+ * `aster_config_identity` on this config become invalid.
+ *
+ * `identity->struct_size` must equal `sizeof(aster_identity_config_t)`;
+ * flags are 0 or 1; `set` holds only `ASTER_IDENTITY_SET_*` bits; the JSON
+ * values parse. The values are validated as a whole (issuer audiences,
+ * ranges, publisher URLs) when a server starts on the node, as
+ * `AsterServer` does.
+ *
+ * # Safety
+ * `config` points to a valid `aster_config_t`; `identity` is NULL or valid.
+ */
+int32_t aster_config_set_identity(struct aster_config_t *config,
+                                  const struct aster_identity_config_t *identity);
+
+/**
+ * Read the `[identity]` / `[remote_config]` settings of `config` (ABI 7.7)
+ * into `*out` as borrowed views, valid until `aster_config_release` or the
+ * next `aster_config_set_identity` on `config`. A config without any reads
+ * as the defaults (`set` 0, the default limits filled in). The caller sets
+ * `out->struct_size` to `sizeof(aster_identity_config_t)` before the call.
+ *
+ * # Safety
+ * `config` points to a valid `aster_config_t`; `out` is writable.
+ */
+int32_t aster_config_identity(const struct aster_config_t *config,
+                              struct aster_identity_config_t *out);
+
+/**
  * Set (or, with `metrics` NULL, clear) the `[metrics]` settings of `config`
  * (ABI 7.4). They are validated and copied into the config's library-owned
  * `storage`, which this allocates for a caller-built config: release such a
@@ -6297,6 +6474,105 @@ int32_t aster_http_listener_stop(aster_runtime_t runtime,
                                  uint32_t grace_ms);
 
 /**
+ * Tell the node's issuer-key publisher (`[identity.publisher]`) that a
+ * token for issuer `iss` carried key id `kid`: when the last published set
+ * lacks it, the issuer is refreshed at once (at most every
+ * `min_refresh_secs`; a notice in the gap is deferred, not dropped). Rust
+ * `PublisherHandle::notice_kid`. An edge calls it for every provider token
+ * it forwards (or uses `aster_enrollment_publisher_notice_token`).
+ * `NOT_FOUND` when the node runs no publisher.
+ *
+ * # Safety
+ * `iss` and `kid` must be readable.
+ */
+int32_t aster_enrollment_publisher_notice(aster_runtime_t runtime,
+                                          aster_enrollment_t enrollment,
+                                          struct aster_bytes_t iss,
+                                          struct aster_bytes_t kid);
+
+/**
+ * As `aster_enrollment_publisher_notice`, reading `iss` and `kid` from a
+ * compact JWT (unverified; a token that does not parse is ignored). Rust
+ * `PublisherHandle::notice_token`.
+ *
+ * # Safety
+ * `token` must be readable.
+ */
+int32_t aster_enrollment_publisher_notice_token(aster_runtime_t runtime,
+                                                aster_enrollment_t enrollment,
+                                                struct aster_bytes_t token);
+
+/**
+ * The publisher's state per issuer as owned JSON (`aster_string_release`):
+ * `{"<iss>": {"kids": ["…"], "fetched_at": <unix s>|null, "publications":
+ * n, "attempts": n, "last_error": "…"|null}}`. `NOT_FOUND` when the node runs no publisher.
+ *
+ * # Safety
+ * `out_json` must be writable.
+ */
+int32_t aster_enrollment_publisher_status(aster_runtime_t runtime,
+                                          aster_enrollment_t enrollment,
+                                          struct aster_bytes_t *out_json);
+
+/**
+ * Mint an edge token for a user (Rust `AsterClient::user_token_issuer` +
+ * `Issuer::mint_user_token`): signed with this node's key, bounded by the
+ * issuer delegation (`aster.identity.issuable_roles`) in the credential the
+ * enrollment holds now. Attach it to calls as the `aster-on-behalf-of`
+ * metadata entry; the node needs `aster.gateway`.
+ *
+ * `request_json`: `{"sub": "…", "roles": ["…"], "amr": ["webauthn"],
+ * "ttl_secs": 60}` (`amr` at least one entry; `ttl_secs` 1..=300). On
+ * success `*out_token` is the compact JWT, owned (`aster_string_release`).
+ * A role outside the delegation, a bad lifetime or value is
+ * `INVALID_ARGUMENT`.
+ *
+ * # Safety
+ * `request_json` must be readable; `out_token` writable.
+ */
+int32_t aster_enrollment_mint_user_token(aster_runtime_t runtime,
+                                         aster_enrollment_t enrollment,
+                                         struct aster_bytes_t request_json,
+                                         struct aster_bytes_t *out_token);
+
+/**
+ * Call `aster.ops.NodeConfig` on the server at the other end of
+ * `connection` (an `aster/1` connection), as Rust's `NodeConfigClient`
+ * does. The caller needs `aster.config-admin` from its own Enrollment
+ * credential for `set` / `clear` (Gate 3 checks the role on every method).
+ *
+ * `request_json` per `method` (all fields optional unless noted; every
+ * request also takes `deadline_ms`, 0 = none):
+ *
+ * - `GET`: `{}`.
+ * - `SET`: `{"expected_generation": 0, "name": "…", "tags": ["…"],
+ *   "attributes": {"k": {"type": "bool"|"int"|"float"|"string", "value": …}},
+ *   "sections": {"identity": {"accept_on_behalf_of": true, "trusted_issuers":
+ *   [...], "edge_token_max_lifetime_secs": n, "clock_leeway_secs": n,
+ *   "max_key_set_age_secs": n}}}` (replaces the whole record).
+ * - `CLEAR`: `{"expected_generation": 0}`.
+ * - `ACK`: `{"generation": n (required), "timeout_ms": 0}`.
+ *
+ * Completes with `ASTER_EVENT_NODE_CONFIG_RESULT` (`handle` = `connection`)
+ * whose JSON payload is `{"code": 0, "result": …}` or, for a refused or
+ * failed call, `{"code": <RPC status code>, "message": "…"}`. `GET`'s
+ * result is the view `{node_id, generation, applied_generation, change,
+ * changed_by, changed_at_ms, name, tags, attributes, sections,
+ * ignored_sections, settings: [{key, value, source}], overridable_sections,
+ * locked_sections}`; the others' is the acknowledgement `{complete,
+ * generation, applied_generation, outstanding: [{part, state, detail}]}`.
+ *
+ * # Safety
+ * `request_json` must be readable; `out_operation` writable.
+ */
+int32_t aster_node_config_call(aster_runtime_t runtime,
+                               aster_connection_t connection,
+                               uint32_t method,
+                               struct aster_bytes_t request_json,
+                               uint64_t user_data,
+                               aster_operation_t *out_operation);
+
+/**
  * Fill `*out` with the defaults of `aster::AsterConfig` (relay DEFAULT,
  * in-memory, hooks off, hook timeout 5000 ms, fail-closed, no transport
  * overrides, blob zstd level 3, port reuse on). Never allocates (`storage` is NULL).
@@ -7466,6 +7742,22 @@ int32_t aster_server_start(aster_runtime_t runtime,
 int32_t aster_server_attach_health(aster_server_builder_t builder, aster_health_t health);
 
 /**
+ * Parse an optional `CapabilityRequirement` JSON (`aster_server_set_topology`
+ * format): an empty span keeps `default`, JSON `null` is none.
+ * ABI 7.7: record every `aster.ops.NodeConfig` `set` and `clear` in the
+ * durable audit outbox `outbox` (`aster_audit_outbox_open`; kinds
+ * `aster.node_config.set` / `aster.node_config.clear`, with the caller, the
+ * generation and the change), as Rust's `AsterServerBuilder::audit_outbox`.
+ * A change the outbox does not accept is refused. `NOT_FOUND` for an
+ * unknown builder or outbox; `ALREADY_CLOSED` once started; `UNSUPPORTED`
+ * when the node config turns NodeConfig off (`[remote_config] enabled =
+ * false`).
+ */
+int32_t aster_server_set_audit_outbox(aster_runtime_t runtime,
+                                      aster_server_builder_t builder,
+                                      uint64_t outbox);
+
+/**
  * Serve `aster.lease.Grantor` (ABI 5.1; Rust `aster::rpc::lease::LeaseGrantor`)
  * on this server, backed by `serializer` (any `aster_lease_serializer_t`:
  * a foreign one answered by the binding over upcalls, or the in-memory
@@ -7679,6 +7971,48 @@ int32_t aster_dispatch_identity(aster_runtime_t runtime,
                                 aster_server_t server_h,
                                 uint64_t call_id,
                                 struct aster_dispatch_identity_t *out);
+
+/**
+ * ABI 7.7: the forwarded identity of a call a gateway made on behalf of a
+ * user (`ASTER_DISPATCH_FLAG_ON_BEHALF_OF`), as a k/v list in this order:
+ * `iss` (the token's issuer: a provider's URL, or the gateway's node id for
+ * an edge-minted token), `sub`, `jti` (empty when the token has none),
+ * `exp` (Unix seconds, decimal), then one `amr` entry per sign-in method
+ * (Rust `CallContext::auth_methods`, e.g. `webauthn`; none for a provider
+ * token without `amr`). The user's roles are the call's attributes
+ * (`aster_dispatch_attributes`); the principal is `iss|sub` and the actor the
+ * transport peer (`aster_dispatch_identity`). A call that was not forwarded
+ * yields an empty list (`*out_buffer` 0). `NOT_FOUND` once the call is over.
+ * Valid until `aster_dispatch_buffer_release`.
+ */
+int32_t aster_dispatch_on_behalf_of(aster_runtime_t runtime,
+                                    aster_server_t server_h,
+                                    uint64_t call_id,
+                                    const uint8_t **out_ptr,
+                                    uint32_t *out_len,
+                                    aster_buffer_t *out_buffer);
+
+/**
+ * ABI 7.7: the server's `aster.ops.NodeConfig` properties as handlers see
+ * them now (Rust `CallContext::node_properties`), as owned JSON
+ * (`aster_string_release`): `{"generation": n, "name": "…", "tags": ["…"],
+ * "attributes": {"k": {"type": "bool"|"int"|"float"|"string", "value": …}}}`.
+ * Attributes describe the node and never authorise anything. With NodeConfig
+ * off the properties are empty (generation 0). `NOT_FOUND` for an unknown
+ * server.
+ *
+ * # Safety
+ * `out_json` must be writable.
+ */
+int32_t aster_server_node_properties(aster_server_t server_h, struct aster_bytes_t *out_json);
+
+/**
+ * ABI 7.7: the `aster.ops.NodeConfig` generation in effect (0: never
+ * changed, or NodeConfig off), so a binding can cache
+ * `aster_server_node_properties` and re-read it only when this changes.
+ * 0 for an unknown server.
+ */
+uint64_t aster_server_node_config_generation(aster_server_t server_h);
 
 /**
  * The server span context of a live call (design §5.2), for the binding's

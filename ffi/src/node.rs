@@ -285,6 +285,10 @@ pub(crate) unsafe fn lower_config(c: &aster_config_t) -> Result<AsterConfig, Str
         if let Some(metrics) = &storage.metrics {
             metrics.apply(&mut cfg);
         }
+        // ABI 7.7: `[identity]` / `[remote_config]`, likewise.
+        if let Some(identity) = &storage.identity {
+            identity.settings.apply(&mut cfg);
+        }
     }
     cfg.blob_zstd_level = match c.blob_zstd_level {
         ASTER_BLOB_ZSTD_LEVEL_DEFAULT => AsterConfig::default().blob_zstd_level,
@@ -488,6 +492,9 @@ pub(crate) struct ConfigStorage {
     pub(crate) network: Option<Box<StoredNetwork>>,
     /// ABI 7.4 `[metrics]` settings (`aster_config_set_metrics`).
     pub(crate) metrics: Option<MetricsSettings>,
+    /// ABI 7.7 `[identity]` / `[remote_config]` settings
+    /// (`aster_config_set_identity`).
+    pub(crate) identity: Option<Box<crate::config_identity::StoredIdentity>>,
 }
 
 struct StoredHealthConfig {
@@ -559,6 +566,10 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
     let metrics = MetricsSettings::from_config(cfg);
     if !metrics.is_default() {
         st.metrics = Some(metrics);
+    }
+    let identity = crate::config_identity::IdentityConfigSettings::from_config(cfg);
+    if !identity.is_default() {
+        st.identity = Some(crate::config_identity::StoredIdentity::new(identity));
     }
     let (relay_mode, urls) = match &cfg.relay_mode {
         RelayMode::Default => (aster_relay_mode_t::ASTER_RELAY_MODE_DEFAULT, Vec::new()),
@@ -684,6 +695,7 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
         || st.health.is_some()
         || st.network.is_some()
         || st.metrics.is_some()
+        || st.identity.is_some()
     {
         out.storage = Box::into_raw(Box::new(st)) as *mut c_void;
     }
@@ -1227,6 +1239,9 @@ pub unsafe extern "C" fn aster_node_start(
         Ok(cfg) => cfg,
         Err(e) => return invalid(e),
     };
+    if let Err(e) = crate::identity::check_unenrolled(&cfg) {
+        return invalid(e);
+    }
     let bridge = try_status!(bridge_for(runtime));
     let gate_entry = if gate == 0 {
         None
@@ -1250,6 +1265,7 @@ pub unsafe extern "C" fn aster_node_start(
         // `aster_health_start` with a NULL config serves this.
         let health = cfg.health_config();
         let peer_labels = crate::health::peer_label_cap(&cfg);
+        let identity = cfg.clone();
         match aster::Node::start(cfg).await {
             Ok(node) => {
                 let core: CoreNode = node.core_node().clone();
@@ -1260,6 +1276,7 @@ pub unsafe extern "C" fn aster_node_start(
                 };
                 let handle = bridge2.nodes.insert(core);
                 crate::health::remember_node_config(handle, health, peer_labels);
+                crate::identity::remember_node_identity(handle, &identity);
                 let slot = receiver
                     .as_ref()
                     .map(|_| Arc::new(RwLock::new(SlotState { gate: gate_entry })));
@@ -1344,6 +1361,7 @@ pub unsafe extern "C" fn aster_node_set_gate(
 /// Remove the gate slot of a node being freed/closed.
 pub(crate) fn forget_node(bridge: &BridgeRuntime, node: aster_node_t) {
     crate::health::forget_node_config(node);
+    crate::identity::forget_node_identity(node);
     crate::enrollment::forget_node(bridge, node);
     bridge
         .node_gates

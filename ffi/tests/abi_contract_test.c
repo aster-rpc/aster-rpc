@@ -222,6 +222,20 @@ OFF(aster_network_config_t, discovery_pkarr_relays, 80);
 _Static_assert(sizeof(aster_discovery_t) == 4, "enum size");
 _Static_assert(ASTER_DISCOVERY_DEFAULT == 0 && ASTER_DISCOVERY_NONE == 1 && ASTER_DISCOVERY_LOCAL == 2 && ASTER_DISCOVERY_CUSTOM == 3, "discovery values");
 
+/* ABI 7.7: [identity] / [remote_config] beside aster_config_t (config_identity.rs). */
+LAYOUT(aster_identity_config_t, 96);
+OFF(aster_identity_config_t, struct_size, 0);
+OFF(aster_identity_config_t, set, 4);
+OFF(aster_identity_config_t, accept_on_behalf_of, 8);
+OFF(aster_identity_config_t, remote_config_disabled, 12);
+OFF(aster_identity_config_t, edge_token_max_lifetime_secs, 16);
+OFF(aster_identity_config_t, clock_leeway_secs, 24);
+OFF(aster_identity_config_t, max_key_set_age_secs, 32);
+OFF(aster_identity_config_t, trusted_issuers_json, 40);
+OFF(aster_identity_config_t, publisher_json, 56);
+OFF(aster_identity_config_t, remote_config_lock, 72);
+OFF(aster_identity_config_t, sources, 88);
+
 /* ABI 7.4: [metrics] settings beside aster_config_t (config_metrics.rs). */
 LAYOUT(aster_metrics_config_t, 16);
 OFF(aster_metrics_config_t, struct_size, 0);
@@ -533,7 +547,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 6); /* 7.6: gateway identity (dispatch identity actor, accept_on_behalf_of option); 7.5: dispatch identity (peer vs principal); 7.4: transfer metrics, [metrics] peer labels; 7.3: cluster network settings; 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 7); /* 7.7: gateway identity config, forwarded identity, NodeConfig, edge tokens; 7.6: gateway identity (dispatch identity actor, accept_on_behalf_of option); 7.5: dispatch identity (peer vs principal); 7.4: transfer metrics, [metrics] peer labels; 7.3: cluster network settings; 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
     {
         /* A 5.x caller (280-byte aster_config_t, no 6.x handshake) is refused
          * cleanly and nothing is written past, or into, its struct. This runs
@@ -586,6 +600,25 @@ static void test_abi_version(void) {
     CHECK(ASTER_EVENT_AUDIT_OUTBOX_OPENED == 114);
     CHECK(ASTER_EVENT_AUDIT_OUTBOX_EXPORTED == 117);
     CHECK(ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS == 128);
+    /* 7.7 */
+    CHECK(ASTER_EVENT_NODE_CONFIG_RESULT == 129);
+    CHECK(ASTER_NODE_CONFIG_GET == 0 && ASTER_NODE_CONFIG_ACK == 3);
+    {
+        aster_operation_t op = 0;
+        aster_bytes_t empty = {NULL, 0};
+        aster_bytes_t out = {NULL, 0};
+        CHECK(aster_node_config_call(0, 0, ASTER_NODE_CONFIG_GET, empty, 0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+        CHECK(aster_node_config_call(0, 0, ASTER_NODE_CONFIG_GET, empty, 0, &op) != ASTER_STATUS_OK);
+        CHECK(aster_enrollment_mint_user_token(0, 0, empty, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+        CHECK(aster_enrollment_mint_user_token(0, 0, empty, &out) != ASTER_STATUS_OK && out.ptr == NULL);
+        CHECK(aster_enrollment_publisher_notice(0, 0, empty, empty) != ASTER_STATUS_OK);
+        CHECK(aster_enrollment_publisher_notice_token(0, 0, empty) != ASTER_STATUS_OK);
+        CHECK(aster_enrollment_publisher_status(0, 0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+        CHECK(aster_server_set_audit_outbox(0, 0, 0) != ASTER_STATUS_OK);
+        CHECK(aster_server_node_properties(0, NULL) == ASTER_STATUS_INVALID_ARGUMENT);
+        CHECK(aster_server_node_properties(424242, &out) == ASTER_STATUS_NOT_FOUND);
+        CHECK(aster_server_node_config_generation(424242) == 0);
+    }
     CHECK(ASTER_AUDIT_OUTBOX_MAX_ACK_WAIT_MS == 3600000);
     {
         aster_operation_t ack_op = 9;
@@ -695,6 +728,11 @@ static void test_enum_values(void) {
     /* 7.5 */
     CHECK(ASTER_DISPATCH_FLAG_HAS_PRINCIPAL == 0x1000);
     CHECK(ASTER_DISPATCH_IDENTITY_PRINCIPAL == 1 && ASTER_DISPATCH_IDENTITY_ACTOR == 2);
+    /* 7.7 */
+    CHECK(ASTER_DISPATCH_FLAG_ON_BEHALF_OF == 0x2000);
+    CHECK(ASTER_IDENTITY_SET_EDGE_TOKEN_MAX_LIFETIME == 1 && ASTER_IDENTITY_SET_CLOCK_LEEWAY == 2 && ASTER_IDENTITY_SET_MAX_KEY_SET_AGE == 4);
+    CHECK(ASTER_IDENTITY_SETTING_ACCEPT_ON_BEHALF_OF == 0 && ASTER_IDENTITY_SETTING_MAX_KEY_SET_AGE == 4);
+    CHECK(ASTER_CONFIG_SOURCE_UNSET == 0 && ASTER_CONFIG_SOURCE_CODE == 4);
 }
 
 static void test_data_plane(void) {
@@ -915,6 +953,47 @@ static void test_config(void) {
     CHECK(aster_config_release(&mc) == ASTER_STATUS_OK);
     CHECK(mc.storage == NULL);
 
+    /* 7.7: [identity] / [remote_config] ride in storage too. */
+    aster_config_t ic;
+    CHECK(aster_config_init(&ic) == ASTER_STATUS_OK);
+    aster_identity_config_t id;
+    memset(&id, 0, sizeof id);
+    id.struct_size = sizeof id;
+    CHECK(aster_config_identity(&ic, &id) == ASTER_STATUS_OK);
+    CHECK(id.set == 0 && id.accept_on_behalf_of == 0 && id.edge_token_max_lifetime_secs == 300);
+    CHECK(id.clock_leeway_secs == 60 && id.max_key_set_age_secs == 172800 && id.trusted_issuers_json.len == 0);
+    CHECK(ic.storage == NULL);
+    const char *issuers = "[{\"iss\":\"https://idp.example\",\"audiences\":[\"svc\"]}]";
+    aster_bytes_t lock[1] = {{(const uint8_t *)"identity", 8}};
+    id.accept_on_behalf_of = 1;
+    id.set = ASTER_IDENTITY_SET_CLOCK_LEEWAY;
+    id.clock_leeway_secs = 0;
+    id.trusted_issuers_json.ptr = (const uint8_t *)issuers;
+    id.trusted_issuers_json.len = strlen(issuers);
+    id.remote_config_lock.items = lock;
+    id.remote_config_lock.len = 1;
+    id.sources[ASTER_IDENTITY_SETTING_ACCEPT_ON_BEHALF_OF] = ASTER_CONFIG_SOURCE_ENV;
+    CHECK(aster_config_set_identity(&ic, &id) == ASTER_STATUS_OK);
+    CHECK(ic.storage != NULL);
+    aster_identity_config_t ib;
+    memset(&ib, 0, sizeof ib);
+    ib.struct_size = sizeof ib;
+    CHECK(aster_config_identity(&ic, &ib) == ASTER_STATUS_OK);
+    CHECK(ib.accept_on_behalf_of == 1 && ib.set == ASTER_IDENTITY_SET_CLOCK_LEEWAY && ib.clock_leeway_secs == 0);
+    CHECK(ib.trusted_issuers_json.len > 0 && ib.trusted_issuers_json.ptr != id.trusted_issuers_json.ptr);
+    CHECK(ib.remote_config_lock.len == 1 && ib.sources[0] == ASTER_CONFIG_SOURCE_ENV);
+    id.set = 0x80;
+    CHECK(aster_config_set_identity(&ic, &id) == ASTER_STATUS_INVALID_ARGUMENT);
+    id.set = 0;
+    id.trusted_issuers_json.ptr = (const uint8_t *)"{}";
+    id.trusted_issuers_json.len = 2;
+    CHECK(aster_config_set_identity(&ic, &id) == ASTER_STATUS_INVALID_ARGUMENT);
+    id.struct_size = 8;
+    CHECK(aster_config_set_identity(&ic, &id) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_config_set_identity(&ic, NULL) == ASTER_STATUS_OK);
+    CHECK(aster_config_release(&ic) == ASTER_STATUS_OK);
+    CHECK(ic.storage == NULL);
+
     aster_blob_transfer_stats_t bs;
     memset(&bs, 0, sizeof bs);
     bs.struct_size = 8;
@@ -1116,6 +1195,19 @@ static void test_dispatch_server(void) {
     CHECK(aster_dispatch_identity(rt, srv, 1, &ident) == ASTER_STATUS_NOT_FOUND);
     CHECK(aster_dispatch_identity(rt, 424242, 1, &ident) == ASTER_STATUS_NOT_FOUND);
     CHECK(aster_dispatch_buffer_release(rt, srv, 0) == ASTER_STATUS_OK);
+    /* 7.7: forwarded identity of an unknown call; node properties. */
+    {
+        const uint8_t *p = NULL;
+        uint32_t plen = 0;
+        aster_buffer_t pbuf = 0;
+        CHECK(aster_dispatch_on_behalf_of(rt, srv, 1, &p, &plen, &pbuf) == ASTER_STATUS_NOT_FOUND);
+        CHECK(aster_dispatch_on_behalf_of(rt, srv, 1, NULL, &plen, &pbuf) == ASTER_STATUS_INVALID_ARGUMENT);
+        aster_bytes_t props = {NULL, 0};
+        CHECK(aster_server_node_properties(srv, &props) == ASTER_STATUS_OK && props.len > 0);
+        CHECK(memcmp(props.ptr, "{", 1) == 0);
+        CHECK(aster_string_release(props.ptr, props.len) == ASTER_STATUS_OK);
+        CHECK(aster_server_node_config_generation(srv) == 0);
+    }
     CHECK(aster_server_live_calls(srv) == 0);
     /* ABI 7.2: an idle server drains at once; a second drain returns the
      * same report; an unknown server is NOT_FOUND. */

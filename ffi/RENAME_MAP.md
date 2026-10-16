@@ -1,4 +1,46 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.6)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.7)
+
+## New in 7.7 (gateway identity on the config-driven path; additive)
+
+Slices 1-4 and 6 of `docs/_internal/web_gateway/gateway-identity.md` (edge
+tokens, provider tokens with replicated issuer keys, the issuer-key
+publisher, the edge helpers, `aster.ops.NodeConfig`) reach the C ABI the way
+they reach `AsterServer` / `AsterClient`: from the node config. The facade's
+`binding_support::identity` runs the same validation and wiring; bindings
+re-implement none of it. No existing layout changes.
+
+Configuration:
+
+| Item | Role |
+|---|---|
+| `aster_identity_config_t` (96 bytes), `aster_config_set_identity`, `aster_config_identity` | `[identity]`, `[identity.publisher]` and `[remote_config]` beside `aster_config_t`, in its `storage`, as 7.3 / 7.4 do. Scalars: `accept_on_behalf_of` (0/1), `remote_config_disabled` (0/1; 0 = NodeConfig served), and `edge_token_max_lifetime_secs`, `clock_leeway_secs`, `max_key_set_age_secs`, each applied only with its `ASTER_IDENTITY_SET_*` bit (clear = the default; leeway 0 is a valid value). Lists as JSON, the shape their environment variables take: `trusted_issuers_json` = `ASTER_IDENTITY_TRUSTED_ISSUERS` (array of `{iss, audiences, roles_claim, role_map, max_token_lifetime_secs}`), `publisher_json` = `ASTER_IDENTITY_PUBLISHER` (`{issuers, jwks_url, refresh_secs, min_refresh_secs, ca_certs, ca_only}`); `remote_config_lock` is an `aster_bytes_list_t`. `sources[ASTER_IDENTITY_SETTING_*]` carries `aster_config_source_t` (`UNSET` 0, `DEFAULT`, `FILE`, `ENV`, `CODE`) so NodeConfig `get` reports where each setting came from; filled configs set it, callers may leave 0. |
+| `aster_config_from_env` / `_from_toml` | Also read `ASTER_IDENTITY_*`, `ASTER_REMOTE_CONFIG_*`, `[identity]`, `[[identity.trusted_issuers]]`, `[identity.publisher]`, `[remote_config]`. |
+| `aster_node_start` / `aster_node_start_enrolled` | Keep the settings with the node. `[identity.publisher]` without Enrollment is `INVALID_ARGUMENT` (as `AsterClient` / `AsterServer`); a client-side enrollment validates it at start. |
+| `aster_server_builder_new` (behaviour change) | Validates `[identity]` as a whole, the `[remote_config]` locks, trusted issuers needing Enrollment and the publisher (`INVALID_ARGUMENT` naming the setting). `ASTER_SERVER_OPTION_ACCEPT_ON_BEHALF_OF`, when set, overrides the config. |
+| `aster_server_start` (behaviour change) | As `AsterServer`: applies the settings; with Enrollment installs the issuer-key cache and, after attaching policy, the fleet-namespace watcher and the publisher (delivering to `[enrollment] replicas`); serves `aster.ops.NodeConfig` behind `aster.config-admin` unless `[remote_config] enabled = false`, applying a stored record before serving. Opening NodeConfig blocks briefly (on a tokio thread it waits on a helper thread). |
+| `aster_server_set_audit_outbox(rt, builder, outbox)` | Durable audit of every NodeConfig `set` / `clear` (`AsterServerBuilder::audit_outbox`). `UNSUPPORTED` with NodeConfig off. |
+
+Handlers (dispatch):
+
+| Item | Role |
+|---|---|
+| `ASTER_DISPATCH_FLAG_ON_BEHALF_OF` (`0x2000`) | A `CALL` a gateway forwarded on behalf of a user (`HAS_PRINCIPAL` is set too; `peer_ptr` is `iss|sub`, `aster_dispatch_identity`'s `actor` / `peer` the gateway). |
+| `aster_dispatch_on_behalf_of(rt, server, call, *ptr, *len, *buffer)` | The forwarded identity as a k/v list: `iss`, `sub`, `jti`, `exp` (Unix s, decimal), then one `amr` per sign-in method (`CallContext::auth_methods`). Empty for other calls; `NOT_FOUND` once the call is over. This is the 7.6 "`amr` has no slot yet": a new accessor rather than a slot, since `aster_dispatch_identity_t` has no room for a list. Roles are the call's attributes. |
+| `aster_server_node_properties(server, *out_json)`, `aster_server_node_config_generation(server)` | NodeConfig properties as handlers see them (`CallContext::node_properties`): `{generation, name, tags, attributes: {k: {type, value}}}`; the generation is cheap, so a binding caches the JSON per generation. Attributes never authorise. |
+
+Edges (clients):
+
+| Item | Role |
+|---|---|
+| `aster_call_options_t.metadata` entry `aster-on-behalf-of` | The per-call token (`CallOptions::on_behalf_of`): Rust's option is exactly this metadata entry, so the existing k/v list carries it and `aster_call_options_t` does not grow. Bindings expose a call option that replaces any earlier entry. |
+| `aster_enrollment_mint_user_token(rt, e, json, *out)` | `AsterClient::user_token_issuer` + `Issuer::mint_user_token`: `{"sub", "roles", "amr", "ttl_secs"}` → the compact JWT (owned). Bounded by the delegation in the credential the enrollment holds now; refused with `INVALID_ARGUMENT`. |
+| `aster_enrollment_publisher_notice(rt, e, iss, kid)`, `_notice_token(rt, e, jwt)`, `_publisher_status(rt, e, *out_json)` | `PublisherHandle::notice_kid` / `notice_token` / `status` for the node's `[identity.publisher]`: a client's runs from its first `aster_enrollment_enroll`, delivering to every server it enrolled with; a server's from `aster_server_start`. `NOT_FOUND` without a publisher. Rust's client notices forwarded tokens itself (unary interceptor); bindings call `_notice_token` for each forwarded provider token. |
+| `aster_node_config_call(rt, connection, method, json, ud, *op)`, `aster_node_config_method_t` (`GET` 0, `SET` 1, `CLEAR` 2, `ACK` 3), `ASTER_EVENT_NODE_CONFIG_RESULT` = 129 | The `aster.ops.NodeConfig` admin client (`NodeConfigClient`) over an `aster/1` connection, with JSON requests (`SET`: `{expected_generation, name, tags, attributes: {k: {type, value}}, sections: {"identity": {...}}}`; `CLEAR`: `{expected_generation}`; `ACK`: `{generation, timeout_ms}`; each takes `deadline_ms`). The event's payload is `{"code": 0, "result": view-or-ack}` or `{"code": <RPC status>, "message"}`. Functions rather than the generic RPC path: the wire types are Fory structs with a union (`aster/NodeConfigView`, `Value`), which bindings would otherwise have to mirror type by type. |
+
+The facade also gains `aster::binding_support::identity` (`plan`,
+`IdentityPlan::apply`, `PendingIdentity::attach`, `ServerIdentity`,
+`client_publisher_plan`). The C ABI builds `aster` with
+`identity-publisher`. Go requires 7.7 (`ABIMinorRequired = 7`).
 
 ## New in 7.6 (gateway identity; additive)
 

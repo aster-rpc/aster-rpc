@@ -112,6 +112,8 @@ pub(crate) struct EnrollmentState {
     /// Set by `aster_enrollment_free`; ends pending revocation waits.
     released: AtomicBool,
     released_notify: tokio::sync::Notify,
+    /// ABI 7.7: the issuer-key publisher (`[identity.publisher]`).
+    pub(crate) publisher: Mutex<crate::identity::PublisherSlot>,
 }
 
 impl EnrollmentState {
@@ -125,6 +127,18 @@ impl EnrollmentState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
+        self.publisher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .release();
+    }
+
+    /// The node's issuer-key publisher, when it runs one.
+    pub(crate) fn publisher_handle(&self) -> Option<aster::rpc::jwks_publisher::PublisherHandle> {
+        self.publisher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .handle()
     }
 
     async fn wait_released(&self) {
@@ -553,6 +567,17 @@ pub unsafe extern "C" fn aster_node_start_enrolled(
         Ok(None) => return node::aster_node_start(runtime, config, 0, user_data, out_operation),
         Err(error) => return invalid(error),
     };
+    // A client runs `[identity.publisher]` itself (validated here, as
+    // `AsterClient` does); a server's is validated when it is built.
+    let publisher = match side {
+        Side::Client => match aster::binding_support::identity::client_publisher_plan(&cfg, true) {
+            Ok(config) => {
+                crate::identity::PublisherSlot::client(config, cfg.identity_max_key_set_age_secs)
+            }
+            Err(error) => return invalid(error),
+        },
+        Side::Server => crate::identity::PublisherSlot::default(),
+    };
 
     let (op_id, cancelled) = match bridge.new_operation(user_data) {
         Ok(operation) => operation,
@@ -566,6 +591,7 @@ pub unsafe extern "C" fn aster_node_start_enrolled(
         }
         let health = cfg.health_config();
         let peer_labels = crate::health::peer_label_cap(&cfg);
+        let identity = cfg.clone();
         let node = match aster::Node::start_with_alpns(
             cfg,
             vec![aster::enrollment::ENROLLMENT_ALPN.to_vec()],
@@ -594,6 +620,7 @@ pub unsafe extern "C" fn aster_node_start_enrolled(
         let revocations = tokio::sync::Mutex::new(installed.enrollment.revocations());
         let handle = bridge2.nodes.insert(node.core_node().clone());
         crate::health::remember_node_config(handle, health, peer_labels);
+        crate::identity::remember_node_identity(handle, &identity);
         let id = bridge2.enrollments.insert(EnrollmentState {
             enrollment: installed.enrollment,
             issuer: installed.issuer,
@@ -604,6 +631,7 @@ pub unsafe extern "C" fn aster_node_start_enrolled(
             revocations,
             released: AtomicBool::new(false),
             released_notify: tokio::sync::Notify::new(),
+            publisher: Mutex::new(publisher),
         });
         bridge2
             .node_enrollments
@@ -844,7 +872,7 @@ fn live(bridge: &BridgeRuntime) -> Result<(), i32> {
     Ok(())
 }
 
-fn enrollment_state(
+pub(crate) fn enrollment_state(
     bridge: &BridgeRuntime,
     enrollment: aster_enrollment_t,
 ) -> Result<Arc<EnrollmentState>, i32> {
@@ -947,6 +975,14 @@ pub unsafe extern "C" fn aster_enrollment_enroll(
             .await
             .map_err(enroll_error)?;
         let renewing = state.start_renewal(Some(&server));
+        // `[identity.publisher]` on a client delivers to every server it
+        // enrolled with (Rust `AsterClient` delivers to its one server).
+        state
+            .publisher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .enrolled(&state.node, &state.enrollment, server.node_id.clone())
+            .map_err(other_error)?;
         Ok(result(
             enrollment,
             json!({"readiness": readiness_json(&readiness), "renewing": renewing}),

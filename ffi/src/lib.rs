@@ -28,6 +28,7 @@ mod audit_test_common;
 #[cfg(test)]
 extern crate self as aster_transport_ffi;
 pub mod call;
+pub mod config_identity;
 pub mod config_metrics;
 pub mod config_network;
 pub mod coordination;
@@ -40,6 +41,7 @@ pub mod expose;
 pub mod grants;
 pub mod health;
 pub mod http_server;
+pub mod identity;
 mod layout;
 pub mod node;
 pub mod observability;
@@ -232,7 +234,7 @@ pub mod upcall;
 //   the `actor` slot reserved in 7.5 (the gateway), with `principal` the user.
 //   Layouts unchanged. See `ffi/RENAME_MAP.md` "7.6".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 6;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 7;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
@@ -507,6 +509,9 @@ pub enum aster_event_kind_t {
     /// ABI 7.1: `aster_audit_outbox_acknowledgements`: versioned JSON page of
     /// acknowledgement-log entries; `handle` = the outbox.
     ASTER_EVENT_AUDIT_OUTBOX_ACKNOWLEDGEMENTS = 128,
+    /// ABI 7.7: `aster_node_config_call`: JSON `{"code": 0, "result": …}` or
+    /// `{"code": <RPC status>, "message": "…"}`; `handle` = the connection.
+    ASTER_EVENT_NODE_CONFIG_RESULT = 129,
 }
 
 /// Value of `connection_type` in `aster_remote_info_t` and
