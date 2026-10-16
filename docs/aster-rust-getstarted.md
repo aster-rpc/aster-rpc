@@ -196,6 +196,8 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `transport_<knob>(v)` | `ASTER_TRANSPORT_<KNOB>` | `[network] transport_<knob>` | `max_concurrent_bidi_streams`, `max_concurrent_uni_streams`, `stream_receive_window`, `receive_window`, `send_window`, `max_idle_timeout_ms`, `keep_alive_interval_ms`, `initial_mtu`, `datagram_receive_buffer_size`, `datagram_send_buffer_size`, `send_fairness`, `enable_segmentation_offload` |
 | `identity_file(p)` | `ASTER_IDENTITY_FILE` | `[identity] file` | `.aster-identity` credential file |
 | `accept_on_behalf_of(b)` | `ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF` | `[identity] accept_on_behalf_of` | default `false`: accept calls a gateway makes for a user (§4.7.1); off, such calls are refused |
+| `remote_config(b)` | `ASTER_REMOTE_CONFIG_ENABLED` | `[remote_config] enabled` | default `true`: serve `aster.ops.NodeConfig` (§4.7.2) |
+| `remote_config_lock([..])` | `ASTER_REMOTE_CONFIG_LOCK` (comma-separated) | `[remote_config] lock = [..]` | sections remote overrides may not touch, e.g. `["identity"]`; an unknown name fails the start |
 | `health_port(p)` | `ASTER_HEALTH_PORT` | `[health] port` | health/metrics HTTP port; `0` (default) = disabled unless `health(true)` |
 | `health_host(h)` | `ASTER_HEALTH_HOST` | `[health] host` | default `127.0.0.1`; `0.0.0.0` for pod probes |
 | `health(b)` | `ASTER_HEALTH_ENABLED` | `[health] enabled` | force on (port `0` → ephemeral) or off; unset = on iff port ≠ 0 |
@@ -965,6 +967,7 @@ let srv = AsterServer::builder()
 | `peer()` | the transport's caller id (Iroh: endpoint id hex); `provenance()` says how far to trust it |
 | `principal()` | the `Authenticator`'s `AuthOutcome.principal`, else `peer()` |
 | `attributes()` / `attribute(k)` | the merged set Gate 3 checked (store + authenticator) |
+| `node_properties()` / `node_attribute(k)` | **this node's** NodeConfig name, tags and typed attributes (§4.7.2); never authorise |
 | `service()`, `method()`, `call_id()` | what was called |
 | `session_id()` | the session, for a session-scoped service |
 | `metadata()` / `metadata_value(k)` | request metadata (HTTP: the request headers) |
@@ -1052,6 +1055,70 @@ the peer, exactly as before. Accepted calls record `principal`, `actor`,
 `obo_iss` and `obo_jti` on their `rpc` span and log under
 `aster::rpc::identity` (debug). Tokens from external identity providers (OIDC)
 come in a later release.
+
+### 4.7.2 Remote overrides (`aster.ops.NodeConfig`)
+
+Every `AsterServer` serves `aster.ops.NodeConfig`, which lets an admin set a
+record on the node:
+
+- **properties:** a name and tags;
+- **typed attributes:** bool, int, float or string;
+- **overrides** of the sections that declare themselves overridable.
+  `[identity]` (`accept_on_behalf_of`) is the only one today.
+
+Gate 3 requires the role `aster.config-admin` on every method. `set` and
+`clear` also require that the role comes from the caller's own Enrollment
+credential, over Iroh, and not on behalf of a user. A node without Enrollment
+therefore refuses every change.
+
+```rust
+use aster::rpc::node_config::{IdentityOverride, NodeConfigSetRequest};
+use aster::rpc::NodeConfigClient;
+
+# async fn f(admin: aster::rpc::AsterClient) -> aster::Result<()> {
+let config = NodeConfigClient::new(admin.rpc());
+let ack = config
+    .set(
+        NodeConfigSetRequest::new()
+            .name("eu-gateway-1")
+            .tag("gateway")
+            .attribute("region", "eu-west")
+            .identity(IdentityOverride { accept_on_behalf_of: Some(true) }),
+    )
+    .await?;
+assert!(ack.complete); // the override is in force on the node
+let view = config.get().await?; // effective values, each with its source
+# Ok(())
+# }
+```
+
+- **Acknowledgement means applied.** `set` and `clear` answer only once the
+  change is live, for example once the next call sees the new
+  `accept_on_behalf_of`. `ack(generation)` answers the same question later,
+  from the node's store and the settings in force. A request is validated as
+  a whole before anything is stored, and applied without a restart.
+- **Precedence:** defaults, then file / env / code, then the override. `get`
+  reports each setting's source: `default`, `file`, `env`, `code` or
+  `override`.
+- **Attributes never authorise.** Keys starting `aster.` are refused, and
+  `requires` never reads them. Handlers read them with
+  `ctx.node_properties()` / `ctx.node_attribute("region")`; other code reads
+  `AsterServer::node_config()`.
+- **Hardening.** Only listed sections and fields can be overridden. Anything
+  else, such as the bind port or `hook_failure_mode`, is refused with
+  `PERMISSION_DENIED`. The local file can lock a section
+  (`[remote_config] lock = ["identity"]`, refused with `FAILED_PRECONDITION`)
+  or turn the service off (`[remote_config] enabled = false`). Either way, a
+  stored override the file no longer allows is ignored.
+- **Storage and reset.** The record is kept in a namespace of the node's own
+  docs store, so it survives a restart when the node is persistent. Only an
+  admin's `set` or `clear` changes it. `clear` reverts to the file
+  configuration, and there is no local reset.
+- **Audit.** Each change records the caller, the time and a generation
+  number. It is logged under `aster::audit` and, with
+  `AsterServerBuilder::audit_outbox(outbox)`, committed to the audit outbox
+  before it is stored. A change the outbox refuses is not made
+  (`UNAVAILABLE`).
 
 ### 4.8 Client interceptors (deadline / retry / circuit breaker)
 
