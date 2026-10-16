@@ -34,9 +34,7 @@ ROOT = Path(__file__).resolve().parents[2]
 # Workspace crates with feature-gated test targets that no CI job tests at
 # all. Listed so that adding one is a visible decision; empty it by giving the
 # crate a test step, which brings it under the guard below.
-UNTESTED_CRATES: dict[str, str] = {
-    'aster-expose': 'no CI step runs `cargo test -p aster-expose` (tests/edge_integration.rs needs `edge`)',
-}
+UNTESTED_CRATES: dict[str, str] = {}
 
 
 # ---------------------------------------------------------------- crates ---

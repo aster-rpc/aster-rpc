@@ -16,7 +16,7 @@ cd "$(dirname "$0")/../.."
 LINT_CHECKS=(
   cli-compat guard-tests fmt clippy-workspace coordination-deps otel-deps
   deny clippy-coordination clippy-binding-support clippy-ffi-fixture
-  clippy-napi clippy-enrollment clippy-exec publish-manifests
+  clippy-napi clippy-enrollment clippy-exec clippy-expose publish-manifests
 )
 
 check() {
@@ -80,6 +80,9 @@ check() {
     clippy-exec)
       cargo clippy --locked -p aster-exec --features service --all-targets \
         -p aster-exec-client -p aster-cli -- -D warnings ;;
+    # `edge` (the Salvo edge and tests/edge_integration.rs) is off by default.
+    clippy-expose)
+      cargo clippy --locked -p aster-expose --features edge --all-targets -- -D warnings ;;
     publish-manifests)
       scripts/release/publish-cargo.sh --check ;;
     # Preflight only: the test job's pytest run, collection only, over a debug
