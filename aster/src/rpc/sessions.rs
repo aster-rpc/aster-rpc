@@ -9,6 +9,14 @@
 //! (`AsterServer._resolve_instance`) and Java (`AsterServer.resolveInstance`)
 //! implement.
 //!
+//! A connection-scoped session also belongs to the principal that opened it:
+//! the forwarded user (`iss|sub`) when the opening call carried an
+//! `aster-on-behalf-of` entry, else the caller (an authenticator's principal,
+//! or the peer). A gateway edge multiplexes many users over one connection,
+//! so a later call on the session from any other principal, the edge itself
+//! included, is refused with `PERMISSION_DENIED` rather than run in the
+//! opener's instance.
+//!
 //! HTTP-style transports (Salvo HTTP, WebTransport) hand the dispatcher no
 //! connection id. Their sessions keep the string `aster-session-id` key, but
 //! scoped to the caller's principal: the [`Authenticator`] principal when one
@@ -59,6 +67,8 @@ pub(crate) enum SessionError {
     NotFound(String),
     /// Opening the session would exceed `max_sessions_per_connection`.
     Exhausted(String),
+    /// The session belongs to another principal on the same connection.
+    NotOwner(String),
 }
 
 impl SessionError {
@@ -67,6 +77,7 @@ impl SessionError {
             SessionError::ScopeMismatch(m) => RpcStatus::error(StatusCode::FailedPrecondition, m),
             SessionError::NotFound(m) => RpcStatus::error(StatusCode::NotFound, m),
             SessionError::Exhausted(m) => RpcStatus::error(StatusCode::ResourceExhausted, m),
+            SessionError::NotOwner(m) => RpcStatus::error(StatusCode::PermissionDenied, m),
         }
     }
 }
@@ -77,7 +88,22 @@ struct ConnectionState {
     /// Highest session id ever opened on this connection. Ids at or below it
     /// that are not active belong to closed sessions (the graveyard).
     last_opened: i32,
-    active: HashMap<(i32, ServiceKey), SessionInstance>,
+    active: HashMap<(i32, ServiceKey), OpenSession>,
+}
+
+/// A live connection-scoped session and the principal it belongs to.
+struct OpenSession {
+    instance: SessionInstance,
+    /// `None` until the opening call's principal is known: a dispatcher with
+    /// an authenticator resolves the session before authenticating, then
+    /// [`SessionStore::claim`]s it.
+    owner: Option<String>,
+}
+
+fn not_owner(session_id: i32) -> SessionError {
+    SessionError::NotOwner(format!(
+        "session {session_id} belongs to another principal on this connection"
+    ))
 }
 
 /// `(principal, service, version, aster-session-id)`.
@@ -100,7 +126,10 @@ impl SessionStore {
     }
 
     /// Lookup-or-create for a connection-scoped call (§7.5). `session_id` must
-    /// already be known to be non-zero.
+    /// already be known to be non-zero. `principal` is the caller's identity
+    /// when it is already known (no authenticator): a new session records it
+    /// and an existing one owned by anyone else is refused. With `None` the
+    /// caller must [`claim`](Self::claim) the session once it knows.
     ///
     /// The factory runs under the store lock. Factories are synchronous
     /// constructors, and holding the lock is what makes "check the cap, bump
@@ -110,13 +139,17 @@ impl SessionStore {
         connection_id: u64,
         service: &ServiceKey,
         session_id: i32,
+        principal: Option<&str>,
         factory: &SessionFactory,
     ) -> Result<SessionInstance, SessionError> {
         let mut conns = self.connections.lock().unwrap();
         let state = conns.entry(connection_id).or_default();
         let key = (session_id, service.clone());
-        if let Some(inst) = state.active.get(&key) {
-            return Ok(inst.clone());
+        if let Some(open) = state.active.get_mut(&key) {
+            if let Some(principal) = principal {
+                check_owner(open, principal, session_id)?;
+            }
+            return Ok(open.instance.clone());
         }
         if session_id <= state.last_opened {
             return Err(SessionError::NotFound(format!(
@@ -134,7 +167,13 @@ impl SessionStore {
         }
         let inst = factory()?;
         state.last_opened = session_id;
-        state.active.insert(key, inst.clone());
+        state.active.insert(
+            key,
+            OpenSession {
+                instance: inst.clone(),
+                owner: principal.map(str::to_string),
+            },
+        );
         tracing::debug!(
             target: SESSION,
             connection_id,
@@ -145,6 +184,26 @@ impl SessionStore {
             "session opened"
         );
         Ok(inst)
+    }
+
+    /// Bind a session resolved with no principal to `principal`, or check
+    /// that it already belongs to it. A session reaped since resolution (its
+    /// connection closed) has nothing to claim and passes.
+    pub(crate) fn claim(
+        &self,
+        connection_id: u64,
+        service: &ServiceKey,
+        session_id: i32,
+        principal: &str,
+    ) -> Result<(), SessionError> {
+        let mut conns = self.connections.lock().unwrap();
+        let Some(open) = conns
+            .get_mut(&connection_id)
+            .and_then(|state| state.active.get_mut(&(session_id, service.clone())))
+        else {
+            return Ok(());
+        };
+        check_owner(open, principal, session_id)
     }
 
     /// Whether session `session_id` of `service` is live on `connection_id`.
@@ -239,7 +298,12 @@ impl SessionStore {
                     .filter(|(_, key)| keys.contains(key))
                     .cloned()
                     .collect();
-                dropped.extend(stale.into_iter().filter_map(|k| state.active.remove(&k)));
+                dropped.extend(
+                    stale
+                        .into_iter()
+                        .filter_map(|k| state.active.remove(&k))
+                        .map(|open| open.instance),
+                );
             }
         }
         {
@@ -278,6 +342,22 @@ impl SessionStore {
     }
 }
 
+/// First principal to claim an unowned session gets it; anyone else is refused.
+fn check_owner(
+    open: &mut OpenSession,
+    principal: &str,
+    session_id: i32,
+) -> Result<(), SessionError> {
+    match &open.owner {
+        Some(owner) if owner == principal => Ok(()),
+        Some(_) => Err(not_owner(session_id)),
+        None => {
+            open.owner = Some(principal.to_string());
+            Ok(())
+        }
+    }
+}
+
 /// Whether a SHARED service may take this call: it must not carry a session id.
 pub(crate) fn check_shared(service: &str, session_id: i32) -> Result<(), SessionError> {
     if session_id != 0 {
@@ -300,6 +380,19 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    struct NoService;
+
+    #[async_trait::async_trait]
+    impl ServiceDispatch for NoService {
+        fn name(&self) -> &str {
+            "test.Counter"
+        }
+        fn version(&self) -> i32 {
+            1
+        }
+        async fn dispatch(&self, _method: &str, _call: crate::rpc::server::Call) {}
+    }
+
     #[test]
     fn failed_factory_does_not_cache_or_advance_session_id() {
         let store = SessionStore::new(4);
@@ -312,11 +405,11 @@ mod tests {
         let service = ("test.Counter".to_string(), 1);
 
         assert!(matches!(
-            store.resolve_connection(7, &service, 3, &factory),
+            store.resolve_connection(7, &service, 3, Some("alice"), &factory),
             Err(SessionError::Exhausted(_))
         ));
         assert!(matches!(
-            store.resolve_connection(7, &service, 3, &factory),
+            store.resolve_connection(7, &service, 3, Some("alice"), &factory),
             Err(SessionError::Exhausted(_))
         ));
         assert_eq!(attempts.load(Ordering::Relaxed), 2, "retry reruns factory");
@@ -324,5 +417,37 @@ mod tests {
         let state = connections.get(&7).unwrap();
         assert_eq!(state.last_opened, 0);
         assert!(state.active.is_empty());
+    }
+
+    #[test]
+    fn a_session_belongs_to_the_principal_that_opened_it() {
+        let store = SessionStore::new(4);
+        let factory: SessionFactory = Arc::new(|| Err(SessionError::Exhausted("unused".into())));
+        let service = ("test.Counter".to_string(), 1);
+        // Seed a live session owned by alice without running a factory.
+        let opened: SessionFactory = Arc::new(|| Ok(SessionInstance::Native(Arc::new(NoService))));
+        store
+            .resolve_connection(7, &service, 3, Some("alice"), &opened)
+            .unwrap();
+        assert!(store
+            .resolve_connection(7, &service, 3, Some("alice"), &factory)
+            .is_ok());
+        assert!(matches!(
+            store.resolve_connection(7, &service, 3, Some("bob"), &factory),
+            Err(SessionError::NotOwner(_))
+        ));
+        // Resolved before authentication, claimed after.
+        store
+            .resolve_connection(7, &service, 4, None, &opened)
+            .unwrap();
+        store.claim(7, &service, 4, "carol").unwrap();
+        assert!(matches!(
+            store.claim(7, &service, 4, "alice"),
+            Err(SessionError::NotOwner(_))
+        ));
+        assert!(matches!(
+            store.resolve_connection(7, &service, 4, Some("alice"), &factory),
+            Err(SessionError::NotOwner(_))
+        ));
     }
 }

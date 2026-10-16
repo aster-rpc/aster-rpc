@@ -1025,6 +1025,31 @@ impl Dispatcher {
             None
         };
 
+        // Without an authenticator the caller's identity is known now: the
+        // Gate-3 attributes and the forwarded user, if any. A connection-scoped
+        // session is bound to that principal (GI-1).
+        let early = if self.authenticator.is_none() {
+            let attributes = if self.public_transport {
+                HashMap::new()
+            } else {
+                self.attributes.get(&parts.peer_id)
+            };
+            // Gateway identity, before Gate 3: a forwarded call is authorised
+            // as the user, with the token's roles only.
+            let forwarded = match self.forwarded(&header, parts, &parts.peer_id, &attributes) {
+                Ok(forwarded) => forwarded,
+                Err(status) => return Route::Reject(status),
+            };
+            Some((attributes, forwarded))
+        } else {
+            None
+        };
+        let principal = early.as_ref().map(|(_, forwarded)| {
+            forwarded
+                .as_deref()
+                .map_or(parts.peer_id.as_str(), ForwardedIdentity::principal)
+        });
+
         let session_scoped = factory.is_some();
         let target = match factory {
             // SHARED service: one instance for everyone, and no session id.
@@ -1044,10 +1069,13 @@ impl Dispatcher {
                 // runs in the serve loop ahead of the connection's
                 // `ConnectionClosed` and can never resurrect a reaped entry.
                 Some(conn) if header.session_id != 0 => {
-                    match self
-                        .sessions
-                        .resolve_connection(conn, &key, header.session_id, &factory)
-                    {
+                    match self.sessions.resolve_connection(
+                        conn,
+                        &key,
+                        header.session_id,
+                        principal,
+                        &factory,
+                    ) {
                         Ok(inst) => target_of(inst, &foreign),
                         Err(e) => return Route::Reject(e.status()),
                     }
@@ -1101,19 +1129,8 @@ impl Dispatcher {
             forwarded: None,
             forwarded_applied: false,
         };
-        if self.authenticator.is_some() {
+        let Some((mut attributes, forwarded)) = early else {
             return Route::Authenticate(routed);
-        }
-        let mut attributes = if self.public_transport {
-            HashMap::new()
-        } else {
-            self.attributes.get(&parts.peer_id)
-        };
-        // Gateway identity, before Gate 3: a forwarded call is authorised as
-        // the user, with the token's roles only.
-        let forwarded = match self.forwarded(&routed.header, parts, &parts.peer_id, &attributes) {
-            Ok(forwarded) => forwarded,
-            Err(status) => return Route::Reject(status),
         };
         if let Some(identity) = &forwarded {
             attributes = identity.attributes();
@@ -1380,6 +1397,16 @@ impl Dispatcher {
             attrs = identity.attributes();
         }
         gate3(&*routed.meta, &routed.header, &attrs)?;
+        // A connection-scoped session was resolved before the principal was
+        // known: bind it to this one, or refuse another's (GI-1).
+        if let (true, Some(conn)) = (routed.session_scoped, parts.connection_id) {
+            let principal = forwarded
+                .as_deref()
+                .map_or(parts.peer_id.as_str(), ForwardedIdentity::principal);
+            self.sessions
+                .claim(conn, &routed.key, routed.header.session_id, principal)
+                .map_err(|error| error.status())?;
+        }
         routed.forwarded = forwarded;
         if let Target::HttpSession { factory, sid } = &routed.target {
             let instance = self

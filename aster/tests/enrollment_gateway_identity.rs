@@ -113,6 +113,26 @@ impl Data for DataImpl {
     }
 }
 
+/// A session-scoped running total: each session's instance is its opener's.
+#[aster::service(name = "Cart", version = 1)]
+trait Cart {
+    async fn add(&self, req: Num, ctx: &CallContext) -> Result<Num>;
+}
+
+#[derive(Default)]
+struct CartImpl {
+    total: std::sync::Mutex<i32>,
+}
+
+#[async_trait]
+impl Cart for CartImpl {
+    async fn add(&self, req: Num, _ctx: &CallContext) -> Result<Num> {
+        let mut total = self.total.lock().unwrap();
+        *total += req.n;
+        Ok(Num { n: *total })
+    }
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -516,6 +536,96 @@ async fn forwarded_identity_reaches_handlers_and_every_refusal_fails_closed() {
         for client in [edge, plain, undelegated, other] {
             client.close().await;
         }
+        server.shutdown().await;
+        root.node.shutdown().await;
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// GI-1: an edge multiplexes users over one connection, so a session it
+/// opens for one user must not be reachable as another user, or as the edge.
+#[tokio::test]
+async fn a_session_opened_for_one_user_refuses_every_other_principal() {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let server = AsterServer::builder()
+            .service(DataServer::new(DataImpl))
+            .register_session(|| CartServer::new(CartImpl::default()))
+            .config(server_config(&root, 11, true, files.path()))
+            .start()
+            .await
+            .unwrap();
+        wait_for_addr(server.node()).await;
+        let edge = connect(
+            &root,
+            &server,
+            5,
+            credential(5, Some(GATEWAY_ROLE), Some("data.read")),
+        )
+        .await;
+        let issuer = Issuer::from_enrollment(edge.node(), edge.enrollment().unwrap()).unwrap();
+        let mint = |user: &str| {
+            issuer
+                .mint_user_token(user, ["data.read"], ["pwd"], Duration::from_secs(120))
+                .unwrap()
+        };
+        let (alice, bob) = (mint("alice"), mint("bob"));
+        let cart = |session: &aster::rpc::RpcSession, token: Option<&str>| {
+            let options = session.options().deadline(Duration::from_secs(20));
+            let options = match token {
+                Some(token) => options.on_behalf_of(token),
+                None => options,
+            };
+            CartClient::new(edge.rpc()).with_options(options)
+        };
+
+        let session = edge.rpc().open_session().unwrap();
+        assert_eq!(
+            cart(&session, Some(&alice))
+                .add(Num { n: 2 })
+                .await
+                .unwrap(),
+            Num { n: 2 }
+        );
+        assert_eq!(
+            code(cart(&session, Some(&bob)).add(Num { n: 1 }).await),
+            Some(StatusCode::PermissionDenied),
+            "another user on the same connection"
+        );
+        assert_eq!(
+            code(cart(&session, None).add(Num { n: 1 }).await),
+            Some(StatusCode::PermissionDenied),
+            "the edge as itself"
+        );
+        assert_eq!(
+            cart(&session, Some(&alice))
+                .add(Num { n: 3 })
+                .await
+                .unwrap(),
+            Num { n: 5 },
+            "the opener continues, untouched by the refused calls"
+        );
+
+        // Bob's own session, and the edge's, are their own.
+        let other = edge.rpc().open_session().unwrap();
+        assert_eq!(
+            cart(&other, Some(&bob)).add(Num { n: 1 }).await.unwrap(),
+            Num { n: 1 }
+        );
+        let own = edge.rpc().open_session().unwrap();
+        assert_eq!(
+            cart(&own, None).add(Num { n: 7 }).await.unwrap(),
+            Num { n: 7 }
+        );
+        assert_eq!(
+            code(cart(&own, Some(&alice)).add(Num { n: 1 }).await),
+            Some(StatusCode::PermissionDenied),
+            "a user on the edge's own session"
+        );
+
+        edge.close().await;
         server.shutdown().await;
         root.node.shutdown().await;
     })
