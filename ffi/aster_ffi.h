@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 7
 
-#define ASTER_ABI_VERSION_MINOR 2
+#define ASTER_ABI_VERSION_MINOR 3
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -796,6 +796,30 @@ typedef enum aster_reuse_last_port_t {
   ASTER_REUSE_LAST_PORT_ENABLED = 1,
   ASTER_REUSE_LAST_PORT_DISABLED = 2,
 } aster_reuse_last_port_t;
+
+/**
+ * `aster_network_config_t.discovery` (ABI 7.3): how a node publishes its
+ * addresses and finds peers by bare node ID.
+ */
+typedef enum aster_discovery_t {
+  /**
+   * n0 pkarr and DNS at `iroh.link`. With `discovery_dns_origin` or
+   * `discovery_pkarr_relays` set, selects `CUSTOM`.
+   */
+  ASTER_DISCOVERY_DEFAULT = 0,
+  /**
+   * No address lookup: dial peers by full address.
+   */
+  ASTER_DISCOVERY_NONE = 1,
+  /**
+   * Local-network mDNS only.
+   */
+  ASTER_DISCOVERY_LOCAL = 2,
+  /**
+   * Only `discovery_dns_origin` / `discovery_pkarr_relays`.
+   */
+  ASTER_DISCOVERY_CUSTOM = 3,
+} aster_discovery_t;
 
 /**
  * Blob wire format (`format` argument of the 3.3 blob downloads).
@@ -1719,127 +1743,6 @@ typedef uint64_t aster_call_t;
 typedef uint64_t aster_buffer_t;
 
 /**
- * Options of `aster_coordination_client_open`. 48 bytes (LP64). Fill with
- * `aster_coordination_client_options_init`; `struct_size` must equal
- * `sizeof(aster_coordination_client_options_t)`.
- */
-typedef struct aster_coordination_client_options_t {
-  uint32_t struct_size;
-  /**
-   * `ASTER_COORDINATION_CLIENT_READ_ONLY` or 0.
-   */
-  uint32_t flags;
-  /**
-   * The group id: exactly 32 raw bytes.
-   */
-  const uint8_t *group_id;
-  /**
-   * Seed tickets (UTF-8 base58, Open credential only): routing hints;
-   * they grant nothing.
-   */
-  struct aster_bytes_list_t seed_tickets;
-  /**
-   * Journal directory (UTF-8 path). Required for the durable client,
-   * ignored by the read-only one.
-   */
-  struct aster_bytes_t journal_dir;
-} aster_coordination_client_options_t;
-
-/**
- * A coordination client (`aster_coordination_client_open`): the durable
- * journaled client, or a read-only one.
- */
-typedef uint64_t aster_coordination_client_t;
-
-/**
- * A resolved mutation awaiting acknowledgement
- * (`ASTER_EVENT_COORDINATION_RESOLVED`).
- */
-typedef uint64_t aster_coordination_resolved_t;
-
-/**
- * A held coordination lease (`ASTER_EVENT_COORDINATION_LEASE_ACQUIRED`).
- */
-typedef uint64_t aster_coordination_lease_t;
-
-/**
- * An upcall table plus its bounded event queue (`aster_upcalls_new`).
- */
-typedef uint64_t aster_upcalls_t;
-
-/**
- * A placement manager (`aster_coordination_placement_manager_new`).
- */
-typedef uint64_t aster_coordination_placement_manager_t;
-
-/**
- * Runtime-local owned temporary custody scope. Free with aster_blob_custody_free.
- */
-typedef uint64_t aster_blob_custody_t;
-
-/**
- * One network path of a connection (`aster::PathInfo`). Strings point into
- * the owning `aster_path_list_t`'s storage; `{NULL, 0}` when absent; not
- * NUL-terminated.
- */
-typedef struct aster_path_info_t {
-  /**
-   * `sizeof(aster_path_info_t)`.
-   */
-  uint32_t struct_size;
-  /**
-   * One of `aster_path_kind_t` (`DIRECT`, `RELAY` or `OTHER`).
-   */
-  uint32_t path_kind;
-  /**
-   * 1 if this path currently carries application data.
-   */
-  uint32_t is_selected;
-  /**
-   * DIRECT: the peer's UDP port.
-   */
-  uint16_t peer_port;
-  uint16_t _pad;
-  /**
-   * DIRECT: the peer's IP address.
-   */
-  struct aster_bytes_t peer_host;
-  /**
-   * RELAY: the relay URL.
-   */
-  struct aster_bytes_t relay_url;
-  /**
-   * OTHER: a description of a custom/future transport.
-   */
-  struct aster_bytes_t other;
-  /**
-   * RTT estimate in microseconds; `UINT64_MAX` when not yet measured.
-   */
-  uint64_t rtt_micros;
-} aster_path_info_t;
-
-/**
- * A list of paths filled by `aster_connection_paths` /
- * `aster_connection_selected_path`. Release with `aster_path_list_release`.
- */
-typedef struct aster_path_list_t {
-  /**
-   * `sizeof(aster_path_list_t)`; written by the library.
-   */
-  uint32_t struct_size;
-  uint32_t _pad;
-  /**
-   * `len` entries, owned by `storage`; NULL when `len == 0`.
-   */
-  const struct aster_path_info_t *items;
-  uintptr_t len;
-  /**
-   * Library-owned backing store; NULL when nothing was allocated.
-   */
-  void *storage;
-} aster_path_list_t;
-
-/**
  * Node configuration: every knob of `aster::AsterConfig` that a node uses
  * (docs/aster-rust-getstarted.md §2.2). Start from `aster_config_init` (or
  * `aster_config_from_env` / `aster_config_from_toml`), then set fields. See
@@ -1969,6 +1872,172 @@ typedef struct aster_config_t {
    */
   uint32_t reuse_last_port;
 } aster_config_t;
+
+/**
+ * Cluster network settings of a node config (ABI 7.3), next to
+ * `aster_config_t`; see `aster_config_set_network`. Strings are UTF-8, not
+ * NUL-terminated; empty = `{NULL, 0}`. A zeroed struct with `struct_size`
+ * set is "nothing configured".
+ */
+typedef struct aster_network_config_t {
+  /**
+   * `sizeof(aster_network_config_t)`, set by the caller.
+   */
+  uint32_t struct_size;
+  /**
+   * One of `aster_discovery_t`.
+   */
+  uint32_t discovery;
+  /**
+   * IPv6 bind address, e.g. `[::]:7842`: pins the IPv6 UDP port as
+   * `aster_config_t.bind_addr` pins the IPv4 one.
+   */
+  struct aster_bytes_t bind_addr_v6;
+  /**
+   * Extra direct addresses (`IP:port`) to advertise, e.g. a NodePort.
+   * Hints only: peers still verify the node key in the TLS handshake.
+   */
+  struct aster_bytes_list_t advertise_addrs;
+  /**
+   * PEM files with CA certificates trusted for relay TLS, in addition to
+   * the WebPKI roots.
+   */
+  struct aster_bytes_list_t relay_ca_certs;
+  /**
+   * 1 = trust only `relay_ca_certs`, not the WebPKI roots.
+   */
+  uint32_t relay_ca_only;
+  uint32_t reserved;
+  /**
+   * DNS origin for custom discovery, e.g. `dns.example.internal`.
+   */
+  struct aster_bytes_t discovery_dns_origin;
+  /**
+   * Pkarr relay URLs for custom discovery.
+   */
+  struct aster_bytes_list_t discovery_pkarr_relays;
+} aster_network_config_t;
+
+/**
+ * Options of `aster_coordination_client_open`. 48 bytes (LP64). Fill with
+ * `aster_coordination_client_options_init`; `struct_size` must equal
+ * `sizeof(aster_coordination_client_options_t)`.
+ */
+typedef struct aster_coordination_client_options_t {
+  uint32_t struct_size;
+  /**
+   * `ASTER_COORDINATION_CLIENT_READ_ONLY` or 0.
+   */
+  uint32_t flags;
+  /**
+   * The group id: exactly 32 raw bytes.
+   */
+  const uint8_t *group_id;
+  /**
+   * Seed tickets (UTF-8 base58, Open credential only): routing hints;
+   * they grant nothing.
+   */
+  struct aster_bytes_list_t seed_tickets;
+  /**
+   * Journal directory (UTF-8 path). Required for the durable client,
+   * ignored by the read-only one.
+   */
+  struct aster_bytes_t journal_dir;
+} aster_coordination_client_options_t;
+
+/**
+ * A coordination client (`aster_coordination_client_open`): the durable
+ * journaled client, or a read-only one.
+ */
+typedef uint64_t aster_coordination_client_t;
+
+/**
+ * A resolved mutation awaiting acknowledgement
+ * (`ASTER_EVENT_COORDINATION_RESOLVED`).
+ */
+typedef uint64_t aster_coordination_resolved_t;
+
+/**
+ * A held coordination lease (`ASTER_EVENT_COORDINATION_LEASE_ACQUIRED`).
+ */
+typedef uint64_t aster_coordination_lease_t;
+
+/**
+ * An upcall table plus its bounded event queue (`aster_upcalls_new`).
+ */
+typedef uint64_t aster_upcalls_t;
+
+/**
+ * A placement manager (`aster_coordination_placement_manager_new`).
+ */
+typedef uint64_t aster_coordination_placement_manager_t;
+
+/**
+ * Runtime-local owned temporary custody scope. Free with aster_blob_custody_free.
+ */
+typedef uint64_t aster_blob_custody_t;
+
+/**
+ * One network path of a connection (`aster::PathInfo`). Strings point into
+ * the owning `aster_path_list_t`'s storage; `{NULL, 0}` when absent; not
+ * NUL-terminated.
+ */
+typedef struct aster_path_info_t {
+  /**
+   * `sizeof(aster_path_info_t)`.
+   */
+  uint32_t struct_size;
+  /**
+   * One of `aster_path_kind_t` (`DIRECT`, `RELAY` or `OTHER`).
+   */
+  uint32_t path_kind;
+  /**
+   * 1 if this path currently carries application data.
+   */
+  uint32_t is_selected;
+  /**
+   * DIRECT: the peer's UDP port.
+   */
+  uint16_t peer_port;
+  uint16_t _pad;
+  /**
+   * DIRECT: the peer's IP address.
+   */
+  struct aster_bytes_t peer_host;
+  /**
+   * RELAY: the relay URL.
+   */
+  struct aster_bytes_t relay_url;
+  /**
+   * OTHER: a description of a custom/future transport.
+   */
+  struct aster_bytes_t other;
+  /**
+   * RTT estimate in microseconds; `UINT64_MAX` when not yet measured.
+   */
+  uint64_t rtt_micros;
+} aster_path_info_t;
+
+/**
+ * A list of paths filled by `aster_connection_paths` /
+ * `aster_connection_selected_path`. Release with `aster_path_list_release`.
+ */
+typedef struct aster_path_list_t {
+  /**
+   * `sizeof(aster_path_list_t)`; written by the library.
+   */
+  uint32_t struct_size;
+  uint32_t _pad;
+  /**
+   * `len` entries, owned by `storage`; NULL when `len == 0`.
+   */
+  const struct aster_path_info_t *items;
+  uintptr_t len;
+  /**
+   * Library-owned backing store; NULL when nothing was allocated.
+   */
+  void *storage;
+} aster_path_list_t;
 
 /**
  * An Enrollment installed by `aster_node_start_enrolled`, scoped to a
@@ -4140,6 +4209,38 @@ int32_t aster_call_discard(aster_runtime_t runtime, aster_call_t call);
 int32_t aster_call_buffer_release(aster_runtime_t runtime, aster_buffer_t buffer);
 
 /**
+ * Set (or, with `network` NULL, clear) the cluster network settings of
+ * `config` (ABI 7.3). The settings are validated and copied into the
+ * config's library-owned `storage`, which this allocates for a caller-built
+ * config: release such a config with `aster_config_release` once it has
+ * been passed to `aster_node_start` (or is no longer needed). Views from an
+ * earlier `aster_config_network` on this config become invalid.
+ *
+ * `network->struct_size` must equal `sizeof(aster_network_config_t)`. A
+ * zeroed struct with `struct_size` set means nothing configured. Settings are
+ * checked further (address syntax, CA files) when the node starts.
+ *
+ * # Safety
+ * `config` points to a valid `aster_config_t`; `network` is NULL or valid.
+ */
+int32_t aster_config_set_network(struct aster_config_t *config,
+                                 const struct aster_network_config_t *network);
+
+/**
+ * Read the cluster network settings of `config` (ABI 7.3) into `*out` as
+ * borrowed views, valid until `aster_config_release` or the next
+ * `aster_config_set_network` on `config`. A config without any (for example
+ * one from `aster_config_init`) reads as a zeroed struct (`DEFAULT`
+ * discovery, nothing set). The caller sets `out->struct_size` to
+ * `sizeof(aster_network_config_t)` before the call.
+ *
+ * # Safety
+ * `config` points to a valid `aster_config_t`; `out` is writable.
+ */
+int32_t aster_config_network(const struct aster_config_t *config,
+                             struct aster_network_config_t *out);
+
+/**
  * Fill `*out` with the defaults (`struct_size` set, durable client, every
  * pointer NULL / empty). Set `group_id` (and `journal_dir`) before use.
  */
@@ -5981,9 +6082,10 @@ int32_t aster_config_from_toml(struct aster_bytes_t path, struct aster_config_t 
 
 /**
  * Free the storage of a config filled by `aster_config_from_env` /
- * `aster_config_from_toml` and zero its pointers. No-op when `storage` is
- * NULL (caller-built or `aster_config_init` configs). Call once per filled
- * struct.
+ * `aster_config_from_toml` (or given network settings by
+ * `aster_config_set_network`, ABI 7.3) and zero its pointers. No-op when
+ * `storage` is NULL (caller-built or `aster_config_init` configs). Call once
+ * per filled struct.
  */
 int32_t aster_config_release(struct aster_config_t *config);
 

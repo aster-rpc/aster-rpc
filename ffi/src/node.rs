@@ -51,6 +51,7 @@ use aster::{
 };
 use aster_transport_core::{CoreAfterHandshakeDecision, CoreHookReceiver, CoreNode};
 
+use crate::config_network::{NetworkSettings, StoredNetwork};
 use crate::{
     aster_bytes_list_t, aster_bytes_t, aster_event_kind_t, aster_hook_decision_t,
     aster_hook_failure_mode_t, aster_hook_invocation_t, aster_node_t, aster_operation_t,
@@ -275,6 +276,10 @@ pub(crate) unsafe fn lower_config(c: &aster_config_t) -> Result<AsterConfig, Str
             cfg.health_host.clone_from(&health.host);
             cfg.health_enabled = health.enabled;
         }
+        // ABI 7.3: settings with no `aster_config_t` slot ride in storage.
+        if let Some(network) = &storage.network {
+            network.settings.apply(&mut cfg);
+        }
     }
     cfg.blob_zstd_level = match c.blob_zstd_level {
         ASTER_BLOB_ZSTD_LEVEL_DEFAULT => AsterConfig::default().blob_zstd_level,
@@ -470,10 +475,12 @@ pub(crate) unsafe fn lower_config(c: &aster_config_t) -> Result<AsterConfig, Str
 /// Library-owned backing for a filled `aster_config_t`. Each inner `Vec`'s
 /// heap buffer is stable once pushed, so views handed out stay valid.
 #[derive(Default)]
-struct ConfigStorage {
+pub(crate) struct ConfigStorage {
     bufs: Vec<Vec<u8>>,
     lists: Vec<Vec<aster_bytes_t>>,
     health: Option<StoredHealthConfig>,
+    /// ABI 7.3 cluster network settings (`aster_config_set_network`).
+    pub(crate) network: Option<Box<StoredNetwork>>,
 }
 
 struct StoredHealthConfig {
@@ -537,6 +544,10 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
             host: cfg.health_host.clone(),
             enabled: cfg.health_enabled,
         });
+    }
+    let network = NetworkSettings::from_config(cfg);
+    if !network.is_default() {
+        st.network = Some(StoredNetwork::new(network));
     }
     let (relay_mode, urls) = match &cfg.relay_mode {
         RelayMode::Default => (aster_relay_mode_t::ASTER_RELAY_MODE_DEFAULT, Vec::new()),
@@ -657,7 +668,7 @@ pub(crate) fn fill_config(cfg: &AsterConfig, out: &mut aster_config_t) {
             aster_reuse_last_port_t::ASTER_REUSE_LAST_PORT_DISABLED
         } as u32,
     };
-    if !st.bufs.is_empty() || !st.lists.is_empty() || st.health.is_some() {
+    if !st.bufs.is_empty() || !st.lists.is_empty() || st.health.is_some() || st.network.is_some() {
         out.storage = Box::into_raw(Box::new(st)) as *mut c_void;
     }
 }
@@ -745,9 +756,10 @@ pub unsafe extern "C" fn aster_config_from_toml(
 }
 
 /// Free the storage of a config filled by `aster_config_from_env` /
-/// `aster_config_from_toml` and zero its pointers. No-op when `storage` is
-/// NULL (caller-built or `aster_config_init` configs). Call once per filled
-/// struct.
+/// `aster_config_from_toml` (or given network settings by
+/// `aster_config_set_network`, ABI 7.3) and zero its pointers. No-op when
+/// `storage` is NULL (caller-built or `aster_config_init` configs). Call once
+/// per filled struct.
 #[no_mangle]
 pub unsafe extern "C" fn aster_config_release(config: *mut aster_config_t) -> i32 {
     if config.is_null() {

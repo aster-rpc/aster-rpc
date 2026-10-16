@@ -208,6 +208,20 @@ OFF(aster_config_t, reuse_last_port, 284);
 _Static_assert(ASTER_BLOB_ZSTD_LEVEL_DEFAULT == 0 && ASTER_BLOB_ZSTD_LEVEL_OFF == -1 && ASTER_BLOB_ZSTD_LEVEL_MAX == 19, "zstd level encoding");
 _Static_assert(ASTER_REUSE_LAST_PORT_DEFAULT == 0 && ASTER_REUSE_LAST_PORT_ENABLED == 1 && ASTER_REUSE_LAST_PORT_DISABLED == 2, "reuse_last_port values");
 
+/* ABI 7.3: cluster network settings beside aster_config_t (config_network.rs). */
+LAYOUT(aster_network_config_t, 96);
+OFF(aster_network_config_t, struct_size, 0);
+OFF(aster_network_config_t, discovery, 4);
+OFF(aster_network_config_t, bind_addr_v6, 8);
+OFF(aster_network_config_t, advertise_addrs, 24);
+OFF(aster_network_config_t, relay_ca_certs, 40);
+OFF(aster_network_config_t, relay_ca_only, 56);
+OFF(aster_network_config_t, reserved, 60);
+OFF(aster_network_config_t, discovery_dns_origin, 64);
+OFF(aster_network_config_t, discovery_pkarr_relays, 80);
+_Static_assert(sizeof(aster_discovery_t) == 4, "enum size");
+_Static_assert(ASTER_DISCOVERY_DEFAULT == 0 && ASTER_DISCOVERY_NONE == 1 && ASTER_DISCOVERY_LOCAL == 2 && ASTER_DISCOVERY_CUSTOM == 3, "discovery values");
+
 /* ABI 3.3: connection paths (data.rs). */
 _Static_assert(sizeof(aster_blob_format_t) == 4, "enum size");
 _Static_assert(sizeof(aster_fetch_strategy_t) == 4, "enum size");
@@ -473,7 +487,7 @@ static void test_abi_version(void) {
     CHECK((v >> 16) == ASTER_ABI_VERSION_MAJOR);
     CHECK(((v >> 8) & 0xff) == ASTER_ABI_VERSION_MINOR);
     CHECK((v & 0xff) == ASTER_ABI_VERSION_PATCH);
-    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 2); /* 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
+    CHECK(ASTER_ABI_VERSION_MAJOR == 7 && ASTER_ABI_VERSION_MINOR == 3); /* 7.3: cluster network settings; 7.2: server drain; 7.1: audit acknowledgement log; 7.0: hook failure mode 0 = FAIL_CLOSED */
     {
         /* A 5.x caller (280-byte aster_config_t, no 6.x handshake) is refused
          * cleanly and nothing is written past, or into, its struct. This runs
@@ -791,6 +805,37 @@ static void test_config(void) {
     memset(&z, 0, sizeof z);
     z.struct_size = sizeof z;
     CHECK(z.hook_failure_mode == ASTER_HOOK_FAILURE_FAIL_CLOSED);
+
+    /* 7.3: network settings ride in the config's storage, so a caller-built
+     * config that gets them must be released. */
+    aster_config_t n;
+    CHECK(aster_config_init(&n) == ASTER_STATUS_OK);
+    aster_network_config_t net;
+    memset(&net, 0, sizeof net);
+    net.struct_size = sizeof net;
+    CHECK(aster_config_network(&n, &net) == ASTER_STATUS_OK);
+    CHECK(net.discovery == ASTER_DISCOVERY_DEFAULT && net.bind_addr_v6.len == 0 && net.advertise_addrs.len == 0);
+    aster_bytes_t adv[1] = {{(const uint8_t *)"203.0.113.10:31842", 18}};
+    net.discovery = ASTER_DISCOVERY_NONE;
+    net.bind_addr_v6.ptr = (const uint8_t *)"[::]:7842";
+    net.bind_addr_v6.len = 9;
+    net.advertise_addrs.items = adv;
+    net.advertise_addrs.len = 1;
+    CHECK(aster_config_set_network(&n, &net) == ASTER_STATUS_OK);
+    CHECK(n.storage != NULL);
+    aster_network_config_t back;
+    memset(&back, 0, sizeof back);
+    back.struct_size = sizeof back;
+    CHECK(aster_config_network(&n, &back) == ASTER_STATUS_OK);
+    CHECK(back.discovery == ASTER_DISCOVERY_NONE && back.bind_addr_v6.len == 9 && back.advertise_addrs.len == 1);
+    CHECK(back.bind_addr_v6.ptr != net.bind_addr_v6.ptr); /* copied, library-owned */
+    net.relay_ca_only = 2;
+    CHECK(aster_config_set_network(&n, &net) == ASTER_STATUS_INVALID_ARGUMENT);
+    net.relay_ca_only = 0;
+    net.struct_size = 8;
+    CHECK(aster_config_set_network(&n, &net) == ASTER_STATUS_INVALID_ARGUMENT);
+    CHECK(aster_config_release(&n) == ASTER_STATUS_OK);
+    CHECK(n.storage == NULL);
 }
 
 static int wait_event(aster_runtime_t rt, aster_operation_t op, aster_event_t *out) {

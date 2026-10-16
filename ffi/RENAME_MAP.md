@@ -1,4 +1,25 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.2)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.3)
+
+## New in 7.3 (cluster network settings; additive)
+
+Node settings for running inside a cluster or an air-gapped network (Kasm
+A6). `aster_config_t` has no spare room and checks `struct_size` exactly, so
+the settings live beside it, in the config's library-owned `storage`;
+`aster_config_t`'s layout does not change.
+
+| Item | Role |
+|---|---|
+| `aster_network_config_t` (96 bytes) | `struct_size`, `discovery` (`aster_discovery_t`), `bind_addr_v6`, `advertise_addrs` (list), `relay_ca_certs` (list of PEM paths), `relay_ca_only` (0/1), `reserved` (0), `discovery_dns_origin`, `discovery_pkarr_relays` (list). |
+| `aster_discovery_t` | `DEFAULT` = 0 (n0 pkarr/DNS at `iroh.link`; with servers set, selects `CUSTOM`), `NONE` = 1, `LOCAL` = 2 (mDNS only), `CUSTOM` = 3. |
+| `aster_config_set_network(config, network)` | Validates and copies the settings into `config->storage` (allocating it for a caller-built config); NULL clears. A config given settings must be released with `aster_config_release`. |
+| `aster_config_network(config, out)` | Reads them back as views valid until release or the next set; the caller sets `out->struct_size`. A config without settings reads as zeroed (`DEFAULT`). |
+| `aster_config_from_env` / `_from_toml` | Also read `ASTER_BIND_ADDR_V6`, `ASTER_ADVERTISE_ADDRS`, `ASTER_RELAY_CA_CERTS`, `ASTER_RELAY_CA_ONLY`, `ASTER_DISCOVERY`, `ASTER_DISCOVERY_DNS_ORIGIN`, `ASTER_DISCOVERY_PKARR_RELAYS` and the matching `[network]` keys into `storage`. |
+
+`aster_node_start` and `aster_node_start_enrolled` apply the settings. Go
+requires 7.3 (`ABIMinorRequired = 3`; `AsterConfig.BindAddrV6`,
+`AdvertiseAddrs`, `RelayCACerts`, `RelayCAOnly`, `Discovery`,
+`DiscoveryDNSOrigin`, `DiscoveryPkarrRelays`). Rust: the same fields on
+`aster::AsterConfig`, `aster::DiscoveryMode`.
 
 ## New in 7.2 (server drain; additive)
 

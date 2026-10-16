@@ -13,6 +13,7 @@
 use crate::audit_outbox::aster_audit_outbox_error_t;
 use core::mem::{align_of, offset_of, size_of};
 
+use crate::config_network::aster_network_config_t;
 use crate::coordination::{
     aster_coordination_client_options_t, aster_coordination_error_t,
     aster_coordination_mutation_op_t, aster_coordination_read_op_t,
@@ -294,6 +295,19 @@ mod lp64 {
         storage = 272,
         blob_zstd_level = 280,
         reuse_last_port = 284,
+    });
+
+    // ABI 7.3: cluster network settings beside aster_config_t (config_network.rs).
+    assert_layout!(aster_network_config_t, size = 96, align = 8, {
+        struct_size = 0,
+        discovery = 4,
+        bind_addr_v6 = 8,
+        advertise_addrs = 24,
+        relay_ca_certs = 40,
+        relay_ca_only = 56,
+        reserved = 60,
+        discovery_dns_origin = 64,
+        discovery_pkarr_relays = 80,
     });
 
     // ABI 3.3: connection paths (data.rs).

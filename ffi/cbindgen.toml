@@ -32,6 +32,7 @@ include = [
   "aster_trust_mode_t",
   "aster_portmapper_t",
   "aster_reuse_last_port_t",
+  "aster_discovery_t",
   "aster_blob_format_t",
   "aster_fetch_strategy_t",
   "aster_blob_status_t",

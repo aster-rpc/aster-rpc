@@ -648,3 +648,67 @@ fn reuse_last_port_disabled_records_no_bind_ports() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// ABI 7.3: network settings set with `aster_config_set_network` reach the
+/// node: the advertised address shows in its address, and a bad relay CA file
+/// fails the start synchronously.
+#[test]
+fn network_settings_reach_the_node() {
+    use aster_transport_ffi::config_network::*;
+    const ADVERTISED: &str = "203.0.113.10:31842";
+    unsafe {
+        let rt = runtime();
+        let mut lb = loopback();
+        let addrs = [bytes(ADVERTISED.as_bytes())];
+        let mut net: aster_network_config_t = std::mem::zeroed();
+        net.struct_size = std::mem::size_of::<aster_network_config_t>() as u32;
+        net.discovery = aster_discovery_t::ASTER_DISCOVERY_NONE as u32;
+        net.advertise_addrs = aster_bytes_list_t {
+            items: addrs.as_ptr(),
+            len: 1,
+        };
+        assert_eq!(aster_config_set_network(&mut lb.cfg, &net), 0);
+        let node = start(rt, &lb.cfg, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let direct = || {
+            let mut buf = vec![0u8; 4096];
+            let mut out: aster_node_addr_t = std::mem::zeroed();
+            assert_eq!(
+                aster_node_addr_info(rt, node, buf.as_mut_ptr(), buf.len(), &mut out),
+                0
+            );
+            if out.direct_addresses.len == 0 {
+                return Vec::new();
+            }
+            std::slice::from_raw_parts(out.direct_addresses.items, out.direct_addresses.len)
+                .iter()
+                .map(|b| String::from_utf8_lossy(std::slice::from_raw_parts(b.ptr, b.len)).into())
+                .collect::<Vec<String>>()
+        };
+        while !direct().iter().any(|a| a == ADVERTISED) {
+            assert!(Instant::now() < deadline, "advertised address never shown");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        close(rt, node);
+
+        let cas = [bytes(b"/nonexistent/aster-relay-ca.pem")];
+        net.relay_ca_certs = aster_bytes_list_t {
+            items: cas.as_ptr(),
+            len: 1,
+        };
+        assert_eq!(aster_config_set_network(&mut lb.cfg, &net), 0);
+        let mut op = 0;
+        let status = aster_node_start(rt, &lb.cfg, 0, 0, &mut op);
+        if status == 0 {
+            // Validation may happen while binding; then the operation fails.
+            let ev = common::wait_for_operation(rt, op);
+            assert_ne!(
+                ev.kind,
+                aster_event_kind_t::ASTER_EVENT_NODE_CREATED as u32,
+                "a missing relay CA file must fail the start"
+            );
+        }
+        assert_eq!(aster_config_release(&mut lb.cfg), 0);
+        close_runtime(rt);
+    }
+}

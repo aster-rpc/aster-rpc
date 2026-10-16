@@ -23,9 +23,10 @@ fn test_abi_version() {
     // 6.0.0: aster_config_t grew 280 -> 288 (blob_zstd_level, reuse_last_port);
     // 7.0.0: aster_hook_failure_mode_t swapped so 0 = FAIL_CLOSED;
     // 7.1.0: audit outbox acknowledgement log (additive);
-    // 7.2.0: aster_server_drain (additive).
+    // 7.2.0: aster_server_drain (additive);
+    // 7.3.0: cluster network settings beside aster_config_t (additive).
     assert_eq!(ASTER_ABI_VERSION_MAJOR, 7);
-    assert_eq!(ASTER_ABI_VERSION_MINOR, 2);
+    assert_eq!(ASTER_ABI_VERSION_MINOR, 3);
     assert_eq!(ASTER_ABI_VERSION_PATCH, 0);
     let v = aster_abi_version();
     assert_eq!(v, ASTER_ABI_VERSION);

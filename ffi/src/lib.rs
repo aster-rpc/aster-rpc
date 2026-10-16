@@ -28,6 +28,7 @@ mod audit_test_common;
 #[cfg(test)]
 extern crate self as aster_transport_ffi;
 pub mod call;
+pub mod config_network;
 pub mod coordination;
 pub mod coordination_codec;
 pub mod custody;
@@ -206,8 +207,13 @@ pub mod upcall;
 // - 7.2.0 (additive): `aster_server_drain` and `aster_drain_report_t`
 //   (graceful server drain), `ASTER_DRAIN_CLOSE_CODE`. See
 //   `ffi/RENAME_MAP.md` "7.2".
+// - 7.3.0 (additive): cluster network settings beside `aster_config_t`
+//   (`aster_network_config_t`, `aster_discovery_t`, `aster_config_set_network`,
+//   `aster_config_network`; `config_network.rs`): IPv6 bind pin, advertised
+//   addresses, relay CA trust, discovery. `aster_config_t` is unchanged. See
+//   `ffi/RENAME_MAP.md` "7.3".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 2;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 3;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.
