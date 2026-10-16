@@ -176,7 +176,7 @@ public class HttpListenerTests
     [Fact]
     public void NativeLayoutMatchesAbi411()
     {
-        Assert.Equal(0u, Native.RequiredAbiMinor);
+        Assert.Equal(5u, Native.RequiredAbiMinor);
         Assert.Equal(64, Marshal.SizeOf<HttpServerConfigNative>());
         foreach (var (field, offset) in new[] { ("struct_size", 0), ("flags", 4), ("bind_addr", 8), ("cert_pem", 24), ("key_pem", 40), ("max_pending_auth", 56), ("max_auth_payload_bytes", 60) })
             Assert.Equal(offset, Marshal.OffsetOf<HttpServerConfigNative>(field).ToInt32());
@@ -212,6 +212,9 @@ public class HttpListenerTests
             Assert.Equal(principal, reply.ServerLang);
             Assert.True(f.Seen.TryDequeue(out var context));
             Assert.Equal(principal, context!.PeerId); Assert.False(context.IrohAuthenticated);
+            // ABI 7.5: the authenticator's principal is apart from the transport peer (the HTTP caller's address).
+            Assert.Equal(principal, context.Principal); Assert.True(context.HasPrincipal);
+            Assert.NotEqual(principal, context.Peer); Assert.False(string.IsNullOrEmpty(context.Peer));
             Assert.Equal(principal == "alice" ? "one" : "two", context.Attributes["tenant"]);
         }
         var generated = await Call(f, client, listener, "generate", requests: [new EchoRequest { Count = 3, Message = "stream" }]);

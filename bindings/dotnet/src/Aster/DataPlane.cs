@@ -44,11 +44,44 @@ public enum RetireOutcome : uint
     Busy = 1,
 }
 
-/// <summary>Per-provider statistics of a fetch.</summary>
-public sealed record FetchProviderStats(string NodeId, uint Attempts, uint Failures, uint CompletedRequests);
+/// <summary>
+/// Per-provider statistics of a fetch (Rust <c>aster::ProviderOutcome</c>; fetch report v2, ABI 7.4).
+/// </summary>
+/// <param name="NodeId">The provider's 64-hex node id.</param>
+/// <param name="Attempts">Requests sent to this provider.</param>
+/// <param name="Failures">Requests that failed.</param>
+/// <param name="CompletedRequests">Requests carried to completion.</param>
+/// <param name="InFlight">Requests mid-attempt when the report was taken (0 in a finished fetch).</param>
+/// <param name="PlainFallbacks">Attempts that went over plain transport because the provider does not serve compressed blobs.</param>
+/// <param name="BytesTransferred">Payload bytes received from this provider.</param>
+/// <param name="WireBytes">Compressed bytes received from this provider over zstd; null when every attempt was plain.</param>
+public sealed record FetchProviderStats(string NodeId, uint Attempts, uint Failures, uint CompletedRequests,
+    uint InFlight = 0, uint PlainFallbacks = 0, ulong BytesTransferred = 0, ulong? WireBytes = null);
 
-/// <summary>Fetch report v1: bytes transferred and per-provider stats in first-attempt order.</summary>
-public sealed record FetchReport(ulong BytesTransferred, IReadOnlyList<FetchProviderStats> Providers);
+/// <summary>A fetch report: bytes transferred (the sum of the providers') and per-provider stats in first-attempt order.</summary>
+public sealed record FetchReport(ulong BytesTransferred, IReadOnlyList<FetchProviderStats> Providers)
+{
+    /// <summary>Providers with a request mid-attempt when the report was taken.</summary>
+    public IEnumerable<string> InFlight() => Providers.Where(p => p.InFlight > 0).Select(p => p.NodeId);
+
+    /// <summary>Providers that do not serve compressed blobs and were fetched from (or tried) over plain transport; cache these as plain-only.</summary>
+    public IEnumerable<string> PlainOnly() => Providers.Where(p => p.PlainFallbacks > 0).Select(p => p.NodeId);
+
+    /// <summary>Providers that carried at least one request to completion.</summary>
+    public IEnumerable<string> Served() => Providers.Where(p => p.CompletedRequests > 0).Select(p => p.NodeId);
+}
+
+/// <summary>
+/// Node-wide blob transfer counters (Rust <c>aster::BlobTransferStats</c>; <see cref="Blobs.TransferStats"/>).
+/// Payload bytes are the blob bytes; wire bytes are what crossed the network (compressed for zstd).
+/// </summary>
+public sealed record BlobTransferStats(
+    ulong FetchedPayloadBytes, ulong FetchedZstdPayloadBytes, ulong FetchedWireBytes, ulong FetchedPlainBytes,
+    ulong ServedPayloadBytes, ulong ServedZstdPayloadBytes, ulong ServedWireBytes, ulong ServedPlainBytes,
+    ulong PlainFallbacks, ulong PlainServes,
+    ulong FetchPlainOk, ulong FetchPlainFailed, ulong FetchZstdOk, ulong FetchZstdFailed,
+    ulong ServePlainOk, ulong ServePlainFailed, ulong ServeZstdOk, ulong ServeZstdFailed,
+    ulong FetchDecodeErrors, ulong ServeDecodeErrors);
 
 /// <summary>A completed fetch: the report and the blob bytes (empty when fetched to the store).</summary>
 public sealed record FetchResult(FetchReport Report, byte[] Data);
@@ -82,23 +115,50 @@ internal static class Ops
         return ev;
     }
 
-    public static FetchReport ParseFetchReport(byte[] payload, out int consumed)
+    // ffi/src/data.rs: ASTER_FETCH_REPORT_HEADER_SIZE, _PROVIDER_RECORD_SIZE (v1), _PROVIDER_RECORD_V2_SIZE.
+    private const int ReportHeader = 16, RecordV1 = 44, RecordV2 = 72;
+    private const uint ProviderHasWireBytes = 1; // ASTER_FETCH_PROVIDER_HAS_WIRE_BYTES
+
+    /// <summary>
+    /// Parses fetch report v1 or v2 (the version byte decides) at the start of <paramref name="payload"/>;
+    /// <paramref name="consumed"/> is where the blob bytes start. A truncated or unknown report throws
+    /// <see cref="IrohException"/>.
+    /// </summary>
+    public static FetchReport ParseFetchReport(ReadOnlySpan<byte> payload, out int consumed)
     {
-        const int header = 16, record = 44;
-        if (payload.Length < header || payload[0] != 1)
-            throw new IrohException(Status.Internal, "fetch report: unsupported version or truncated");
-        uint n = BinaryPrimitives.ReadUInt32LittleEndian(payload.AsSpan(4));
-        ulong bytes = BinaryPrimitives.ReadUInt64LittleEndian(payload.AsSpan(8));
+        if (payload.Length < ReportHeader)
+            throw new IrohException(Status.Internal, "fetch report: truncated header");
+        int record = payload[0] switch
+        {
+            1 => RecordV1,
+            2 => RecordV2,
+            _ => throw new IrohException(Status.Internal, $"fetch report: unsupported version {payload[0]}"),
+        };
+        uint n = BinaryPrimitives.ReadUInt32LittleEndian(payload[4..]);
+        ulong bytes = BinaryPrimitives.ReadUInt64LittleEndian(payload[8..]);
+        if (n > (uint)((payload.Length - ReportHeader) / record))
+            throw new IrohException(Status.Internal, $"fetch report: {n} provider records do not fit in {payload.Length} bytes");
         var providers = new List<FetchProviderStats>((int)n);
-        int off = header;
+        int off = ReportHeader;
         for (uint i = 0; i < n; i++, off += record)
         {
-            var r = payload.AsSpan(off, record);
-            providers.Add(new FetchProviderStats(
-                Convert.ToHexString(r[..32]).ToLowerInvariant(),
-                BinaryPrimitives.ReadUInt32LittleEndian(r[32..]),
-                BinaryPrimitives.ReadUInt32LittleEndian(r[36..]),
-                BinaryPrimitives.ReadUInt32LittleEndian(r[40..])));
+            var r = payload.Slice(off, record);
+            string node = Convert.ToHexString(r[..32]).ToLowerInvariant();
+            uint attempts = BinaryPrimitives.ReadUInt32LittleEndian(r[32..]);
+            uint failures = BinaryPrimitives.ReadUInt32LittleEndian(r[36..]);
+            uint completed = BinaryPrimitives.ReadUInt32LittleEndian(r[40..]);
+            if (record == RecordV1)
+            {
+                providers.Add(new FetchProviderStats(node, attempts, failures, completed));
+                continue;
+            }
+            uint flags = BinaryPrimitives.ReadUInt32LittleEndian(r[52..]);
+            ulong wire = BinaryPrimitives.ReadUInt64LittleEndian(r[64..]);
+            providers.Add(new FetchProviderStats(node, attempts, failures, completed,
+                InFlight: BinaryPrimitives.ReadUInt32LittleEndian(r[44..]),
+                PlainFallbacks: BinaryPrimitives.ReadUInt32LittleEndian(r[48..]),
+                BytesTransferred: BinaryPrimitives.ReadUInt64LittleEndian(r[56..]),
+                WireBytes: (flags & ProviderHasWireBytes) != 0 ? wire : null));
         }
         consumed = off;
         return new FetchReport(bytes, providers);
@@ -145,11 +205,29 @@ public sealed partial class Blobs
         ulong op;
         using (var s = new NativeScope())
             Native.Check(Native.aster_blobs_download_hash_from(_runtime.Handle, _nodeHandle, s.Utf8(hashHex), s.Utf8List(providers),
-                (uint)format, (uint)strategy, toStore ? FetchToStore : 0, 0, out op), "aster_blobs_download_hash_from");
+                (uint)format, (uint)strategy, (toStore ? FetchToStore : 0) | Native.FetchReportV2, 0, out op), "aster_blobs_download_hash_from");
         var ev = await Ops.Await(_runtime, op, EventKind.BlobFetched, "aster_blobs_download_hash_from", ct).ConfigureAwait(false);
         byte[] payload = EventError.TakePayload(_runtime, ev);
         var report = Ops.ParseFetchReport(payload, out int consumed);
         return new FetchResult(report, payload.AsSpan(consumed).ToArray());
+    }
+
+    /// <summary>
+    /// The node's blob transfer counters since it started (Rust <c>aster::Blobs::transfer_stats</c>,
+    /// <c>aster_blobs_transfer_stats</c>, ABI 7.4): every fetch and serve, plain and zstd.
+    /// </summary>
+    public unsafe BlobTransferStats TransferStats()
+    {
+        BlobTransferStatsNative n = default;
+        n.struct_size = (uint)sizeof(BlobTransferStatsNative);
+        Native.Check(Native.aster_blobs_transfer_stats(_runtime.Handle, _nodeHandle, &n), "aster_blobs_transfer_stats");
+        return new BlobTransferStats(
+            n.fetched_payload_bytes, n.fetched_zstd_payload_bytes, n.fetched_wire_bytes, n.fetched_plain_bytes,
+            n.served_payload_bytes, n.served_zstd_payload_bytes, n.served_wire_bytes, n.served_plain_bytes,
+            n.plain_fallbacks, n.plain_serves,
+            n.fetch_plain_ok, n.fetch_plain_failed, n.fetch_zstd_ok, n.fetch_zstd_failed,
+            n.serve_plain_ok, n.serve_plain_failed, n.serve_zstd_ok, n.serve_zstd_failed,
+            n.fetch_decode_errors, n.serve_decode_errors);
     }
 
     /// <summary>Runs one node-wide blob GC pass.</summary>

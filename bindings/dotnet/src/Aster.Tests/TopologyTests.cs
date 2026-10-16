@@ -91,7 +91,7 @@ public class TopologyTests
         Assert.Equal(ulong.MaxValue, peer.ThroughputBps); Assert.Equal(4294967298UL, peer.Samples); Assert.Null(peer.RemoteAddr);
         foreach (string bad in new[] { """{"rtt_us":18446744073709551616}""", """{"rtt_us":-1}""", """{"rtt_us":"1"}""", "{} {}" })
             Assert.Throws<JsonException>(() => JsonSerializer.Deserialize<TopologyPeerView>(bad, TopologyView.JsonOptions));
-        Assert.Equal(120u, (uint)EventKind.TopologySnapshot); Assert.Equal(0u, Native.RequiredAbiMinor);
+        Assert.Equal(120u, (uint)EventKind.TopologySnapshot); Assert.Equal(5u, Native.RequiredAbiMinor);
     }
 
     [Fact]

@@ -175,6 +175,8 @@ public enum EventKind : uint
     RawWTAcked = 126,
     /// <summary>ABI 5.1: an Enrollment operation's JSON result (payload); <c>handle</c> = the enrollment.</summary>
     EnrollmentResult = 127,
+    /// <summary>ABI 7.1: a page of the audit outbox acknowledgement log (JSON payload); <c>handle</c> = the outbox.</summary>
+    AuditOutboxAcknowledgements = 128,
 
     // Errors
     OperationCancelled = 98,

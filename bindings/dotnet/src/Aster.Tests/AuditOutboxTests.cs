@@ -74,6 +74,61 @@ public sealed class AuditOutboxTests
         finally { directory.Delete(recursive: true); }
     }
 
+    [Fact(Timeout = 30000)]
+    public async Task AcknowledgementLogPagesWaitsAndWatches()
+    {
+        var directory = Directory.CreateTempSubdirectory("aster-audit-dotnet-");
+        try
+        {
+            using var receiver = new Receiver(Path.Combine(directory.FullName, "receiver.sqlite"));
+            using var rt = new Runtime();
+            await using var box = await AuditOutbox.OpenAsync(rt, new AuditOutboxConfig(Path.Combine(directory.FullName, "outbox"), new(receiver.Endpoint)));
+            Assert.Empty(await box.AcknowledgementsAsync());
+            // Nothing follows: a short wait returns an empty page.
+            Assert.Empty(await box.WaitAcknowledgementsAsync(0, 10, TimeSpan.FromMilliseconds(50)));
+
+            using var watchCts = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+            var watched = new List<AuditAcknowledgement>();
+            var watch = Task.Run(async () =>
+            {
+                await foreach (var ack in box.WatchAcknowledgementsAsync(0, watchCts.Token))
+                {
+                    watched.Add(ack);
+                    if (watched.Count == 2) watchCts.Cancel();
+                }
+            });
+
+            string first = await box.SubmitAsync(new(1, "dotnet.ack", JsonSerializer.SerializeToElement(new { n = 1 })));
+            string second = await box.SubmitAsync(new(2, "dotnet.ack", JsonSerializer.SerializeToElement(new { n = 2 })));
+            await box.FlushAsync(TimeSpan.FromSeconds(10));
+
+            var page = await box.AcknowledgementsAsync(0, 1000);
+            Assert.Equal(new[] { first, second }, page.Select(a => a.EventId));
+            Assert.True(page[0].Cursor < page[1].Cursor);
+            Assert.All(page, a => { Assert.NotEmpty(a.BatchId); Assert.True(a.AcknowledgedAt > DateTimeOffset.UnixEpoch); });
+            Assert.Equal(new[] { second }, (await box.AcknowledgementsAsync(page[0].Cursor, 1)).Select(a => a.EventId));
+            Assert.Empty(await box.AcknowledgementsAsync(page[1].Cursor));
+
+            await watch.WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.Equal(new[] { first, second }, watched.Select(a => a.EventId));
+
+            foreach (int bad in new[] { 0, 1001 })
+                Assert.Equal(AuditErrorKind.InvalidEvent, (await Assert.ThrowsAsync<AuditOutboxException>(() => box.AcknowledgementsAsync(0, bad))).Kind);
+            await Assert.ThrowsAsync<AuditOutboxException>(() => box.WaitAcknowledgementsAsync(0, 1, TimeSpan.FromHours(2)));
+        }
+        finally { directory.Delete(recursive: true); }
+    }
+
+    [Fact]
+    public void AcknowledgementPageParsesAndRefusesOtherVersions()
+    {
+        var page = AuditOutbox.ParseAcknowledgements("""{"version":1,"acknowledgements":[{"cursor":7,"event_id":"e","sequence":3,"batch_id":"b","acknowledged_at_ms":1700000000000}]}"""u8);
+        var ack = Assert.Single(page);
+        Assert.Equal((7UL, "e", 3UL, "b"), (ack.Cursor, ack.EventId, ack.Sequence, ack.BatchId));
+        Assert.Equal(DateTimeOffset.FromUnixTimeMilliseconds(1_700_000_000_000), ack.AcknowledgedAt);
+        Assert.Throws<IrohException>(() => AuditOutbox.ParseAcknowledgements("""{"version":2,"acknowledgements":[]}"""u8));
+    }
+
     [Fact(Timeout = 20000)]
     public async Task CanceledCloseStillStopsClonesAndReleasesLock()
     {

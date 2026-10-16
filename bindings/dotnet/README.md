@@ -1,7 +1,7 @@
 # Aster .NET binding
 
 The .NET API wraps Aster's shared Rust engine through the C ABI. This checkout
-targets .NET 9 and requires native C ABI **7.0 or newer within major 7**.
+targets .NET 9 and requires native C ABI **7.5 or newer within major 7**.
 `Runtime` checks compatibility when it opens. Supply the native library through
 the repository build or an explicit build property:
 
@@ -73,6 +73,80 @@ or code, as in the Rust SDK:
 var config = AsterConfig.FromEnv() with { BlobZstdLevel = 0, ReuseLastPort = false };
 await using var server = await AsterServer.StartAsync(new AsterServerOptions { Config = config });
 ```
+
+## Cluster network and metrics settings (C ABI 7.3 / 7.4)
+
+For a node inside a cluster or an air-gapped network, and for per-peer
+metrics. Rust reads the environment and TOML (`AsterConfig.FromEnv` /
+`FromToml`), so names and precedence match every binding:
+
+| `AsterConfig` | Env | TOML | Meaning |
+|---|---|---|---|
+| `BindAddrV6` | `ASTER_BIND_ADDR_V6` | `[network] bind_addr_v6` | IPv6 bind address (e.g. `[::]:7842`) |
+| `AdvertiseAddrs` | `ASTER_ADVERTISE_ADDRS` | `[network] advertise_addrs` | extra `IP:port` to advertise (a NodePort); hints only |
+| `RelayCaCerts` | `ASTER_RELAY_CA_CERTS` | `[network] relay_ca_certs` | PEM files trusted for relay TLS, beside the WebPKI roots |
+| `RelayCaOnly` | `ASTER_RELAY_CA_ONLY` | `[network] relay_ca_only` | trust only `RelayCaCerts` |
+| `Discovery` (`DiscoveryMode`) | `ASTER_DISCOVERY` | `[network] discovery` | `Default` (n0 pkarr + DNS), `None`, `Local` (mDNS), `Custom` |
+| `DiscoveryDnsOrigin` | `ASTER_DISCOVERY_DNS_ORIGIN` | `[network] discovery_dns_origin` | DNS origin for custom discovery |
+| `DiscoveryPkarrRelays` | `ASTER_DISCOVERY_PKARR_RELAYS` | `[network] discovery_pkarr_relays` | pkarr relays for custom discovery |
+| `MetricsPeerLabels` | `ASTER_METRICS_PEER_LABELS` | `[metrics] peer_labels` | label `aster.peer.bytes` per peer |
+| `MetricsPeerLabelCap` | `ASTER_METRICS_PEER_LABEL_CAP` | `[metrics] peer_label_cap` | peers with their own series; 0 = 64 |
+
+Transfer metrics: `node.Blobs().TransferStats()` returns the node-wide
+`BlobTransferStats` counters; `DownloadHashFromAsync` (plain and custody)
+asks for fetch report v2, so each `FetchProviderStats` carries `InFlight`,
+`PlainFallbacks`, `BytesTransferred` and `WireBytes` (null when every attempt
+was plain), and `FetchReport.InFlight()` / `PlainOnly()` / `Served()` list
+providers. With `EnableMonitoring`, `node.Topology.Peer(id)` has
+`QuicTraffic` (QUIC bytes by protocol family) and `BlobTransfer`.
+
+## Drain, handler context and the audit acknowledgement log (C ABI 7.1 / 7.2 / 7.5)
+
+`await server.DrainAsync(TimeSpan.FromSeconds(30))` takes the server out of
+rotation (an attached health listener turns not ready, new connections and
+calls are refused, in-flight calls run until the grace), then disposes it and
+returns a `DrainReport`. `server.IsDraining` reports a started drain; a client
+sees a refused call as `RpcError.IsDraining` (`UNAVAILABLE` with the
+`aster.draining` detail; `RpcError.IsDrainingError(e)` for wrapped errors).
+
+Handlers receive a `ServerCallContext` as their explicit parameter, and the
+dispatcher also sets `ServerCallContext.Current` (an `AsyncLocal`) around the
+handler and interceptors. `Peer` is the transport caller (the node id over
+iroh, the HTTP caller's id otherwise); `Principal` is the `Authenticator`'s
+principal, else the same as `Peer` (`HasPrincipal` says they differ).
+`IrohAuthenticated`, `CallId` / `WireCallId`, `Metadata` / `MetadataValue`,
+`Attributes`, `Deadline` / `Remaining`, `CancellationToken` / `IsCancelled` /
+`CancelledAsync()` and the session fields complete it.
+
+`AuditOutbox.AcknowledgementsAsync(after, limit)` pages the acknowledgement
+log, `WaitAcknowledgementsAsync` waits for the next entry, and
+`WatchAcknowledgementsAsync(after, ct)` streams them as an
+`IAsyncEnumerable<AuditAcknowledgement>`; record the last `Cursor` to resume.
+
+Clients: `RpcConnection.UnaryAsync` / `ServerStreamAsync` /
+`ClientStreamAsync` / `BidiStreamAsync` take `CallOptions` (deadline,
+metadata, session id). There is no generated .NET client yet.
+
+## Contract types: timestamp, date, decimal, uuid, ulid, recursion
+
+| Contract type | Payload field | Convert with |
+|---|---|---|
+| `timestamp` | `DateTimeOffset` (truncated to microseconds on encode) | |
+| `date` | `DateOnly` | |
+| `decimal` | `ForyDecimal` (arbitrary precision) | `AsterDecimal.FromDecimal` / `ToDecimal` (refuses a value `decimal` cannot hold exactly) |
+| `decimal(p,s)` | `ForyDecimal` with `[WireDecimal(p, s)]` | as `decimal`; the codec rescales to `s` and refuses rounding or more than `p` digits, both ways |
+| `uuid` | `byte[]` with `[WireUuid]` | `AsterUuid.ToBytes(guid)` / `ToGuid` (RFC 9562 byte order, not `Guid.ToByteArray()`) |
+| `ulid` | `byte[]` with `[WireUlid]` | `Ulid.FromBytes` / `ToBytes`, `Parse` / `ToString` (Crockford base32) |
+
+Fory C# has no xlang UUID and no `System.Decimal` serializer, so the payload
+field is the wire type, as in Rust (`[u8; 16]` with `#[aster(uuid)]`); a
+`[ForyField(Ignore = true)]` `Guid` / `decimal` property can wrap it.
+`DateTime`, `Guid` and `decimal` fields are refused when the contract is
+computed. `[WireUuid]` / `[WireUlid]` on a list or map applies to its
+`byte[]` elements or keys. Recursive types (`TreeNode` with
+`List<TreeNode> Children`, mutual recursion) hash with `SELF_REF` as Rust and
+Python do. `conformance/vectors/contract-types.json` pins all of it
+(`ContractTypeVectorTests`).
 
 ## Authenticated HTTPS and WebTransport serving
 

@@ -36,6 +36,18 @@ public sealed record AuditOutboxStatus(
     bool StorageRecovered);
 public sealed record AuditDispositionReceipt(string EventId, string Action, ulong TimestampMs,
     string Reason, string OperatorReference, string DestinationFingerprint, AuditDeliveryError? Rejection);
+/// <summary>
+/// One event the receiver acknowledged as durably stored (ABI 7.1). The outbox
+/// writes it in the same local transaction that deletes the event, so an event is
+/// either still pending or present here until the log's count/age bounds prune it.
+/// <see cref="Cursor"/> increases with each acknowledgement and is never reused.
+/// </summary>
+public sealed record AuditAcknowledgement(ulong Cursor, string EventId, ulong Sequence, string BatchId,
+    ulong AcknowledgedAtMs)
+{
+    /// <summary><see cref="AcknowledgedAtMs"/> (local Unix milliseconds of the commit) as a timestamp.</summary>
+    public DateTimeOffset AcknowledgedAt => DateTimeOffset.FromUnixTimeMilliseconds(checked((long)AcknowledgedAtMs));
+}
 public sealed record AuditQuarantineExport(string EventId, string EnvelopeBase64, bool Pending,
     IReadOnlyList<AuditDispositionReceipt> Receipts);
 
@@ -46,7 +58,11 @@ public sealed record AuditQuarantineExport(string EventId, string EnvelopeBase64
 /// </summary>
 public sealed class AuditOutbox : IDisposable, IAsyncDisposable
 {
-    private const uint Opened = 114, Submitted = 115, StatusResult = 116, Exported = 117;
+    private const uint Opened = 114, Submitted = 115, StatusResult = 116, Exported = 117, Acknowledged = 128;
+    /// <summary>The largest page one acknowledgement read returns.</summary>
+    public const int AcknowledgementPageMax = 1000;
+    /// <summary>The longest wait one acknowledgement read accepts (<c>ASTER_AUDIT_OUTBOX_MAX_ACK_WAIT_MS</c>).</summary>
+    public static readonly TimeSpan AcknowledgementWaitMax = TimeSpan.FromMilliseconds(Native.AuditOutboxMaxAckWaitMs);
     private static readonly JsonSerializerOptions Json = new() { PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower, MaxDepth = 128 };
     private readonly Runtime _runtime;
     private readonly OutboxHandle _handle;
@@ -259,6 +275,69 @@ public sealed class AuditOutbox : IDisposable, IAsyncDisposable
         ulong op = StartJson("event_id", eventId, OperatorJsonLimit, AuditErrorKind.IntegrityConflict, (Bytes data, out ulong id) => Native.aster_audit_outbox_export(_runtime.Handle, handle, data, 0, out id));
         var (_, data) = await Await(_runtime, op, Exported, ct).ConfigureAwait(false);
         return Decode<AuditQuarantineExport>(data, "export");
+    }
+    /// <summary>
+    /// Up to <paramref name="limit"/> (1..<see cref="AcknowledgementPageMax"/>) logged acknowledgements
+    /// with a cursor greater than <paramref name="after"/>, oldest first. Pass 0 to start at the oldest
+    /// retained entry.
+    /// </summary>
+    public Task<IReadOnlyList<AuditAcknowledgement>> AcknowledgementsAsync(ulong after = 0, int limit = AcknowledgementPageMax,
+        CancellationToken ct = default) => WaitAcknowledgementsAsync(after, limit, TimeSpan.Zero, ct);
+
+    /// <summary>
+    /// <see cref="AcknowledgementsAsync"/>, but when nothing follows <paramref name="after"/> it waits up to
+    /// <paramref name="wait"/> (at most <see cref="AcknowledgementWaitMax"/>) for the next acknowledgement,
+    /// returning an empty page when the wait ends first. Cancellation abandons the wait.
+    /// </summary>
+    public async Task<IReadOnlyList<AuditAcknowledgement>> WaitAcknowledgementsAsync(ulong after, int limit, TimeSpan wait,
+        CancellationToken ct = default)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (limit < 1 || limit > AcknowledgementPageMax)
+            throw new AuditOutboxException(AuditErrorKind.InvalidEvent, "acknowledgement limit must be between 1 and 1000");
+        if (wait < TimeSpan.Zero || wait > AcknowledgementWaitMax)
+            throw new AuditOutboxException(AuditErrorKind.InvalidEvent, "acknowledgement wait must be between 0 and one hour");
+        ulong handle = Handle;
+        byte[] request = JsonSerializer.SerializeToUtf8Bytes(new
+        {
+            version = 1, after, limit, wait_ms = (ulong)(wait.Ticks / TimeSpan.TicksPerMillisecond),
+        });
+        ulong op;
+        using (var scope = new NativeScope())
+            Native.Check(Native.aster_audit_outbox_acknowledgements(_runtime.Handle, handle, scope.Bytes(request), 0, out op), "audit acknowledgements");
+        var (_, data) = await Await(_runtime, op, Acknowledged, ct).ConfigureAwait(false);
+        return ParseAcknowledgements(data);
+    }
+
+    internal static IReadOnlyList<AuditAcknowledgement> ParseAcknowledgements(ReadOnlySpan<byte> data)
+    {
+        var page = JsonSerializer.Deserialize<AcknowledgementPage>(data, Json) ?? throw new IrohException("Missing audit acknowledgements");
+        if (page.Version != 1) throw new IrohException("Unsupported audit acknowledgements version");
+        return page.Acknowledgements ?? [];
+    }
+    private sealed record AcknowledgementPage(int Version, List<AuditAcknowledgement>? Acknowledgements);
+
+    /// <summary>
+    /// Streams acknowledgements with a cursor greater than <paramref name="after"/> until
+    /// <paramref name="ct"/> is cancelled (the enumeration then ends without throwing) or the outbox
+    /// fails (it throws). Delivery is lossless while entries are retained: record the last
+    /// <see cref="AuditAcknowledgement.Cursor"/> to resume after a restart.
+    /// </summary>
+    public async IAsyncEnumerable<AuditAcknowledgement> WatchAcknowledgementsAsync(ulong after = 0,
+        [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken ct = default)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            IReadOnlyList<AuditAcknowledgement> page;
+            try { page = await WaitAcknowledgementsAsync(after, AcknowledgementPageMax, TimeSpan.FromSeconds(30), ct).ConfigureAwait(false); }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { yield break; }
+            foreach (var ack in page)
+            {
+                if (ct.IsCancellationRequested) yield break;
+                after = ack.Cursor;
+                yield return ack;
+            }
+        }
     }
     private async Task Unit(ulong op, CancellationToken ct) => await Await(_runtime, op, (uint)EventKind.UnitResult, ct).ConfigureAwait(false);
     public AuditOutbox Clone()

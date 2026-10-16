@@ -498,7 +498,7 @@ public class AbiContractTests
             "aster_server_add_lease_grantor", "aster_lease_serializer_grantor_new",
         ]);
         Assert.Equal(127u, (uint)EventKind.EnrollmentResult);
-        Assert.Equal(0u, Native.RequiredAbiMinor);
+        Assert.Equal(5u, Native.RequiredAbiMinor);
         Assert.Equal(new uint[] { 0, 1, 2, 3, 4 }, Enum.GetValues<AdmissionErrorKind>().Select(k => (uint)k).Order().ToArray());
         Assert.Equal(0u, Native.EnrollmentSideServer);
         Assert.Equal(1u, Native.EnrollmentSideClient);

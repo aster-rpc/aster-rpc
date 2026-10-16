@@ -14,6 +14,10 @@ namespace Aster;
 internal sealed unsafe class NativeScope : IDisposable
 {
     private readonly List<IntPtr> _allocations = new();
+    private List<Action>? _cleanups;
+
+    /// <summary>Runs <paramref name="cleanup"/> on <see cref="Dispose"/>, before the allocations are freed (latest first).</summary>
+    public void OnDispose(Action cleanup) => (_cleanups ??= new()).Add(cleanup);
 
     /// <summary>Allocates <paramref name="size"/> zeroed bytes owned by this scope.</summary>
     public IntPtr Alloc(int size)
@@ -60,6 +64,11 @@ internal sealed unsafe class NativeScope : IDisposable
 
     public void Dispose()
     {
+        if (_cleanups is { } cleanups)
+        {
+            _cleanups = null;
+            for (int i = cleanups.Count - 1; i >= 0; i--) cleanups[i]();
+        }
         foreach (var p in _allocations) NativeMemory.Free((void*)p);
         _allocations.Clear();
     }

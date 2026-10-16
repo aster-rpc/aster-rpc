@@ -15,7 +15,37 @@ public sealed record TopologyPeerView(string NodeId, TopologyLadderLevel Level, 
     uint LossPpm, ulong ThroughputBps, ulong CwndCeilingBps, bool Direct, string? RelayUrl, string? RemoteAddr,
     ulong CongestionEvents, ulong Samples, uint ConfidencePpm,
     [property: JsonPropertyName("last_measured_unix_ms")] ulong LastMeasuredUnixMilliseconds,
-    [property: JsonPropertyName("cluster_held_since_unix_ms")] ulong ClusterHeldSinceUnixMilliseconds, bool IsConnected);
+    [property: JsonPropertyName("cluster_held_since_unix_ms")] ulong ClusterHeldSinceUnixMilliseconds, bool IsConnected,
+    TopologyQuicTraffic? QuicTraffic = null, TopologyPeerBlobStats? BlobTransfer = null);
+
+/// <summary>QUIC-level bytes on a peer's connections (UDP datagram payload: headers, ACKs and retransmits included).</summary>
+public sealed record TopologyQuicBytes(
+    [property: JsonPropertyName("quic_bytes_sent")] ulong Sent,
+    [property: JsonPropertyName("quic_bytes_received")] ulong Received);
+
+/// <summary>A peer's QUIC bytes by protocol family, cumulative since the node started and across reconnects (C ABI 7.4).</summary>
+public sealed record TopologyQuicTraffic(
+    TopologyQuicBytes? Blobs, [property: JsonPropertyName("blobs-zstd")] TopologyQuicBytes? BlobsZstd,
+    TopologyQuicBytes? Docs, TopologyQuicBytes? Gossip, TopologyQuicBytes? Rpc, TopologyQuicBytes? Other)
+{
+    /// <summary>Every protocol family summed.</summary>
+    public TopologyQuicBytes Total()
+    {
+        ulong sent = 0, received = 0;
+        foreach (var b in new[] { Blobs, BlobsZstd, Docs, Gossip, Rpc, Other })
+        {
+            if (b is null) continue;
+            sent += b.Sent; received += b.Received;
+        }
+        return new(sent, received);
+    }
+}
+
+/// <summary>The exact blob payload (and zstd wire) bytes exchanged with one peer, cumulative like <see cref="TopologyQuicTraffic"/> (C ABI 7.4).</summary>
+public sealed record TopologyPeerBlobStats(
+    ulong FetchedPayloadBytes, ulong FetchedZstdPayloadBytes, ulong FetchedWireBytes, ulong FetchedPlainBytes,
+    ulong ServedPayloadBytes, ulong ServedZstdPayloadBytes, ulong ServedWireBytes, ulong ServedPlainBytes,
+    ulong PlainFallbacks);
 
 /// <summary>Null fields retain native defaults. Explicit zero is preserved except position refresh (60s).</summary>
 public sealed record TopologySwarmOptions

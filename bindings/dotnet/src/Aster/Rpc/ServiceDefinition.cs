@@ -61,18 +61,29 @@ public sealed record CapabilityRequirement(CapabilityKind Kind, IReadOnlyList<st
     };
 }
 
-/// <summary>Per-call information handed to a server handler.</summary>
+/// <summary>
+/// Per-call information handed to a server handler (Rust <c>aster::rpc::CallContext</c>; design
+/// <c>ffi_spec/handler-context-design.md</c>). Handlers get it as their explicit parameter, and the
+/// dispatcher also sets <see cref="Current"/> (an <see cref="AsyncLocal{T}"/>) around every handler and
+/// interceptor, so code deep in a call chain can read it without threading it through. Work the handler
+/// starts with <see cref="Task.Run(Action)"/> inherits it (the execution context flows); work started
+/// with <c>ExecutionContext.SuppressFlow</c> does not.
+/// </summary>
 public sealed class ServerCallContext
 {
+    private static readonly AsyncLocal<ServerCallContext?> s_current = new();
+
     internal ServerCallContext(string service, string method, MethodPattern pattern, string peerId, ulong connectionId,
         int sessionId, ulong sessionKey, object? session,
         IReadOnlyList<KeyValuePair<string, string>> metadata, IReadOnlyDictionary<string, string> attributes,
-        DateTimeOffset? deadline, CancellationToken cancellationToken, bool irohAuthenticated = false)
+        DateTimeOffset? deadline, CancellationToken cancellationToken, bool irohAuthenticated = false,
+        string? transportPeer = null, ulong callId = 0, int wireCallId = 0)
     {
         Service = service;
         Method = method;
         Pattern = pattern;
         PeerId = peerId;
+        Peer = transportPeer ?? peerId;
         ConnectionId = connectionId;
         SessionId = sessionId;
         SessionKey = sessionKey;
@@ -82,17 +93,60 @@ public sealed class ServerCallContext
         Deadline = deadline;
         CancellationToken = cancellationToken;
         IrohAuthenticated = irohAuthenticated;
+        CallId = callId;
+        WireCallId = wireCallId;
     }
+
+    /// <summary>
+    /// The context of the handler call running on this async flow, or null outside one (Rust
+    /// <c>CallContext::try_current</c>).
+    /// </summary>
+    public static ServerCallContext? Current => s_current.Value;
+
+    /// <summary>
+    /// The context of the handler call running on this async flow (Rust <c>CallContext::current</c>).
+    /// Throws <see cref="InvalidOperationException"/> outside a handler.
+    /// </summary>
+    public static ServerCallContext Require()
+        => s_current.Value ?? throw new InvalidOperationException("no Aster handler call is running on this async flow");
+
+    /// <summary>Sets <see cref="Current"/> for the rest of the calling async method (the dispatcher's scope).</summary>
+    internal static void SetCurrent(ServerCallContext? ctx) => s_current.Value = ctx;
 
     public string Service { get; }
     public string Method { get; }
     public MethodPattern Pattern { get; }
 
-    /// <summary>The resolved principal, or the caller's node id on an Iroh-authenticated call.</summary>
+    /// <summary>
+    /// The transport's caller id (Rust <c>peer()</c>): the 64-hex node id over iroh, the id the HTTP /
+    /// WebTransport transport resolved otherwise. Unlike <see cref="Principal"/>, an
+    /// <c>Authenticator</c> does not change it.
+    /// </summary>
+    public string Peer { get; }
+
+    /// <summary>
+    /// Who the call acts as (Rust <c>principal()</c>): the <c>Authenticator</c>'s principal when one
+    /// resolved it, else the same as <see cref="Peer"/>. Gate 3 and the interceptors' <c>CallContext.Peer</c> use this.
+    /// </summary>
+    public string Principal => PeerId;
+
+    /// <summary>Same as <see cref="Principal"/> (the name before ABI 7.5 separated the transport <see cref="Peer"/>).</summary>
     public string PeerId { get; }
 
-    /// <summary>True only for transport-authenticated Iroh calls; credential authentication does not upgrade HTTP/WT provenance.</summary>
+    /// <summary>An <c>Authenticator</c> resolved a principal different from the transport <see cref="Peer"/>.</summary>
+    public bool HasPrincipal => !string.Equals(Peer, PeerId, StringComparison.Ordinal);
+
+    /// <summary>
+    /// Provenance: true only for transport-authenticated Iroh calls (the caller proved <see cref="Peer"/>
+    /// in the QUIC handshake); credential authentication does not upgrade HTTP/WT provenance.
+    /// </summary>
     public bool IrohAuthenticated { get; }
+
+    /// <summary>The server-side call id (unique per server, the id the dispatch ABI keys the call by).</summary>
+    public ulong CallId { get; }
+
+    /// <summary>The call id the client put in its call header (0 when it sent none); for correlating logs with the client.</summary>
+    public int WireCallId { get; }
 
     /// <summary>Iroh server connection id; zero for HTTP/WT. Only use nonzero ids for per-connection state (see <see cref="AsterServer.ConnectionClosed"/>).</summary>
     public ulong ConnectionId { get; }
@@ -113,14 +167,42 @@ public sealed class ServerCallContext
     /// <summary>Request metadata from the stream header.</summary>
     public IReadOnlyList<KeyValuePair<string, string>> Metadata { get; }
 
-    /// <summary>The caller's attributes (what Gate 3 saw; e.g. <c>aster.role</c>).</summary>
+    /// <summary>The last value of metadata key <paramref name="key"/>, or null.</summary>
+    public string? MetadataValue(string key)
+    {
+        string? value = null;
+        foreach (var kv in Metadata)
+            if (kv.Key == key) value = kv.Value;
+        return value;
+    }
+
+    /// <summary>The caller's attributes (what Gate 3 saw, authenticator attributes included; e.g. <c>aster.role</c>).</summary>
     public IReadOnlyDictionary<string, string> Attributes { get; }
 
-    /// <summary>When Rust cancels the call with <c>DEADLINE_EXCEEDED</c> (caller deadline, method default or handler cap).</summary>
+    /// <summary>
+    /// When Rust cancels the call with <c>DEADLINE_EXCEEDED</c>: the earliest of the caller's deadline,
+    /// the method's default timeout and the server's handler timeout. Null = none.
+    /// </summary>
     public DateTimeOffset? Deadline { get; }
 
-    /// <summary>Cancelled when the deadline passes, the peer cancels, or the server stops.</summary>
+    /// <summary>Time left until <see cref="Deadline"/> (zero once it passed); null when there is none.</summary>
+    public TimeSpan? Remaining
+        => Deadline is { } d ? (d - DateTimeOffset.UtcNow) is var left && left > TimeSpan.Zero ? left : TimeSpan.Zero : null;
+
+    /// <summary>Cancelled when the deadline passes, the peer cancels, the stream fails, or the server stops.</summary>
     public CancellationToken CancellationToken { get; }
+
+    /// <summary>Whether the call was cancelled (see <see cref="CancellationToken"/>).</summary>
+    public bool IsCancelled => CancellationToken.IsCancellationRequested;
+
+    /// <summary>Completes when the call is cancelled (never faults); for <c>Task.WhenAny</c> early exits.</summary>
+    public Task CancelledAsync()
+    {
+        if (CancellationToken.IsCancellationRequested) return Task.CompletedTask;
+        var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        CancellationToken.Register(static s => ((TaskCompletionSource)s!).TrySetResult(), tcs);
+        return tcs.Task;
+    }
 }
 
 /// <summary>One method of a <see cref="ServiceDefinition"/>.</summary>

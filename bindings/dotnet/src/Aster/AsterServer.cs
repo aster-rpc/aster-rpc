@@ -394,7 +394,7 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
     private sealed record Inbound(
         ulong CallId, ServiceDefinition Service, MethodDefinition Method, DispatchFlags Flags,
         ulong SessionKey, int SessionId, object? Session, ulong ConnectionId, long DeadlineUnixMs,
-        byte[] Request, string Peer, CancellationTokenSource Cts);
+        byte[] Request, string Peer, string TransportPeer, int WireCallId, CancellationTokenSource Cts);
 
     private unsafe void OnCall(ref DispatchEventNative ev)
     {
@@ -402,7 +402,10 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
         byte[] request = ev.request_len == 0 ? Array.Empty<byte>() : new ReadOnlySpan<byte>((byte*)ev.request_ptr, (int)ev.request_len).ToArray();
         // HTTP/WT has connection id zero and authenticates each call separately.
         // Caching its first principal would attribute later callers to that user.
-        bool cachePeer = ((DispatchFlags)ev.flags & DispatchFlags.IrohAuthenticated) != 0 && ev.connection_id != 0;
+        // A call with a distinct principal (ABI 7.5) reads its transport peer per call instead.
+        var evFlags = (DispatchFlags)ev.flags;
+        bool hasPrincipal = (evFlags & DispatchFlags.HasPrincipal) != 0;
+        bool cachePeer = (evFlags & DispatchFlags.IrohAuthenticated) != 0 && ev.connection_id != 0 && !hasPrincipal;
         string? peer;
         if (!cachePeer || !_peers.TryGetValue(ev.connection_id, out peer))
         {
@@ -410,6 +413,9 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
             if (cachePeer) _peers[ev.connection_id] = peer;
         }
         _dispatch.BufferRelease(ev.buffer);
+        // peer_ptr is the principal; with HAS_PRINCIPAL the transport peer comes from
+        // aster_dispatch_identity while the call is live (NOT_FOUND = already over: fall back).
+        string transportPeer = hasPrincipal ? _dispatch.TransportPeer(callId) ?? peer : peer;
 
         ServiceDefinition? svc = ev.service_idx < _byIndex.Length ? _byIndex[ev.service_idx] : null;
         if (svc is null || ev.method_idx >= svc.OrderedMethods.Length)
@@ -430,7 +436,7 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
         _live[callId] = cts;
         var inbound = new Inbound(callId, svc, svc.OrderedMethods[ev.method_idx], (DispatchFlags)ev.flags,
             ev.session_key, unchecked((int)ev.session_id), session, ev.connection_id, ev.deadline_unix_ms,
-            request, peer, cts);
+            request, peer, transportPeer, ev.wire_call_id, cts);
         Interlocked.Increment(ref _inFlight);
         ThreadPool.UnsafeQueueUserWorkItem(static s => _ = s.server.DispatchAsync(s.call), (server: this, call: inbound), preferLocal: false);
     }
@@ -457,7 +463,9 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
             var method = inbound.Method;
             var ctx = new ServerCallContext(inbound.Service.Name, method.Name, method.Pattern, inbound.Peer, inbound.ConnectionId,
                 inbound.SessionId, inbound.SessionKey, inbound.Session, metadata, attributes, deadline, inbound.Cts.Token,
-                (flags & DispatchFlags.IrohAuthenticated) != 0);
+                (flags & DispatchFlags.IrohAuthenticated) != 0, inbound.TransportPeer, inbound.CallId, inbound.WireCallId);
+            // Path 2 of the handler-context design: the async-local, scoped to this async method.
+            ServerCallContext.SetCurrent(ctx);
             call = new ServerCall(_dispatch, inbound.CallId, inbound.Request, (flags & DispatchFlags.FirstIsEnd) != 0, _codec, ctx);
             if (_interceptors.Count > 0)
             {

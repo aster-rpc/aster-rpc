@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Changed: native C ABI 7.5 required
+
+`Native.RequiredAbiMinor` is now 5; a 7.0 – 7.4 library is refused. Added
+on the way:
+
+- **7.1** `AuditOutbox.AcknowledgementsAsync` / `WaitAcknowledgementsAsync` /
+  `WatchAcknowledgementsAsync` (`IAsyncEnumerable<AuditAcknowledgement>`).
+- **7.2** `AsterServer.DrainAsync(grace)` returning `DrainReport`,
+  `AsterServer.IsDraining`, `DrainCloseCode`, `RpcError.IsDraining`.
+- **7.3** `AsterConfig.BindAddrV6`, `AdvertiseAddrs`, `RelayCaCerts`,
+  `RelayCaOnly`, `Discovery` (`DiscoveryMode`), `DiscoveryDnsOrigin`,
+  `DiscoveryPkarrRelays`, read from env / TOML by Rust.
+- **7.4** `Blobs.TransferStats()`; fetch report v2 (`FetchProviderStats`
+  gains `InFlight`, `PlainFallbacks`, `BytesTransferred`, `WireBytes`; the
+  parser now bounds-checks and raises `IrohException` on a short report);
+  `TopologyPeerView.QuicTraffic` / `BlobTransfer`;
+  `AsterConfig.MetricsPeerLabels` / `MetricsPeerLabelCap`.
+- **7.5** `ServerCallContext.Peer` (transport) apart from `Principal`
+  (`PeerId` stays the principal), `HasPrincipal`, `CallId`, `WireCallId`,
+  `MetadataValue`, `Remaining`, `IsCancelled`, `CancelledAsync()`, and the
+  async-local `ServerCallContext.Current` / `Require()`.
+
+### Added: contract types and recursive types
+
+`DateTimeOffset` (timestamp), `DateOnly` (date), `ForyDecimal` (decimal;
+`[WireDecimal(p, s)]` for decimal(p,s)), `byte[]` with `[WireUuid]` /
+`[WireUlid]`, and recursive type graphs (SELF_REF), matching Rust and
+Python contract ids and wire bytes (`conformance/vectors/contract-types.json`).
+Helpers: `AsterUuid` (RFC 9562 byte order), `Ulid`, `AsterDecimal`.
+`ForyCodec` now applies the encode / decode rules (timestamp truncation,
+decimal(p,s) rescale, 16-byte identifiers) and throws
+`ContractValueException` (`INVALID_ARGUMENT`) for a value that does not fit.
+
 ### Changed (breaking): native C ABI 7.0, zero means fail closed
 
 Requires native C ABI **7.0** or a later 7.x (`Native.AbiVersionMajor` = 7,

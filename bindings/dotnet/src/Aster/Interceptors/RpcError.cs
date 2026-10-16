@@ -22,6 +22,23 @@ public class RpcError : Exception
         Details = details ?? new Dictionary<string, string>();
     }
 
+    /// <summary>The <see cref="Details"/> key (value <c>"true"</c>) a draining server sets on its <c>UNAVAILABLE</c> answer.</summary>
+    public const string DrainingDetailKey = "aster.draining";
+
+    /// <summary>
+    /// The server was draining (<see cref="AsterServer.DrainAsync"/>): it refused the call, or closed the
+    /// connection under it. Retrying on the same connection cannot succeed; connect to another replica.
+    /// </summary>
+    public bool IsDraining => Code == StatusCode.Unavailable && Details.ContainsKey(DrainingDetailKey);
+
+    /// <summary>Whether <paramref name="error"/> is (or wraps) a draining server's answer (see <see cref="IsDraining"/>).</summary>
+    public static bool IsDrainingError(Exception? error)
+    {
+        for (var e = error; e is not null; e = e.InnerException)
+            if (e is RpcError { IsDraining: true }) return true;
+        return false;
+    }
+
     public override string ToString()
         => $"RpcError(Code={Code}, Message=\"{Message}\", Details=[{Details.Count} entries])";
 }

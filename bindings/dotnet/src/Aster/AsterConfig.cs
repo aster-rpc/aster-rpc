@@ -20,6 +20,22 @@ public enum Portmapper : uint
 /// <summary>
 /// QUIC transport tuning (<c>aster_config_t.transport_*</c>). <c>null</c> keeps the Rust default.
 /// </summary>
+/// <summary>
+/// How a node publishes and resolves addresses (<c>aster_discovery_t</c>, Rust <c>DiscoveryMode</c>). Only
+/// <see cref="Default"/> contacts n0 infrastructure; relays are configured separately (<see cref="AsterConfig.RelayMode"/>).
+/// </summary>
+public enum DiscoveryMode : uint
+{
+    /// <summary>n0 pkarr + DNS at <c>iroh.link</c> (custom with a DNS origin or pkarr relays set).</summary>
+    Default = 0,
+    /// <summary>No address lookup: dial peers by full address.</summary>
+    None = 1,
+    /// <summary>Local-network mDNS only.</summary>
+    Local = 2,
+    /// <summary>Only <see cref="AsterConfig.DiscoveryDnsOrigin"/> / <see cref="AsterConfig.DiscoveryPkarrRelays"/>.</summary>
+    Custom = 3,
+}
+
 public sealed record TransportConfig
 {
     public ulong? MaxConcurrentBidiStreams { get; init; }
@@ -100,6 +116,51 @@ public sealed record AsterConfig
     /// </summary>
     public bool? ReuseLastPort { get; init; }
 
+    // ── Cluster network settings (C ABI 7.3, aster_network_config_t) ─────
+
+    /// <summary>
+    /// IPv6 bind address, e.g. <c>[::]:7842</c>: pins the IPv6 UDP port as <see cref="BindAddr"/> pins the
+    /// IPv4 one. Env <c>ASTER_BIND_ADDR_V6</c>; TOML <c>[network] bind_addr_v6</c>.
+    /// </summary>
+    public string? BindAddrV6 { get; init; }
+    /// <summary>
+    /// Extra direct addresses (<c>IP:port</c>) to advertise, e.g. a NodePort. Hints only: peers still verify
+    /// the node key in the TLS handshake. Env <c>ASTER_ADVERTISE_ADDRS</c> (comma-separated); TOML
+    /// <c>[network] advertise_addrs</c>.
+    /// </summary>
+    public IReadOnlyList<string> AdvertiseAddrs { get; init; } = Array.Empty<string>();
+    /// <summary>
+    /// PEM files with CA certificates trusted for relay TLS, in addition to the WebPKI roots. Env
+    /// <c>ASTER_RELAY_CA_CERTS</c>; TOML <c>[network] relay_ca_certs</c>.
+    /// </summary>
+    public IReadOnlyList<string> RelayCaCerts { get; init; } = Array.Empty<string>();
+    /// <summary>Trust only <see cref="RelayCaCerts"/> for relay TLS, not the WebPKI roots. Env <c>ASTER_RELAY_CA_ONLY</c>; TOML <c>[network] relay_ca_only</c>.</summary>
+    public bool RelayCaOnly { get; init; }
+    /// <summary>
+    /// How the node publishes and resolves addresses (Rust <c>DiscoveryMode</c>). <see cref="DiscoveryMode.Default"/>
+    /// with <see cref="DiscoveryDnsOrigin"/> or <see cref="DiscoveryPkarrRelays"/> set selects
+    /// <see cref="DiscoveryMode.Custom"/>. Env <c>ASTER_DISCOVERY</c>; TOML <c>[network] discovery</c>.
+    /// </summary>
+    public DiscoveryMode Discovery { get; init; }
+    /// <summary>DNS origin for custom discovery, e.g. <c>dns.example.internal</c>. Env <c>ASTER_DISCOVERY_DNS_ORIGIN</c>.</summary>
+    public string? DiscoveryDnsOrigin { get; init; }
+    /// <summary>Pkarr relay URLs for custom discovery. Env <c>ASTER_DISCOVERY_PKARR_RELAYS</c>.</summary>
+    public IReadOnlyList<string> DiscoveryPkarrRelays { get; init; } = Array.Empty<string>();
+
+    // ── [metrics] (C ABI 7.4, aster_metrics_config_t) ────────────────────
+
+    /// <summary>
+    /// Label <c>aster.peer.bytes</c> per peer (<c>aster.peer</c>) instead of by locality level: the first
+    /// <see cref="MetricsPeerLabelCap"/> peers get their own series, later ones count under <c>_OTHER</c>.
+    /// The node's ops listener applies it. Env <c>ASTER_METRICS_PEER_LABELS</c>; TOML <c>[metrics] peer_labels</c>.
+    /// </summary>
+    public bool MetricsPeerLabels { get; init; }
+    /// <summary>
+    /// How many peers get their own <c>aster.peer</c> series; 0 = the default (64). Env
+    /// <c>ASTER_METRICS_PEER_LABEL_CAP</c>; TOML <c>[metrics] peer_label_cap</c>.
+    /// </summary>
+    public uint MetricsPeerLabelCap { get; init; }
+
     // ── Trust and Enrollment ([trust], [enrollment]; design §15.3) ────────
     //
     // Read by FromEnv / FromToml through the Rust aster::AsterConfig
@@ -175,7 +236,8 @@ public sealed record AsterConfig
         ConfigNative n = default;
         Native.EnsureAbi();
         Native.Check(Native.aster_config_init(&n), "aster_config_init");
-        return FromNative(in n, new AsterConfig());
+        try { return FromNative(in n, new AsterConfig()); }
+        finally { Native.aster_config_release(&n); }
     }
 
     /// <summary>
@@ -349,10 +411,81 @@ public sealed record AsterConfig
         if (t.SendFairness is { } fair) { n.transport_send_fairness = fair ? 1u : 0u; set |= TFairness; }
         if (t.EnableSegmentationOffload is { } gso) { n.transport_enable_segmentation_offload = gso ? 1u : 0u; set |= TGso; }
         n.transport_set = set;
+        SetNetworkAndMetrics(scope, ref n);
         return n;
     }
 
-    private static AsterConfig FromNative(in ConfigNative n, AsterConfig b)
+    private bool HasNetworkSettings =>
+        !string.IsNullOrEmpty(BindAddrV6) || AdvertiseAddrs.Count > 0 || RelayCaCerts.Count > 0 || RelayCaOnly
+        || Discovery != DiscoveryMode.Default || !string.IsNullOrEmpty(DiscoveryDnsOrigin) || DiscoveryPkarrRelays.Count > 0;
+
+    /// <summary>
+    /// Copies the 7.3 network and 7.4 metrics settings into the config's library-owned storage, which
+    /// <paramref name="scope"/> releases (<c>aster_config_release</c>) when it is disposed.
+    /// </summary>
+    private unsafe void SetNetworkAndMetrics(NativeScope scope, ref ConfigNative n)
+    {
+        bool network = HasNetworkSettings, metrics = MetricsPeerLabels || MetricsPeerLabelCap != 0;
+        if (!network && !metrics) return;
+        if (!Enum.IsDefined(Discovery))
+            throw new ArgumentException($"Discovery: unknown mode {(uint)Discovery}", nameof(Discovery));
+        ConfigNative* cfg = scope.Struct<ConfigNative>();
+        *cfg = n;
+        // Registered first so the storage is released even if a set below fails.
+        scope.OnDispose(() => Native.aster_config_release(cfg));
+        if (network)
+        {
+            NetworkConfigNative net = default;
+            net.struct_size = (uint)sizeof(NetworkConfigNative);
+            net.discovery = (uint)Discovery;
+            net.bind_addr_v6 = scope.Utf8(BindAddrV6);
+            net.advertise_addrs = scope.Utf8List(AdvertiseAddrs);
+            net.relay_ca_certs = scope.Utf8List(RelayCaCerts);
+            net.relay_ca_only = RelayCaOnly ? 1u : 0u;
+            net.discovery_dns_origin = scope.Utf8(DiscoveryDnsOrigin);
+            net.discovery_pkarr_relays = scope.Utf8List(DiscoveryPkarrRelays);
+            Native.Check(Native.aster_config_set_network(cfg, &net), "aster_config_set_network");
+        }
+        if (metrics)
+        {
+            MetricsConfigNative m = default;
+            m.struct_size = (uint)sizeof(MetricsConfigNative);
+            m.peer_labels = MetricsPeerLabels ? 1u : 0u;
+            m.peer_label_cap = MetricsPeerLabelCap;
+            Native.Check(Native.aster_config_set_metrics(cfg, &m), "aster_config_set_metrics");
+        }
+        n = *cfg;
+    }
+
+    private static unsafe AsterConfig WithNetworkAndMetrics(in ConfigNative n, AsterConfig c)
+    {
+        fixed (ConfigNative* cfg = &n)
+        {
+            NetworkConfigNative net = default;
+            net.struct_size = (uint)sizeof(NetworkConfigNative);
+            Native.Check(Native.aster_config_network(cfg, &net), "aster_config_network");
+            MetricsConfigNative m = default;
+            m.struct_size = (uint)sizeof(MetricsConfigNative);
+            Native.Check(Native.aster_config_metrics(cfg, &m), "aster_config_metrics");
+            string? Str(Bytes x) => x.IsEmpty ? null : x.ToUtf8String();
+            return c with
+            {
+                Discovery = (DiscoveryMode)net.discovery,
+                BindAddrV6 = Str(net.bind_addr_v6),
+                AdvertiseAddrs = NativeScope.ReadUtf8List(net.advertise_addrs),
+                RelayCaCerts = NativeScope.ReadUtf8List(net.relay_ca_certs),
+                RelayCaOnly = net.relay_ca_only != 0,
+                DiscoveryDnsOrigin = Str(net.discovery_dns_origin),
+                DiscoveryPkarrRelays = NativeScope.ReadUtf8List(net.discovery_pkarr_relays),
+                MetricsPeerLabels = m.peer_labels != 0,
+                MetricsPeerLabelCap = m.peer_label_cap,
+            };
+        }
+    }
+
+    internal static AsterConfig FromNative(in ConfigNative n, AsterConfig b) => WithNetworkAndMetrics(in n, FromNativeBase(in n, b));
+
+    private static AsterConfig FromNativeBase(in ConfigNative n, AsterConfig b)
     {
         string? Str(Bytes x) => x.IsEmpty ? null : x.ToUtf8String();
         uint set = n.transport_set;

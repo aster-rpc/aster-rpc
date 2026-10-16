@@ -150,7 +150,7 @@ public sealed class BlobCustodyScope : IDisposable, IAsyncDisposable
         byte[] payload = await Run("aster_blob_custody_download_hash_from", EventKind.BlobFetched, () =>
         {
             using var s = new NativeScope();
-            Native.Check(Native.aster_blob_custody_download_hash_from(_runtime.Handle, _handle, s.Utf8(hash), s.Utf8List(providers), (uint)format, (uint)strategy, toStore ? 1u : 0u, 0, out ulong op), "aster_blob_custody_download_hash_from");
+            Native.Check(Native.aster_blob_custody_download_hash_from(_runtime.Handle, _handle, s.Utf8(hash), s.Utf8List(providers), (uint)format, (uint)strategy, (toStore ? 1u : 0u) | Native.FetchReportV2, 0, out ulong op), "aster_blob_custody_download_hash_from");
             return op;
         }, ct).ConfigureAwait(false);
         var report = Ops.ParseFetchReport(payload, out int consumed);

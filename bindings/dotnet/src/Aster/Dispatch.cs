@@ -44,6 +44,8 @@ internal enum DispatchFlags : uint
     HasTrace = 0x400,
     /// <summary>The call carried baggage / tracestate: <c>aster_dispatch_inbound_trace</c> (ABI 4.6).</summary>
     HasInboundTrace = 0x800,
+    /// <summary>ABI 7.5: an <c>Authenticator</c> resolved a principal other than the transport peer; <c>peer_ptr</c> is that principal.</summary>
+    HasPrincipal = 0x1000,
 }
 
 /// <summary><c>aster_server_option_t</c>.</summary>
@@ -326,6 +328,35 @@ internal sealed class DispatchServer : IDisposable
             case (int)Status.NotFound: return RecvStatus.Gone;
             default: throw IrohException.FromStatus(r, "aster_dispatch_recv");
         }
+    }
+
+    /// <summary>
+    /// The transport peer of a live call (<c>aster_dispatch_identity</c>, ABI 7.5): the 64-hex node id
+    /// over iroh, the id the HTTP / WebTransport transport resolved otherwise. Null once the call is over.
+    /// </summary>
+    public unsafe string? TransportPeer(ulong callId)
+    {
+        if (_disposed) return null;
+        DispatchIdentityNative id = default;
+        id.struct_size = (uint)sizeof(DispatchIdentityNative);
+        int r = Native.aster_dispatch_identity(_runtime, _handle, callId, &id);
+        if (r == (int)Status.NotFound) return null;
+        if (r != 0) throw IrohException.FromStatus(r, "aster_dispatch_identity");
+        try { return id.peer_len == 0 ? "" : Encoding.UTF8.GetString((byte*)id.peer_ptr, (int)id.peer_len); }
+        finally { BufferRelease(id.buffer); }
+    }
+
+    /// <summary>
+    /// <c>aster_server_drain</c> (ABI 7.2). Blocks for up to the grace (plus Rust's cancel wait); must not
+    /// run on the poll thread, which keeps lowering the calls the drain waits for.
+    /// </summary>
+    public unsafe DrainReport Drain(uint graceMs)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        DrainReportNative r = default;
+        Native.Check(Native.aster_server_drain(_runtime, _handle, graceMs, &r), "aster_server_drain");
+        return new DrainReport(r.calls_in_flight, r.calls_completed, r.calls_cancelled, r.calls_refused,
+            r.connections_closed, r.connections_refused, r.deadline_reached != 0, TimeSpan.FromMilliseconds(r.elapsed_ms));
     }
 
     /// <summary>Whether the call was cancelled, finished or is unknown (stop producing).</summary>
