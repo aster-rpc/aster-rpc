@@ -340,8 +340,10 @@ authenticated identity. Return `null` for `UNAUTHENTICATED`, or a nonempty
 principal with attributes local to this call. Callback/encoding errors and auth
 timeout fail closed with `UNAVAILABLE`; admission failure modes never grant
 access. Auth attributes are passed to the normal Gate 3 checks and
-`CallContext.attributes`. `CallContext.peer` is the resolved principal, while
-`CallContext.irohAuthenticated` remains false for HTTPS/WebTransport. Iroh policy
+`CallContext.attributes`. `CallContext.principal` is the resolved principal
+and `CallContext.peer` the transport's caller id (`socket://…` here), while
+`CallContext.irohAuthenticated` remains false for HTTPS/WebTransport
+(`provenance` is `'other'`). Iroh policy
 and provenance remain native properties.
 
 The callback's `context.signal` aborts on timeout, transport cancellation,
@@ -496,6 +498,71 @@ const server = new AsterServer({
 `blobZstdLevel` is the zstd level of blob transport (unset = 3, `0` = off,
 1–19). `reuseLastPort` lets a persistent node re-bind the UDP ports recorded
 in `bind-ports.json` on restart, so peers' cached addresses stay valid.
+
+## The handler context
+
+A handler that declares a second parameter gets the call's `CallContext`;
+anywhere inside the handler (including a streaming handler's generator body)
+`CallContext.current()` returns the same object:
+
+```ts
+@Rpc({ request: OrderRequest, response: Order })
+async placeOrder(req: OrderRequest, ctx: CallContext): Promise<Order> {
+  ctx.peer;         // transport caller id (iroh node id over QUIC)
+  ctx.principal;    // the authenticator's principal, else `peer`
+  ctx.provenance;   // 'iroh_authenticated' | 'other'
+  ctx.attributes;   // what Gate 3 checked, e.g. ctx.attributes['aster.role']
+  ctx.metadata;     // the caller's call metadata
+  ctx.remainingSeconds;
+  // `signal` aborts when the peer cancels, the stream fails or the deadline
+  // passes; `isCancelled()` and the promise `cancelled()` report the same.
+  return this.store.place(req, { signal: ctx.signal });
+}
+```
+
+## Graceful drain
+
+`server.drain(graceMs)` takes a replica out of rotation for a rolling update.
+It runs the Rust drain: readiness turns not-ready, new connections and new
+calls are refused (`UNAVAILABLE` with the `aster.draining` detail; clients see
+`err.isDraining`), idle connections close, in-flight calls and calls on live
+sessions get up to `graceMs` to finish, and what still runs is cancelled. It
+then closes the server and resolves with a report:
+
+```ts
+process.once('SIGTERM', async () => {
+  const r = await server.drain(30_000);
+  console.log(`completed ${r.callsCompleted}, cancelled ${r.callsCancelled}, refused ${r.callsRefused}`);
+});
+
+// Client side: reconnect elsewhere on a draining answer.
+try { await orders.placeOrder(req); } catch (e) { if (e instanceof RpcError && e.isDraining) reconnect(); }
+```
+
+## Transfer metrics
+
+- `node.blobs().transferStats()`: node-wide blob counters since start
+  (payload, zstd payload, wire and plain bytes for fetching and serving,
+  plain fallbacks, transfers by encoding and result, zstd decode errors).
+- A multi-provider fetch's `FetchReport` gives each provider's
+  `bytesTransferred`, `wireBytes` (absent when it served plain), `inFlight`
+  and `plainFallbacks`, plus the report-level `inFlight` and `plainOnly`
+  provider lists.
+- With `enableMonitoring`, each topology `PeerView` carries `quicTraffic`
+  (QUIC bytes sent / received per protocol: `blobs`, `blobsZstd`, `docs`,
+  `gossip`, `rpc`, `other`) and `blobTransfer` (this peer's blob counters).
+- `metricsPeerLabels: true` (`ASTER_METRICS_PEER_LABELS`, `[metrics]
+  peer_labels`) labels `aster.peer.bytes` per peer for the first
+  `metricsPeerLabelCap` peers (default 64); later peers count under `_OTHER`.
+
+## Cluster network settings
+
+The `[network]` settings for Kubernetes and air-gapped installs
+([relay guide](../../../../docs/relay-self-hosted.md#running-inside-kubernetes))
+are `AsterConfig` fields too, read from the same `ASTER_*` variables and TOML
+keys: `bindAddrV6`, `advertiseAddrs`, `relayCaCerts`, `relayCaOnly`,
+`discovery` (`'default' | 'none' | 'local' | 'custom'`), `discoveryDnsOrigin`
+and `discoveryPkarrRelays` (either selects `custom`).
 
 ## Observability
 

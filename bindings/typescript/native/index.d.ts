@@ -121,6 +121,11 @@ export declare class BlobsClient {
   custody(): BlobCustody
   addBytesVerified(data: Buffer, expectedHash: string, format: string, tag: string, token?: BlobCancelToken | undefined | null): Promise<string>
   addPathVerified(path: string, expectedHash: string, format: string, tag: string, token?: BlobCancelToken | undefined | null): Promise<string>
+  /**
+   * Blob transfer counters for this node (every client and the serving
+   * side, plain and zstd), since it started.
+   */
+  transferStats(): BlobTransferStats
   /** Add bytes to the blob store, returning the hash hex string. */
   addBytes(data: Buffer): Promise<string>
   /**
@@ -557,7 +562,21 @@ export declare class DispatchServer {
    * Stop serving (and, for `start`, shut the node down). Releases the
    * event callback and resolves any pending `nextBatch` with `[]`.
    * Untaken non-RPC connections are closed.
+   * Drain the server (Rust `aster::rpc::drain`): refuse new connections
+   * (QUIC close `DRAIN_CLOSE_CODE`) and new calls (`UNAVAILABLE` with
+   * detail `aster.draining`), close connections as they go idle, let
+   * in-flight calls and calls on live sessions run until `graceMs`, then
+   * close what remains, which cancels it. A `start` server's Rust health
+   * listener reports not ready from the start of the drain.
+   *
+   * Serving stops refusing only at `close()`, which should follow. A call
+   * while a drain runs moves its deadline earlier when `graceMs` ends
+   * sooner and resolves with the same report; a call after it ended
+   * resolves with that report again. Rejects after `close()`.
    */
+  drain(graceMs: number): Promise<DrainReport>
+  /** Whether `drain` has started. */
+  get isDraining(): boolean
   close(): Promise<void>
 }
 
@@ -1226,6 +1245,14 @@ export declare class NativeAuditOutbox {
   reconfigure(destinationJson: string): Promise<void>
   quarantine(eventId: string, reason: string, operatorReference: string): Promise<void>
   export(eventId: string): Promise<string>
+  /**
+   * Up to `limit` (1..=1000) acknowledgement-log entries with a cursor
+   * greater than `after` (a decimal u64 string), oldest first, as JSON
+   * with u64 values as decimal strings. With `waitMs`, waits up to that
+   * long (at most one hour) for the next acknowledgement when none follows
+   * `after` yet, and returns an empty page when the wait ends first.
+   */
+  acknowledgements(after: string, limit: number, waitMs?: number | undefined | null): Promise<string>
   replay(eventId: string): Promise<void>
 }
 
@@ -1749,6 +1776,48 @@ export interface AsterConfig {
   /** Local bind address, e.g. `"0.0.0.0:9000"`. `ASTER_BIND_ADDR`. */
   bindAddr?: string
   /**
+   * IPv6 bind address, e.g. `"[::]:7842"`: pins the IPv6 socket the way
+   * `bindAddr` pins the IPv4 one (which must then be IPv4 or unset). A
+   * host without IPv6 fails to start with it set. `ASTER_BIND_ADDR_V6`,
+   * `[network] bind_addr_v6`.
+   */
+  bindAddrV6?: string
+  /**
+   * Extra `ip:port` addresses published in discovery records (hints:
+   * peers still verify this node's key). Requires direct IP transports.
+   * `ASTER_ADVERTISE_ADDRS` (comma-separated), `[network] advertise_addrs`.
+   */
+  advertiseAddrs?: Array<string>
+  /**
+   * PEM CA certificate files trusted for relay TLS (and custom
+   * discovery's pkarr relays) beside the WebPKI roots.
+   * `ASTER_RELAY_CA_CERTS` (comma-separated), `[network] relay_ca_certs`.
+   */
+  relayCaCerts?: Array<string>
+  /**
+   * Trust only `relayCaCerts` for relay TLS (default false).
+   * `ASTER_RELAY_CA_ONLY`, `[network] relay_ca_only`.
+   */
+  relayCaOnly?: boolean
+  /**
+   * Address lookup: `"default"` (n0 at `iroh.link`), `"none"`, `"local"`
+   * (mDNS only) or `"custom"` (`discoveryDnsOrigin` /
+   * `discoveryPkarrRelays`; setting either selects it).
+   * `ASTER_DISCOVERY`, `[network] discovery`.
+   */
+  discovery?: 'default' | 'none' | 'local' | 'custom'
+  /**
+   * DNS origin for custom discovery, e.g. `"dns.example.internal"`.
+   * `ASTER_DISCOVERY_DNS_ORIGIN`, `[network] discovery_dns_origin`.
+   */
+  discoveryDnsOrigin?: string
+  /**
+   * Pkarr relay URLs for custom discovery (publish and resolve).
+   * `ASTER_DISCOVERY_PKARR_RELAYS` (comma-separated),
+   * `[network] discovery_pkarr_relays`.
+   */
+  discoveryPkarrRelays?: Array<string>
+  /**
    * Re-bind a persistent node's last UDP ports on restart (default true).
    * `ASTER_REUSE_LAST_PORT`, `[network] reuse_last_port`.
    */
@@ -1827,6 +1896,18 @@ export interface AsterConfig {
    * `ASTER_HEALTH_ENABLED`, `[health] enabled`.
    */
   healthEnabled?: boolean
+  /**
+   * Label `aster.peer.bytes` per peer (`aster.peer`) instead of by
+   * locality level; the first `metricsPeerLabelCap` peers keep their own
+   * series, later ones count under `_OTHER`. Default off.
+   * `ASTER_METRICS_PEER_LABELS`, `[metrics] peer_labels`.
+   */
+  metricsPeerLabels?: boolean
+  /**
+   * Peers with their own `aster.peer` series (default 64).
+   * `ASTER_METRICS_PEER_LABEL_CAP`, `[metrics] peer_label_cap`.
+   */
+  metricsPeerLabelCap?: U64Value
 }
 
 /**
@@ -1951,6 +2032,53 @@ export interface BlobStatusInfo {
    * size (`complete`). `null` for `not_found`.
    */
   size?: number
+}
+
+/** Transfers by encoding and result. */
+export interface BlobTransferCounts {
+  plainOk: number
+  plainFailed: number
+  zstdOk: number
+  zstdFailed: number
+}
+
+/**
+ * Blob transfer counters for the whole node (every client and the serving
+ * side, plain and zstd), since it started. Monotonic.
+ *
+ * Payload is blob content as decoded: compression coverage is
+ * `*ZstdPayloadBytes / *PayloadBytes`, and its saving is
+ * `*PlainBytes - *WireBytes` over the compressed subset.
+ */
+export interface BlobTransferStats {
+  /** Payload bytes this node fetched, plain and zstd. */
+  fetchedPayloadBytes: number
+  /** The part of `fetchedPayloadBytes` that came over zstd. */
+  fetchedZstdPayloadBytes: number
+  /** Compressed bytes received while fetching over zstd. */
+  fetchedWireBytes: number
+  /** Protocol bytes those decompressed to. */
+  fetchedPlainBytes: number
+  /** Payload bytes this node served, plain and zstd. */
+  servedPayloadBytes: number
+  /** The part of `servedPayloadBytes` that went out over zstd. */
+  servedZstdPayloadBytes: number
+  /** Compressed bytes sent while serving over zstd. */
+  servedWireBytes: number
+  /** Protocol bytes those were compressed from. */
+  servedPlainBytes: number
+  /** Fetch attempts that went plain because the provider does not serve zstd. */
+  plainFallbacks: number
+  /** Requests this node served over plain transport. */
+  plainServes: number
+  /** Fetch attempts by encoding and result. */
+  fetchTransfers: BlobTransferCounts
+  /** Served requests by encoding and result. */
+  serveTransfers: BlobTransferCounts
+  /** Fetched zstd streams that failed on malformed or truncated zstd data. */
+  fetchDecodeErrors: number
+  /** Served zstd streams that failed the same way. */
+  serveDecodeErrors: number
 }
 
 /**
@@ -2423,6 +2551,12 @@ export interface DispatchEvent {
    * connection-closed only.
    */
   peer?: string
+  /**
+   * The transport's caller id when an `Authenticator` resolved a
+   * different principal (`flags & HAS_PRINCIPAL`; `peer` is then the
+   * principal). Absent when `peer` is the transport's id.
+   */
+  transportPeer?: string
   /** The first request payload, already decompressed; calls only. */
   request?: Buffer
   /** Call metadata (header), when non-empty. */
@@ -2524,6 +2658,38 @@ export interface DownloadPolicy {
   mode: 'everything' | 'nothing_except' | 'everything_except'
   /** Key prefixes for the `*_except` modes. */
   prefixes?: Array<string | Uint8Array>
+}
+
+/** The QUIC application close code a draining server closes connections with. */
+export const DRAIN_CLOSE_CODE: number
+
+/**
+ * What `DispatchServer.drain` did. Calls count those admitted to a handler,
+ * not those refused at routing.
+ */
+export interface DrainReport {
+  /** Calls in flight when the drain started. */
+  callsInFlight: number
+  /**
+   * Calls that finished before the deadline (those in flight at the start
+   * and calls on existing sessions admitted during the drain).
+   */
+  callsCompleted: number
+  /**
+   * Calls still running at the deadline, cancelled by closing their
+   * connection.
+   */
+  callsCancelled: number
+  /** New calls answered `UNAVAILABLE` (draining) during the drain. */
+  callsRefused: number
+  /** Connections the drain closed with the drain close code (503). */
+  connectionsClosed: number
+  /** New connections refused at accept during the drain. */
+  connectionsRefused: number
+  /** Whether the deadline passed with work outstanding. */
+  deadlineReached: boolean
+  /** How long the drain took, ms. */
+  elapsedMs: number
 }
 
 /**
@@ -2768,6 +2934,16 @@ export interface FetchReport {
   failed: Array<string>
   /** Providers that completed at least one request. */
   served: Array<string>
+  /**
+   * Providers that were mid-attempt when the report was taken (empty for a
+   * finished fetch).
+   */
+  inFlight: Array<string>
+  /**
+   * Providers that do not serve compressed blobs and were fetched from
+   * over plain transport: cache them as plain-only, not as bad providers.
+   */
+  plainOnly: Array<string>
   /** Payload bytes pulled off the wire (a transfer metric, not a size). */
   bytesTransferred: number
 }
@@ -3376,6 +3552,28 @@ export interface PeerAdmission {
   source: string
 }
 
+/** Blob transfer counters for one peer, since this node started. Monotonic. */
+export interface PeerBlobStats {
+  /** Payload bytes fetched from this peer, plain and zstd. */
+  fetchedPayloadBytes: number
+  /** The part of `fetchedPayloadBytes` that came over zstd. */
+  fetchedZstdPayloadBytes: number
+  /** Compressed bytes received from this peer while fetching over zstd. */
+  fetchedWireBytes: number
+  /** Protocol bytes those decompressed to. */
+  fetchedPlainBytes: number
+  /** Payload bytes served to this peer, plain and zstd. */
+  servedPayloadBytes: number
+  /** The part of `servedPayloadBytes` that went out over zstd. */
+  servedZstdPayloadBytes: number
+  /** Compressed bytes sent to this peer while serving over zstd. */
+  servedWireBytes: number
+  /** Protocol bytes those were compressed from. */
+  servedPlainBytes: number
+  /** Fetch attempts against this peer that fell back to plain transport. */
+  plainFallbacks: number
+}
+
 /** One peer's proximity view (topology v1). */
 export interface PeerView {
   nodeId: string
@@ -3408,6 +3606,16 @@ export interface PeerView {
   /** Since when RTT has held under the cluster threshold; 0 = not held. */
   clusterHeldSinceUnixMs: number
   isConnected: boolean
+  /**
+   * QUIC bytes on this peer's connections by protocol, cumulative since
+   * the node started and across reconnects.
+   */
+  quicTraffic: QuicTraffic
+  /**
+   * Exact blob payload (and zstd wire) bytes exchanged with this peer,
+   * cumulative like `quicTraffic`.
+   */
+  blobTransfer: PeerBlobStats
 }
 
 /**
@@ -3426,6 +3634,51 @@ export interface ProviderOutcome {
   failures: number
   /** Requests this provider carried to completion. */
   completedRequests: number
+  /**
+   * Requests mid-attempt against this provider when the report was taken
+   * (always 0 in a finished fetch's report).
+   */
+  inFlight: number
+  /**
+   * Attempts that went over plain transport because this provider does
+   * not serve compressed blobs (still counted in `failures` or
+   * `completedRequests`).
+   */
+  plainFallbacks: number
+  /**
+   * Payload bytes this provider carried, failed attempts included. Summed
+   * over all providers this is the report's `bytesTransferred`.
+   */
+  bytesTransferred: number
+  /**
+   * Compressed bytes received from this provider over zstd; absent when
+   * every attempt against it went over plain transport.
+   */
+  wireBytes?: number
+}
+
+/**
+ * QUIC-level bytes (UDP datagram payload: headers, ACKs and retransmits
+ * included) on one protocol's connections to a peer.
+ */
+export interface QuicBytes {
+  quicBytesSent: number
+  quicBytesReceived: number
+}
+
+/** A peer's QUIC bytes by protocol (iroh opens one connection per ALPN). */
+export interface QuicTraffic {
+  /** Plain blobs transfers, including docs entry content. */
+  blobs: QuicBytes
+  /** zstd blobs transfers. */
+  blobsZstd: QuicBytes
+  /** The docs sync protocol (entries, not their content). */
+  docs: QuicBytes
+  gossip: QuicBytes
+  /** Aster RPC (`aster/1`), every service on one connection. */
+  rpc: QuicBytes
+  /** Anything else: admission, enrollment, custom ALPNs. */
+  other: QuicBytes
 }
 
 export interface RawWtOptions {

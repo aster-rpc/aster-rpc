@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { AuditOutbox, AuditOutboxError, type AuditOutboxConfig } from '@aster-rpc/aster';
+import { AuditOutbox, AuditOutboxError, type AuditAcknowledgement, type AuditOutboxConfig } from '@aster-rpc/aster';
 
 const repo = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const receiverScript = resolve(repo, 'tests/audit_outbox/receiver.py');
@@ -121,6 +121,70 @@ describe('shared native durable audit outbox', () => {
         .rejects.toMatchObject({ kind: 'invalid_event' });
       await expect(outbox.submit({ timestampMs: -1n, kind: 'invalid', payload: {} })).rejects.toMatchObject({ kind: 'invalid_event' });
       expect((await outbox.status()).pendingRecords).toBe(0n);
+    } finally { await outbox.close(); }
+  });
+
+  it('reads, waits on and watches the acknowledgement log', async () => {
+    const directory = temporary();
+    const fixture = await startReceiver(resolve(directory, 'receiver.sqlite'));
+    const outbox = await AuditOutbox.open({ directory: resolve(directory, 'outbox'), destination: { endpoint: fixture.endpoint } });
+    try {
+      expect(await outbox.acknowledgements()).toEqual([]);
+      // Nothing to wait for: an empty page once the wait ends.
+      expect(await outbox.waitAcknowledgements(0n, 10, 20)).toEqual([]);
+
+      const controller = new AbortController();
+      const watched: AuditAcknowledgement[] = [];
+      const watching = (async () => {
+        for await (const ack of outbox.watchAcknowledgements(0n, { signal: controller.signal })) {
+          watched.push(ack);
+          if (watched.length === 2) controller.abort();
+        }
+      })();
+
+      const first = await outbox.submit({ timestampMs: 1n, kind: 'intent', payload: { n: 1 } });
+      await outbox.flush(10_000);
+      const page = await outbox.acknowledgements(0n, 10);
+      expect(page).toHaveLength(1);
+      expect(page[0]).toMatchObject({ eventId: first, sequence: 1n });
+      expect(typeof page[0].cursor).toBe('bigint');
+      expect(typeof page[0].acknowledgedAtMs).toBe('bigint');
+      expect(page[0].batchId.length).toBeGreaterThan(0);
+      expect(await outbox.acknowledgements(page[0].cursor, 10)).toEqual([]);
+
+      // A waiter after the last cursor wakes on the next acknowledgement.
+      const waiting = outbox.waitAcknowledgements(page[0].cursor, 10, 10_000);
+      const second = await outbox.submit({ timestampMs: 2n, kind: 'intent', payload: { n: 2 } });
+      const next = await waiting;
+      expect(next.map((a) => a.eventId)).toEqual([second]);
+      expect(next[0].cursor > page[0].cursor).toBe(true);
+
+      // The watch saw both, in order, and ended on abort.
+      await watching;
+      expect(watched.map((a) => a.eventId)).toEqual([first, second]);
+
+      await expect(outbox.acknowledgements(0n, 0)).rejects.toMatchObject({ kind: 'invalid_event' });
+      await expect(outbox.acknowledgements(0n, 1001)).rejects.toMatchObject({ kind: 'invalid_event' });
+      await expect(outbox.waitAcknowledgements(0n, 1, 3_600_001)).rejects.toMatchObject({ kind: 'invalid_event' });
+      await expect(outbox.acknowledgements(-1n, 1)).rejects.toMatchObject({ kind: 'invalid_event' });
+    } finally { await outbox.close(); }
+  });
+
+  it('a watch that is broken out of stops', async () => {
+    const directory = temporary();
+    const fixture = await startReceiver(resolve(directory, 'receiver.sqlite'));
+    const outbox = await AuditOutbox.open({ directory: resolve(directory, 'outbox'), destination: { endpoint: fixture.endpoint } });
+    try {
+      const id = await outbox.submit({ timestampMs: 1n, kind: 'intent', payload: {} });
+      for await (const ack of outbox.watchAcknowledgements()) {
+        expect(ack.eventId).toBe(id);
+        break;
+      }
+      // Already aborted: ends at once.
+      const done = new AbortController(); done.abort();
+      const none: unknown[] = [];
+      for await (const ack of outbox.watchAcknowledgements(0n, { signal: done.signal })) none.push(ack);
+      expect(none).toEqual([]);
     } finally { await outbox.close(); }
   });
 });

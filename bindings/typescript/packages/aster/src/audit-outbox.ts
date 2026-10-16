@@ -91,6 +91,45 @@ export interface AuditQuarantineExport {
   receipts: AuditDispositionReceipt[];
 }
 
+/**
+ * One event the receiver acknowledged as durably stored. The outbox writes it
+ * in the same local transaction that deletes the event, so an event is either
+ * still pending or in this log (until pruned by its count / age bounds).
+ * `cursor` increases with each acknowledgement and is never reused: pass the
+ * last one seen to continue reading.
+ */
+export interface AuditAcknowledgement {
+  cursor: bigint;
+  eventId: string;
+  sequence: bigint;
+  /** The batch digest the receiver echoed in its durable acknowledgement. */
+  batchId: string;
+  /** Local Unix milliseconds when the acknowledgement committed. */
+  acknowledgedAtMs: bigint;
+}
+
+/** The largest page one acknowledgement read returns. */
+export const AUDIT_ACKNOWLEDGEMENT_PAGE_MAX = 1000;
+/** The longest wait {@link AuditOutbox.waitAcknowledgements} accepts (one hour). */
+const ACK_WAIT_MAX_MS = 3_600_000;
+/** How long each read of {@link AuditOutbox.watchAcknowledgements} waits. */
+const WATCH_WAIT_MS = 30_000;
+
+function pageLimit(limit: number): number {
+  if (!Number.isInteger(limit) || limit < 1 || limit > AUDIT_ACKNOWLEDGEMENT_PAGE_MAX) {
+    throw new AuditOutboxError('invalid_event', 'acknowledgement limit must be between 1 and 1000');
+  }
+  return limit;
+}
+
+function aborted(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    const fail = () => reject(signal.reason ?? new Error('aborted'));
+    if (signal.aborted) fail();
+    else signal.addEventListener('abort', fail, { once: true });
+  });
+}
+
 function unsigned(value: bigint, kind: AuditOutboxErrorKind = 'invalid_event'): string {
   if (typeof value !== 'bigint' || value < 0n || value > 0xffff_ffff_ffff_ffffn) {
     throw new AuditOutboxError(kind, 'expected an unsigned 64-bit bigint');
@@ -130,7 +169,7 @@ const INTEGER_FIELDS = new Set([
   'dead_letter_bytes', 'disposition_receipts', 'disposition_bytes', 'retained_bytes',
   'max_retained_bytes', 'queued_records', 'queued_bytes', 'oldest_age_ms',
   'maintenance_duration_ms', 'durable_commits', 'last_group_size', 'http_status',
-  'sequence', 'timestamp_ms',
+  'sequence', 'timestamp_ms', 'cursor', 'acknowledged_at_ms',
 ]);
 function metadata(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(metadata);
@@ -202,5 +241,79 @@ export class AuditOutbox implements AsyncDisposable {
     return metadata(JSON.parse(await call(() => this.native.export(eventId)))) as AuditQuarantineExport;
   }
   async replay(eventId: string): Promise<void> { await call(() => this.native.replay(eventId)); }
+
+  /**
+   * Up to `limit` (1..1000) logged acknowledgements with a cursor greater
+   * than `after`, oldest first. Pass `0n` to start at the oldest retained
+   * entry. Pruning by the configured bounds shows as a gap in cursors, never
+   * a reordering.
+   */
+  async acknowledgements(after: bigint = 0n, limit: number = AUDIT_ACKNOWLEDGEMENT_PAGE_MAX): Promise<AuditAcknowledgement[]> {
+    const from = unsigned(after);
+    const max = pageLimit(limit);
+    return metadata(JSON.parse(await call(() => this.native.acknowledgements(from, max)))) as AuditAcknowledgement[];
+  }
+
+  /**
+   * {@link acknowledgements}, but when nothing follows `after` yet it waits
+   * up to `waitMs` (at most one hour) for the next acknowledgement. Resolves
+   * with an empty page when the wait ends first.
+   */
+  async waitAcknowledgements(after: bigint, limit: number, waitMs: number): Promise<AuditAcknowledgement[]> {
+    const from = unsigned(after);
+    const max = pageLimit(limit);
+    if (!Number.isFinite(waitMs) || waitMs < 0 || waitMs > ACK_WAIT_MAX_MS) {
+      throw new AuditOutboxError('invalid_event', 'acknowledgement wait must be between 0 and one hour');
+    }
+    return metadata(JSON.parse(await call(() => this.native.acknowledgements(from, max, waitMs)))) as AuditAcknowledgement[];
+  }
+
+  /**
+   * Every acknowledgement with a cursor greater than `after`, as they commit,
+   * until `signal` aborts (the iteration then ends), the loop breaks, or the
+   * outbox fails (the iteration throws). Lossless while entries are
+   * retained: record the last `cursor` to resume after a restart.
+   *
+   * ```ts
+   * for await (const ack of outbox.watchAcknowledgements(lastCursor, { signal })) {
+   *   markDelivered(ack.eventId);
+   *   lastCursor = ack.cursor;
+   * }
+   * ```
+   */
+  async *watchAcknowledgements(after: bigint = 0n, options: { signal?: AbortSignal } = {}): AsyncGenerator<AuditAcknowledgement, void, undefined> {
+    unsigned(after);
+    // Breaking out of the loop aborts this too, so a pending wait stops
+    // holding the generator (the native wait itself ends on its timeout).
+    const stop = new AbortController();
+    const onAbort = () => stop.abort(options.signal?.reason);
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.signal?.aborted) stop.abort(options.signal.reason);
+    const halted = aborted(stop.signal);
+    halted.catch(() => {});
+    let cursor = after;
+    try {
+      while (!stop.signal.aborted) {
+        let page: AuditAcknowledgement[];
+        try {
+          page = await Promise.race([
+            this.waitAcknowledgements(cursor, AUDIT_ACKNOWLEDGEMENT_PAGE_MAX, WATCH_WAIT_MS),
+            halted,
+          ]);
+        } catch (error) {
+          if (stop.signal.aborted) return;
+          throw error;
+        }
+        for (const ack of page) {
+          if (stop.signal.aborted) return;
+          yield ack;
+          cursor = ack.cursor;
+        }
+      }
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort);
+      stop.abort();
+    }
+  }
   async [Symbol.asyncDispose](): Promise<void> { await this.close(); }
 }

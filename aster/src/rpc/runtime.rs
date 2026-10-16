@@ -962,6 +962,15 @@ impl AsterServer {
         self.enrollment.as_ref().and_then(|e| e.issuer.as_ref())
     }
 
+    /// A cloneable handle that runs this server's drain
+    /// ([`ServerHandle::drainer`](super::ServerHandle::drainer)) without
+    /// consuming the server, for a binding that keeps it behind a lock while
+    /// the drain runs. Unlike [`drain`](Self::drain) it neither flips
+    /// readiness nor shuts the server down afterwards.
+    pub fn drainer(&self) -> super::ServerDrainer {
+        self.handle.drainer()
+    }
+
     /// Start configuring a server.
     pub fn builder() -> AsterServerBuilder {
         AsterServerBuilder::default()

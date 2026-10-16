@@ -68,6 +68,59 @@ export interface PeerView {
   /** Since when RTT has held under the cluster threshold (absent = not held). */
   clusterHeldSince?: Date;
   isConnected: boolean;
+  /**
+   * QUIC bytes on this peer's connections, by protocol, cumulative since the
+   * node started and across reconnects.
+   */
+  quicTraffic: QuicTraffic;
+  /** Exact blob payload (and zstd wire) bytes exchanged with this peer. */
+  blobTransfer: PeerBlobStats;
+}
+
+/**
+ * QUIC-level bytes (UDP datagram payload, so headers, ACKs and retransmits
+ * included) on one protocol's connections to a peer.
+ * @group Topology
+ */
+export interface QuicBytes {
+  quicBytesSent: number;
+  quicBytesReceived: number;
+}
+
+/**
+ * A peer's QUIC bytes by protocol (iroh opens one connection per ALPN).
+ * `blobs` includes docs entry content; `other` is admission, enrollment and
+ * custom ALPNs.
+ * @group Topology
+ */
+export interface QuicTraffic {
+  blobs: QuicBytes;
+  blobsZstd: QuicBytes;
+  docs: QuicBytes;
+  gossip: QuicBytes;
+  rpc: QuicBytes;
+  other: QuicBytes;
+}
+
+/**
+ * Blob transfer counters for one peer, since this node started. Monotonic.
+ * Fetch figures count when each attempt ends.
+ * @group Topology
+ */
+export interface PeerBlobStats {
+  fetchedPayloadBytes: number;
+  /** The part of `fetchedPayloadBytes` that came over zstd. */
+  fetchedZstdPayloadBytes: number;
+  /** Compressed bytes received while fetching over zstd. */
+  fetchedWireBytes: number;
+  /** Protocol bytes those decompressed to. */
+  fetchedPlainBytes: number;
+  servedPayloadBytes: number;
+  servedZstdPayloadBytes: number;
+  servedWireBytes: number;
+  servedPlainBytes: number;
+  /** Fetch attempts against this peer that fell back to plain transport. */
+  plainFallbacks: number;
 }
 
 /** One derived cluster (v2). @group Topology */
@@ -139,6 +192,8 @@ function peerOut(p: NativePeerView): PeerView {
     lastMeasured: new Date(p.lastMeasuredUnixMs),
     ...(p.clusterHeldSinceUnixMs > 0 ? { clusterHeldSince: new Date(p.clusterHeldSinceUnixMs) } : {}),
     isConnected: p.isConnected,
+    quicTraffic: { ...p.quicTraffic },
+    blobTransfer: { ...p.blobTransfer },
   };
 }
 

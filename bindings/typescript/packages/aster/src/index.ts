@@ -32,6 +32,8 @@ export {
   DataLossError,
   UnauthenticatedError,
   ContractViolationError,
+  DRAINING_DETAIL_KEY,
+  DRAIN_CLOSE_CODE,
 } from './status.js';
 
 // Types and enums
@@ -229,6 +231,7 @@ export {
   normalizeError,
   type Interceptor,
   type PeerAddr,
+  type PeerProvenance,
 } from './interceptors/base.js';
 export { RetryInterceptor } from './interceptors/retry.js';
 export { RateLimitInterceptor, type RateLimitOptions } from './interceptors/rate-limit.js';
@@ -416,6 +419,9 @@ export {
   type LadderLevel,
   type SeparationVerdict,
   type PeerView,
+  type QuicBytes,
+  type QuicTraffic,
+  type PeerBlobStats,
   type ClusterView,
   type TopologySnapshot,
   type TopologyTiming,
@@ -493,6 +499,9 @@ export type {
   AdmissionRequests,
   AuthorityReport,
   BlobStatusInfo,
+  BlobTransferCounts,
+  BlobTransferStats,
+  DrainReport,
   CollectionFetchResult,
   DocEntry,
   DocEvent,
@@ -529,6 +538,7 @@ export {
   type AsterIdentity,
   type IdentityPeer,
   type RelayModeName,
+  type DiscoveryMode,
   type HookFailureMode,
   type LogFormat,
   type LogLevel,
@@ -763,6 +773,7 @@ export {
   type AuditOutboxErrorKind, type AuditDestination, type AuditOutboxConfig,
   type AuditEvent, type AuditJson, type AuditOutboxStatus, type AuditDeliveryError,
   type AuditDispositionReceipt, type AuditQuarantineExport,
+  type AuditAcknowledgement, AUDIT_ACKNOWLEDGEMENT_PAGE_MAX,
 } from './audit-outbox.js';
 
 export { HttpListener, HttpListenerStartError, type HttpListenerOptions, type RpcAuthenticator, type RpcAuthRequest, type RpcAuthIdentity } from './http-listener.js';

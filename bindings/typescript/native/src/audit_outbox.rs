@@ -7,6 +7,10 @@ use napi_derive::napi;
 use serde_json::Value;
 use std::time::Duration;
 
+/// The longest acknowledgement wait one call accepts (the C ABI's
+/// `ASTER_AUDIT_OUTBOX_MAX_ACK_WAIT_MS`).
+const MAX_ACK_WAIT_MS: f64 = 3_600_000.0;
+
 fn native_error(e: AuditError) -> Error {
     let kind = serde_json::to_value(e.kind()).expect("error kind serializes");
     Error::new(
@@ -161,6 +165,40 @@ impl NativeAuditOutbox {
         if let Some(receipts) = value.get_mut("receipts") {
             integers_out(receipts);
         }
+        serde_json::to_string(&value).map_err(invalid)
+    }
+
+    /// Up to `limit` (1..=1000) acknowledgement-log entries with a cursor
+    /// greater than `after` (a decimal u64 string), oldest first, as JSON
+    /// with u64 values as decimal strings. With `waitMs`, waits up to that
+    /// long (at most one hour) for the next acknowledgement when none follows
+    /// `after` yet, and returns an empty page when the wait ends first.
+    #[napi]
+    pub async fn acknowledgements(
+        &self,
+        after: String,
+        limit: u32,
+        wait_ms: Option<f64>,
+    ) -> Result<String> {
+        let after: u64 = after.parse().map_err(invalid)?;
+        let limit = limit as usize;
+        let page = match wait_ms {
+            None => self.inner.acknowledgements(after, limit).await,
+            Some(ms) => {
+                if !ms.is_finite() || !(0.0..=MAX_ACK_WAIT_MS).contains(&ms) {
+                    return Err(Error::new(
+                        Status::InvalidArg,
+                        "[audit_outbox:invalid_event] acknowledgement wait must be between 0 and one hour",
+                    ));
+                }
+                self.inner
+                    .wait_acknowledgements(after, limit, Duration::from_secs_f64(ms / 1000.0))
+                    .await
+            }
+        }
+        .map_err(native_error)?;
+        let mut value = serde_json::to_value(page).map_err(invalid)?;
+        integers_out(&mut value);
         serde_json::to_string(&value).map_err(invalid)
     }
 

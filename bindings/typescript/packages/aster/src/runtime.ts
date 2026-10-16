@@ -22,6 +22,7 @@ import { createLogger, type AsterLogger } from './logging.js';
 import type {
   AsterClient as NativeAsterClient,
   DispatchServer as NativeDispatchServer,
+  DrainReport,
   HealthServer,
 } from '@aster-rpc/transport';
 import { ensureObservability } from './observability.js';
@@ -766,6 +767,38 @@ export class AsterServer {
     } catch (e) {
       if (!this._closed) throw e;
     }
+  }
+
+  /**
+   * Gracefully drain, then close (Rust `AsterServer::drain`): readiness
+   * flips to not-ready, new connections and calls are refused (clients see
+   * {@link RpcError.isDraining}), idle connections close, in-flight calls and
+   * calls on live sessions get up to `graceMs` to finish, and what still runs
+   * at the deadline is cancelled. Resolves with what the drain did once the
+   * server is closed.
+   *
+   * ```ts
+   * process.once('SIGTERM', async () => {
+   *   const report = await server.drain(30_000);
+   *   console.log(`completed ${report.callsCompleted}, cancelled ${report.callsCancelled}`);
+   * });
+   * ```
+   */
+  async drain(graceMs: number): Promise<DrainReport> {
+    if (!Number.isFinite(graceMs) || graceMs < 0) throw new RangeError('graceMs must be a non-negative number');
+    await this._starting?.catch(() => {});
+    if (this._closed || !this._rpcServer) throw new Error('server is not serving');
+    this._health?.setReady(false);
+    try {
+      return await this._rpcServer.drain(graceMs);
+    } finally {
+      await this.close();
+    }
+  }
+
+  /** Whether {@link drain} has started. */
+  get isDraining(): boolean {
+    return this._rpcServer?.isDraining ?? false;
   }
 
   /**

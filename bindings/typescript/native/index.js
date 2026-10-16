@@ -672,6 +672,7 @@ module.exports.decodeRpcStatus = nativeBinding.decodeRpcStatus
 module.exports.decodeStreamHeader = nativeBinding.decodeStreamHeader
 module.exports.decompressPayload = nativeBinding.decompressPayload
 module.exports.defaultAuthorId = nativeBinding.defaultAuthorId
+module.exports.DRAIN_CLOSE_CODE = nativeBinding.DRAIN_CLOSE_CODE
 module.exports.dynamicServiceContractId = nativeBinding.dynamicServiceContractId
 module.exports.encodeCallHeader = nativeBinding.encodeCallHeader
 module.exports.encodeFrameNative = nativeBinding.encodeFrameNative

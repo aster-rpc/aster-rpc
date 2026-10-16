@@ -23,6 +23,9 @@ const _callContextStorage = new AsyncLocalStorage<CallContext>();
 /** The `signal` of a context that is not attached to a dispatched call. */
 const NEVER_ABORTED: AbortSignal = new AbortController().signal;
 
+/** How the transport learned a call's peer id ({@link CallContext.provenance}). */
+export type PeerProvenance = 'iroh_authenticated' | 'other';
+
 /** Peer's UDP socket address when the selected QUIC path is direct. */
 export interface PeerAddr {
   host: string;
@@ -38,7 +41,17 @@ export class CallContext {
   method: string;
   callId: string;
   sessionId: string | undefined;
+  /**
+   * The transport's caller id: the iroh node id over QUIC (see
+   * {@link provenance}). Distinct from {@link principal} when an
+   * authenticator resolved one.
+   */
   peer: string | undefined;
+  /**
+   * The verified caller: the authenticator's principal when it resolved
+   * one, else {@link peer}. Attributes and `requires` are keyed by it.
+   */
+  principal: string | undefined;
   /** True only for native Iroh endpoint authentication, never an HTTP/WT auth callback. */
   readonly irohAuthenticated: boolean;
   metadata: Record<string, string>;
@@ -66,6 +79,7 @@ export class CallContext {
     callId?: string;
     sessionId?: string;
     peer?: string;
+    principal?: string;
     irohAuthenticated?: boolean;
     metadata?: Record<string, string>;
     attributes?: Record<string, string>;
@@ -83,6 +97,7 @@ export class CallContext {
     this.callId = init.callId ?? crypto.randomUUID();
     this.sessionId = init.sessionId;
     this.peer = init.peer;
+    this.principal = init.principal ?? init.peer;
     this.irohAuthenticated = init.irohAuthenticated ?? false;
     this.metadata = init.metadata ?? {};
     this._attributes = init.attributes ?? {};
@@ -175,6 +190,34 @@ export class CallContext {
    */
   get signal(): AbortSignal {
     return NEVER_ABORTED;
+  }
+
+  /**
+   * How the transport learned {@link peer}: `iroh_authenticated` (the QUIC
+   * handshake proved the node id) or `other` (any other transport: treat the
+   * id as a hint, never as an authority).
+   */
+  get provenance(): PeerProvenance {
+    return this.irohAuthenticated ? 'iroh_authenticated' : 'other';
+  }
+
+  /**
+   * Whether the call is over before the handler finished: the peer
+   * cancelled it, the stream failed under it, or its deadline passed.
+   */
+  isCancelled(): boolean {
+    return this.signal.aborted || this.expired;
+  }
+
+  /**
+   * Resolves once {@link isCancelled} becomes true (never for a call that
+   * completes normally). Race it against long work for an early exit:
+   * `await Promise.race([work(ctx.signal), ctx.cancelled()])`.
+   */
+  cancelled(): Promise<void> {
+    const signal = this.signal;
+    if (this.isCancelled()) return Promise.resolve();
+    return new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
   }
 
   /** Seconds until deadline, or undefined if no deadline set. */

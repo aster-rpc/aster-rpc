@@ -124,6 +124,43 @@ export interface AsterConfig {
   /** Local bind address, e.g. `"0.0.0.0:9000"`. `ASTER_BIND_ADDR`. */
   bindAddr?: string;
   /**
+   * IPv6 bind address, e.g. `"[::]:7842"`: pins the IPv6 socket the way
+   * `bindAddr` pins the IPv4 one (`bindAddr` must then be IPv4 or unset), so a
+   * default-deny NetworkPolicy can allow one UDP port per family. A host
+   * without IPv6 fails to start with it set. `ASTER_BIND_ADDR_V6`,
+   * `[network] bind_addr_v6`.
+   */
+  bindAddrV6?: string;
+  /**
+   * Extra `ip:port` addresses published in every discovery record, e.g. a
+   * Service or load-balancer address. Hints only: peers still verify the node
+   * key in the TLS handshake. Requires direct IP transports.
+   * `ASTER_ADVERTISE_ADDRS` (comma-separated), `[network] advertise_addrs`.
+   */
+  advertiseAddrs?: string[];
+  /**
+   * PEM CA certificate files trusted for relay TLS beside the WebPKI roots
+   * (a self-hosted relay with a private CA; also custom discovery's pkarr
+   * relays). `ASTER_RELAY_CA_CERTS` (comma-separated), `[network] relay_ca_certs`.
+   */
+  relayCaCerts?: string[];
+  /** Trust only `relayCaCerts` for relay TLS (default `false`). `ASTER_RELAY_CA_ONLY`, `[network] relay_ca_only`. */
+  relayCaOnly?: boolean;
+  /**
+   * Address lookup for dialing by bare node id: `default` (n0 at
+   * `iroh.link`), `none` (full addresses only), `local` (mDNS only) or
+   * `custom` (`discoveryDnsOrigin` / `discoveryPkarrRelays`; setting either
+   * selects it). `ASTER_DISCOVERY`, `[network] discovery`.
+   */
+  discovery?: DiscoveryMode;
+  /** DNS origin for custom discovery, e.g. `"dns.example.internal"`. `ASTER_DISCOVERY_DNS_ORIGIN`, `[network] discovery_dns_origin`. */
+  discoveryDnsOrigin?: string;
+  /**
+   * Pkarr relay URLs for custom discovery (publish and resolve).
+   * `ASTER_DISCOVERY_PKARR_RELAYS` (comma-separated), `[network] discovery_pkarr_relays`.
+   */
+  discoveryPkarrRelays?: string[];
+  /**
    * Re-bind a persistent node's last UDP ports on restart (default `true`);
    * `false` binds fresh ports and records none in `bind-ports.json`.
    * `ASTER_REUSE_LAST_PORT`, `[network] reuse_last_port`.
@@ -194,7 +231,21 @@ export interface AsterConfig {
    * `ASTER_HEALTH_ENABLED`, `[health] enabled`.
    */
   healthEnabled?: boolean;
+
+  // ── Metrics ────────────────────────────────────────────────────────────
+  /**
+   * Label `aster.peer.bytes` per peer (`aster.peer`) instead of by locality
+   * level. For small fleets and debugging: the first `metricsPeerLabelCap`
+   * peers keep their own series, later ones count under `_OTHER`. Default
+   * off. `ASTER_METRICS_PEER_LABELS`, `[metrics] peer_labels`.
+   */
+  metricsPeerLabels?: boolean;
+  /** Peers with their own `aster.peer` series (default 64). `ASTER_METRICS_PEER_LABEL_CAP`, `[metrics] peer_label_cap`. */
+  metricsPeerLabelCap?: number | bigint;
 }
+
+/** Address lookup mode ({@link AsterConfig.discovery}). @group Server and Client */
+export type DiscoveryMode = 'default' | 'none' | 'local' | 'custom';
 
 
 /**

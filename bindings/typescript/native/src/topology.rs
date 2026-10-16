@@ -83,6 +83,97 @@ pub struct PeerView {
     /// Since when RTT has held under the cluster threshold; 0 = not held.
     pub cluster_held_since_unix_ms: f64,
     pub is_connected: bool,
+    /// QUIC bytes on this peer's connections by protocol, cumulative since
+    /// the node started and across reconnects.
+    pub quic_traffic: QuicTraffic,
+    /// Exact blob payload (and zstd wire) bytes exchanged with this peer,
+    /// cumulative like `quicTraffic`.
+    pub blob_transfer: PeerBlobStats,
+}
+
+/// QUIC-level bytes (UDP datagram payload: headers, ACKs and retransmits
+/// included) on one protocol's connections to a peer.
+#[napi(object)]
+pub struct QuicBytes {
+    pub quic_bytes_sent: f64,
+    pub quic_bytes_received: f64,
+}
+
+impl From<aster::topology::QuicBytes> for QuicBytes {
+    fn from(b: aster::topology::QuicBytes) -> Self {
+        Self {
+            quic_bytes_sent: b.quic_bytes_sent as f64,
+            quic_bytes_received: b.quic_bytes_received as f64,
+        }
+    }
+}
+
+/// A peer's QUIC bytes by protocol (iroh opens one connection per ALPN).
+#[napi(object)]
+pub struct QuicTraffic {
+    /// Plain blobs transfers, including docs entry content.
+    pub blobs: QuicBytes,
+    /// zstd blobs transfers.
+    pub blobs_zstd: QuicBytes,
+    /// The docs sync protocol (entries, not their content).
+    pub docs: QuicBytes,
+    pub gossip: QuicBytes,
+    /// Aster RPC (`aster/1`), every service on one connection.
+    pub rpc: QuicBytes,
+    /// Anything else: admission, enrollment, custom ALPNs.
+    pub other: QuicBytes,
+}
+
+impl From<aster::topology::QuicTraffic> for QuicTraffic {
+    fn from(t: aster::topology::QuicTraffic) -> Self {
+        Self {
+            blobs: t.blobs.into(),
+            blobs_zstd: t.blobs_zstd.into(),
+            docs: t.docs.into(),
+            gossip: t.gossip.into(),
+            rpc: t.rpc.into(),
+            other: t.other.into(),
+        }
+    }
+}
+
+/// Blob transfer counters for one peer, since this node started. Monotonic.
+#[napi(object)]
+pub struct PeerBlobStats {
+    /// Payload bytes fetched from this peer, plain and zstd.
+    pub fetched_payload_bytes: f64,
+    /// The part of `fetchedPayloadBytes` that came over zstd.
+    pub fetched_zstd_payload_bytes: f64,
+    /// Compressed bytes received from this peer while fetching over zstd.
+    pub fetched_wire_bytes: f64,
+    /// Protocol bytes those decompressed to.
+    pub fetched_plain_bytes: f64,
+    /// Payload bytes served to this peer, plain and zstd.
+    pub served_payload_bytes: f64,
+    /// The part of `servedPayloadBytes` that went out over zstd.
+    pub served_zstd_payload_bytes: f64,
+    /// Compressed bytes sent to this peer while serving over zstd.
+    pub served_wire_bytes: f64,
+    /// Protocol bytes those were compressed from.
+    pub served_plain_bytes: f64,
+    /// Fetch attempts against this peer that fell back to plain transport.
+    pub plain_fallbacks: f64,
+}
+
+impl From<aster::topology::PeerBlobStats> for PeerBlobStats {
+    fn from(b: aster::topology::PeerBlobStats) -> Self {
+        Self {
+            fetched_payload_bytes: b.fetched_payload_bytes as f64,
+            fetched_zstd_payload_bytes: b.fetched_zstd_payload_bytes as f64,
+            fetched_wire_bytes: b.fetched_wire_bytes as f64,
+            fetched_plain_bytes: b.fetched_plain_bytes as f64,
+            served_payload_bytes: b.served_payload_bytes as f64,
+            served_zstd_payload_bytes: b.served_zstd_payload_bytes as f64,
+            served_wire_bytes: b.served_wire_bytes as f64,
+            served_plain_bytes: b.served_plain_bytes as f64,
+            plain_fallbacks: b.plain_fallbacks as f64,
+        }
+    }
 }
 
 impl From<RsPeerView> for PeerView {
@@ -106,6 +197,8 @@ impl From<RsPeerView> for PeerView {
             last_measured_unix_ms: p.last_measured_unix_ms as f64,
             cluster_held_since_unix_ms: p.cluster_held_since_unix_ms as f64,
             is_connected: p.is_connected,
+            quic_traffic: p.quic_traffic.into(),
+            blob_transfer: p.blob_transfer.into(),
         }
     }
 }

@@ -15,8 +15,9 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use aster::{
-    AsterConfig as RsConfig, AsterIdentityPeer, EnrollmentConfig as RsEnrollmentConfig,
-    EnrollmentLimits as RsEnrollmentLimits, HookFailureMode, LoadedIdentity, PublicKey, RelayMode,
+    AsterConfig as RsConfig, AsterIdentityPeer, DiscoveryMode,
+    EnrollmentConfig as RsEnrollmentConfig, EnrollmentLimits as RsEnrollmentLimits,
+    HookFailureMode, LoadedIdentity, PublicKey, RelayMode,
     RoleMappingConfig as RsRoleMappingConfig, SecretKey,
 };
 
@@ -93,6 +94,35 @@ pub struct JsAsterConfig {
     pub relay_urls: Option<Vec<String>>,
     /// Local bind address, e.g. `"0.0.0.0:9000"`. `ASTER_BIND_ADDR`.
     pub bind_addr: Option<String>,
+    /// IPv6 bind address, e.g. `"[::]:7842"`: pins the IPv6 socket the way
+    /// `bindAddr` pins the IPv4 one (which must then be IPv4 or unset). A
+    /// host without IPv6 fails to start with it set. `ASTER_BIND_ADDR_V6`,
+    /// `[network] bind_addr_v6`.
+    pub bind_addr_v6: Option<String>,
+    /// Extra `ip:port` addresses published in discovery records (hints:
+    /// peers still verify this node's key). Requires direct IP transports.
+    /// `ASTER_ADVERTISE_ADDRS` (comma-separated), `[network] advertise_addrs`.
+    pub advertise_addrs: Option<Vec<String>>,
+    /// PEM CA certificate files trusted for relay TLS (and custom
+    /// discovery's pkarr relays) beside the WebPKI roots.
+    /// `ASTER_RELAY_CA_CERTS` (comma-separated), `[network] relay_ca_certs`.
+    pub relay_ca_certs: Option<Vec<String>>,
+    /// Trust only `relayCaCerts` for relay TLS (default false).
+    /// `ASTER_RELAY_CA_ONLY`, `[network] relay_ca_only`.
+    pub relay_ca_only: Option<bool>,
+    /// Address lookup: `"default"` (n0 at `iroh.link`), `"none"`, `"local"`
+    /// (mDNS only) or `"custom"` (`discoveryDnsOrigin` /
+    /// `discoveryPkarrRelays`; setting either selects it).
+    /// `ASTER_DISCOVERY`, `[network] discovery`.
+    #[napi(ts_type = "'default' | 'none' | 'local' | 'custom'")]
+    pub discovery: Option<String>,
+    /// DNS origin for custom discovery, e.g. `"dns.example.internal"`.
+    /// `ASTER_DISCOVERY_DNS_ORIGIN`, `[network] discovery_dns_origin`.
+    pub discovery_dns_origin: Option<String>,
+    /// Pkarr relay URLs for custom discovery (publish and resolve).
+    /// `ASTER_DISCOVERY_PKARR_RELAYS` (comma-separated),
+    /// `[network] discovery_pkarr_relays`.
+    pub discovery_pkarr_relays: Option<Vec<String>>,
     /// Re-bind a persistent node's last UDP ports on restart (default true).
     /// `ASTER_REUSE_LAST_PORT`, `[network] reuse_last_port`.
     pub reuse_last_port: Option<bool>,
@@ -163,6 +193,15 @@ pub struct JsAsterConfig {
     /// off (`false`). Unset: on exactly when `healthPort` is non-zero.
     /// `ASTER_HEALTH_ENABLED`, `[health] enabled`.
     pub health_enabled: Option<bool>,
+    // ── Metrics ──────────────────────────────────────────────────────────
+    /// Label `aster.peer.bytes` per peer (`aster.peer`) instead of by
+    /// locality level; the first `metricsPeerLabelCap` peers keep their own
+    /// series, later ones count under `_OTHER`. Default off.
+    /// `ASTER_METRICS_PEER_LABELS`, `[metrics] peer_labels`.
+    pub metrics_peer_labels: Option<bool>,
+    /// Peers with their own `aster.peer` series (default 64).
+    /// `ASTER_METRICS_PEER_LABEL_CAP`, `[metrics] peer_label_cap`.
+    pub metrics_peer_label_cap: Option<U64Value>,
 }
 
 /// `[enrollment.limits]`: overrides of the Enrollment defaults
@@ -449,6 +488,31 @@ fn parse_relay(mode: Option<&str>, urls: Option<&Vec<String>>) -> Result<Option<
     }
 }
 
+/// The discovery mode for `discovery` plus the custom servers, with the
+/// Rust loaders' rule: servers alone select `custom`. `default` beside
+/// servers is what `{ ...AsterConfig.fromEnv(), discoveryDnsOrigin }`
+/// produces, so the servers win there as they do for `relayUrls`.
+fn parse_discovery(
+    mode: Option<&str>,
+    dns_origin: Option<&str>,
+    pkarr_relays: Option<&Vec<String>>,
+) -> Result<Option<DiscoveryMode>> {
+    let servers = dns_origin.is_some_and(|o| !o.trim().is_empty())
+        || pkarr_relays.is_some_and(|r| !r.is_empty());
+    let parsed = mode
+        .filter(|m| !m.trim().is_empty())
+        .map(|m| DiscoveryMode::parse(m).map_err(|e| invalid(format!("discovery: {e}"))))
+        .transpose()?;
+    match parsed {
+        Some(DiscoveryMode::None | DiscoveryMode::Local) if servers => Err(invalid(format!(
+            "discoveryDnsOrigin / discoveryPkarrRelays require discovery \"custom\", got {:?}",
+            mode.unwrap_or_default()
+        ))),
+        _ if servers => Ok(Some(DiscoveryMode::Custom)),
+        other => Ok(other),
+    }
+}
+
 impl JsAsterConfig {
     /// Lower onto [`aster::AsterConfig`]; unset fields keep the Rust defaults.
     pub(crate) fn to_rust(&self) -> Result<RsConfig> {
@@ -495,6 +559,30 @@ impl JsAsterConfig {
             c.relay_mode = mode;
         }
         c.bind_addr = self.bind_addr.clone();
+        c.bind_addr_v6 = self.bind_addr_v6.clone();
+        if let Some(v) = &self.advertise_addrs {
+            c.advertise_addrs = v.clone();
+        }
+        if let Some(v) = &self.relay_ca_certs {
+            c.relay_ca_certs = v.iter().map(PathBuf::from).collect();
+        }
+        if let Some(v) = self.relay_ca_only {
+            c.relay_ca_only = v;
+        }
+        if let Some(mode) = parse_discovery(
+            self.discovery.as_deref(),
+            self.discovery_dns_origin.as_deref(),
+            self.discovery_pkarr_relays.as_ref(),
+        )? {
+            c.discovery = mode;
+        }
+        c.discovery_dns_origin = self
+            .discovery_dns_origin
+            .clone()
+            .filter(|o| !o.trim().is_empty());
+        if let Some(v) = &self.discovery_pkarr_relays {
+            c.discovery_pkarr_relays = v.clone();
+        }
         if let Some(v) = self.reuse_last_port {
             c.reuse_last_port = v;
         }
@@ -602,6 +690,12 @@ impl JsAsterConfig {
             c.health_host = v.clone();
         }
         c.health_enabled = self.health_enabled;
+        if let Some(v) = self.metrics_peer_labels {
+            c.metrics_peer_labels = v;
+        }
+        if let Some(v) = &self.metrics_peer_label_cap {
+            c.metrics_peer_label_cap = usize_in("metricsPeerLabelCap", v)?;
+        }
         Ok(c)
     }
 
@@ -637,6 +731,18 @@ impl JsAsterConfig {
             relay_mode: Some(relay_mode.to_string()),
             relay_urls,
             bind_addr: c.bind_addr.clone(),
+            bind_addr_v6: c.bind_addr_v6.clone(),
+            advertise_addrs: Some(c.advertise_addrs.clone()),
+            relay_ca_certs: Some(
+                c.relay_ca_certs
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            relay_ca_only: Some(c.relay_ca_only),
+            discovery: Some(c.discovery.as_str().to_string()),
+            discovery_dns_origin: c.discovery_dns_origin.clone(),
+            discovery_pkarr_relays: Some(c.discovery_pkarr_relays.clone()),
             reuse_last_port: Some(c.reuse_last_port),
             local_discovery: Some(c.local_discovery),
             enable_monitoring: Some(c.enable_monitoring),
@@ -675,6 +781,8 @@ impl JsAsterConfig {
             health_port: Some(u32::from(c.health_port)),
             health_host: Some(c.health_host.clone()),
             health_enabled: c.health_enabled,
+            metrics_peer_labels: Some(c.metrics_peer_labels),
+            metrics_peer_label_cap: Some(u64_out(c.metrics_peer_label_cap as u64)),
         }
     }
 }

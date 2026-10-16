@@ -93,6 +93,10 @@ pub const FLAG_HAS_TRACE: u32 = 0x400;
 /// `flags` bit: the event carries `baggage` and/or `tracestate` (the caller's
 /// W3C headers, hidden from `metadata`), whether or not the span is exported.
 pub const FLAG_HAS_INBOUND_TRACE: u32 = 0x800;
+/// `flags` bit: an `Authenticator` resolved a principal other than the
+/// transport's caller id; `peer` is that principal and `transportPeer` the
+/// transport's id (C ABI `ASTER_DISPATCH_FLAG_HAS_PRINCIPAL`).
+pub const FLAG_HAS_PRINCIPAL: u32 = 0x1000;
 
 /// One dispatch event, flattened for JS. Fields that do not apply to the
 /// event's `kind` are `0` (numbers) or absent.
@@ -127,6 +131,10 @@ pub struct JsDispatchEvent {
     /// Peer endpoint id (or authenticator principal); calls and
     /// connection-closed only.
     pub peer: Option<String>,
+    /// The transport's caller id when an `Authenticator` resolved a
+    /// different principal (`flags & HAS_PRINCIPAL`; `peer` is then the
+    /// principal). Absent when `peer` is the transport's id.
+    pub transport_peer: Option<String>,
     /// The first request payload, already decompressed; calls only.
     pub request: Option<Buffer>,
     /// Call metadata (header), when non-empty.
@@ -161,6 +169,7 @@ struct Ev {
     wire_call_id: i32,
     session_id: i32,
     peer: Option<Arc<str>>,
+    transport_peer: Option<Arc<str>>,
     request: Option<Vec<u8>>,
     metadata: Option<Vec<(String, String)>>,
     attributes: Option<Vec<(String, String)>>,
@@ -185,6 +194,7 @@ impl Ev {
             wire_call_id: 0,
             session_id: 0,
             peer: None,
+            transport_peer: None,
             request: None,
             metadata: None,
             attributes: None,
@@ -209,6 +219,7 @@ impl Ev {
             wire_call_id: self.wire_call_id,
             session_id: self.session_id,
             peer: self.peer.map(|p| p.to_string()),
+            transport_peer: self.transport_peer.map(|p| p.to_string()),
             // External buffer over the Vec: no copy.
             request: self.request.map(Buffer::from),
             metadata: self.metadata.map(|m| m.into_iter().collect()),
@@ -274,6 +285,9 @@ impl Shared {
                     }
                     .traceparent()
                 });
+                if call.transport_peer_id.is_some() {
+                    flags |= FLAG_HAS_PRINCIPAL;
+                }
                 let (baggage, tracestate) = match &call.inbound_trace {
                     Some(t) => {
                         flags |= FLAG_HAS_INBOUND_TRACE;
@@ -297,6 +311,7 @@ impl Shared {
                     wire_call_id: call.wire_call_id,
                     session_id: header.session_id,
                     peer: Some(call.peer_id),
+                    transport_peer: call.transport_peer_id,
                     request: Some(call.request),
                     metadata,
                     attributes,
@@ -794,6 +809,50 @@ pub struct DispatchServerOptions {
     pub handler_timeout_ms: Option<f64>,
 }
 
+/// What `DispatchServer.drain` did. Calls count those admitted to a handler,
+/// not those refused at routing.
+#[napi(object)]
+pub struct DrainReport {
+    /// Calls in flight when the drain started.
+    pub calls_in_flight: f64,
+    /// Calls that finished before the deadline (those in flight at the start
+    /// and calls on existing sessions admitted during the drain).
+    pub calls_completed: f64,
+    /// Calls still running at the deadline, cancelled by closing their
+    /// connection.
+    pub calls_cancelled: f64,
+    /// New calls answered `UNAVAILABLE` (draining) during the drain.
+    pub calls_refused: f64,
+    /// Connections the drain closed with the drain close code (503).
+    pub connections_closed: f64,
+    /// New connections refused at accept during the drain.
+    pub connections_refused: f64,
+    /// Whether the deadline passed with work outstanding.
+    pub deadline_reached: bool,
+    /// How long the drain took, ms.
+    pub elapsed_ms: f64,
+}
+
+impl From<aster::rpc::DrainReport> for DrainReport {
+    fn from(r: aster::rpc::DrainReport) -> Self {
+        Self {
+            calls_in_flight: r.calls_in_flight as f64,
+            calls_completed: r.calls_completed as f64,
+            calls_cancelled: r.calls_cancelled as f64,
+            calls_refused: r.calls_refused as f64,
+            connections_closed: r.connections_closed as f64,
+            connections_refused: r.connections_refused as f64,
+            deadline_reached: r.deadline_reached,
+            elapsed_ms: r.elapsed.as_secs_f64() * 1000.0,
+        }
+    }
+}
+
+/// The QUIC application close code a draining server closes connections with.
+#[napi]
+pub const DRAIN_CLOSE_CODE: u32 = 503;
+const _: () = assert!(aster::rpc::DRAIN_CLOSE_CODE == DRAIN_CLOSE_CODE as u64);
+
 /// What a `start` server owns beyond the running `AsterServer`.
 struct Owned {
     node: aster::Node,
@@ -828,6 +887,7 @@ pub(crate) enum Running {
 pub struct DispatchServer {
     runtime: tokio::runtime::Handle,
     dispatcher: Dispatcher,
+    drainer: aster::rpc::ServerDrainer,
     http_children: Arc<Mutex<Vec<HttpOwner>>>,
     pub(crate) running: Arc<tokio::sync::Mutex<Option<Running>>>,
     table: CallTable,
@@ -1092,9 +1152,14 @@ impl Sinks {
             // left its events queued; schedule another for them.
             s.notify();
         }
+        let drainer = match &running {
+            Running::Own(server) => server.drainer(),
+            Running::Attached(handle) => handle.drainer(),
+        };
         DispatchServer {
             runtime: tokio::runtime::Handle::current(),
             dispatcher,
+            drainer,
             http_children: Arc::new(Mutex::new(Vec::new())),
             running: Arc::new(tokio::sync::Mutex::new(Some(running))),
             table,
@@ -1777,6 +1842,50 @@ impl DispatchServer {
     /// Stop serving (and, for `start`, shut the node down). Releases the
     /// event callback and resolves any pending `nextBatch` with `[]`.
     /// Untaken non-RPC connections are closed.
+    /// Drain the server (Rust `aster::rpc::drain`): refuse new connections
+    /// (QUIC close `DRAIN_CLOSE_CODE`) and new calls (`UNAVAILABLE` with
+    /// detail `aster.draining`), close connections as they go idle, let
+    /// in-flight calls and calls on live sessions run until `graceMs`, then
+    /// close what remains, which cancels it. A `start` server's Rust health
+    /// listener reports not ready from the start of the drain.
+    ///
+    /// Serving stops refusing only at `close()`, which should follow. A call
+    /// while a drain runs moves its deadline earlier when `graceMs` ends
+    /// sooner and resolves with the same report; a call after it ended
+    /// resolves with that report again. Rejects after `close()`.
+    #[napi]
+    pub async fn drain(&self, grace_ms: f64) -> Result<DrainReport> {
+        if !grace_ms.is_finite() || grace_ms < 0.0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "graceMs must be a non-negative number",
+            ));
+        }
+        {
+            let running = self.running.lock().await;
+            match running.as_ref() {
+                Some(Running::Own(server)) => {
+                    if let Some(health) = server.health() {
+                        health.set_ready(false);
+                    }
+                }
+                Some(Running::Attached(_)) => {}
+                None => return Err(Error::from_reason("the server is closed")),
+            }
+        }
+        let report = self
+            .drainer
+            .drain(Duration::from_secs_f64(grace_ms / 1000.0))
+            .await;
+        Ok(report.into())
+    }
+
+    /// Whether `drain` has started.
+    #[napi(getter)]
+    pub fn is_draining(&self) -> bool {
+        self.drainer.is_draining()
+    }
+
     #[napi]
     pub async fn close(&self) -> Result<()> {
         let mut running = self.running.lock().await;

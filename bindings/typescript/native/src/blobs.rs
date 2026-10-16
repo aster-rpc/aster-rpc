@@ -100,6 +100,19 @@ pub struct ProviderOutcome {
     pub failures: u32,
     /// Requests this provider carried to completion.
     pub completed_requests: u32,
+    /// Requests mid-attempt against this provider when the report was taken
+    /// (always 0 in a finished fetch's report).
+    pub in_flight: u32,
+    /// Attempts that went over plain transport because this provider does
+    /// not serve compressed blobs (still counted in `failures` or
+    /// `completedRequests`).
+    pub plain_fallbacks: u32,
+    /// Payload bytes this provider carried, failed attempts included. Summed
+    /// over all providers this is the report's `bytesTransferred`.
+    pub bytes_transferred: f64,
+    /// Compressed bytes received from this provider over zstd; absent when
+    /// every attempt against it went over plain transport.
+    pub wire_bytes: Option<f64>,
 }
 
 /// What a multi-provider fetch did — feed it back into provider ranking.
@@ -113,6 +126,12 @@ pub struct FetchReport {
     pub failed: Vec<String>,
     /// Providers that completed at least one request.
     pub served: Vec<String>,
+    /// Providers that were mid-attempt when the report was taken (empty for a
+    /// finished fetch).
+    pub in_flight: Vec<String>,
+    /// Providers that do not serve compressed blobs and were fetched from
+    /// over plain transport: cache them as plain-only, not as bad providers.
+    pub plain_only: Vec<String>,
     /// Payload bytes pulled off the wire (a transfer metric, not a size).
     pub bytes_transferred: f64,
 }
@@ -126,6 +145,8 @@ impl From<aster::FetchReport> for FetchReport {
             attempted: ids(&mut r.attempted()),
             failed: ids(&mut r.failed()),
             served: ids(&mut r.served()),
+            in_flight: ids(&mut r.in_flight()),
+            plain_only: ids(&mut r.plain_only()),
             bytes_transferred: r.bytes_transferred() as f64,
             providers: r
                 .providers()
@@ -135,8 +156,91 @@ impl From<aster::FetchReport> for FetchReport {
                     attempts: p.attempts(),
                     failures: p.failures(),
                     completed_requests: p.completed_requests(),
+                    in_flight: p.in_flight(),
+                    plain_fallbacks: p.plain_fallbacks(),
+                    bytes_transferred: p.bytes_transferred() as f64,
+                    wire_bytes: p.wire_bytes().map(|b| b as f64),
                 })
                 .collect(),
+        }
+    }
+}
+
+/// Transfers by encoding and result.
+#[napi(object)]
+pub struct BlobTransferCounts {
+    pub plain_ok: f64,
+    pub plain_failed: f64,
+    pub zstd_ok: f64,
+    pub zstd_failed: f64,
+}
+
+impl From<aster::BlobTransferCounts> for BlobTransferCounts {
+    fn from(c: aster::BlobTransferCounts) -> Self {
+        Self {
+            plain_ok: c.plain_ok as f64,
+            plain_failed: c.plain_failed as f64,
+            zstd_ok: c.zstd_ok as f64,
+            zstd_failed: c.zstd_failed as f64,
+        }
+    }
+}
+
+/// Blob transfer counters for the whole node (every client and the serving
+/// side, plain and zstd), since it started. Monotonic.
+///
+/// Payload is blob content as decoded: compression coverage is
+/// `*ZstdPayloadBytes / *PayloadBytes`, and its saving is
+/// `*PlainBytes - *WireBytes` over the compressed subset.
+#[napi(object)]
+pub struct BlobTransferStats {
+    /// Payload bytes this node fetched, plain and zstd.
+    pub fetched_payload_bytes: f64,
+    /// The part of `fetchedPayloadBytes` that came over zstd.
+    pub fetched_zstd_payload_bytes: f64,
+    /// Compressed bytes received while fetching over zstd.
+    pub fetched_wire_bytes: f64,
+    /// Protocol bytes those decompressed to.
+    pub fetched_plain_bytes: f64,
+    /// Payload bytes this node served, plain and zstd.
+    pub served_payload_bytes: f64,
+    /// The part of `servedPayloadBytes` that went out over zstd.
+    pub served_zstd_payload_bytes: f64,
+    /// Compressed bytes sent while serving over zstd.
+    pub served_wire_bytes: f64,
+    /// Protocol bytes those were compressed from.
+    pub served_plain_bytes: f64,
+    /// Fetch attempts that went plain because the provider does not serve zstd.
+    pub plain_fallbacks: f64,
+    /// Requests this node served over plain transport.
+    pub plain_serves: f64,
+    /// Fetch attempts by encoding and result.
+    pub fetch_transfers: BlobTransferCounts,
+    /// Served requests by encoding and result.
+    pub serve_transfers: BlobTransferCounts,
+    /// Fetched zstd streams that failed on malformed or truncated zstd data.
+    pub fetch_decode_errors: f64,
+    /// Served zstd streams that failed the same way.
+    pub serve_decode_errors: f64,
+}
+
+impl From<aster::BlobTransferStats> for BlobTransferStats {
+    fn from(s: aster::BlobTransferStats) -> Self {
+        Self {
+            fetched_payload_bytes: s.fetched_payload_bytes as f64,
+            fetched_zstd_payload_bytes: s.fetched_zstd_payload_bytes as f64,
+            fetched_wire_bytes: s.fetched_wire_bytes as f64,
+            fetched_plain_bytes: s.fetched_plain_bytes as f64,
+            served_payload_bytes: s.served_payload_bytes as f64,
+            served_zstd_payload_bytes: s.served_zstd_payload_bytes as f64,
+            served_wire_bytes: s.served_wire_bytes as f64,
+            served_plain_bytes: s.served_plain_bytes as f64,
+            plain_fallbacks: s.plain_fallbacks as f64,
+            plain_serves: s.plain_serves as f64,
+            fetch_transfers: s.fetch_transfers.into(),
+            serve_transfers: s.serve_transfers.into(),
+            fetch_decode_errors: s.fetch_decode_errors as f64,
+            serve_decode_errors: s.serve_decode_errors as f64,
         }
     }
 }
@@ -170,6 +274,13 @@ pub struct CollectionFetchResult {
 
 #[napi]
 impl BlobsClient {
+    /// Blob transfer counters for this node (every client and the serving
+    /// side, plain and zstd), since it started.
+    #[napi]
+    pub fn transfer_stats(&self) -> BlobTransferStats {
+        self.blobs.transfer_stats().into()
+    }
+
     /// Add bytes to the blob store, returning the hash hex string.
     #[napi]
     pub async fn add_bytes(&self, data: Buffer) -> Result<String> {

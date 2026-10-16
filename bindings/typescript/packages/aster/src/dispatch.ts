@@ -23,7 +23,7 @@ import { HttpListener, type HttpListenerOptions, type RpcAuthenticator } from '.
  * aborts it too.
  */
 
-import type { AsterConfig as NativeAsterConfig, IrohConnection } from '@aster-rpc/transport';
+import type { AsterConfig as NativeAsterConfig, DrainReport, IrohConnection } from '@aster-rpc/transport';
 import { toNativeConfig, type AsterConfig } from './config.js';
 import type { Codec } from './codec.js';
 import { createXlangCodec } from './xlang.js';
@@ -132,14 +132,24 @@ class DispatchCallContext extends CallContext {
   ) {
     super(init);
     if (connectionId) this._transport = () => native.transportSnapshot(connectionId) as any;
-    if (attributes && !init.attributes && init.peer) {
-      const peer = init.peer;
-      this._attributesLoader = () => attributes(peer);
+    const principal = init.principal ?? init.peer;
+    if (attributes && !init.attributes && principal) {
+      this._attributesLoader = () => attributes(principal);
     }
   }
 
   override get signal(): AbortSignal {
     return this.state.signal();
+  }
+
+  override isCancelled(): boolean {
+    // Rust enforces the deadline and reports it as a cancel event; the clock
+    // check covers the moment between the deadline and that event.
+    return this.state.cancelled !== 0 || this.expired;
+  }
+
+  override cancelled(): Promise<void> {
+    return this.state.whenCancelled();
   }
 }
 
@@ -313,6 +323,24 @@ export class RpcServer {
     return listener;
   }
 
+  /**
+   * Drain (Rust `aster::rpc::drain`): refuse new connections and calls
+   * (`UNAVAILABLE`, {@link RpcError.isDraining}), close connections as they
+   * go idle, let in-flight calls and calls on live sessions run until
+   * `graceMs`, then close what remains, cancelling it. The server keeps
+   * refusing until {@link close}, which should follow. A second call while
+   * a drain runs resolves with the same report.
+   */
+  async drain(graceMs: number): Promise<DrainReport> {
+    if (!this.native || this.closing) throw new Error('RPC server is not running');
+    return this.native.drain(graceMs);
+  }
+
+  /** Whether {@link drain} has started. */
+  get isDraining(): boolean {
+    return this.native?.isDraining ?? false;
+  }
+
   /** Stop serving. The node stays up. */
   close(): Promise<void> {
     if (this.closing) return this.closing;
@@ -433,7 +461,10 @@ export class RpcServer {
         method: m.name,
         callId: String(ev.wireCallId || id),
         sessionId: ev.sessionId ? String(ev.sessionId) : undefined,
-        peer: ev.peer ?? undefined,
+        // With `HasPrincipal`, `peer` is the authenticator's principal and
+        // `transportPeer` the transport's caller id.
+        peer: ev.transportPeer ?? ev.peer ?? undefined,
+        principal: ev.peer ?? undefined,
         irohAuthenticated: !!(ev.flags & DispatchFlags.IrohAuthenticated),
         metadata: ev.metadata ?? {},
         attributes: ev.attributes ?? undefined,
@@ -451,7 +482,7 @@ export class RpcServer {
     try {
       const instance = this.instanceFor(svc, ev);
       run = withRequestContext(
-        { service: svc.info.name, method: m.name, requestId: ctx.callId, peer: ctx.peer },
+        { service: svc.info.name, method: m.name, requestId: ctx.callId, peer: ctx.principal },
         // The call's server span is the current trace context for the handler.
         () => withInboundTrace(ev.traceparent, ev.baggage, () => this.run(srv, ev, m, instance, ctx, state)),
       );
@@ -582,11 +613,15 @@ export class RpcServer {
   ): Promise<void> {
     const ints = this.interceptors;
     const iterable = await source;
-    const it = iterable[Symbol.asyncIterator]();
+    // An async generator's body runs on `next()`, not when the handler
+    // returns it: resume it inside the call's context so
+    // `CallContext.current()` works there too.
+    const it = CallContext.runWith(ctx, () => iterable[Symbol.asyncIterator]());
+    const next = () => CallContext.runWith(ctx, () => it.next());
     const cancelled = state.whenCancelled().then((): typeof CANCELLED => CANCELLED);
     try {
       while (true) {
-        const step = await Promise.race([it.next(), cancelled]);
+        const step = await Promise.race([next(), cancelled]);
         if (step === CANCELLED || state.cancelled) return;
         if (step.done) break;
         let item = step.value;
@@ -605,7 +640,7 @@ export class RpcServer {
     } finally {
       if (state.cancelled) {
         // Let the generator run its `finally` blocks.
-        void Promise.resolve(it.return?.()).catch(() => {});
+        void Promise.resolve(CallContext.runWith(ctx, () => it.return?.())).catch(() => {});
       }
     }
   }

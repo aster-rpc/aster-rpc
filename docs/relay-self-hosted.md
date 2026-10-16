@@ -216,12 +216,13 @@ ConfigMap or Secret:
 | Environment | `ASTER_RELAY_CA_CERTS=/etc/aster/relay-ca.pem` (comma-separated for several), `ASTER_RELAY_CA_ONLY=true` |
 | `aster.toml` | `[network]` `relay_ca_certs = ["/etc/aster/relay-ca.pem"]`, `relay_ca_only = true` |
 | Go | `cfg.RelayCACerts = []string{"/etc/aster/relay-ca.pem"}; cfg.RelayCAOnly = true` |
+| TypeScript | `relayCaCerts: ["/etc/aster/relay-ca.pem"], relayCaOnly: true` in the `AsterConfig` |
 | C ABI (7.3) | `aster_network_config_t.relay_ca_certs`, `.relay_ca_only`, set with `aster_config_set_network` |
 
 The CAs are trusted in addition to the WebPKI roots; `relay_ca_only` trusts
 them alone. A file that is missing, unreadable or holds no `CERTIFICATE` block
-fails the node's start. Python, TypeScript, Java and .NET read these settings
-in a later release.
+fails the node's start. Python, Java and .NET read these settings in a later
+release.
 
 This is transport security for the hop to the relay. It does not affect peer
 identity: traffic between two nodes is end-to-end encrypted and authenticated
@@ -305,5 +306,7 @@ relay_mode = "disabled"           # direct only, or relay_urls = [...] for a pri
   probes upward, so a 1450-byte overlay (flannel VXLAN) works.
 
 Go: `cfg.BindAddr`, `cfg.BindAddrV6`, `cfg.AdvertiseAddrs`, `cfg.Discovery =
-aster.DiscoveryNone`, `cfg.RelayMode = "disabled"` (C ABI 7.3). Python,
-TypeScript, Java and .NET pick these settings up in a later release.
+aster.DiscoveryNone`, `cfg.RelayMode = "disabled"` (C ABI 7.3). TypeScript:
+`bindAddr`, `bindAddrV6`, `advertiseAddrs`, `discovery: 'none'`,
+`discoveryDnsOrigin`, `discoveryPkarrRelays`, `relayMode: 'disabled'` in the
+`AsterConfig`. Python, Java and .NET pick these settings up in a later release.

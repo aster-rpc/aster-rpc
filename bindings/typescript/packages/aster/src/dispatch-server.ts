@@ -73,6 +73,8 @@ export const DispatchFlags = {
   HasMetadata: 0x100,
   /** The event carries `attributes`. */
   HasAttributes: 0x200,
+  /** An authenticator resolved a principal other than the transport peer (`transportPeer` is set). */
+  HasPrincipal: 0x1000,
 } as const;
 
 /** Results of the native `respond` / `send` / `finish` (`> 0` = queue full, bytes needed). */

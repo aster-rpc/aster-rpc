@@ -71,6 +71,11 @@ export function statusName(code: StatusCode): string {
  * Base error class for Aster RPC errors.
  * @group Errors
  */
+/** The `RpcStatus` detail key a draining server sets (value `"true"`). */
+export const DRAINING_DETAIL_KEY = 'aster.draining';
+/** The QUIC application close code a draining server closes connections with. */
+export const DRAIN_CLOSE_CODE = 503;
+
 export class RpcError extends Error {
   readonly code: StatusCode;
   readonly details: Record<string, string>;
@@ -84,6 +89,16 @@ export class RpcError extends Error {
     this.name = 'RpcError';
     this.code = code;
     this.details = details ?? {};
+  }
+
+  /**
+   * Whether this is a draining server's answer: `UNAVAILABLE` with the
+   * `aster.draining` detail, for a call it refused or a connection it closed
+   * with the drain close code. Retrying on the same connection cannot
+   * succeed; reconnect to another replica.
+   */
+  get isDraining(): boolean {
+    return this.code === StatusCode.UNAVAILABLE && Object.hasOwn(this.details, DRAINING_DETAIL_KEY);
   }
 
   /** Create the most specific RpcError subclass for a status code. */

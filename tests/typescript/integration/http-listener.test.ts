@@ -187,7 +187,10 @@ describe('authenticated HTTP listener', () => {
       for (const principal of ['alice', 'bob', 'alice']) {
         expect(await call(listener.tcpAddr, 'unary', [[1, 255]], principal, client)).toEqual({ code: 0, data: [[1, 255]] });
         const context = service.calls.at(-1)!;
-        expect(context.peer).toBe(principal);
+        // The authenticator's principal; the transport's caller id stays `peer`.
+        expect(context.principal).toBe(principal);
+        expect(context.peer).toMatch(/^socket:\/\/127\.0\.0\.1:\d+$/);
+        expect(context.provenance).toBe('other');
         expect(context.attributes).toEqual({ 'aster.role': 'admin', tenant: principal === 'bob' ? 'b' : 'a' });
         expect(context.irohAuthenticated).toBe(false);
         expect(context.peerAddr).toBeUndefined();
