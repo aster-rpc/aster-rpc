@@ -47,6 +47,9 @@ pub mod proxy;
 pub mod runtime;
 pub mod scalars;
 pub mod server;
+#[cfg(all(feature = "binding-support", feature = "enrollment", feature = "docs"))]
+#[doc(hidden)]
+pub mod server_identity;
 mod sessions;
 pub mod status;
 pub mod streaming;

@@ -62,3 +62,14 @@ pub mod enrollment {
         plan, serve_inbound_enrollment, Installed, Overrides, Plan, Side,
     };
 }
+
+/// Gateway identity from `AsterConfig` for a server a binding builds itself
+/// (the C ABI): `[identity]` validation, the issuer-key cache and watcher,
+/// the publisher and `aster.ops.NodeConfig`, wired as `AsterServer` wires
+/// them.
+#[cfg(all(feature = "enrollment", feature = "rpc", feature = "docs"))]
+pub mod identity {
+    pub use crate::rpc::server_identity::{
+        client_publisher_plan, plan, IdentityPlan, PendingIdentity, ServerIdentity,
+    };
+}
