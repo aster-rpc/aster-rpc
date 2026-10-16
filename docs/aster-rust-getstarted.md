@@ -199,6 +199,8 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `trusted_issuer(TrustedIssuer)` / `trusted_issuers([..])` | `ASTER_IDENTITY_TRUSTED_ISSUERS` (JSON array) | `[[identity.trusted_issuers]]` | identity providers whose forwarded tokens are accepted (§4.7.1.1); each needs `audiences`; needs `[enrollment]` |
 | `edge_token_max_lifetime_secs(n)` | `ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS` | `[identity] edge_token_max_lifetime_secs` | default and maximum `300` |
 | `clock_leeway_secs(n)` | `ASTER_IDENTITY_CLOCK_LEEWAY_SECS` | `[identity] clock_leeway_secs` | default `60`, at most `300`; applies to `iat`/`nbf`, never `exp` |
+| `max_key_set_age_secs(n)` | `ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS` | `[identity] max_key_set_age_secs` | default `172800` (48 h), `60..=2592000`: an issuer key set older than this verifies nothing (§4.7.1.1) |
+| `identity_publisher(IdentityPublisherConfig)` | `ASTER_IDENTITY_PUBLISHER` (JSON object) | `[identity.publisher]` | publish identity providers' keys from this node (§4.7.1.2); feature `identity-publisher`, needs `[enrollment]` |
 | `remote_config(b)` | `ASTER_REMOTE_CONFIG_ENABLED` | `[remote_config] enabled` | default `true`: serve `aster.ops.NodeConfig` (§4.7.2) |
 | `remote_config_lock([..])` | `ASTER_REMOTE_CONFIG_LOCK` (comma-separated) | `[remote_config] lock = [..]` | sections remote overrides may not touch, e.g. `["identity"]`; an unknown name fails the start |
 | `health_port(p)` | `ASTER_HEALTH_PORT` | `[health] port` | health/metrics HTTP port; `0` (default) = disabled unless `health(true)` |
@@ -1096,23 +1098,97 @@ its docs author (the node that wrote it) holds a credential granting
 `aster.identity-publisher`; the record carries that credential, so the
 publisher needs no session with each service. The newest record per issuer
 wins, so publishing a new key set rotates keys without a restart, and a key
-dropped from it stops verifying once it syncs. A publisher writes with
-`aster::rpc::issuer_keys::publish_issuer_keys`:
-
-```rust
-use aster::rpc::issuer_keys::{publish_issuer_keys, IssuerKeyPublication};
-
-let chain = client.enrollment().unwrap().credential().map(|(chain, _)| chain);
-publish_issuer_keys(client.node(), &fleet_doc, chain.as_deref(), &IssuerKeyPublication {
-    iss: "https://accounts.example.com".into(),
-    source_url: "https://accounts.example.com/.well-known/jwks.json".into(),
-    jwks_json, // as fetched over validated TLS
-    fetched_at,
-}).await?;
-```
+dropped from it stops verifying once it syncs. A set older than
+`[identity] max_key_set_age_secs` (default 172800, 48 hours; 60..=2592000,
+overridable through `aster.ops.NodeConfig`) verifies nothing, so a publisher
+that stops refreshing cannot keep a removed key alive. When the root rotates,
+the service reads keys from the new root's fleet namespace; nothing written
+under the old root counts.
 
 `AsterServer::issuer_keys()` shows what a service holds (issuer, publisher,
-`kid`s, fetch time).
+`kid`s, fetch time). The publisher below writes these records; the low-level
+writer is `aster::rpc::issuer_keys::publish_issuer_keys`.
+
+#### 4.7.1.2 Publishing issuer keys (`[identity.publisher]`)
+
+One node publishes each issuer's keys, normally the gateway, which already
+talks HTTPS to the identity provider. Build `aster` with the
+`identity-publisher` feature and configure it:
+
+```toml
+[identity.publisher]
+issuers = ["https://accounts.example.com"]
+jwks_url = { "https://accounts.example.com" = "https://accounts.example.com/.well-known/jwks.json" }
+refresh_secs = 3600          # default; 60..=86400, with ±10 % jitter
+min_refresh_secs = 60        # default; unknown-kid refreshes at most this often
+ca_certs = ["/etc/aster/idp-ca.pem"]   # optional extra roots, as for relay_ca_certs
+ca_only = false              # true: trust only ca_certs, not the WebPKI roots
+```
+
+(Env: `ASTER_IDENTITY_PUBLISHER`, a JSON object of the same fields; builder:
+`AsterConfigBuilder::identity_publisher(IdentityPublisherConfig::new(...))`.)
+`AsterClient` and `AsterServer` both run it; it needs `[enrollment]`, and
+start-up fails on an invalid section.
+
+- **Fetching.** HTTPS only, with TLS validated against the WebPKI roots plus
+  `ca_certs` (or only `ca_certs`). No redirects, no proxy, at most 1 MiB, 5 s
+  to connect and 15 s per fetch, status 200 only. Keys of an unsupported type
+  or algorithm (anything but RSA RS256/PS256 and EC P-256 ES256), private
+  keys and non-signature keys are dropped with a warning; a set with no
+  usable key is a failure.
+- **Refreshing.** Every `refresh_secs`, and at once when a token names a
+  `kid` the publisher has not published for its issuer (the usual sign of a
+  rotation): `AsterClient` checks every call it makes with
+  `on_behalf_of` (unary calls, through its interceptor), and `AsterServer`
+  every provider token it refuses for an unknown `kid`. Other edges call
+  `publisher.notice_kid(iss, kid)` or `notice_token(jwt)` on the handle from
+  `identity_publisher()`. A failure is retried with backoff (5 s doubling to
+  `refresh_secs`) and **never replaces the last good record**.
+- **Writing.** Every successful refresh writes the record again with a new
+  fetch time, then synchronizes the fleet namespace with the server the
+  client is connected to (or a server's `[enrollment] replicas`).
+- **Status.** `identity_publisher().status()` gives each issuer's published
+  `kid`s, fetch time, counts and the last error.
+
+**Interplay with `max_key_set_age_secs`.** A record lives for
+`max_key_set_age_secs` after its fetch. `refresh_secs` must be at most half
+of the publisher's own `max_key_set_age_secs` (start-up refuses more), so a
+failed refresh is retried for at least as long again before services stop
+trusting the keys. With the defaults (3600 s and 48 h) the provider can be
+unreachable for about 47 hours before its tokens stop verifying. Keep the
+services' limit no lower than the publisher's.
+
+**Admin steps.**
+
+1. **Grant the role.** Issue the publisher's credential with
+   `aster.identity-publisher` in its roles (for example
+   `aster.role = "aster.gateway,aster.identity-publisher"`). Whoever holds
+   this role can forge any user of the issuers it publishes for, so grant it
+   to one or two nodes only.
+2. **Seal the write grant.** Only the root can write the fleet namespace.
+   The root seals its write capability to the publisher's node key, HPKE
+   addressed as for observer grants, into the fleet namespace at
+   `aster/identity-grants/v1/publishers/grants/<node id>`:
+
+   ```sh
+   aster enroll identity-publisher --seal-to <publisher node id> \
+       --fleet-namespace <id> --fleet-secret-file fleet.secret \
+       --audience <fleet> --peer <policy replica>
+   ```
+
+   The publisher opens the grant before every write, so it can be issued
+   before or after the publisher starts. Withdraw it with
+   `--unseal <node id>`; an honest publisher stops writing. A leaked
+   capability can only be revoked by rotating the root (and so the fleet
+   namespace); revoking the publisher's credential makes services ignore
+   its records at once.
+3. **Configure** `[identity.publisher]` on that node and
+   `[[identity.trusted_issuers]]` on the services.
+
+**Root rotation.** After a rotation, services and the publisher use the new
+root's fleet namespace. The new root must seal a new write grant there, and
+the publisher needs a credential from the new root; until then nothing is
+published, and services hold no keys for the issuer.
 
 ### 4.7.2 Remote overrides (`aster.ops.NodeConfig`)
 
@@ -1123,8 +1199,8 @@ record on the node:
 - **typed attributes:** bool, int, float or string;
 - **overrides** of the sections that declare themselves overridable.
   `[identity]` (`accept_on_behalf_of`, `trusted_issuers`,
-  `edge_token_max_lifetime_secs`, `clock_leeway_secs`) is the only one
-  today. `trusted_issuers` replaces the whole list, and the resulting
+  `edge_token_max_lifetime_secs`, `clock_leeway_secs`,
+  `max_key_set_age_secs`) is the only one today. `trusted_issuers` replaces the whole list, and the resulting
   section is validated as a whole (an issuer without audiences is
   `INVALID_ARGUMENT`).
 
