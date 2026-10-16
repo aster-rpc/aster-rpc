@@ -887,13 +887,6 @@ static void test_config(void) {
     CHECK(f.storage == NULL);
     CHECK(aster_config_init(NULL) == ASTER_STATUS_INVALID_ARGUMENT);
 
-    /* A caller that zero-fills the struct instead of calling
-     * aster_config_init gets fail-closed admission (7.0). */
-    aster_config_t z;
-    memset(&z, 0, sizeof z);
-    z.struct_size = sizeof z;
-    CHECK(z.hook_failure_mode == ASTER_HOOK_FAILURE_FAIL_CLOSED);
-
     /* 7.3: network settings ride in the config's storage, so a caller-built
      * config that gets them must be released. */
     aster_config_t n;
@@ -1062,6 +1055,71 @@ static void test_gate_and_node(void) {
 static aster_bytes_t bstr(const char *s) {
     aster_bytes_t b = {(const uint8_t *)s, strlen(s)};
     return b;
+}
+
+/* 7.0: a caller that zero-fills aster_config_t instead of calling
+ * aster_config_init gets fail-closed admission. Driven through
+ * aster_node_start: hooks on and nothing answering admission, so an inbound
+ * connection must be closed 403 once the hook times out (fail-open would
+ * leave it open). */
+static void test_zeroed_config_fails_closed(void) {
+    printf("[zeroed config fails closed]\n");
+    aster_runtime_t rt = 0;
+    CHECK(aster_runtime_new(ASTER_ABI_VERSION_MAJOR, NULL, &rt) == ASTER_STATUS_OK);
+    aster_bytes_t alpn = bstr("aster/zeroed-config");
+
+    aster_config_t z;
+    memset(&z, 0, sizeof z);
+    z.struct_size = sizeof z;
+    /* Only what a loopback node with hooks needs; hook_failure_mode stays 0. */
+    z.relay_mode = ASTER_RELAY_MODE_DISABLED;
+    z.bind_addr = bstr("127.0.0.1:0");
+    z.alpns = (aster_bytes_list_t){&alpn, 1};
+    z.enable_hooks = 1;
+    z.hook_timeout_ms = 200;
+    aster_operation_t op = 0;
+    aster_event_t ev;
+    memset(&ev, 0, sizeof ev);
+    CHECK(aster_node_start(rt, &z, 0, 0, &op) == ASTER_STATUS_OK);
+    CHECK(wait_event(rt, op, &ev) && ev.kind == ASTER_EVENT_NODE_CREATED);
+    aster_node_t server = ev.handle;
+
+    aster_config_t c;
+    CHECK(aster_config_init(&c) == ASTER_STATUS_OK);
+    c.relay_mode = ASTER_RELAY_MODE_DISABLED;
+    c.bind_addr = bstr("127.0.0.1:0");
+    c.alpns = (aster_bytes_list_t){&alpn, 1};
+    memset(&ev, 0, sizeof ev);
+    CHECK(aster_node_start(rt, &c, 0, 0, &op) == ASTER_STATUS_OK);
+    CHECK(wait_event(rt, op, &ev) && ev.kind == ASTER_EVENT_NODE_CREATED);
+    aster_node_t client = ev.handle;
+
+    uint8_t addr_buf[4096];
+    aster_node_addr_t addr;
+    memset(&addr, 0, sizeof addr);
+    for (int i = 0; i < 100; i++) {
+        CHECK(aster_node_addr_info(rt, server, addr_buf, sizeof addr_buf, &addr) == ASTER_STATUS_OK);
+        if (addr.direct_addresses.len > 0) break;
+        aster_event_t idle[1];
+        aster_poll_events(rt, idle, 1, 50);
+    }
+    CHECK(addr.direct_addresses.len > 0);
+    aster_connect_config_t cc = {sizeof(aster_connect_config_t), 0, addr.endpoint_id, alpn, &addr};
+    memset(&ev, 0, sizeof ev);
+    CHECK(aster_connect(rt, client, &cc, 0, &op) == ASTER_STATUS_OK);
+    CHECK(wait_event(rt, op, &ev) && ev.kind == ASTER_EVENT_CONNECTED);
+    aster_connection_t conn = ev.handle;
+    /* The server's admission event is never answered (wait_event drops it). */
+    memset(&ev, 0, sizeof ev);
+    CHECK(aster_connection_closed(rt, conn, 0, &op) == ASTER_STATUS_OK);
+    CHECK(wait_event(rt, op, &ev) && ev.kind == ASTER_EVENT_CONNECTION_CLOSED);
+    CHECK(ev.error_code == 403);
+    if (ev.buffer) aster_buffer_release(rt, ev.buffer);
+
+    CHECK(aster_connection_free(rt, conn) == ASTER_STATUS_OK);
+    CHECK(aster_node_free(rt, client) == ASTER_STATUS_OK);
+    CHECK(aster_node_free(rt, server) == ASTER_STATUS_OK);
+    CHECK(aster_runtime_close(rt) == ASTER_STATUS_OK);
 }
 
 static void test_pure_functions(void) {
@@ -1815,6 +1873,7 @@ int main(void) {
     test_envelope();
     test_config();
     test_gate_and_node();
+    test_zeroed_config_fails_closed();
     test_data_plane();
     test_pure_functions();
     test_dispatch_server();
