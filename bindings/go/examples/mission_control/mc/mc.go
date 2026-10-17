@@ -28,61 +28,67 @@ const (
 
 // ─── wire types ───────────────────────────────────────────────────────────
 
-type StatusRequest struct{ AgentID string }
+type StatusRequest struct {
+	AgentId string `aster:"name=agent_id"`
+}
 
 func (StatusRequest) AsterWireType() string { return "mission/StatusRequest" }
 
 type StatusResponse struct {
-	AgentID    string
-	Status     string
-	UptimeSecs int64
+	AgentId    string `aster:"name=agent_id"`
+	Status     string `aster:"name=status"`
+	UptimeSecs int64  `aster:"name=uptime_secs"`
 }
 
 func (StatusResponse) AsterWireType() string { return "mission/StatusResponse" }
 
 type LogEntry struct {
-	Timestamp float64
-	Level     string
-	Message   string
-	AgentID   string
+	Timestamp float64 `aster:"name=timestamp"`
+	Level     string  `aster:"name=level"`
+	Message   string  `aster:"name=message"`
+	AgentId   string  `aster:"name=agent_id"`
 }
 
 func (LogEntry) AsterWireType() string { return "mission/LogEntry" }
 
-type SubmitLogResult struct{ Accepted bool }
+type SubmitLogResult struct {
+	Accepted bool `aster:"name=accepted"`
+}
 
 func (SubmitLogResult) AsterWireType() string { return "mission/SubmitLogResult" }
 
 type TailRequest struct {
-	AgentID string
-	Level   string
+	AgentId string `aster:"name=agent_id"`
+	Level   string `aster:"name=level"`
 }
 
 func (TailRequest) AsterWireType() string { return "mission/TailRequest" }
 
 type MetricPoint struct {
-	Name      string
-	Value     float64
-	Timestamp float64
+	Name      string  `aster:"name=name"`
+	Value     float64 `aster:"name=value"`
+	Timestamp float64 `aster:"name=timestamp"`
 }
 
 func (MetricPoint) AsterWireType() string { return "mission/MetricPoint" }
 
 type IngestResult struct {
-	Accepted int32
-	Dropped  int32
+	Accepted int32 `aster:"name=accepted"`
+	Dropped  int32 `aster:"name=dropped"`
 }
 
 func (IngestResult) AsterWireType() string { return "mission/IngestResult" }
 
-type Command struct{ Command string }
+type Command struct {
+	Command string `aster:"name=command"`
+}
 
 func (Command) AsterWireType() string { return "mission/Command" }
 
 type CommandResult struct {
-	Stdout   string
-	Stderr   string
-	ExitCode int32
+	Stdout   string `aster:"name=stdout"`
+	Stderr   string `aster:"name=stderr"`
+	ExitCode int32  `aster:"name=exit_code"`
 }
 
 func (CommandResult) AsterWireType() string { return "mission/CommandResult" }
@@ -117,7 +123,7 @@ func Service(auth bool) *aster.Service {
 }
 
 func getStatus(_ context.Context, r *StatusRequest) (*StatusResponse, error) {
-	return &StatusResponse{AgentID: r.AgentID, Status: "running", UptimeSecs: 3600}, nil
+	return &StatusResponse{AgentId: r.AgentId, Status: "running", UptimeSecs: 3600}, nil
 }
 
 func submitLog(_ context.Context, _ *LogEntry) (*SubmitLogResult, error) {
@@ -126,7 +132,7 @@ func submitLog(_ context.Context, _ *LogEntry) (*SubmitLogResult, error) {
 
 func tailLogs(_ context.Context, r *TailRequest, send func(*LogEntry) error) error {
 	for i := range 3 {
-		if err := send(&LogEntry{Timestamp: float64(i), Level: "info", Message: fmt.Sprintf("log %d", i), AgentID: r.AgentID}); err != nil {
+		if err := send(&LogEntry{Timestamp: float64(i), Level: "info", Message: fmt.Sprintf("log %d", i), AgentId: r.AgentId}); err != nil {
 			return err
 		}
 	}

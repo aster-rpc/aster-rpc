@@ -58,7 +58,7 @@ func run() error {
 	}
 
 	status, err := aster.Call[mc.StatusRequest, mc.StatusResponse](ctx, conn, "MissionControl", "getStatus",
-		&mc.StatusRequest{AgentID: "go-agent-1"})
+		&mc.StatusRequest{AgentId: "go-agent-1"})
 	if err != nil {
 		fmt.Println("getStatus refused:", err)
 	} else {
@@ -67,7 +67,7 @@ func run() error {
 
 	now := float64(time.Now().UnixMilli()) / 1000
 	if _, err := aster.Call[mc.LogEntry, mc.SubmitLogResult](ctx, conn, "MissionControl", "submitLog",
-		&mc.LogEntry{Timestamp: now, Level: "info", Message: "agent started", AgentID: "go-agent-1"}); err != nil {
+		&mc.LogEntry{Timestamp: now, Level: "info", Message: "agent started", AgentId: "go-agent-1"}); err != nil {
 		return err
 	}
 	fmt.Println("Log submitted")

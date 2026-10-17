@@ -53,20 +53,20 @@ const (
 // ─── the protected store: Work.Write ──────────────────────────────────────
 
 type WriteRequest struct {
-	Resource string
+	Resource string `aster:"name=resource"`
 	// Epoch is the fence epoch the writer holds (Lease.Fence at send time).
 	// The holder is never a field: it is the caller's authenticated node id.
-	Epoch   int64
-	Payload string
+	Epoch   int64  `aster:"name=epoch"`
+	Payload string `aster:"name=payload"`
 }
 
 func (WriteRequest) AsterWireType() string { return "examples.lease/WriteRequest" }
 
 type WriteReply struct {
-	Applied bool
-	Reason  string // stale_epoch, not_holder, not_held, future_epoch
-	Carried int64
-	Current int64
+	Applied bool   `aster:"name=applied"`
+	Reason  string `aster:"name=reason"` // stale_epoch, not_holder, not_held, future_epoch
+	Carried int64  `aster:"name=carried"`
+	Current int64  `aster:"name=current"`
 }
 
 func (WriteReply) AsterWireType() string { return "examples.lease/WriteReply" }

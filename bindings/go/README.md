@@ -72,9 +72,14 @@ the 7.0 header and library together.
   Go writes Rust's exact bytes. Fory Go 1.7.6 needs that for `list<uuid>` /
   `map<uuid, _>` fields: from metadata that differs from the local type it
   refuses such a list and panics building such a map (the codec turns the
-  panic into an error). Other fields decode across the difference. Field
-  names are Fory's snake_case of the Go name, so `ID` is `i_d`: name the
-  field `Id` to get `id`.
+  panic into an error). Other fields decode across the difference.
+- **Field names** (`ffi_spec/Aster-FieldNaming.md`): a field's contract name
+  is the Go field name, verbatim (`WrittenBy`). A type implementing a
+  contract defined in another language names each field with
+  `aster:"name=written_by"`. The contract is refused when a name is not
+  plain (`ID`, `HTTPServer`: Fory Go writes `ID` as `i_d`, so name it `Id`),
+  when the field's Fory form differs from its name's snake_case form, or when
+  two fields have one snake_case form.
 - **Envelope / compression:** AEv1 `StreamHeader` / `CallHeader` / `RpcStatus`
   and zstd come from the C ABI (`EncodeStreamHeader`, `DecodeRpcStatus`,
   `ZstdMaybeCompress`, `EncodePayloadFrame`, ...); `conformance/vectors/

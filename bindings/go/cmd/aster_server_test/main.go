@@ -15,14 +15,14 @@ import (
 )
 
 type EchoRequest struct {
-	Message string
+	Message string `aster:"name=message"`
 }
 
 func (EchoRequest) AsterWireType() string { return "example/EchoRequest" }
 
 type EchoReply struct {
-	Message string
-	Seq     int32
+	Message string `aster:"name=message"`
+	Seq     int32  `aster:"name=seq"`
 }
 
 func (EchoReply) AsterWireType() string { return "example/EchoReply" }

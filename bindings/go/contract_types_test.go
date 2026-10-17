@@ -14,88 +14,92 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	forygo "github.com/apache/fory/go/fory"
 )
 
 // Go mirrors of aster/tests/it/contract_types.rs, checked against
 // conformance/vectors/contract-types.json (the Rust golden vectors). The
+// contract is defined in Rust, so each field names its Rust (snake_case)
+// name with `aster:"name=..."` (Aster-FieldNaming.md). The
 // `nullable=false` hints make Go's Fory type metadata byte-identical to
 // Rust's (see scalars.go).
 
 type ctTemporal struct {
-	At      time.Time
-	Day     Date
-	Amount  Decimal
-	MaybeAt *time.Time
-	History []time.Time `fory:"type=list(element=_(nullable=false))"`
+	At      time.Time   `aster:"name=at"`
+	Day     Date        `aster:"name=day"`
+	Amount  Decimal     `aster:"name=amount"`
+	MaybeAt *time.Time  `aster:"name=maybe_at"`
+	History []time.Time `fory:"type=list(element=_(nullable=false))" aster:"name=history"`
 }
 
 func (ctTemporal) AsterWireType() string { return "types.v1/Temporal" }
 
 type ctTreeNode struct {
-	Value    string
-	Children []ctTreeNode `fory:"type=list(element=_(nullable=false))"`
+	Value    string       `aster:"name=value"`
+	Children []ctTreeNode `fory:"type=list(element=_(nullable=false))" aster:"name=children"`
 }
 
 func (ctTreeNode) AsterWireType() string { return "types.v1/TreeNode" }
 
 type ctChain struct {
-	Value int32
-	Next  *ctChain
+	Value int32    `aster:"name=value"`
+	Next  *ctChain `aster:"name=next"`
 }
 
 func (ctChain) AsterWireType() string { return "types.v1/Chain" }
 
 type ctAuthor struct {
-	Name  string
-	Books []ctBook `fory:"type=list(element=_(nullable=false))"`
+	Name  string   `aster:"name=name"`
+	Books []ctBook `fory:"type=list(element=_(nullable=false))" aster:"name=books"`
 }
 
 func (ctAuthor) AsterWireType() string { return "types.v1/Author" }
 
 type ctBook struct {
-	Title     string
-	WrittenBy *ctAuthor
+	Title     string    `aster:"name=title"`
+	WrittenBy *ctAuthor `aster:"name=written_by"`
 }
 
 func (ctBook) AsterWireType() string { return "types.v1/Book" }
 
-type ctAlpha struct{ Next *ctBeta }
+type ctAlpha struct {
+	Next *ctBeta `aster:"name=next"`
+}
 
 func (ctAlpha) AsterWireType() string { return "types.v1/Alpha" }
 
-type ctBeta struct{ Next *ctGamma }
+type ctBeta struct {
+	Next *ctGamma `aster:"name=next"`
+}
 
 func (ctBeta) AsterWireType() string { return "types.v1/Beta" }
 
 type ctGamma struct {
-	Next []ctAlpha `fory:"type=list(element=_(nullable=false))"`
+	Next []ctAlpha `fory:"type=list(element=_(nullable=false))" aster:"name=next"`
 }
 
 func (ctGamma) AsterWireType() string { return "types.v1/Gamma" }
 
 type ctForest struct {
-	Trees []ctTreeNode `fory:"type=list(element=_(nullable=false))"`
+	Trees []ctTreeNode `fory:"type=list(element=_(nullable=false))" aster:"name=trees"`
 }
 
 func (ctForest) AsterWireType() string { return "types.v1/Forest" }
 
 type ctIdentified struct {
-	Id      UUID            `fory:"type=bytes"` // Fory snake-cases "ID" as "i_d"
-	Trace   ULID            `fory:"type=bytes"`
-	Parent  *UUID           `fory:"type=bytes"`
-	History []ULID          `fory:"type=list(element=bytes(nullable=false))"`
-	Names   map[UUID]string `fory:"type=map(key=bytes(nullable=false),value=_(nullable=false))"`
+	Id      UUID            `fory:"type=bytes" aster:"name=id"` // Fory Go writes "ID" as "i_d"
+	Trace   ULID            `fory:"type=bytes" aster:"name=trace"`
+	Parent  *UUID           `fory:"type=bytes" aster:"name=parent"`
+	History []ULID          `fory:"type=list(element=bytes(nullable=false))" aster:"name=history"`
+	Names   map[UUID]string `fory:"type=map(key=bytes(nullable=false),value=_(nullable=false))" aster:"name=names"`
 }
 
 func (ctIdentified) AsterWireType() string { return "types.v1/Identified" }
 
 type ctPriced struct {
-	Price      Decimal  `aster:"decimal(18,4)"`
-	Rate       Decimal  `aster:"decimal(5,0)"`
-	MaybePrice *Decimal `aster:"decimal(18,4)"`
-	Amount     Decimal
+	Price      Decimal  `aster:"decimal(18,4),name=price"`
+	Rate       Decimal  `aster:"decimal(5,0),name=rate"`
+	MaybePrice *Decimal `aster:"decimal(18,4),name=maybe_price"`
+	Amount     Decimal  `aster:"name=amount"`
 }
 
 func (ctPriced) AsterWireType() string { return "types.v1/Priced" }
@@ -103,37 +107,41 @@ func (ctPriced) AsterWireType() string { return "types.v1/Priced" }
 // A cycle whose spanning tree depends on codepoint (not UTF-16) order:
 // Ａ (U+FF21) and 𝔸 (U+1D538). Contract identity only, as in Rust.
 type ctOrd struct {
-	Wide *ctWide
-	Math *ctMath
+	Wide *ctWide `aster:"name=wide"`
+	Math *ctMath `aster:"name=math"`
 }
 
 func (ctOrd) AsterWireType() string { return "types.v1/Ord" }
 
 type ctWide struct {
-	Back *ctOrd
-	Math *ctMath
+	Back *ctOrd  `aster:"name=back"`
+	Math *ctMath `aster:"name=math"`
 }
 
 func (ctWide) AsterWireType() string { return "types.v1/\uff21" }
 
-type ctMath struct{ Wide *ctWide }
+type ctMath struct {
+	Wide *ctWide `aster:"name=wide"`
+}
 
 func (ctMath) AsterWireType() string { return "types.v1/\U0001d538" }
 
 // The spec's B.4 diamond: A -> C is a back-edge though C is hashed first.
 type ctDiamondA struct {
-	B *ctDiamondB
-	C *ctDiamondC
+	B *ctDiamondB `aster:"name=b"`
+	C *ctDiamondC `aster:"name=c"`
 }
 
 func (ctDiamondA) AsterWireType() string { return "types.v1/DiamondA" }
 
-type ctDiamondB struct{ C *ctDiamondC }
+type ctDiamondB struct {
+	C *ctDiamondC `aster:"name=c"`
+}
 
 func (ctDiamondB) AsterWireType() string { return "types.v1/DiamondB" }
 
 type ctDiamondC struct {
-	A []ctDiamondA `fory:"type=list(element=_(nullable=false))"`
+	A []ctDiamondA `fory:"type=list(element=_(nullable=false))" aster:"name=a"`
 }
 
 func (ctDiamondC) AsterWireType() string { return "types.v1/DiamondC" }
@@ -318,7 +326,9 @@ func ctJSON(v reflect.Value) any {
 	case reflect.Struct:
 		out := map[string]any{}
 		for i := 0; i < v.NumField(); i++ {
-			out[forygo.SnakeCase(v.Type().Field(i).Name)] = ctJSON(v.Field(i))
+			sf := v.Type().Field(i)
+			tag, _ := parseAsterTag(sf)
+			out[tag.contractName(sf)] = ctJSON(v.Field(i))
 		}
 		return out
 	case reflect.String:

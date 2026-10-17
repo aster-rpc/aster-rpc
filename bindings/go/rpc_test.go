@@ -17,18 +17,18 @@ import (
 )
 
 type testEchoRequest struct {
-	Message string
-	Count   int32
-	Data    []byte `fory:"type=bytes"`
+	Message string `aster:"name=message"`
+	Count   int32  `aster:"name=count"`
+	Data    []byte `fory:"type=bytes" aster:"name=data"`
 }
 
 func (testEchoRequest) AsterWireType() string { return "interop/EchoRequest" }
 
 type testEchoReply struct {
-	Message    string
-	Count      int32
-	Data       []byte `fory:"type=bytes"`
-	ServerLang string
+	Message    string `aster:"name=message"`
+	Count      int32  `aster:"name=count"`
+	Data       []byte `fory:"type=bytes" aster:"name=data"`
+	ServerLang string `aster:"name=server_lang"`
 }
 
 func (testEchoReply) AsterWireType() string { return "interop/EchoReply" }

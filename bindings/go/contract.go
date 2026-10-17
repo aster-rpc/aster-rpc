@@ -8,8 +8,6 @@ import (
 	"reflect"
 	"sort"
 	"strings"
-
-	forygo "github.com/apache/fory/go/fory"
 )
 
 // Contract identity (Aster-ContractIdentity §11.3): the TypeDef /
@@ -28,7 +26,8 @@ import (
 // arrays become lists, maps maps; WireTyped structs become refs; pointer
 // fields are optional. A []byte field must be tagged `fory:"type=bytes"`
 // (binary; untagged, Fory Go writes list<uint8>) or `aster:"uint8_list"`
-// (list<uint8>). Field names are Fory's snake_case of the Go name.
+// (list<uint8>). A field's contract name is the Go field name, verbatim, or
+// its `aster:"name=..."` override (field_names.go).
 //
 // The canonical scalars (scalars.go): time.Time timestamp, aster.Date date,
 // aster.Decimal decimal (decimal(p,s) with an `aster:"decimal(p,s)"` tag),
@@ -135,6 +134,7 @@ func (r *typeResolver) typeDefJSON(t reflect.Type) (string, error) {
 	}
 	pkg, name := splitWireType(tag)
 	fields := []fieldJSON{}
+	names := []fieldName{}
 	for i := 0; i < t.NumField(); i++ {
 		sf := t.Field(i)
 		if !sf.IsExported() || foryIgnored(sf) {
@@ -145,6 +145,10 @@ func (r *typeResolver) typeDefJSON(t reflect.Type) (string, error) {
 			return "", fmt.Errorf("%v.%s: %w", t, sf.Name, err)
 		}
 		fields = append(fields, f)
+		names = append(names, memberFieldName(sf.Name, f.Name))
+	}
+	if err := checkFieldNames(names); err != nil {
+		return "", fmt.Errorf("%v: %w", t, err)
 	}
 	b, err := json.Marshal(struct {
 		Kind          string      `json:"kind"`
@@ -214,7 +218,7 @@ func (r *typeResolver) field(sf reflect.StructField) (fieldJSON, error) {
 		case foryTypeHint(sf) == "bytes":
 		case tag.uint8List:
 			f := fieldJSON{
-				Name: forygo.SnakeCase(sf.Name), TypeKind: "primitive", TypePrimitive: "uint8",
+				Name: tag.contractName(sf), TypeKind: "primitive", TypePrimitive: "uint8",
 				Optional: optional, Container: "list", ContainerKeyKind: "primitive", Required: true,
 			}
 			return f, tag.applyDefault(&f)
@@ -268,7 +272,7 @@ func (r *typeResolver) field(sf reflect.StructField) (fieldJSON, error) {
 		return fieldJSON{}, err
 	}
 	f := fieldJSON{
-		Name: forygo.SnakeCase(sf.Name), TypeKind: l.kind, TypePrimitive: l.prim, TypeRef: l.ref,
+		Name: tag.contractName(sf), TypeKind: l.kind, TypePrimitive: l.prim, TypeRef: l.ref,
 		SelfRefName: l.selfRef, Optional: optional, Container: container,
 		ContainerKeyKind: "primitive", Required: true,
 	}

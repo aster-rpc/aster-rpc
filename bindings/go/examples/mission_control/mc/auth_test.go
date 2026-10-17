@@ -128,11 +128,11 @@ state_path = %q
 		return conn
 	}
 	status := func(conn *aster.RpcConnection) (*StatusResponse, error) {
-		return aster.Call[StatusRequest, StatusResponse](ctx, conn, "MissionControl", "getStatus", &StatusRequest{AgentID: "a1"})
+		return aster.Call[StatusRequest, StatusResponse](ctx, conn, "MissionControl", "getStatus", &StatusRequest{AgentId: "a1"})
 	}
 	tail := func(conn *aster.RpcConnection) error {
 		for _, err := range aster.CallServerStream[TailRequest, LogEntry](ctx, conn, "MissionControl", "tailLogs",
-			&TailRequest{AgentID: "a1", Level: "info"}) {
+			&TailRequest{AgentId: "a1", Level: "info"}) {
 			return err // the first item decides
 		}
 		return nil

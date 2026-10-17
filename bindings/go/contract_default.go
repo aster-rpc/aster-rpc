@@ -46,6 +46,7 @@ import (
 
 // asterTag is a parsed `aster:"..."` struct tag.
 type asterTag struct {
+	name       string // `name=...`: the contract name, when not the Go field name
 	uint8List  bool
 	hasDefault bool
 	hasValue   bool   // `default=VALUE` rather than a bare `default`
@@ -66,6 +67,11 @@ func parseAsterTag(sf reflect.StructField) (asterTag, error) {
 		case "", "uuid", "ulid":
 		case "uint8_list":
 			t.uint8List = true
+		case "name":
+			if !hasEq || strings.TrimSpace(v) == "" {
+				return t, fmt.Errorf("aster tag option %q needs a name (name=written_by)", opt)
+			}
+			t.name = strings.TrimSpace(v)
 		case "default":
 			t.hasDefault = true
 			if hasEq {
@@ -81,6 +87,15 @@ func parseAsterTag(sf reflect.StructField) (asterTag, error) {
 	sc, err := parseScalarTag(sf)
 	t.scalar = sc
 	return t, err
+}
+
+// contractName is the field's contract name: the `name=` override, else the
+// Go field name verbatim (Aster-FieldNaming.md).
+func (t asterTag) contractName(sf reflect.StructField) string {
+	if t.name != "" {
+		return t.name
+	}
+	return sf.Name
 }
 
 // applyDefault marks f as having a contract default when the tag declares one.

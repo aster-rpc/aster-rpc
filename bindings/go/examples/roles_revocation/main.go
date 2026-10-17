@@ -47,33 +47,44 @@ import (
 
 // ─── wire types ───────────────────────────────────────────────────────────
 
-type ReadRequest struct{ ClipboardID string }
+type ReadRequest struct {
+	ClipboardId string `aster:"name=clipboard_id"`
+}
 
 func (ReadRequest) AsterWireType() string { return "examples.roles/ReadRequest" }
 
-type ReadReply struct{ Text string }
+type ReadReply struct {
+	Text string `aster:"name=text"`
+}
 
 func (ReadReply) AsterWireType() string { return "examples.roles/ReadReply" }
 
-type WriteRequest struct{ ClipboardID, Text string }
+type WriteRequest struct {
+	ClipboardId string `aster:"name=clipboard_id"`
+	Text        string `aster:"name=text"`
+}
 
 func (WriteRequest) AsterWireType() string { return "examples.roles/WriteRequest" }
 
-type WriteReply struct{ Written int32 }
+type WriteReply struct {
+	Written int32 `aster:"name=written"`
+}
 
 func (WriteReply) AsterWireType() string { return "examples.roles/WriteReply" }
 
 type RestrictRolesRequest struct {
 	// Peer is the 64-hex node id whose credential roles are narrowed.
-	Peer string
+	Peer string `aster:"name=peer"`
 	// Roles is the comma-separated set the peer keeps (intersected with its
 	// credential roles); "" leaves it no roles.
-	Roles string
+	Roles string `aster:"name=roles"`
 }
 
 func (RestrictRolesRequest) AsterWireType() string { return "examples.roles/RestrictRolesRequest" }
 
-type RestrictRolesReply struct{ Roles string }
+type RestrictRolesReply struct {
+	Roles string `aster:"name=roles"`
+}
 
 func (RestrictRolesReply) AsterWireType() string { return "examples.roles/RestrictRolesReply" }
 
@@ -92,7 +103,7 @@ const (
 func Services(srv **aster.AsterServer) []*aster.Service {
 	clipboard := aster.NewService("Clipboard", 1,
 		aster.Unary("Read", func(ctx context.Context, r *ReadRequest) (*ReadReply, error) {
-			return &ReadReply{Text: "contents of " + r.ClipboardID}, nil
+			return &ReadReply{Text: "contents of " + r.ClipboardId}, nil
 		}, aster.Requires(aster.RequireRole(RoleClipboardRead))),
 		aster.Unary("Write", func(ctx context.Context, r *WriteRequest) (*WriteReply, error) {
 			return &WriteReply{Written: int32(len(r.Text))}, nil
@@ -330,7 +341,7 @@ func Run(ctx context.Context, out io.Writer) error {
 		if err != nil {
 			return nil, err
 		}
-		return aster.Call[ReadRequest, ReadReply](cctx, conn, "Clipboard", "Read", &ReadRequest{ClipboardID: "desk-7"})
+		return aster.Call[ReadRequest, ReadReply](cctx, conn, "Clipboard", "Read", &ReadRequest{ClipboardId: "desk-7"})
 	}
 	write := func(cl *aster.AsterClient) error {
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -339,7 +350,7 @@ func Run(ctx context.Context, out io.Writer) error {
 		if err != nil {
 			return err
 		}
-		_, err = aster.Call[WriteRequest, WriteReply](cctx, conn, "Clipboard", "Write", &WriteRequest{ClipboardID: "desk-7", Text: "hello"})
+		_, err = aster.Call[WriteRequest, WriteReply](cctx, conn, "Clipboard", "Write", &WriteRequest{ClipboardId: "desk-7", Text: "hello"})
 		return err
 	}
 	expectDenied := func(step string, err error) error {
