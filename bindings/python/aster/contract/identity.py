@@ -23,6 +23,8 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, get_type_hints
 
+from aster.contract.field_names import check_dataclass, contract_field_name
+
 
 # ── Enum types (§11.3.3, fixed normative values) ─────────────────────────────
 
@@ -803,7 +805,7 @@ def _build_field_def_for(
 
     return FieldDef(
         id=field_index,
-        name=field_obj.name,
+        name=contract_field_name(field_obj),
         type_kind=type_kind,
         type_primitive=type_primitive,
         type_ref=type_ref,
@@ -1017,6 +1019,7 @@ def _build_type_def(
     except Exception:
         hints = {}
 
+    check_dataclass(cls)
     fields: list[FieldDef] = []
     for idx, dc_field in enumerate(dataclasses.fields(cls), start=1):
         field_type = hints.get(dc_field.name, dc_field.type)

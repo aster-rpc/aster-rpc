@@ -210,6 +210,48 @@ def contract_default(
     return dataclasses.field(**kwargs)
 
 
+def wire_name(
+    name: str,
+    *,
+    default: Any = dataclasses.MISSING,
+    default_factory: Any = dataclasses.MISSING,
+    **field_kwargs: Any,
+) -> Any:
+    """Name a field for a contract defined in another language.
+
+    A field's contract name is the attribute name, verbatim
+    (``ffi_spec/Aster-FieldNaming.md``). A dataclass implementing a contract
+    defined in Java or TypeScript keeps its snake_case attribute and names the
+    field::
+
+        @wire_type("books.v1/Book")      # defined in Java: writtenBy
+        @dataclass
+        class Book:
+            written_by: Optional[Author] = wire_name("writtenBy", default=None)
+
+    pyfory writes the attribute's own snake_case form, so the name's
+    snake_case form must equal the attribute's (``author`` named
+    ``writtenBy`` is refused when the contract is computed). Combine with a
+    contract default as ``contract_default(..., metadata={WIRE_NAME_KEY:
+    "..."})``. Extra keyword arguments go to :func:`pyfory.field` when they
+    are pyfory field options, else to :func:`dataclasses.field`.
+    """
+    from aster.contract.field_names import WIRE_NAME_KEY
+
+    if not name:
+        raise TypeError("wire_name() needs a non-empty name")
+    metadata = dict(field_kwargs.pop("metadata", None) or {})
+    metadata[WIRE_NAME_KEY] = name
+    kwargs: dict[str, Any] = {"metadata": metadata, **field_kwargs}
+    if default is not dataclasses.MISSING:
+        kwargs["default"] = default
+    if default_factory is not dataclasses.MISSING:
+        kwargs["default_factory"] = default_factory
+    if _FORY_FIELD_KWARGS & field_kwargs.keys():
+        return pyfory.field(**kwargs)
+    return dataclasses.field(**kwargs)
+
+
 def fory_registration_name(namespace: str, typename: str) -> str:
     """The Fory named-registration string for ``namespace`` + ``typename``.
 

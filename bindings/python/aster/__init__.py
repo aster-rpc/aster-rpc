@@ -308,6 +308,7 @@ from .wire import (
 from .codec import (
     wire_type,
     contract_default,
+    wire_name,
     ForyCodec,
     ForyConfig,
     DEFAULT_COMPRESSION_THRESHOLD,
@@ -578,6 +579,7 @@ __all__ = [
     "RpcStatus",
     "wire_type",
     "contract_default",
+    "wire_name",
     "ULID",
     "ScalarError",
     "decimal",

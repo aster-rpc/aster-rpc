@@ -406,20 +406,28 @@ def _gen_type_class(rec: _TypeRecord, known_types: dict[str, str]) -> str:
         return "\n".join(lines)
 
     for f in rec.fields:
-        # Snake-case whatever the server's manifest declared so the
-        # generated Python attribute follows Python convention
-        # (``agent_id`` rather than ``agentId``). pyfory's fingerprint
-        # uses the raw attribute name, and Fory Java/TS auto-snake-case
-        # at fingerprint time, so normalizing here keeps the wire tokens
-        # aligned cross-binding.
+        # The generated attribute follows Python convention (``agent_id``
+        # rather than ``agentId``). The contract's name is kept verbatim
+        # (ffi_spec/Aster-FieldNaming.md): when the two differ the field
+        # carries ``wire_name(<contract name>)``, so the generated class
+        # publishes the server's contract, and pyfory writes the attribute's
+        # snake_case form, which is the contract name's.
         fname = _to_snake_case(f["name"])
         ftype_str = _py_type_from_field(f, known_types)
         default = _py_default_from_field(f)
 
+        if fname != f["name"]:
+            name_lit = repr(f["name"])
+            if default is None:
+                default = f"wire_name({name_lit})"
+            elif default.startswith("dataclasses.field(default_factory="):
+                factory = default[len("dataclasses.field(default_factory="):-1]
+                default = f"wire_name({name_lit}, default_factory={factory})"
+            else:
+                default = f"wire_name({name_lit}, default={default})"
+
         if default is None:
             lines.append(f"    {fname}: {ftype_str}")
-        elif default.startswith("dataclasses.field(default_factory="):
-            lines.append(f"    {fname}: {ftype_str} = {default}")
         else:
             lines.append(f"    {fname}: {ftype_str} = {default}")
 
@@ -713,7 +721,7 @@ def generate_python_clients(
     contract_id = first_manifest.get("contract_id", "")
 
     # Common imports for type files
-    _type_imports = "\nimport dataclasses\nfrom typing import Any, Optional\n\nimport pyfory\nfrom aster.codec import wire_type\n"
+    _type_imports = "\nimport dataclasses\nfrom typing import Any, Optional\n\nimport pyfory\nfrom aster.codec import wire_name, wire_type\n"
 
     # Step 4a: Generate shared type files
     for rec in sorted(shared_types, key=lambda r: r.display_name):

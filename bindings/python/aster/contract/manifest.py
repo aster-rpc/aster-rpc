@@ -17,6 +17,7 @@ import dataclasses
 from dataclasses import asdict, dataclass, field
 
 from aster._aster import blake3_hex
+from aster.contract.field_names import contract_field_name
 
 FIELD_SCHEMA_VERSION = 1
 
@@ -580,7 +581,7 @@ def build_field_v1(
                 field_tags = wt_tags
 
     field_dict: dict[str, Any] = {
-        "name": f.name,
+        "name": contract_field_name(f),
         "kind": info.get("kind", "string"),
         "nullable": info.get("nullable", False),
         "required": not has_default,
