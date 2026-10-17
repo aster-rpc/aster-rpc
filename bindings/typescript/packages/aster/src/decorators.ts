@@ -361,6 +361,48 @@ export function ContractDefault(...args: [] | [value: unknown]) {
   };
 }
 
+/** Static key holding a `@WireType` class's `@WireName` overrides (`{ property: name }`). */
+export const WIRE_NAMES_KEY = Symbol.for('aster.wire_names');
+
+/**
+ * A field's **contract name**, when the contract is defined in another
+ * language (default: the property name, verbatim; `ffi_spec/Aster-FieldNaming.md`).
+ *
+ * Fory writes the property's own snake_case form on the wire, so the name's
+ * snake_case form must equal the property's: `@WireName('written_by')` on
+ * `writtenBy` is fine, on `author` it is refused. `aster-gen` reads this
+ * decorator statically, so the name must be a string literal.
+ *
+ * @example
+ * ```ts
+ * @WireType('books.v1/Book')   // a contract defined in Rust
+ * class Book {
+ *   @WireName('written_by') writtenBy: Author | null = null;
+ * }
+ * ```
+ * @group Decorators
+ */
+export function WireName(name: string) {
+  // Dual-mode: TC39 field decorators get (undefined, context); Bun's legacy
+  // decorators get (prototype, propertyKey).
+  return function (target: unknown, context: ClassFieldDecoratorContext | string | symbol): void {
+    let meta: Record<PropertyKey, any> | undefined;
+    let key: string;
+    if (typeof context === 'object' && context !== null) {
+      meta = context.metadata as Record<PropertyKey, any> | undefined;
+      key = String(context.name);
+    } else {
+      meta = (target as any)?.constructor;
+      key = String(context);
+    }
+    if (!meta) return;
+    const own = Object.prototype.hasOwnProperty.call(meta, WIRE_NAMES_KEY)
+      ? meta[WIRE_NAMES_KEY]
+      : (meta[WIRE_NAMES_KEY] = { ...(meta[WIRE_NAMES_KEY] ?? {}) });
+    own[key] = name;
+  };
+}
+
 /**
  * The contract defaults declared on a `@WireType` class, as
  * `{ fieldName: value }`. Fields declared with a bare `@ContractDefault()`

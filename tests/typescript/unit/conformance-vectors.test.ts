@@ -14,6 +14,7 @@
 import { describe, it, expect, beforeAll } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import {
   encodeStreamHeader,
@@ -48,6 +49,10 @@ import {
   DynamicTypeFactory,
   Decimal,
   ScalarError,
+  referenceSnakeCase,
+  notPlain,
+  plainSuggestion,
+  checkFieldNames,
 } from '@aster-rpc/aster';
 import { loadNative } from '../../../bindings/typescript/packages/aster/src/native.js';
 
@@ -422,4 +427,71 @@ describe('contract-types.json (Time, UUID, and Decimal; recursive types)', () =>
     const ids = new DynIdentified({ id: '0190F2A8-1B2C-7D3E-8F40-123456789ABC' });
     expect((dyn.decode(dyn.encode(ids), DynIdentified) as any).id).toBe('0190f2a8-1b2c-7d3e-8f40-123456789abc');
   });
+});
+
+// -- contract-types.json field_names (ffi_spec/Aster-FieldNaming.md) ------------------
+
+describe('contract-types.json field_names', () => {
+  const fn = load('contract-types.json').vector.field_names;
+  const PKG_ROOT = path.join(ROOT, 'bindings/typescript/packages/aster');
+  const fixture = (name: string) => path.join(PKG_ROOT, 'tests/fixtures', name);
+  const gen = (name: string) => spawnSync('node', [
+    path.join(PKG_ROOT, 'dist/cli/gen.js'),
+    '-p', path.join(fixture(name), 'tsconfig.json'),
+    '-o', path.join(fixture(name), 'aster-rpc.generated.ts'),
+  ], { encoding: 'utf8', cwd: PKG_ROOT });
+
+  it("Fory JS's snake_case and plainness match the vector", () => {
+    const { TypeMeta } = createRequire(path.join(PKG_ROOT, 'package.json'))(
+      '@apache-fory/core/dist/lib/meta/TypeMeta.js');
+    for (const [name, row] of Object.entries<any>(fn.snake_case)) {
+      expect(TypeMeta.toSnakeCase(name), name).toBe(row.javascript);
+      expect(referenceSnakeCase(name), name).toBe(row.rust);
+      expect(notPlain(name) === undefined, name).toBe(row.plain);
+      if (!row.plain) expect(notPlain(plainSuggestion(name)), name).toBeUndefined();
+    }
+  });
+
+  it('refuses and accepts the vector cases', () => {
+    const entries = (c: any) => c.fields.map((f: any) => ({ memberSnake: f.member_snake, name: f.name }));
+    for (const c of fn.refused) expect(() => checkFieldNames(entries(c)), JSON.stringify(c)).toThrow(c.error);
+    for (const c of fn.accepted) expect(() => checkFieldNames(entries(c))).not.toThrow();
+  });
+
+  it('aster-gen refuses an override that does not match its property', () => {
+    const r = gen('field-names-bad');
+    expect(r.status).not.toBe(0);
+    expect(r.stderr).toContain('does not match');
+  });
+
+  for (const [def, dir] of [['java_defined', 'field-names-java'], ['rust_defined', 'field-names-rust']] as const) {
+    it(`${def}: hashes, contract id and the shared payload`, async () => {
+      const r = gen(dir);
+      if (r.status !== 0) throw new Error(`aster-gen failed: ${r.stderr}`);
+      const g = await import(path.join(fixture(dir), 'aster-rpc.generated.ts'));
+      const d = fn[def];
+      for (const [fqn, t] of Object.entries<any>(d.types)) {
+        const shape = g.WIRE_TYPES.find((w: any) => w.tag === fqn.replace(/\.([^.]+)$/, '/$1'));
+        expect(shape.typeHashHex, fqn).toBe(t.expected_type_hash);
+        expect(hex(shape.typeDefBytes), fqn).toBe(t.expected_canonical_type_def_hex);
+      }
+      const { fory, Type } = newXlangFory();
+      const codec = createXlangCodec(fory);
+      registerGenerated({ SERVICES: g.SERVICES, WIRE_TYPES: g.WIRE_TYPES, buildAllTypes: g.BUILD_ALL_TYPES, fory, Type, codec });
+      const svc = g.SERVICES.find((s: any) => s.name === 'Orders').ctor;
+      expect(contractIdFromContract(fromServiceInfo(getServiceInfo(svc)! as any))).toBe(d.expected_contract_id);
+      const Order = g.WIRE_TYPES.find((w: any) => w.tag === 'names.v1/Order').ctor;
+      const got = codec.decode(fromHex(d.payload.hex), Order);
+      // The properties are camelCase in both fixtures, whatever the
+      // contract's names (orderId or order_id): Fory matches by snake_case.
+      const plain = JSON.parse(JSON.stringify(got));
+      expect(plain).toEqual({
+        orderId: 'o-1',
+        lineItems: [{ skuCode: 'sku-a', unitCount: 2 }, { skuCode: 'sku-b', unitCount: 1 }],
+        totalCents: 1250,
+        note: null,
+      });
+      expect(JSON.parse(JSON.stringify(codec.decode(codec.encode(got), Order)))).toEqual(plain);
+    });
+  }
 });

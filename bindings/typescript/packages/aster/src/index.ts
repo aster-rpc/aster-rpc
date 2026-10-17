@@ -121,6 +121,7 @@ export {
   WireType,
   ContractDefault,
   getContractDefaults,
+  WireName,
   WIRE_TYPE_KEY,
   WIRE_TYPE_FIELDS_KEY,
   CONTRACT_DEFAULTS_KEY,
@@ -818,3 +819,6 @@ export {
 
 export { WebTransportListener, WebTransportSession, WebTransportStream } from "./webtransport.js";
 export type { WebTransportOptions, WebTransportOperation, WebTransportSessionInfo, WebTransportStreamInfo, WebTransportCloseInfo, WebTransportStats } from "./webtransport.js";
+
+// Field names (ffi_spec/Aster-FieldNaming.md).
+export { referenceSnakeCase, notPlain, plainSuggestion, checkFieldNames, type FieldNameEntry } from './field-names.js';

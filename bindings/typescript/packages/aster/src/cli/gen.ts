@@ -25,6 +25,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { encodeContractDefault, foryTypeExpr } from '../wire-types.js';
+import { checkFieldNames, referenceSnakeCase } from '../field-names.js';
 import { formatUsageSnippet, generateTypescriptClients } from '../codegen/client.js';
 
 // ─── CLI argv ────────────────────────────────────────────────────────────────
@@ -276,7 +277,29 @@ type ScanField = (
   contractDefaultHex?: string;
   /** The declared default value itself (for the manifest). */
   contractDefaultValue?: unknown;
+  /**
+   * The field's contract name from `@WireName('...')`, when the contract is
+   * defined in another language (Aster-FieldNaming.md). Absent = the
+   * property name, verbatim. Top-level fields only.
+   */
+  wireName?: string;
 };
+
+/** A top-level field's contract name: its `@WireName`, else the property name. */
+function contractName(f: ScanField): string {
+  return f.wireName ?? f.name;
+}
+
+/** Read a property's `@WireName('...')` (a string literal). */
+function readWireName(decl: ts.PropertyDeclaration): string | undefined {
+  const dec = findDecorator(decl, ['WireName']);
+  if (!dec) return undefined;
+  const arg = ts.isCallExpression(dec.expression) ? dec.expression.arguments[0] : undefined;
+  if (!arg || !ts.isStringLiteralLike(arg) || arg.text === '') {
+    throw new ScanError('@WireName needs a non-empty string literal', locationOf(dec));
+  }
+  return arg.text;
+}
 
 /**
  * Maps a brand tag (from `src/brand.ts`) to its canonical wire primitive.
@@ -719,7 +742,14 @@ function scanWireType(
     const propType = ctx.checker.getTypeOfSymbolAtLocation(prop, decl);
     const field = typeToField(ctx, prop.getName(), propType, locationOf(decl));
     applyContractDefault(field, decl);
+    field.wireName = readWireName(decl);
     fields.push(field);
+  }
+  // Fory JS writes the property's snake_case form, which is the reference form.
+  try {
+    checkFieldNames(fields.map(f => ({ memberSnake: referenceSnakeCase(f.name), name: contractName(f) })));
+  } catch (e) {
+    throw new ScanError(`@WireType('${tag}'): ${(e as Error).message}`, locationOf(classDecl));
   }
 
   return {
@@ -1146,7 +1176,7 @@ function scanFieldToFieldDef(
 ): FieldDefJson {
   const base: FieldDefJson = {
     id: index,
-    name: f.name,
+    name: contractName(f),
     type_kind: 'primitive',
     type_primitive: '',
     type_ref: '',
@@ -1587,7 +1617,7 @@ interface ManifestFieldOut {
 
 function scanFieldToManifest(f: ScanField): ManifestFieldOut {
   return {
-    name: f.name,
+    name: contractName(f),
     type: wireToManifestType(f),
     required: !f.nullable && f.contractDefaultHex === undefined,
     default: f.contractDefaultHex !== undefined ? f.contractDefaultValue : manifestDefault(f),
