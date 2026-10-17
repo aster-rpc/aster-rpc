@@ -526,57 +526,43 @@ class LocalTransport(Transport):
             service, method, metadata, deadline_secs, is_streaming=True
         )
 
+        async def requests() -> AsyncIterator[Any]:
+            # The client's sends, in order, until it half-closes.
+            while True:
+                msg = await send_queue.get()
+                if msg.is_close:
+                    return
+                if msg.is_send:
+                    yield await apply_request_interceptors(self._interceptors, ctx, msg.data)
+
+        accepts_ctx = handler_accepts_ctx(handler)
+        _cv_token = None
         try:
-            # Get the async generator handler
-            response_iter = handler(None)  # Bidi handlers receive context
-            
+            response_iter, _cv_token = invoke_handler_with_ctx(
+                handler, requests(), ctx, accepts_ctx
+            )
             if asyncio.iscoroutine(response_iter):
                 response_iter = await self._await_with_deadline(ctx, response_iter)
-            
-            # Message loop -- asyncio.Queue is NOT an async iterator,
-            # so we use get() in a loop instead.
-            while True:
-                try:
-                    msg = await asyncio.wait_for(send_queue.get(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    # Check if handler has more items to yield (non-blocking peek via try)
-                    continue
-                
-                if msg.is_close:
-                    break
-                
-                if msg.is_send:
-                    # Run request through interceptor chain
-                    msg.data = await apply_request_interceptors(self._interceptors, ctx, msg.data)
-                    
-                    # Send to handler
-                    try:
-                        item = await response_iter.__anext__()
-                        # Run response through interceptor chain
-                        item = await apply_response_interceptors(self._interceptors, ctx, item)
-                        
-                        # Serialize if wire_compatible
-                        if self._wire_compatible:
-                            item = self._deserialize(
-                                self._get_serialized_bytes(item, True),
-                                type(item),
-                                True
-                            )
-                        
-                        await recv_queue.put(LocalBidiMessage(is_send=True, data=item))
-                    except StopAsyncIteration:
-                        # Handler is done
-                        break
-            
-            # Signal end of stream
+
+            async for item in response_iter:
+                item = await apply_response_interceptors(self._interceptors, ctx, item)
+                if self._wire_compatible:
+                    item = self._deserialize(
+                        self._get_serialized_bytes(item, True), type(item), True
+                    )
+                await recv_queue.put(LocalBidiMessage(is_send=True, data=item))
+
+            # The handler finished: end of stream, then an OK trailer.
             await recv_queue.put(LocalBidiMessage(is_send=False, is_close=True))
             await trailer_queue.put((StatusCode.OK, ""))
-            
+
         except Exception as e:
             err = normalize_error(e)
             await apply_error_interceptors(self._interceptors, ctx, err)
             await recv_queue.put(LocalBidiMessage(is_send=False, is_close=True))
             await trailer_queue.put((StatusCode.UNKNOWN, str(e)))
+        finally:
+            reset_call_context(_cv_token)
 
 
 # ── In-memory frame streams (for testing wire protocol) ─────────────────────
