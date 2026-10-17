@@ -12,18 +12,20 @@ import (
 
 // Settings is the type of conformance/vectors/contract-defaults.json
 // (produced by Rust #[derive(AsterType)] with #[aster(default = ...)]).
+// The Rust-defined field names are snake_case, so each Go field names its
+// contract name with `aster:"name=..."` (Aster-FieldNaming.md).
 type defaultsSettings struct {
-	Name    string
-	State   string            `aster:"default=idle"`
-	Note    string            `aster:"default"`
-	Enabled bool              `aster:"default=true"`
-	Retries int32             `aster:"default=-3"`
-	SinceMs int64             `aster:"default=1700000000000"`
-	Ratio   float64           `aster:"default=0.5"`
-	Label   *string           `aster:"default=x"`
-	Tags    []string          `aster:"default"`
-	Attrs   map[string]string `aster:"default"`
-	Blob    []byte            `fory:"type=bytes"`
+	Name    string            `aster:"name=name"`
+	State   string            `aster:"name=state,default=idle"`
+	Note    string            `aster:"name=note,default"`
+	Enabled bool              `aster:"name=enabled,default=true"`
+	Retries int32             `aster:"name=retries,default=-3"`
+	SinceMs int64             `aster:"name=since_ms,default=1700000000000"`
+	Ratio   float64           `aster:"name=ratio,default=0.5"`
+	Label   *string           `aster:"name=label,default=x"`
+	Tags    []string          `aster:"name=tags,default"`
+	Attrs   map[string]string `aster:"name=attrs,default"`
+	Blob    []byte            `fory:"type=bytes" aster:"name=blob"`
 }
 
 func (defaultsSettings) AsterWireType() string { return "defaults.v1/Settings" }
