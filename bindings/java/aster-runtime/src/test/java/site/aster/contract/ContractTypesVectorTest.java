@@ -198,7 +198,7 @@ final class ContractTypesVectorTest {
 
   // ── vector ───────────────────────────────────────────────────────────────
 
-  private static final JsonNode VECTOR = load();
+  static final JsonNode VECTOR = load();
 
   private static JsonNode load() {
     Path dir = Path.of("").toAbsolutePath();
@@ -503,7 +503,7 @@ final class ContractTypesVectorTest {
     for (Field field : v.getClass().getDeclaredFields()) {
       if (Modifier.isStatic(field.getModifiers())) continue;
       try {
-        o.set(field.getName(), render(field.get(v)));
+        o.set(FieldNames.contractName(field, field.getName()), render(field.get(v)));
       } catch (IllegalAccessException e) {
         throw new AssertionError(e);
       }

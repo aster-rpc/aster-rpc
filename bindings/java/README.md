@@ -202,9 +202,14 @@ has too many digits, on encode and on decode, without modifying the caller's
 object; it refuses a `uuid` / `ulid` of any length but 16. Declare an optional
 field with Fory's type-use `@org.apache.fory.annotation.Nullable` (Fory does
 not serialize `Optional` in xlang mode); contract identity reads it as
-optional. Java contract identity uses the declared field name, so give
-multi-word fields their wire (snake_case) name when the contract must match
-another binding's. `ContractTypesVectorTest` pins all of this to
+optional. A field's contract name is its declared name, verbatim
+(`ffi_spec/Aster-FieldNaming.md`); a class implementing a contract defined in
+another language names the field with `@WireName("written_by")` on a
+`writtenBy` member. Contract identity refuses a name that is not plain
+(`userID`), a member whose Fory snake_case form differs from its name's
+(`author` named `writtenBy`, or a member starting with a capital, which Fory
+Java writes as `_value`), and two fields with one snake_case form
+(`FieldNameVectorTest`). `ContractTypesVectorTest` pins all of this to
 `conformance/vectors/contract-types.json`. Fory Java writes collection
 elements as nullable and ASCII strings as LATIN1, so payloads holding a list
 or a string are not byte-identical to Rust's (they decode both ways); the

@@ -317,7 +317,7 @@ public final class ContractManifestBuilder {
       for (RecordComponent rc : cls.getRecordComponents()) {
         out.add(
             fieldDict(
-                rc.getName(),
+                FieldNames.contractName(rc, rc.getName()),
                 rc.getGenericType(),
                 rc.getAnnotation(ContractDefault.class),
                 meta.fields()));
@@ -330,7 +330,7 @@ public final class ContractManifestBuilder {
       }
       out.add(
           fieldDict(
-              f.getName(),
+              FieldNames.contractName(f, f.getName()),
               f.getGenericType(),
               f.getAnnotation(ContractDefault.class),
               meta.fields()));

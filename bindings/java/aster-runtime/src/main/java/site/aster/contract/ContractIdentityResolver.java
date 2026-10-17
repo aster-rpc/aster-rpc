@@ -293,13 +293,39 @@ public final class ContractIdentityResolver {
     return t != null && t.isAnnotationPresent(org.apache.fory.annotation.Nullable.class);
   }
 
+  /**
+   * A type's fields, each named by its contract name ({@link FieldNames}): the declared name, or
+   * its {@code @WireName}. Refuses the names Aster-FieldNaming.md refuses.
+   */
   private static List<RecordOrClassField> fieldsOf(Class<?> cls) {
+    List<RecordOrClassField> out = fieldsOfUnchecked(cls);
+    List<FieldNames.Entry> names = new ArrayList<>();
+    if (cls.isRecord()) {
+      for (RecordComponent rc : cls.getRecordComponents()) {
+        names.add(
+            new FieldNames.Entry(
+                FieldNames.forySnakeCase(rc.getName()), FieldNames.contractName(rc, rc.getName())));
+      }
+    } else {
+      for (java.lang.reflect.Field f : cls.getDeclaredFields()) {
+        if (!java.lang.reflect.Modifier.isStatic(f.getModifiers()) && !f.isSynthetic()) {
+          names.add(
+              new FieldNames.Entry(
+                  FieldNames.forySnakeCase(f.getName()), FieldNames.contractName(f, f.getName())));
+        }
+      }
+    }
+    FieldNames.check(cls, names);
+    return out;
+  }
+
+  private static List<RecordOrClassField> fieldsOfUnchecked(Class<?> cls) {
     List<RecordOrClassField> out = new ArrayList<>();
     if (cls.isRecord()) {
       for (RecordComponent rc : cls.getRecordComponents()) {
         out.add(
             new RecordOrClassField(
-                rc.getName(),
+                FieldNames.contractName(rc, rc.getName()),
                 rc.getGenericType(),
                 rc.getAnnotation(ContractDefault.class),
                 rc.getAnnotation(FixedDecimal.class),
@@ -313,7 +339,7 @@ public final class ContractIdentityResolver {
       }
       out.add(
           new RecordOrClassField(
-              f.getName(),
+              FieldNames.contractName(f, f.getName()),
               f.getGenericType(),
               f.getAnnotation(ContractDefault.class),
               f.getAnnotation(FixedDecimal.class),
