@@ -1,0 +1,11 @@
+;; hermetic.sb -- the macOS sandbox profile for scripts/ci/hermetic.sh.
+;; Everything is allowed except outbound network: IP traffic only to
+;; localhost (127.0.0.1 and ::1), Unix sockets allowed (build daemons, the
+;; Kache socket, IPC) except mDNSResponder, which is the system resolver, so
+;; only /etc/hosts names resolve. Inbound (listening, accepting) is allowed.
+(version 1)
+(allow default)
+(deny network-outbound)
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-outbound (remote unix-socket))
+(deny network-outbound (literal "/private/var/run/mDNSResponder"))

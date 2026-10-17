@@ -106,7 +106,10 @@ fi
 # green, and proving nothing. These are the only tests that assert over-cap
 # bytes were never *materialized*, rather than that the call was refused.
 step "cargo test (core, ingress allocation proofs)"
-if cargo test -p aster_transport_core --features ingress-metrics --test ingress_metrics; then
+# Test commands run under scripts/ci/hermetic.sh: no network but loopback.
+HERMETIC="$(cd "$(dirname "$0")" && pwd)/ci/hermetic.sh"
+cargo test -p aster_transport_core --features ingress-metrics --test ingress_metrics --no-run
+if "$HERMETIC" cargo test -p aster_transport_core --features ingress-metrics --test ingress_metrics; then
     pass "Ingress allocation proofs OK"
 else
     fail "Ingress allocation proofs failed. See the output above."
@@ -128,7 +131,7 @@ fi
 # ── 4. Tests via uv ────────────────────────────────────────────────
 step "uv run pytest tests/python/"
 if command -v uv &>/dev/null; then
-    if uv run pytest tests/python/ -v --timeout=60; then
+    if "$HERMETIC" uv run --no-sync pytest tests/python/ -v --timeout=60; then
         pass "Tests OK"
     else
         fail "Tests failed"
@@ -161,7 +164,7 @@ if command -v bun &>/dev/null || [ -x "$HOME/.bun/bin/bun" ]; then
     fi
 
     step "TypeScript tests (vitest)"
-    if (cd bindings/typescript/packages/aster && "$BUN" run vitest run); then
+    if (cd bindings/typescript/packages/aster && "$HERMETIC" "$BUN" run vitest run); then
         pass "TypeScript tests OK"
     else
         fail "TypeScript tests failed"
