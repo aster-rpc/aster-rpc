@@ -464,6 +464,12 @@ public final class AsterServer implements AutoCloseable {
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
     }
+    // A closing server has cancelled every call it still holds (a drain that reached its
+    // deadline, or a plain close). The poll loop has stopped, so CANCELLED events still queued
+    // will never be read: complete their signals here, or a handler waiting on cancelled()
+    // hangs past shutdown.
+    cancelSignals.values().forEach(signal -> signal.complete(null));
+    cancelSignals.clear();
     callExecutor.shutdown();
     streamingExecutor.shutdown();
     try {
