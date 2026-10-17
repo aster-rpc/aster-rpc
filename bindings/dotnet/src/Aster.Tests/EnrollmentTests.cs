@@ -15,14 +15,14 @@ namespace Aster.Tests;
 [WireType("test.enrollment/OpsRequest")]
 public sealed class OpsRequest
 {
-    public int N { get; set; }
+    [WireName("n")] public int N { get; set; }
 }
 
 [ForyStruct]
 [WireType("test.enrollment/OpsReply")]
 public sealed class OpsReply
 {
-    public string Roles { get; set; } = "";
+    [WireName("roles")] public string Roles { get; set; } = "";
 }
 
 /// <summary>

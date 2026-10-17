@@ -30,59 +30,59 @@ public static class Roles
 }
 
 [ForyStruct, WireType("mission/StatusRequest")]
-public sealed class StatusRequest { public string AgentId { get; set; } = ""; }
+public sealed class StatusRequest { [WireName("agent_id")] public string AgentId { get; set; } = ""; }
 
 [ForyStruct, WireType("mission/StatusResponse")]
 public sealed class StatusResponse
 {
-    public string AgentId { get; set; } = "";
-    public string Status { get; set; } = "";
-    public long UptimeSecs { get; set; }
+    [WireName("agent_id")] public string AgentId { get; set; } = "";
+    [WireName("status")] public string Status { get; set; } = "";
+    [WireName("uptime_secs")] public long UptimeSecs { get; set; }
 }
 
 [ForyStruct, WireType("mission/LogEntry")]
 public sealed class LogEntry
 {
-    public double Timestamp { get; set; }
-    public string Level { get; set; } = "";
-    public string Message { get; set; } = "";
-    public string AgentId { get; set; } = "";
+    [WireName("timestamp")] public double Timestamp { get; set; }
+    [WireName("level")] public string Level { get; set; } = "";
+    [WireName("message")] public string Message { get; set; } = "";
+    [WireName("agent_id")] public string AgentId { get; set; } = "";
 }
 
 [ForyStruct, WireType("mission/SubmitLogResult")]
-public sealed class SubmitLogResult { public bool Accepted { get; set; } }
+public sealed class SubmitLogResult { [WireName("accepted")] public bool Accepted { get; set; } }
 
 [ForyStruct, WireType("mission/TailRequest")]
 public sealed class TailRequest
 {
-    public string AgentId { get; set; } = "";
-    public string Level { get; set; } = "";
+    [WireName("agent_id")] public string AgentId { get; set; } = "";
+    [WireName("level")] public string Level { get; set; } = "";
 }
 
 [ForyStruct, WireType("mission/MetricPoint")]
 public sealed class MetricPoint
 {
-    public string Name { get; set; } = "";
-    public double Value { get; set; }
-    public double Timestamp { get; set; }
+    [WireName("name")] public string Name { get; set; } = "";
+    [WireName("value")] public double Value { get; set; }
+    [WireName("timestamp")] public double Timestamp { get; set; }
 }
 
 [ForyStruct, WireType("mission/IngestResult")]
 public sealed class IngestResult
 {
-    public int Accepted { get; set; }
-    public int Dropped { get; set; }
+    [WireName("accepted")] public int Accepted { get; set; }
+    [WireName("dropped")] public int Dropped { get; set; }
 }
 
 [ForyStruct, WireType("mission/Command")]
-public sealed class CommandRequest { public string Command { get; set; } = ""; }
+public sealed class CommandRequest { [WireName("command")] public string Command { get; set; } = ""; }
 
 [ForyStruct, WireType("mission/CommandResult")]
 public sealed class CommandResult
 {
-    public string Stdout { get; set; } = "";
-    public string Stderr { get; set; } = "";
-    public int ExitCode { get; set; }
+    [WireName("stdout")] public string Stdout { get; set; } = "";
+    [WireName("stderr")] public string Stderr { get; set; } = "";
+    [WireName("exit_code")] public int ExitCode { get; set; }
 }
 
 public static class MissionControl

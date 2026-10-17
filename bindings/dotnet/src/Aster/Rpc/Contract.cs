@@ -27,8 +27,9 @@ public sealed class WireTypeAttribute(string tag) : Attribute
 }
 
 /// <summary>
-/// Overrides a property's contract/wire field name (default: the property name in snake_case,
-/// which is also what Fory writes).
+/// A property's or field's contract name, when the contract is defined in another language
+/// (default: the member name, verbatim). Fory writes the member's own snake_case form, so the
+/// override's snake_case form must equal the member's (<see cref="FieldNames"/>).
 /// </summary>
 [AttributeUsage(AttributeTargets.Property | AttributeTargets.Field, Inherited = false)]
 public sealed class WireNameAttribute(string name) : Attribute
@@ -199,25 +200,6 @@ public static class ContractBuilder
 
     /// <summary>The 64-hex type hash: BLAKE3 of the canonical <c>TypeDef</c> bytes.</summary>
     public static string TypeHash(Type type) => new Resolver().Hash(type);
-
-    /// <summary>PascalCase / camelCase → snake_case (what Fory writes for a property name).</summary>
-    public static string SnakeCase(string name)
-    {
-        var sb = new StringBuilder(name.Length + 4);
-        for (int i = 0; i < name.Length; i++)
-        {
-            char c = name[i];
-            if (char.IsUpper(c))
-            {
-                bool prevLowerOrDigit = i > 0 && (char.IsLower(name[i - 1]) || char.IsDigit(name[i - 1]));
-                bool acronymEnd = i > 0 && char.IsUpper(name[i - 1]) && i + 1 < name.Length && char.IsLower(name[i + 1]);
-                if (sb.Length > 0 && sb[^1] != '_' && (prevLowerOrDigit || acronymEnd)) sb.Append('_');
-                sb.Append(char.ToLowerInvariant(c));
-            }
-            else sb.Append(c);
-        }
-        return sb.ToString();
-    }
 
     /// <summary>The members Fory serializes (and the contract lists): public read/write properties and public fields, minus <c>[ForyField(Ignore = true)]</c>.</summary>
     internal static IEnumerable<MemberInfo> PayloadMembers(Type type)
@@ -423,7 +405,11 @@ public static class ContractBuilder
                 w.WriteString("name", name);
                 w.WriteStartArray("fields");
                 if (!type.IsEnum)
-                    foreach (var member in PayloadMembers(type)) WriteField(w, member);
+                {
+                    var members = PayloadMembers(type).ToList();
+                    FieldNames.Check(type, members);
+                    foreach (var member in members) WriteField(w, member);
+                }
                 w.WriteEndArray();
                 w.WriteStartArray("enum_values");
                 if (type.IsEnum)
@@ -475,7 +461,7 @@ public static class ContractBuilder
             }
             w.WriteStartObject();
             w.WriteNumber("id", 0);
-            w.WriteString("name", member.GetCustomAttribute<WireNameAttribute>()?.Name ?? SnakeCase(member.Name));
+            w.WriteString("name", FieldNames.ContractName(member));
             w.WriteString("type_kind", kind);
             w.WriteString("type_primitive", primitive);
             w.WriteString("type_ref", typeRef);

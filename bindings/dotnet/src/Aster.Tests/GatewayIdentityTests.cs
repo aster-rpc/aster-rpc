@@ -18,21 +18,21 @@ namespace Aster.Tests;
 [WireType("test.gateway/WhoRequest")]
 public sealed class WhoRequest
 {
-    public int N { get; set; }
+    [WireName("n")] public int N { get; set; }
 }
 
 [ForyStruct]
 [WireType("test.gateway/WhoReply")]
 public sealed class WhoReply
 {
-    public string Principal { get; set; } = "";
-    public string Peer { get; set; } = "";
-    public string Actor { get; set; } = "";
-    public string Amr { get; set; } = "";
-    public string Roles { get; set; } = "";
-    public string Issuer { get; set; } = "";
-    public long Tier { get; set; }
-    public string Name { get; set; } = "";
+    [WireName("principal")] public string Principal { get; set; } = "";
+    [WireName("peer")] public string Peer { get; set; } = "";
+    [WireName("actor")] public string Actor { get; set; } = "";
+    [WireName("amr")] public string Amr { get; set; } = "";
+    [WireName("roles")] public string Roles { get; set; } = "";
+    [WireName("issuer")] public string Issuer { get; set; } = "";
+    [WireName("tier")] public long Tier { get; set; }
+    [WireName("name")] public string Name { get; set; } = "";
 }
 
 /// <summary>

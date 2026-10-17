@@ -16,34 +16,34 @@ public class ContractDefaultTests
     [WireType("defaults.v1/Settings")]
     public class Settings
     {
-        public string Name { get; set; } = "";
-        [ContractDefault] public string State { get; set; } = "idle";
-        [ContractDefault] public string Note { get; set; } = "";
-        [ContractDefault] public bool Enabled { get; set; } = true;
-        [ContractDefault] public int Retries { get; set; } = -3;
-        [ContractDefault] public long SinceMs { get; set; } = 1_700_000_000_000;
-        [ContractDefault] public double Ratio { get; set; } = 0.5;
-        [ContractDefault] public string? Label { get; set; } = "x";
-        [ContractDefault] public List<string> Tags { get; set; } = new();
-        [ContractDefault] public Dictionary<string, string> Attrs { get; set; } = new();
-        public byte[] Blob { get; set; } = [];
+        [WireName("name")] public string Name { get; set; } = "";
+        [ContractDefault] [WireName("state")] public string State { get; set; } = "idle";
+        [ContractDefault] [WireName("note")] public string Note { get; set; } = "";
+        [ContractDefault] [WireName("enabled")] public bool Enabled { get; set; } = true;
+        [ContractDefault] [WireName("retries")] public int Retries { get; set; } = -3;
+        [ContractDefault] [WireName("since_ms")] public long SinceMs { get; set; } = 1_700_000_000_000;
+        [ContractDefault] [WireName("ratio")] public double Ratio { get; set; } = 0.5;
+        [ContractDefault] [WireName("label")] public string? Label { get; set; } = "x";
+        [ContractDefault] [WireName("tags")] public List<string> Tags { get; set; } = new();
+        [ContractDefault] [WireName("attrs")] public Dictionary<string, string> Attrs { get; set; } = new();
+        [WireName("blob")] public byte[] Blob { get; set; } = [];
     }
 
     /// <summary>The same shape with every default dropped (all fields required).</summary>
     [WireType("defaults.v1/Settings")]
     public class SettingsRequired
     {
-        public string Name { get; set; } = "";
-        public string State { get; set; } = "idle";
-        public string Note { get; set; } = "";
-        public bool Enabled { get; set; } = true;
-        public int Retries { get; set; } = -3;
-        public long SinceMs { get; set; } = 1_700_000_000_000;
-        public double Ratio { get; set; } = 0.5;
-        public string? Label { get; set; } = "x";
-        public List<string> Tags { get; set; } = new();
-        public Dictionary<string, string> Attrs { get; set; } = new();
-        public byte[] Blob { get; set; } = [];
+        [WireName("name")] public string Name { get; set; } = "";
+        [WireName("state")] public string State { get; set; } = "idle";
+        [WireName("note")] public string Note { get; set; } = "";
+        [WireName("enabled")] public bool Enabled { get; set; } = true;
+        [WireName("retries")] public int Retries { get; set; } = -3;
+        [WireName("since_ms")] public long SinceMs { get; set; } = 1_700_000_000_000;
+        [WireName("ratio")] public double Ratio { get; set; } = 0.5;
+        [WireName("label")] public string? Label { get; set; } = "x";
+        [WireName("tags")] public List<string> Tags { get; set; } = new();
+        [WireName("attrs")] public Dictionary<string, string> Attrs { get; set; } = new();
+        [WireName("blob")] public byte[] Blob { get; set; } = [];
     }
 
     private static ServiceDefinition Service<T>() where T : class, new()
@@ -106,17 +106,17 @@ public class ContractDefaultTests
     [WireType("defaults.v1/Settings")]
     public class ChangedDefault
     {
-        [ContractDefault] public int Retries { get; set; } = 4;
+        [ContractDefault] [WireName("retries")] public int Retries { get; set; } = 4;
     }
 
-    [WireType("t/Bad1")] public class NonEmptyList { [ContractDefault] public List<string> Tags { get; set; } = ["a"]; }
-    [WireType("t/Bad2")] public class NullDefault { [ContractDefault] public string? Label { get; set; } }
-    [WireType("t/Bad3")] public class ReservedFloat32 { [ContractDefault] public float Ratio { get; set; } = 1f; }
-    [WireType("t/Bad4")] public class ReservedUInt8 { [ContractDefault] public byte B { get; set; } = 1; }
-    [WireType("t/Bad5")] public class NaNDefault { [ContractDefault] public double D { get; set; } = double.NaN; }
-    [WireType("t/Bad6")] public class SubnormalDefault { [ContractDefault] public double D { get; set; } = 1e-310; }
-    [WireType("t/Bad7")] public class NoDefaultCtor { public NoDefaultCtor(int x) { X = x; } [ContractDefault] public int X { get; set; } }
-    [WireType("t/Bad8")] public class RefDefault { [ContractDefault] public Settings S { get; set; } = new(); }
+    [WireType("t/Bad1")] public class NonEmptyList { [ContractDefault] [WireName("tags")] public List<string> Tags { get; set; } = ["a"]; }
+    [WireType("t/Bad2")] public class NullDefault { [ContractDefault] [WireName("label")] public string? Label { get; set; } }
+    [WireType("t/Bad3")] public class ReservedFloat32 { [ContractDefault] [WireName("ratio")] public float Ratio { get; set; } = 1f; }
+    [WireType("t/Bad4")] public class ReservedUInt8 { [ContractDefault] [WireName("b")] public byte B { get; set; } = 1; }
+    [WireType("t/Bad5")] public class NaNDefault { [ContractDefault] [WireName("d")] public double D { get; set; } = double.NaN; }
+    [WireType("t/Bad6")] public class SubnormalDefault { [ContractDefault] [WireName("d")] public double D { get; set; } = 1e-310; }
+    [WireType("t/Bad7")] public class NoDefaultCtor { public NoDefaultCtor(int x) { X = x; } [ContractDefault] [WireName("x")] public int X { get; set; } }
+    [WireType("t/Bad8")] public class RefDefault { [ContractDefault] [WireName("s")] public Settings S { get; set; } = new(); }
 
     [Theory]
     [InlineData(typeof(NonEmptyList))]
@@ -133,10 +133,10 @@ public class ContractDefaultTests
     [WireType("t/Edge")]
     public class Edge
     {
-        [ContractDefault] public int Min { get; set; } = int.MinValue;
-        [ContractDefault] public long Max { get; set; } = long.MaxValue;
-        [ContractDefault] public double NegZero { get; set; } = -0.0;
-        [ContractDefault] public int? Maybe { get; set; } = 7;
+        [ContractDefault] [WireName("min")] public int Min { get; set; } = int.MinValue;
+        [ContractDefault] [WireName("max")] public long Max { get; set; } = long.MaxValue;
+        [ContractDefault] [WireName("neg_zero")] public double NegZero { get; set; } = -0.0;
+        [ContractDefault] [WireName("maybe")] public int? Maybe { get; set; } = 7;
     }
 
     [Fact]

@@ -63,19 +63,19 @@ switch (args)
 [WireType("interop/EchoRequest")]
 public sealed class EchoRequest
 {
-    public string Message { get; set; } = "";
-    public int Count { get; set; }
-    public byte[] Data { get; set; } = [];
+    [WireName("message")] public string Message { get; set; } = "";
+    [WireName("count")] public int Count { get; set; }
+    [WireName("data")] public byte[] Data { get; set; } = [];
 }
 
 [ForyStruct]
 [WireType("interop/EchoReply")]
 public sealed class EchoReply
 {
-    public string Message { get; set; } = "";
-    public int Count { get; set; }
-    public byte[] Data { get; set; } = [];
-    public string ServerLang { get; set; } = "";
+    [WireName("message")] public string Message { get; set; } = "";
+    [WireName("count")] public int Count { get; set; }
+    [WireName("data")] public byte[] Data { get; set; } = [];
+    [WireName("server_lang")] public string ServerLang { get; set; } = "";
 }
 
 internal static class InteropEcho

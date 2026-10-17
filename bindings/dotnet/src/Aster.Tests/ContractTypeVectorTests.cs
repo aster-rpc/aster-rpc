@@ -14,71 +14,71 @@ namespace Aster.Tests;
 [ForyStruct, WireType("types.v1/Temporal")]
 public sealed class CtTemporal
 {
-    public DateTimeOffset At { get; set; }
-    public DateOnly Day { get; set; }
-    public ForyDecimal Amount { get; set; }
-    public DateTimeOffset? MaybeAt { get; set; }
-    public List<DateTimeOffset> History { get; set; } = new();
+    [WireName("at")] public DateTimeOffset At { get; set; }
+    [WireName("day")] public DateOnly Day { get; set; }
+    [WireName("amount")] public ForyDecimal Amount { get; set; }
+    [WireName("maybe_at")] public DateTimeOffset? MaybeAt { get; set; }
+    [WireName("history")] public List<DateTimeOffset> History { get; set; } = new();
 }
 
 [ForyStruct, WireType("types.v1/TreeNode")]
 public sealed class CtTreeNode
 {
-    public string Value { get; set; } = "";
-    public List<CtTreeNode> Children { get; set; } = new();
+    [WireName("value")] public string Value { get; set; } = "";
+    [WireName("children")] public List<CtTreeNode> Children { get; set; } = new();
 }
 
 /// <summary>Contract identity only, as in Rust (a cycle through an optional field alone).</summary>
 [ForyStruct, WireType("types.v1/Chain")]
 public sealed class CtChain
 {
-    public int Value { get; set; }
-    public CtChain? Next { get; set; }
+    [WireName("value")] public int Value { get; set; }
+    [WireName("next")] public CtChain? Next { get; set; }
 }
 
 [ForyStruct, WireType("types.v1/Author")]
 public sealed class CtAuthor
 {
-    public string Name { get; set; } = "";
-    public List<CtBook> Books { get; set; } = new();
+    [WireName("name")] public string Name { get; set; } = "";
+    [WireName("books")] public List<CtBook> Books { get; set; } = new();
 }
 
 [ForyStruct, WireType("types.v1/Book")]
 public sealed class CtBook
 {
-    public string Title { get; set; } = "";
-    public CtAuthor? WrittenBy { get; set; }
+    [WireName("title")] public string Title { get; set; } = "";
+    [WireName("written_by")] public CtAuthor? WrittenBy { get; set; }
 }
 
 [ForyStruct, WireType("types.v1/Alpha")]
-public sealed class CtAlpha { public CtBeta? Next { get; set; } }
+public sealed class CtAlpha { [WireName("next")] public CtBeta? Next { get; set; } }
 
 [ForyStruct, WireType("types.v1/Beta")]
-public sealed class CtBeta { public CtGamma? Next { get; set; } }
+public sealed class CtBeta { [WireName("next")] public CtGamma? Next { get; set; } }
 
 [ForyStruct, WireType("types.v1/Gamma")]
-public sealed class CtGamma { public List<CtAlpha> Next { get; set; } = new(); }
+public sealed class CtGamma { [WireName("next")] public List<CtAlpha> Next { get; set; } = new(); }
 
 [ForyStruct, WireType("types.v1/Forest")]
-public sealed class CtForest { public List<CtTreeNode> Trees { get; set; } = new(); }
+public sealed class CtForest { [WireName("trees")] public List<CtTreeNode> Trees { get; set; } = new(); }
 
 [ForyStruct, WireType("types.v1/Identified")]
 public sealed class CtIdentified
 {
-    [WireUuid] public byte[] Id { get; set; } = new byte[16];
-    [WireUlid] public byte[] Trace { get; set; } = new byte[16];
-    [WireUuid] public byte[]? Parent { get; set; }
-    [WireUlid] public List<byte[]> History { get; set; } = new();
-    [WireUuid] public Dictionary<byte[], string> Names { get; set; } = new();
+    [WireUuid] [WireName("id")] public byte[] Id { get; set; } = new byte[16];
+    [WireUlid] [WireName("trace")] public byte[] Trace { get; set; } = new byte[16];
+    [WireUuid] [WireName("parent")] public byte[]? Parent { get; set; }
+    [WireUlid] [WireName("history")] public List<byte[]> History { get; set; } = new();
+    [WireUuid] [WireName("names")] public Dictionary<byte[], string> Names { get; set; } = new();
 }
 
 [ForyStruct, WireType("types.v1/Priced")]
 public sealed class CtPriced
 {
-    [WireDecimal(18, 4)] public ForyDecimal Price { get; set; }
-    [WireDecimal(5, 0)] public ForyDecimal Rate { get; set; }
-    [WireDecimal(18, 4)] public ForyDecimal? MaybePrice { get; set; }
-    public ForyDecimal Amount { get; set; }
+    [WireDecimal(18, 4)] [WireName("price")] public ForyDecimal Price { get; set; }
+    [WireDecimal(5, 0)] [WireName("rate")] public ForyDecimal Rate { get; set; }
+    [WireDecimal(18, 4)] [WireName("maybe_price")] public ForyDecimal? MaybePrice { get; set; }
+    [WireName("amount")] public ForyDecimal Amount { get; set; }
 }
 
 // A cycle whose spanning tree depends on codepoint (not UTF-16) order: Ａ (U+FF21) and 𝔸
@@ -86,33 +86,33 @@ public sealed class CtPriced
 [ForyStruct, WireType("types.v1/Ord")]
 public sealed class CtOrd
 {
-    public CtWide? Wide { get; set; }
-    public CtMath? Math { get; set; }
+    [WireName("wide")] public CtWide? Wide { get; set; }
+    [WireName("math")] public CtMath? Math { get; set; }
 }
 
 [ForyStruct, WireType("types.v1/\uFF21")]
 public sealed class CtWide
 {
-    public CtOrd? Back { get; set; }
-    public CtMath? Math { get; set; }
+    [WireName("back")] public CtOrd? Back { get; set; }
+    [WireName("math")] public CtMath? Math { get; set; }
 }
 
 [ForyStruct, WireType("types.v1/\U0001D538")]
-public sealed class CtMath { public CtWide? Wide { get; set; } }
+public sealed class CtMath { [WireName("wide")] public CtWide? Wide { get; set; } }
 
 // The spec's B.4 diamond: A -> C is a back-edge though C is hashed first.
 [ForyStruct, WireType("types.v1/DiamondA")]
 public sealed class CtDiamondA
 {
-    public CtDiamondB? B { get; set; }
-    public CtDiamondC? C { get; set; }
+    [WireName("b")] public CtDiamondB? B { get; set; }
+    [WireName("c")] public CtDiamondC? C { get; set; }
 }
 
 [ForyStruct, WireType("types.v1/DiamondB")]
-public sealed class CtDiamondB { public CtDiamondC? C { get; set; } }
+public sealed class CtDiamondB { [WireName("c")] public CtDiamondC? C { get; set; } }
 
 [ForyStruct, WireType("types.v1/DiamondC")]
-public sealed class CtDiamondC { public List<CtDiamondA> A { get; set; } = new(); }
+public sealed class CtDiamondC { [WireName("a")] public List<CtDiamondA> A { get; set; } = new(); }
 
 /// <summary>
 /// conformance/vectors/contract-types.json: the .NET contract types (timestamp, date, decimal,
@@ -307,9 +307,9 @@ public class ContractTypeVectorTests
         Assert.Throws<NotSupportedException>(() => ContractBuilder.TypeDefJson(typeof(BadDecimal)));
     }
 
-    [WireType("bad.v1/BadDateTime")] public sealed class BadDateTime { public DateTime At { get; set; } }
-    [WireType("bad.v1/BadGuid")] public sealed class BadGuid { public Guid Id { get; set; } }
-    [WireType("bad.v1/BadDecimal")] public sealed class BadDecimal { public decimal Amount { get; set; } }
+    [WireType("bad.v1/BadDateTime")] public sealed class BadDateTime { [WireName("at")] public DateTime At { get; set; } }
+    [WireType("bad.v1/BadGuid")] public sealed class BadGuid { [WireName("id")] public Guid Id { get; set; } }
+    [WireType("bad.v1/BadDecimal")] public sealed class BadDecimal { [WireName("amount")] public decimal Amount { get; set; } }
 
     // ── helpers ─────────────────────────────────────────────────────────────
 
@@ -329,7 +329,7 @@ public class ContractTypeVectorTests
     }
 
     /// <summary>The vector's JSON form of a decoded value (snake_case names; the contract types' string forms).</summary>
-    private static JsonNode? ToJson(object? value, MemberInfo? member = null)
+    internal static JsonNode? ToJson(object? value, MemberInfo? member = null)
     {
         switch (value)
         {
@@ -359,7 +359,7 @@ public class ContractTypeVectorTests
             {
                 var o = new JsonObject();
                 foreach (var p in value.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance))
-                    o[ContractBuilder.SnakeCase(p.Name)] = ToJson(p.GetValue(value), p);
+                    o[FieldNames.ContractName(p)] = ToJson(p.GetValue(value), p);
                 return o;
             }
         }

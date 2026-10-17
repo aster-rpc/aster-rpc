@@ -14,40 +14,40 @@ namespace Aster.Tests;
 [WireType("interop/EchoRequest")]
 public sealed class EchoRequest
 {
-    public string Message { get; set; } = "";
-    public int Count { get; set; }
-    public byte[] Data { get; set; } = [];
+    [WireName("message")] public string Message { get; set; } = "";
+    [WireName("count")] public int Count { get; set; }
+    [WireName("data")] public byte[] Data { get; set; } = [];
 }
 
 [ForyStruct]
 [WireType("interop/EchoReply")]
 public sealed class EchoReply
 {
-    public string Message { get; set; } = "";
-    public int Count { get; set; }
-    public byte[] Data { get; set; } = [];
-    public string ServerLang { get; set; } = "";
+    [WireName("message")] public string Message { get; set; } = "";
+    [WireName("count")] public int Count { get; set; }
+    [WireName("data")] public byte[] Data { get; set; } = [];
+    [WireName("server_lang")] public string ServerLang { get; set; } = "";
 }
 
 [ForyStruct]
 [WireType("test/Numbers")]
 public sealed class Numbers
 {
-    public int I { get; set; }
-    public long L { get; set; }
-    public uint U { get; set; }
-    public ulong UL { get; set; }
-    public short S { get; set; }
-    public sbyte SB { get; set; }
-    public byte B { get; set; }
-    public float F { get; set; }
-    public double D { get; set; }
-    public bool Flag { get; set; }
-    public int? MaybeInt { get; set; }
-    public string? MaybeText { get; set; }
-    public List<string> Names { get; set; } = [];
-    public Dictionary<string, long> Totals { get; set; } = [];
-    public EchoRequest Nested { get; set; } = new();
+    [WireName("i")] public int I { get; set; }
+    [WireName("l")] public long L { get; set; }
+    [WireName("u")] public uint U { get; set; }
+    [WireName("ul")] public ulong Ul { get; set; }
+    [WireName("s")] public short S { get; set; }
+    [WireName("sb")] public sbyte Sb { get; set; }
+    [WireName("b")] public byte B { get; set; }
+    [WireName("f")] public float F { get; set; }
+    [WireName("d")] public double D { get; set; }
+    [WireName("flag")] public bool Flag { get; set; }
+    [WireName("maybe_int")] public int? MaybeInt { get; set; }
+    [WireName("maybe_text")] public string? MaybeText { get; set; }
+    [WireName("names")] public List<string> Names { get; set; } = [];
+    [WireName("totals")] public Dictionary<string, long> Totals { get; set; } = [];
+    [WireName("nested")] public EchoRequest Nested { get; set; } = new();
 }
 
 /// <summary>Server + client end to end over loopback (unary, streaming, errors, deadlines).</summary>

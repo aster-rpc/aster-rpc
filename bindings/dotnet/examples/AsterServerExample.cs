@@ -10,14 +10,14 @@ namespace Examples;
 [WireType("examples/EchoRequest")]
 public sealed class EchoRequest
 {
-    public string Message { get; set; } = "";
+    [WireName("message")] public string Message { get; set; } = "";
 }
 
 [ForyStruct]
 [WireType("examples/EchoReply")]
 public sealed class EchoReply
 {
-    public string Message { get; set; } = "";
+    [WireName("message")] public string Message { get; set; } = "";
 }
 
 /// <summary>A unary echo service served and called in-process over loopback.</summary>
