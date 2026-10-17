@@ -5462,7 +5462,11 @@ int32_t aster_node_start_enrolled(aster_runtime_t runtime,
  * "direct_addresses": ["ip:port"]?}`. Completes with
  * `ASTER_EVENT_ENROLLMENT_RESULT`: `{"readiness": {"peer", "source":
  * "chain"|"registration", "observed_source", "policy_sync", "local_clock"},
- * "renewing": bool}`, or `ASTER_EVENT_ERROR`. An admission decision by
+ * "renewing": bool, "publisher_error": "…"?}`, or `ASTER_EVENT_ERROR`. With
+ * `[identity.publisher]` the first enrollment starts the issuer-key
+ * publisher and each later one adds its server as a delivery target; a
+ * publisher that would not start is `publisher_error`, not a failed
+ * enrollment. An admission decision by
  * either side keeps its `aster_enrollment_error_t` in `flags`, with status
  * `PERMISSION_DENIED` (`DENIED`: the server refused this node, or this node
  * refused the server), `UNAUTHENTICATED` (`NOT_ADMITTED`) or `UNAVAILABLE`
@@ -6604,8 +6608,9 @@ int32_t aster_config_from_toml(struct aster_bytes_t path, struct aster_config_t 
 
 /**
  * Free the storage of a config filled by `aster_config_from_env` /
- * `aster_config_from_toml` (or given network settings by
- * `aster_config_set_network`, ABI 7.3) and zero its pointers. No-op when
+ * `aster_config_from_toml` (or given settings beside it by
+ * `aster_config_set_network` (ABI 7.3), `aster_config_set_metrics` (7.4) or
+ * `aster_config_set_identity` (7.7)) and zero its pointers. No-op when
  * `storage` is NULL (caller-built or `aster_config_init` configs). Call once
  * per filled struct.
  */
