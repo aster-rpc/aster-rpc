@@ -240,7 +240,7 @@ pub async fn lifecycle(ctx: &Ctx, command: DaemonCommand) -> Result<()> {
     let dir = directory(ctx)?;
     let socket = dir.join("client.sock");
     match command {
-        DaemonCommand::Foreground => serve(ctx, &dir).await,
+        DaemonCommand::Foreground => serve(ctx, &dir, crate::node_network()?).await,
         DaemonCommand::Status => {
             println!("{}", exchange(&socket, json!({"operation":"ping"})).await?);
             Ok(())
@@ -277,8 +277,10 @@ pub(super) fn load_node_key(path: &std::path::Path) -> Result<aster::SecretKey> 
     let seed = super::grants::identity(text.trim())?;
     Ok(aster::SecretKey::from_bytes(seed))
 }
+/// Own `dir`'s socket and serve until stopped or idle. `network` supplies
+/// the node's network settings ([`crate::node_network`] in production).
 #[cfg(unix)]
-async fn serve(ctx: &Ctx, dir: &std::path::Path) -> Result<()> {
+async fn serve(ctx: &Ctx, dir: &std::path::Path, network: aster::AsterConfig) -> Result<()> {
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -337,7 +339,7 @@ async fn serve(ctx: &Ctx, dir: &std::path::Path) -> Result<()> {
         root_pubkey: Some(aster::PublicKey::from_hex(&hex::encode(root))?),
         enable_hooks: true,
         hook_failure_mode: aster::HookFailureMode::FailClosed,
-        ..Default::default()
+        ..network
     };
     let node =
         aster::Node::start_with_alpns(config, vec![aster::enrollment::ENROLLMENT_ALPN.to_vec()])
@@ -637,6 +639,15 @@ pub async fn lifecycle(_: &Ctx, _: DaemonCommand) -> Result<()> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    /// Direct-only on loopback: no relay to wait for, no lookup to make.
+    fn loopback() -> aster::AsterConfig {
+        aster::AsterConfig {
+            bind_addr: Some("127.0.0.1:0".into()),
+            relay_mode: aster::RelayMode::Disabled,
+            discovery: aster::DiscoveryMode::None,
+            ..Default::default()
+        }
+    }
     #[test]
     fn missing_caller_key_is_never_generated() {
         let path = std::env::temp_dir().join(format!("missing-exec-key-{}", uuid::Uuid::new_v4()));
@@ -703,11 +714,9 @@ mod tests {
         std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600)).unwrap();
         let server_config = aster::AsterConfig {
             secret_key: Some(root_key.clone()),
-            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
-            relay_mode: aster::RelayMode::Disabled,
             enable_hooks: true,
             hook_failure_mode: aster::HookFailureMode::FailClosed,
-            ..Default::default()
+            ..loopback()
         };
         let server = aster::Node::start_with_alpns(
             server_config,
@@ -792,15 +801,23 @@ mod tests {
         for _ in 0..2 {
             let task_ctx = ctx.clone();
             let task_dir = dir.clone();
-            let owner = tokio::spawn(async move { serve(&task_ctx, &task_dir).await });
-            for _ in 0..200 {
-                if socket.exists() {
-                    break;
+            let owner = tokio::spawn(async move { serve(&task_ctx, &task_dir, loopback()).await });
+            // Start-up is a node start and an enrollment install: well under
+            // a second on loopback, so this bound only catches a hang.
+            let _ = tokio::time::timeout(Duration::from_secs(60), async {
+                while !socket.exists() && !owner.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
+            })
+            .await;
             if !socket.exists() {
-                panic!("daemon failed to initialize: {:?}", owner.await.unwrap());
+                if owner.is_finished() {
+                    panic!(
+                        "daemon exited before creating its socket: {:?}",
+                        owner.await.unwrap()
+                    );
+                }
+                panic!("daemon did not create its socket within 60 s");
             }
             let (first, second) = tokio::join!(
                 exchange(&socket, json!({"operation":"ping"})),
@@ -841,7 +858,7 @@ mod tests {
                 .await
                 .expect("daemon must complete real enrollment before RPC");
             assert!(
-                serve(&ctx, &dir).await.is_err(),
+                serve(&ctx, &dir, loopback()).await.is_err(),
                 "second owner must not replace an active daemon"
             );
             assert_eq!(std::fs::metadata(&socket).unwrap().mode() & 0o777, 0o600);

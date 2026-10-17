@@ -241,7 +241,7 @@ pub async fn publish(ctx: &Ctx, args: PublishArgs, revoked: bool) -> Result<()> 
         root_pubkey: Some(aster::PublicKey::from_hex(root)?),
         enable_hooks: true,
         hook_failure_mode: aster::HookFailureMode::FailClosed,
-        ..Default::default()
+        ..crate::node_network()?
     };
     let node =
         aster::Node::start_with_alpns(config, vec![aster::enrollment::ENROLLMENT_ALPN.to_vec()])
@@ -348,6 +348,14 @@ pub async fn publish(ctx: &Ctx, args: PublishArgs, revoked: bool) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Direct-only on loopback: no relay to wait for, no lookup to make.
+    fn loopback() -> aster::AsterConfig {
+        aster::AsterConfig::builder()
+            .relay(aster::RelayMode::Disabled)
+            .discovery_mode(aster::DiscoveryMode::None)
+            .bind_addr("127.0.0.1:0")
+            .build()
+    }
     fn grant() -> ExecGrantV1 {
         serde_json::from_value(json!({"version":1,"issuer":"11".repeat(32),"audience":"fleet","caller":"22".repeat(32),"target":"33".repeat(32),"revision":1,"issued_at":1,"status":"active","account_alias":"builder","profiles":["open"],"operations":["submit"],"cwd_roots":["/srv/build"],"max_timeout_ms":1000,"max_output_bytes":4096,"cancel_on_revocation":true})).unwrap()
     }
@@ -366,9 +374,7 @@ mod tests {
     }
     #[tokio::test]
     async fn publishes_exact_root_record_durably_and_replays_idempotently() {
-        let node = aster::Node::start(aster::AsterConfig::builder().build())
-            .await
-            .unwrap();
+        let node = aster::Node::start(loopback()).await.unwrap();
         let docs = node.docs();
         let doc = docs.create().await.unwrap();
         let root = aster::SecretKey::generate();
@@ -407,14 +413,8 @@ mod tests {
     }
     #[tokio::test]
     async fn stale_publisher_reconciles_exact_root_revocation_before_writing() {
-        let config = || {
-            aster::AsterConfig::builder()
-                .relay(aster::RelayMode::Disabled)
-                .bind_addr("127.0.0.1:0")
-                .build()
-        };
-        let replica = aster::Node::start(config()).await.unwrap();
-        let publisher = aster::Node::start(config()).await.unwrap();
+        let replica = aster::Node::start(loopback()).await.unwrap();
+        let publisher = aster::Node::start(loopback()).await.unwrap();
         for node in [&replica, &publisher] {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while node.addr().direct_addresses.is_empty() {
@@ -502,14 +502,7 @@ mod tests {
 
     #[tokio::test]
     async fn unavailable_replica_or_missing_peers_never_publish() {
-        let node = aster::Node::start(
-            aster::AsterConfig::builder()
-                .relay(aster::RelayMode::Disabled)
-                .bind_addr("127.0.0.1:0")
-                .build(),
-        )
-        .await
-        .unwrap();
+        let node = aster::Node::start(loopback()).await.unwrap();
         let doc = node.docs().create().await.unwrap();
         let author = node.docs().default_author().await.unwrap();
         let mut g = grant();

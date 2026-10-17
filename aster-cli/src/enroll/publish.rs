@@ -250,7 +250,7 @@ impl Session {
             root_pubkey: Some(aster::PublicKey::from_hex(root_hex)?),
             enable_hooks: true,
             hook_failure_mode: aster::HookFailureMode::FailClosed,
-            ..Default::default()
+            ..crate::node_network()?
         };
         let node = aster::Node::start_with_alpns(config, vec![ENROLLMENT_ALPN.to_vec()]).await?;
         let enrollment = Enrollment::install(

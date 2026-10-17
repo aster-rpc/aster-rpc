@@ -14,6 +14,35 @@ use aster_cli_kit::mcp::Server;
 use aster_cli_kit::{Ctx, GlobalArgs, Result, Tool};
 use clap::{CommandFactory, Parser, Subcommand};
 
+/// Network settings for a node the CLI starts (the Exec daemon, grant and
+/// enrollment publication sessions), from the `ASTER_*` variables a server
+/// reads: `ASTER_RELAY_MODE`, `ASTER_BIND_ADDR`, `ASTER_DISCOVERY` and the
+/// rest of the `[network]` group. With none set this is the default (n0
+/// relays and discovery). Identity, trust and storage never come from here;
+/// callers set them from the profile.
+pub(crate) fn node_network() -> Result<aster::AsterConfig> {
+    let mut env = aster::AsterConfig::default();
+    env.apply_env()?;
+    Ok(aster::AsterConfig {
+        relay_mode: env.relay_mode,
+        bind_addr: env.bind_addr,
+        bind_addr_v6: env.bind_addr_v6,
+        advertise_addrs: env.advertise_addrs,
+        relay_ca_certs: env.relay_ca_certs,
+        relay_ca_only: env.relay_ca_only,
+        discovery: env.discovery,
+        discovery_dns_origin: env.discovery_dns_origin,
+        discovery_pkarr_relays: env.discovery_pkarr_relays,
+        local_discovery: env.local_discovery,
+        clear_ip_transports: env.clear_ip_transports,
+        clear_relay_transports: env.clear_relay_transports,
+        portmapper_config: env.portmapper_config,
+        proxy_url: env.proxy_url,
+        proxy_from_env: env.proxy_from_env,
+        ..Default::default()
+    })
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "aster", version, about = "Aster command-line tools")]
 pub struct Cli {

@@ -265,7 +265,7 @@ edge's `aster.gateway` role before Exec runs. Exec then treats the user
 edge as the actor. A grant names such a user in `caller`, the same way it
 names a node:
 
-```json
+```text
 {"caller": "https://idp.example|alice", "target": "TARGET_ID", ...}
 ```
 
