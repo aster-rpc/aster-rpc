@@ -78,6 +78,14 @@ else
     fail "Swallowed failures in test code: handle them or add swallow-ok: <reason>"
 fi
 
+# ── 0c. Fork compatibility (only when iroh-fork-manifest.toml changed) ─
+step "fork_compat.sh"
+if scripts/ci/fork_compat.sh; then
+    pass "Fork suites and patch blocks match the manifest (or it is unchanged)"
+else
+    fail "Fork compatibility failed. See the output above."
+fi
+
 # ── 1. Rust formatting (entire workspace) ─────────────────────────
 step "cargo fmt --all --check"
 if cargo fmt --all -- --check; then
