@@ -70,6 +70,14 @@ else
     fail "Failed to pin fork deps"
 fi
 
+# ── 0b. No swallowed failures in test code ────────────────────────
+step "lint_test_swallow.py"
+if python3 scripts/ci/lint_test_swallow.py; then
+    pass "No unexplained swallows in test code"
+else
+    fail "Swallowed failures in test code: handle them or add swallow-ok: <reason>"
+fi
+
 # ── 1. Rust formatting (entire workspace) ─────────────────────────
 step "cargo fmt --all --check"
 if cargo fmt --all -- --check; then

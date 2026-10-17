@@ -102,7 +102,7 @@ async function pair() {
 const cleanup: Array<() => Promise<void>> = [];
 afterEach(async () => {
   hooks.release.resolve();
-  for (const f of cleanup.splice(0).reverse()) await f().catch(() => {});
+  for (const f of cleanup.splice(0).reverse()) await f().catch(() => {}); // swallow-ok: best-effort teardown; the resource may already be closed
   hooks.entered = deferred();
   hooks.release = deferred();
   hooks.streamCancelled = deferred<boolean>();
@@ -184,7 +184,7 @@ describe.skipIf(!available)('handler CallContext', () => {
     const it = stream[Symbol.asyncIterator]();
     expect((await it.next()).value.text).toBe('started');
     controller.abort();
-    await it.return?.().catch(() => {});
+    await it.return?.().catch(() => {}); // swallow-ok: closing the aborted iterator may reject; the cancellation is asserted next
     expect(await hooks.streamCancelled.promise).toBe(true);
   });
 

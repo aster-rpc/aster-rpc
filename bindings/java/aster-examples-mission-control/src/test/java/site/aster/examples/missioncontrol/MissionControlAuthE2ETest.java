@@ -64,7 +64,7 @@ final class MissionControlAuthE2ETest {
       try {
         closers.get(i).close();
       } catch (Exception ignored) {
-        // best effort
+        // swallow-ok: best-effort teardown; the resource may already be closed
       }
     }
   }

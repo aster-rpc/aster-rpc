@@ -107,7 +107,7 @@ it.each(['empty', 'oversized'])('native %s encoded request rejects locally, canc
   } finally {
     await call?.cancel();
     if (outcome) await bounded(outcome, 'owned cancelled wrapper cleanup');
-    try { conn?.close(0, 'done'); } catch { }
+    try { conn?.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
     await peer?.close();
     await server.close();
   }

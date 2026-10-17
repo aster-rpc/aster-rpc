@@ -130,7 +130,7 @@ async function serve(forwardTicket?: string): Promise<void> {
     await waitStdinEof();
     await server.close();
   } finally {
-    try { forwardConn?.close(0, 'done'); } catch { /* already closed */ }
+    try { forwardConn?.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
     await forwardNode?.close();
   }
 }
@@ -182,7 +182,7 @@ async function runClient(ticket: string): Promise<boolean> {
       console.log(`CASE ${name} FAIL ${String(e).split('\n')[0]}`);
     }
   }
-  try { conn.close(0, 'done'); } catch { /* ignore */ }
+  try { conn.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
   await node.close();
   return allOk;
 }

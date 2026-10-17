@@ -117,7 +117,7 @@ async def test_g1_session_continues_after_recv_fault():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================
@@ -174,7 +174,7 @@ async def test_g2_cancel_produces_cancelled_trailer():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================
@@ -215,7 +215,7 @@ async def test_g4_client_stream_rejects_non_ok_trailer():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 @pytest.mark.timeout(15)
@@ -263,7 +263,7 @@ async def test_g4_client_stream_non_ok_eoi():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================
@@ -386,7 +386,7 @@ async def test_g6_bidi_reader_error_not_silent_eof():
         try:
             await task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================
@@ -485,7 +485,7 @@ async def test_g1_concurrent_calls_after_recv_fault():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================
@@ -554,7 +554,7 @@ async def test_g5_decompression_bomb_rejected():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================
@@ -623,7 +623,7 @@ async def test_g8_deadline_enforced_in_session():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================
@@ -676,7 +676,7 @@ async def test_g3_oversized_metadata_rejected():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 @pytest.mark.timeout(15)
@@ -716,7 +716,7 @@ async def test_g3_too_many_metadata_entries_rejected():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================
@@ -761,7 +761,7 @@ async def test_g12_corrupt_payload_produces_error_trailer():
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================

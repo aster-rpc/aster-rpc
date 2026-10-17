@@ -348,7 +348,7 @@ final class MissionControlE2ETest {
       try {
         client.close();
       } catch (Exception ignored) {
-        // best-effort
+        // swallow-ok: best-effort teardown; the resource may already be closed
       }
       server.close();
     }

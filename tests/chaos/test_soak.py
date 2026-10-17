@@ -87,7 +87,7 @@ async def _cleanup(task):
     try:
         await task
     except (asyncio.CancelledError, Exception):
-        pass
+        pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================
@@ -396,16 +396,16 @@ async def test_soak_concurrent_with_faults():
             try:
                 await task
             except (asyncio.CancelledError, Exception):
-                pass
+                pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
             # Try another call -- should fail
             try:
                 await asyncio.wait_for(
                     stub.echo(EchoReq(value=999)), timeout=3.0
                 )
             except Exception:
-                pass  # Expected
+                pass  # swallow-ok: faulted sessions may fail in any way; only healthy sessions are asserted
         except Exception:
-            pass  # Faulted sessions are expected to fail
+            pass  # swallow-ok: faulted sessions may fail in any way; only healthy sessions are asserted
 
     try:
         all_tasks = []

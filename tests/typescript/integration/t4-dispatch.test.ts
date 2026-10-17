@@ -204,7 +204,7 @@ async function connect(f: Fixture): Promise<IrohTransport> {
 async function teardown(f: Fixture | undefined): Promise<void> {
   if (!f) return;
   for (const c of f.conns) {
-    try { c.close(0, 'done'); } catch { /* ignore */ }
+    try { c.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
   }
   await f.server.close();
   await f.serverNode.close();
@@ -407,6 +407,6 @@ describe.skipIf(!available)('T4: Gate 3 requires, attribute bridges, non-RPC ALP
     const c = await f.clientNode.connect(f.serverNode.nodeId(), SIDE_ALPN);
     await until(() => got.length === 1);
     expect(got[0]).toBe(`t4/side:${f.clientNode.nodeId()}`);
-    try { c.close(0, 'x'); } catch { /* ignore */ }
+    try { c.close(0, 'x'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
   });
 });

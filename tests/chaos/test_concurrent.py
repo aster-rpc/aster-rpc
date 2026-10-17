@@ -94,7 +94,7 @@ async def _cleanup(server_task):
     try:
         await server_task
     except (asyncio.CancelledError, Exception):
-        pass
+        pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 # =============================================================================

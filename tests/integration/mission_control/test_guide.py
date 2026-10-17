@@ -146,7 +146,7 @@ async def test_ch2b_tail_logs(mc) -> None:
     try:
         await task
     except (asyncio.CancelledError, Exception):
-        pass
+        pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
     if not received:
         fail("Ch2b tailLogs", "stream returned no entries")
@@ -338,7 +338,7 @@ async def test_ch5_edge_credential(address: str, keys_dir: str) -> None:
             try:
                 await channel.close()
             except Exception:
-                pass
+                pass  # swallow-ok: best-effort teardown; the resource may already be closed
         fail("Ch5 edge runCommand denied", "bidi succeeded (should have been denied)")
     except Exception as e:
         if "PERMISSION_DENIED" in str(e) or "permission" in str(e).lower():
@@ -411,7 +411,7 @@ async def test_ch5_ops_credential(address: str, keys_dir: str) -> None:
             try:
                 await task
             except Exception:
-                pass
+                pass  # swallow-ok: the stream's outcome is checked through `received` below
             if not received:
                 fail("Ch5 ops tailLogs", "stream returned no entries")
             else:

@@ -16,7 +16,7 @@ describe('raw WebTransport media', () => {
     const listener = await WebTransportListener.startPublic(options());
     const remote = peer(listener.quicAddr);
     // Attach immediately: the child can fail before server accept completes.
-    void remote.catch(() => {});
+    void remote.catch(() => {}); // swallow-ok: the peer child is awaited (or reaped) later; attach a handler now
     let session;
     try {
       session = await listener.accept();
@@ -62,7 +62,7 @@ describe('raw WebTransport media', () => {
   it('preserves a canceled read tail, resets and stops streams, opens bidi and wakes on close', async () => {
     const listener = await WebTransportListener.startPublic(options());
     const remote = peer(listener.quicAddr, ['--scenario', 'lifecycle']);
-    void remote.catch(() => {});
+    void remote.catch(() => {}); // swallow-ok: the peer child is awaited (or reaped) later; attach a handler now
     let session: Awaited<ReturnType<typeof listener.accept>> | undefined;
     const streams: Array<{ close(): Promise<void> }> = [];
     try {
@@ -101,7 +101,7 @@ describe('raw WebTransport media', () => {
     } finally {
       await Promise.allSettled(streams.map(stream => stream.close()));
       session?.close(); await listener.close();
-      await remote.catch(() => {});
+      await remote.catch(() => {}); // swallow-ok: the peer child is awaited (or reaped) later; attach a handler now
     }
   }, 30000);
 

@@ -396,6 +396,9 @@ async function testCh5OpsCredential(address: string, keysDir: string): Promise<v
   })();
 
   await new Promise(r => setTimeout(r, 300));
+  // The marker feeds the stream; if submitting it fails, say so when the
+  // stream then times out instead of reporting a bare timeout.
+  let submitError: unknown = null;
   try {
     await mc.submitLog({
       timestamp: Date.now() / 1000,
@@ -403,13 +406,15 @@ async function testCh5OpsCredential(address: string, keysDir: string): Promise<v
       message: 'ops auth marker',
       agent_id: 'ops',
     });
-  } catch { /* ignore */ }
+  } catch (e) {
+    submitError = e;
+  }
 
   const timeout = new Promise(resolve => setTimeout(() => resolve('timeout'), 5000));
   const result = await Promise.race([consumePromise, timeout]);
 
   if (result === 'timeout') {
-    fail('Ch5 ops tailLogs', 'no entry received within 5s');
+    fail('Ch5 ops tailLogs', `no entry received within 5s${submitError ? ` (submitLog failed: ${submitError})` : ''}`);
   } else if (consumeError) {
     fail('Ch5 ops tailLogs', String(consumeError));
   } else if (received.length > 0) {

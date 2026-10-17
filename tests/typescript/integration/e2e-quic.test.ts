@@ -43,7 +43,7 @@ const candidates = [
 let native: any;
 for (const path of candidates) {
   if (existsSync(path)) {
-    try { native = require(path); break; } catch { /* next */ }
+    try { native = require(path); break; } catch { /* swallow-ok: probe the next candidate path */ }
   }
 }
 

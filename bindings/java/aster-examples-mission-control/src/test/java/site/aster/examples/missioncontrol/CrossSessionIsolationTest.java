@@ -360,6 +360,7 @@ final class CrossSessionIsolationTest {
       try {
         client.close();
       } catch (Exception ignored) {
+        // swallow-ok: best-effort teardown; the resource may already be closed
       }
       server.close();
     }

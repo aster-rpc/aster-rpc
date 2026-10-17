@@ -163,7 +163,7 @@ public class EndpointTests : IDisposable
         }
         catch
         {
-            // Any exception is acceptable — just shouldn't hang
+            // swallow-ok: any outcome but a hang passes
         }
     }
 

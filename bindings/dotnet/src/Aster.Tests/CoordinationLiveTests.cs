@@ -94,10 +94,10 @@ public sealed class CoordinationFixture : IAsyncLifetime
         if (Root != null) await Root.DisposeAsync();
         if (_proc != null)
         {
-            try { _proc.StandardInput.Close(); } catch (Exception) { }
+            try { _proc.StandardInput.Close(); } catch (Exception) { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
             if (!_proc.WaitForExit(15000)) _proc.Kill(true);
         }
-        try { if (_dir.Length > 0) Directory.Delete(_dir, true); } catch (Exception) { }
+        try { if (_dir.Length > 0) Directory.Delete(_dir, true); } catch (Exception) { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
     }
 }
 

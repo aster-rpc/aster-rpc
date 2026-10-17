@@ -89,7 +89,7 @@ public class StreamingLifecycleTests
         finally
         {
             requests.Release.TrySetResult(false);
-            try { await result.WaitAsync(TimeSpan.FromSeconds(3)); } catch { }
+            try { await result.WaitAsync(TimeSpan.FromSeconds(3)); } catch { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
         }
     }
     private sealed class ThrowingRequests(Exception error, string phase) : IAsyncEnumerable<EchoRequest>, IAsyncEnumerator<EchoRequest>
@@ -229,7 +229,7 @@ public class StreamingLifecycleTests
         finally
         {
             requests.Release.TrySetResult(false);
-            try { await result.WaitAsync(TimeSpan.FromSeconds(3)); } catch { }
+            try { await result.WaitAsync(TimeSpan.FromSeconds(3)); } catch { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
             await Task.Run(async () => { while (requests.Disposals == 0) await Task.Delay(5); }).WaitAsync(TimeSpan.FromSeconds(3));
         }
         Assert.Equal(1, requests.Disposals);
@@ -335,7 +335,7 @@ public class StreamingLifecycleTests
         finally
         {
             cancel.Cancel();
-            try { await result.WaitAsync(TimeSpan.FromSeconds(3)); } catch { }
+            try { await result.WaitAsync(TimeSpan.FromSeconds(3)); } catch { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
         }
     }
 }

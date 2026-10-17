@@ -229,13 +229,14 @@ async def test_bidi_stream_echo_each_item():
             if item is None:
                 break
             responses.append(item)
-    except Exception:
+    except Exception:  # swallow-ok: the end of the stream is raised; every echo is asserted below
         pass
 
-    # Verify echoed responses have the "echo: " prefix
+    # Every chunk comes back, in order. Without this an error on the first
+    # recv left `responses` empty and the loop below passed vacuously.
+    assert [r.text for r in responses] == ["echo: a", "echo: b", "echo: c"]
     for resp in responses:
         assert isinstance(resp, EchoChunk)
-        assert resp.text.startswith("echo: ")
 
 
 @pytest.mark.asyncio

@@ -93,7 +93,7 @@ async def run_command(session) -> str:
         try:
             await channel.close()
         except Exception:  # noqa: BLE001
-            pass
+            pass  # swallow-ok: best-effort teardown; the resource may already be closed
 
 
 async def test_roles_in_credentials_gate_each_method(tmp_path: Path):

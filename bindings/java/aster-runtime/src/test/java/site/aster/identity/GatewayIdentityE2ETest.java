@@ -103,7 +103,7 @@ final class GatewayIdentityE2ETest {
       try {
         closers.get(i).close();
       } catch (Exception ignored) {
-        // best effort
+        // swallow-ok: best-effort teardown; the resource may already be closed
       }
     }
   }
@@ -232,7 +232,7 @@ final class GatewayIdentityE2ETest {
     try {
       fory.register(Who.class, MSG);
     } catch (Throwable ignored) {
-      // already registered
+      // swallow-ok: already registered by an earlier test in this process
     }
   }
 

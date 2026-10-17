@@ -192,7 +192,7 @@ async fn observed_persistent_node_is_promoted_and_outlives_its_chain() {
         let verifier = JwtEnrollmentVerifier::new(public(1), FLEET).unwrap();
         let reviewed = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
-                let _ = joiner_enroll.connect(replica.addr()).await;
+                let _ = joiner_enroll.connect(replica.addr()).await; // swallow-ok: retried until the review lands; the outcome is asserted after the loop
                 let _ = observations
                     .sync_with_timeout(&[replica.id()], Duration::from_secs(2))
                     .await;

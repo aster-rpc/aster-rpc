@@ -141,7 +141,7 @@ beforeAll(async () => {
 });
 
 afterEach(async () => {
-  while (cleanups.length) await cleanups.pop()!().catch(() => {});
+  while (cleanups.length) await cleanups.pop()!().catch(() => {}); // swallow-ok: best-effort teardown; the resource may already be closed
 });
 
 afterAll(async () => {

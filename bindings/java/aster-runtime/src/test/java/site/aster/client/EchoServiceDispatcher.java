@@ -125,14 +125,17 @@ public final class EchoServiceDispatcher implements ServiceDispatcher {
     try {
       fory.register(EchoRequest.class, REQ_TYPE_TAG);
     } catch (Throwable ignored) {
+      // swallow-ok: already registered by an earlier test in this process
     }
     try {
       fory.register(EchoResponse.class, RESP_TYPE_TAG);
     } catch (Throwable ignored) {
+      // swallow-ok: already registered by an earlier test in this process
     }
     try {
       fory.register(EchoStreamRequest.class, STREAM_REQ_TYPE_TAG);
     } catch (Throwable ignored) {
+      // swallow-ok: already registered by an earlier test in this process
     }
   }
 }

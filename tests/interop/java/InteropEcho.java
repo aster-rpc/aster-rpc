@@ -135,12 +135,12 @@ public final class InteropEcho {
     try {
       ForyTags.register(fory, EchoRequest.class, REQ_TAG);
     } catch (Throwable ignored) {
-      // already registered
+      // swallow-ok: already registered by an earlier test in this process
     }
     try {
       ForyTags.register(fory, EchoReply.class, REPLY_TAG);
     } catch (Throwable ignored) {
-      // already registered
+      // swallow-ok: already registered by an earlier test in this process
     }
   }
 

@@ -87,7 +87,7 @@ describe('review: parked client-stream producer', () => {
       release({ done: true, value: undefined });
       try { if (outcome) await bounded(outcome, 'released wrapper teardown'); }
       finally {
-        try { conn?.close(0, 'done'); } catch { /* ignore */ }
+        try { conn?.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
         await peer?.close();
         await server.close();
       }

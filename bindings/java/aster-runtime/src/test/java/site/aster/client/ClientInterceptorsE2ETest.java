@@ -97,7 +97,7 @@ final class ClientInterceptorsE2ETest {
     try {
       fory.register(Msg.class, MSG);
     } catch (Throwable ignored) {
-      // already registered
+      // swallow-ok: already registered by an earlier test in this process
     }
   }
 

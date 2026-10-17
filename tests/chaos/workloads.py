@@ -240,7 +240,7 @@ async def unary_workload(nemesis: NemesisBase, history: History) -> None:
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 async def session_sequential_workload(nemesis: NemesisBase, history: History) -> None:
@@ -274,7 +274,7 @@ async def session_sequential_workload(nemesis: NemesisBase, history: History) ->
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 async def client_stream_workload(nemesis: NemesisBase, history: History) -> None:
@@ -310,7 +310,7 @@ async def client_stream_workload(nemesis: NemesisBase, history: History) -> None
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
 
 
 async def cancel_workload(nemesis: NemesisBase, history: History) -> None:
@@ -358,7 +358,7 @@ async def cancel_workload(nemesis: NemesisBase, history: History) -> None:
                     if status.code == StatusCode.CANCELLED:
                         got_cancelled = True
                 except Exception:
-                    pass
+                    pass  # swallow-ok: an undecodable trailer counts as not cancelled and is recorded below
                 break
 
         if got_cancelled:
@@ -373,4 +373,4 @@ async def cancel_workload(nemesis: NemesisBase, history: History) -> None:
         try:
             await server_task
         except (asyncio.CancelledError, Exception):
-            pass
+            pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test

@@ -78,7 +78,7 @@ final class EnrollmentAsterServerTest {
       try {
         closers.get(i).close();
       } catch (Exception ignored) {
-        // best effort
+        // swallow-ok: best-effort teardown; the resource may already be closed
       }
     }
   }
@@ -166,7 +166,7 @@ final class EnrollmentAsterServerTest {
       try {
         fory.register(Ops.class, MSG);
       } catch (Throwable ignored) {
-        // already registered
+        // swallow-ok: already registered by an earlier test in this process
       }
     }
 
@@ -190,7 +190,7 @@ final class EnrollmentAsterServerTest {
     try {
       codec.fory().register(Ops.class, MSG);
     } catch (Throwable ignored) {
-      // already registered
+      // swallow-ok: already registered by an earlier test in this process
     }
     return codec;
   }

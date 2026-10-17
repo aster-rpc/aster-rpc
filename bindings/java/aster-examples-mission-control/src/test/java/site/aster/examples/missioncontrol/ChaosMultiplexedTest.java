@@ -354,6 +354,7 @@ final class ChaosMultiplexedTest {
         try {
           client2.close();
         } catch (Exception ignored) {
+          // swallow-ok: best-effort teardown; the resource may already be closed
         }
       }
     }
@@ -423,6 +424,7 @@ final class ChaosMultiplexedTest {
       try {
         client.close();
       } catch (Exception ignored) {
+        // swallow-ok: best-effort teardown; the resource may already be closed
       }
       server.close();
     }

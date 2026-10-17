@@ -96,7 +96,7 @@ async def test_finish_is_idempotent(connected_pair):
     try:
         await send.finish()
     except (IrohError, Exception):
-        pass  # acceptable -- what's NOT acceptable is a Rust panic
+        pass  # swallow-ok: any clean Python exception passes; the test guards against a panic
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ async def test_stop_does_not_panic(connected_pair):
     try:
         recv.stop(0)
     except (IrohError, Exception):
-        pass  # clean Python exception is fine
+        pass  # swallow-ok: any clean Python exception passes; the test guards against a panic
 
 
 # ---------------------------------------------------------------------------
@@ -149,7 +149,7 @@ async def test_connection_double_close_does_not_panic(connected_pair):
     try:
         conn.close(0, b"second")
     except (IrohError, Exception):
-        pass  # clean error is acceptable; panic is not
+        pass  # swallow-ok: any clean Python exception passes; the test guards against a panic
 
 
 # ---------------------------------------------------------------------------

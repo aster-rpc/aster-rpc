@@ -372,6 +372,7 @@ describe('streaming consumer relay', () => {
       try {
         upload.abort();
       } catch {
+          // swallow-ok: best-effort teardown; the resource may already be closed
         /* already over */
       }
 

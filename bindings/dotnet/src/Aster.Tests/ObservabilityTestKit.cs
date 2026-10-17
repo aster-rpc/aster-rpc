@@ -137,8 +137,8 @@ public sealed class OtlpReceiver : IDisposable
     public void Dispose()
     {
         _stop.Cancel();
-        try { _listener.Close(); } catch (Exception) { /* closing */ }
-        try { _loop.Wait(1000); } catch (Exception) { /* closing */ }
+        try { _listener.Close(); } catch (Exception) { /* swallow-ok: best-effort teardown of the collector */ }
+        try { _loop.Wait(1000); } catch (Exception) { /* swallow-ok: best-effort teardown of the collector */ }
     }
 }
 

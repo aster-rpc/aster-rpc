@@ -100,7 +100,7 @@ internal sealed class ExposeRig : IAsyncDisposable
         Bodies?.Dispose();
         if (Client != null) await Client.DisposeAsync();
         if (Server != null) await Server.DisposeAsync();
-        try { await Serving.WaitAsync(TimeSpan.FromSeconds(5)); } catch (Exception) { }
+        try { await Serving.WaitAsync(TimeSpan.FromSeconds(5)); } catch (Exception) { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
     }
 }
 

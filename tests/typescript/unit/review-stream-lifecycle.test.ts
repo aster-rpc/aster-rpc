@@ -27,7 +27,7 @@ describe('review: streaming cancellation during native open', () => {
         await transport.clientStream('Echo', 'ingest', (async function* () {})(), { signal: controller.signal });
       }
     } catch {
-      // Rejecting cancellation is valid; the native call must also be cancelled.
+      // swallow-ok: rejecting on cancellation is valid; the native cancel is asserted next
     }
     expect(call.cancel).toHaveBeenCalledOnce();
   });

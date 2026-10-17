@@ -197,7 +197,7 @@ describe.skipIf(!hasDispatch).each(DISPATCH_DELIVERIES)('DispatchServer (%s)', (
   });
 
   afterAll(async () => {
-    try { client?.conn.close(0, 'done'); } catch { /* ignore */ }
+    try { client?.conn.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
     await client?.node.close();
     await fx?.loop.close();
   });
@@ -329,7 +329,7 @@ describe.skipIf(!hasDispatch)('DispatchServer ring delivery close', () => {
       expect(await bounded(unread)).toBe(StatusCode.INTERNAL);
       expect(server.liveCalls()).toBe(0);
     } finally {
-      try { conn.close(0, 'done'); } catch { /* ignore */ }
+      try { conn.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
       await peer.close();
       await node.close();
     }
@@ -430,7 +430,7 @@ describe.skipIf(!hasDispatch)('DispatchLoop JS wrapper attach window', () => {
         loop ??= await serving;
         await loop?.close();
       } finally {
-        try { conn?.close(0, 'done'); } catch { /* ignore */ }
+        try { conn?.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
         await peer?.close();
         await node?.close();
       }
@@ -463,7 +463,7 @@ describe.skipIf(typeof native?.DispatchServer?.debugArmAttach !== 'function')(
         conn = await peer.connectNodeAddr(node.nodeId(), RPC_ALPN, node.directAddresses(), undefined);
         const transport = new IrohTransport(conn, BYTES as any);
         const reply = transport.unary('test.Echo', 'echo', Buffer.from('early'));
-        void reply.catch(() => {});
+        void reply.catch(() => {}); // swallow-ok: handler attached early; the call's outcome is not under test here
         // A live call in the held native gate proves arrival before attach.
         await until(() => native.DispatchServer.debugAttachState() === 1);
         native.DispatchServer.debugReleaseAttach();
@@ -475,7 +475,7 @@ describe.skipIf(typeof native?.DispatchServer?.debugArmAttach !== 'function')(
         expect(got).toBe('echo:early');
       } finally {
         native.DispatchServer.debugReleaseAttach();
-        try { conn?.close(0, 'done'); } catch { /* ignore */ }
+        try { conn?.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
         try {
           loop ??= await serving;
           await loop?.close();
@@ -527,7 +527,7 @@ describe.skipIf(!hasDispatch)('DispatchServer bounded TSFN delivery', () => {
         expect(state[2]).toBe(0);
         expect(state[5]).toBeGreaterThan(0);
       } finally {
-        try { client.conn.close(0, 'done'); } catch { /* ignore */ }
+        try { client.conn.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
         await client.node.close();
         await server.close();
       }
@@ -589,7 +589,7 @@ describe.skipIf(!hasDispatch)('DispatchServer bounded TSFN delivery', () => {
       const resumed = await client.transport.unary('test.Echo', 'echo', Buffer.from('resumed'));
       expect(Buffer.from(resumed as Uint8Array).toString()).toBe('resumed');
     } finally {
-      try { client.conn.close(0, 'done'); } catch { /* ignore */ }
+      try { client.conn.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
       await client.node.close();
       await server.close();
     }
@@ -609,7 +609,7 @@ describe.skipIf(!hasDispatch)('native breaker aftermath', () => {
         seen.push(tag);
         if (tag === 'seed') return respondCall(srv, ev.callId, Buffer.alloc(0), StatusCode.UNAVAILABLE, 'seed');
         if (tag === 'hold') {
-          return gate.then(() => respondCall(srv, ev.callId, Buffer.from('released'))).catch(() => {});
+          return gate.then(() => respondCall(srv, ev.callId, Buffer.from('released'))).catch(() => {}); // swallow-ok: the held call may be torn down before the gate opens
         }
         return respondCall(srv, ev.callId, Buffer.from(tag));
       },
@@ -646,7 +646,7 @@ describe.skipIf(!hasDispatch)('native breaker aftermath', () => {
       expect(seen).toEqual(aftermath === 'later_refusal' ? ['seed', 'healthy-probe'] : ['seed', 'hold', 'healthy-probe']);
     } finally {
       abort.abort(); release();
-      try { peer?.conn.close(0, 'done'); } catch { /* closed */ }
+      try { peer?.conn.close(0, 'done'); } catch { /* swallow-ok: best-effort teardown; the resource may already be closed */ }
       await peer?.node.close();
       await loop.close();
     }

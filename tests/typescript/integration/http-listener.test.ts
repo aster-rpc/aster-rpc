@@ -259,7 +259,7 @@ describe('authenticated HTTP listener', () => {
   it('server close cancels a pending handler and releases child sockets', async () => {
     const f = await fixture();
     const l = await HttpListener.start(f.loop.native, options(), () => ({ principal: 'alice' }));
-    const pending = call(l.tcpAddr, 'hang').catch(() => null);
+    const pending = call(l.tcpAddr, 'hang').catch(() => null); // swallow-ok: the call fails when the listener closes; the test awaits it after
     while (!f.seen.length) await new Promise((r) => setTimeout(r, 5));
     await f.loop.close();
     await pending;
@@ -275,7 +275,7 @@ describe('authenticated HTTP listener', () => {
     const l = await HttpListener.start(f.loop.native, options(), (_r, ctx) => new Promise((resolve) => {
       begin(); ctx.signal.addEventListener('abort', () => { cancelled(); resolve(null); }, { once: true });
     }));
-    const pending = call(l.tcpAddr, 'unary').catch(() => null);
+    const pending = call(l.tcpAddr, 'unary').catch(() => null); // swallow-ok: the call fails when the listener closes; the test awaits it after
     await started;
     await l.close();
     await ended;

@@ -94,7 +94,7 @@ async def pipe_streams(
                     # transports); full close is the only option.
                     local_writer.close()
             except Exception:
-                pass
+                pass  # swallow-ok: the relay ends when either side closes the pipe
 
     async def local_to_quic():
         try:
@@ -104,12 +104,12 @@ async def pipe_streams(
                     break
                 await send.write_all(chunk)
         except Exception:
-            pass
+            pass  # swallow-ok: the relay ends when either side closes the pipe
         finally:
             try:
                 await send.finish()
             except Exception:
-                pass
+                pass  # swallow-ok: the relay ends when either side closes the pipe
 
     await asyncio.gather(
         asyncio.create_task(quic_to_local()),
@@ -120,7 +120,7 @@ async def pipe_streams(
     try:
         local_writer.close()
     except Exception:
-        pass
+        pass  # swallow-ok: the relay ends when either side closes the pipe
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +232,7 @@ async def _forward_to_tcp(
         tcp_reader, tcp_writer = await asyncio.open_connection(host, port)
         await pipe_streams(send, recv, tcp_reader, tcp_writer)
     except Exception:
-        pass
+        pass  # swallow-ok: the relay ends when either side closes the pipe
 
 
 async def connect_tcp(
@@ -254,7 +254,7 @@ async def connect_tcp(
             await send_handshake(send)
             await pipe_streams(send, recv, tcp_reader, tcp_writer)
         except Exception:
-            pass
+            pass  # swallow-ok: the relay ends when either side closes the pipe
 
     server = await asyncio.start_server(handle_tcp, listen_addr, listen_port)
     return ep, server
@@ -303,7 +303,7 @@ async def _forward_to_unix(
         unix_reader, unix_writer = await asyncio.open_unix_connection(socket_path)
         await pipe_streams(send, recv, unix_reader, unix_writer)
     except Exception:
-        pass
+        pass  # swallow-ok: the relay ends when either side closes the pipe
 
 
 async def connect_unix(
@@ -331,7 +331,7 @@ async def connect_unix(
             await send_handshake(send)
             await pipe_streams(send, recv, unix_reader, unix_writer)
         except Exception:
-            pass
+            pass  # swallow-ok: the relay ends when either side closes the pipe
 
     server = await asyncio.start_unix_server(handle_unix, path=socket_path)
     return ep, server

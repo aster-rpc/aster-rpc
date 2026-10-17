@@ -32,7 +32,7 @@ for (const path of candidates) {
       native = require(path);
       break;
     } catch {
-      // try next
+      // swallow-ok: probe the next candidate path
     }
   }
 }

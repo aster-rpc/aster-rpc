@@ -14,7 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 LINT_CHECKS=(
-  cli-compat guard-tests fmt clippy-workspace coordination-deps otel-deps
+  cli-compat guard-tests test-swallow fmt clippy-workspace coordination-deps otel-deps
   deny clippy-coordination clippy-binding-support clippy-ffi-fixture
   clippy-napi clippy-enrollment clippy-exec clippy-expose publish-manifests
 )
@@ -25,6 +25,10 @@ check() {
       python3 scripts/check-cli-compat.py ;;
     guard-tests)
       python3 -S -m unittest discover -s scripts/ci -p 'test_*.py' ;;
+    # Empty catch / except-pass / `_ = err` in test code without a
+    # `swallow-ok: <reason>` (resilience-test-plan.md §4).
+    test-swallow)
+      python3 scripts/ci/lint_test_swallow.py ;;
     fmt)
       cargo fmt --all -- --check ;;
     clippy-workspace)
