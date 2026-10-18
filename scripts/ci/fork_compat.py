@@ -96,8 +96,17 @@ def lock_packages(cargo_lock: str) -> list[dict]:
     return load_toml(cargo_lock).get("package", [])
 
 
-def stale_findings(name: str, fork: dict, manifest: dict, cargo_toml: str, cargo_lock: str) -> list[str]:
-    """Why `name` at its pinned commit does not build against the manifest's stack."""
+def stale_findings(name: str, fork: dict, manifest: dict, cargo_toml: str, cargo_lock: str,
+                   equivalent=None) -> list[str]:
+    """Why `name` at its pinned commit does not build against the manifest's stack.
+
+    `equivalent(other, rev, want)` says whether fork `other` at `rev` is the
+    same source as the manifest's `want` (see `lock_only_repin`). A sibling
+    pinned at an older commit that differs only by a lock-only re-pin builds
+    the same code, so it is not stale (the ledger's convention: such re-pins
+    keep the crate version and the publisher skips them as identical).
+    """
+    same = equivalent or (lambda other, rev, want: rev == want)
     owner = crate_owner(manifest)
     forks = manifest["forks"]
     own = set(fork.get("crates", []) + fork.get("registry_crates", []))
@@ -108,7 +117,7 @@ def stale_findings(name: str, fork: dict, manifest: dict, cargo_toml: str, cargo
             continue
         want = forks[other]["commit"]
         rev = spec.get("rev") or spec.get("tag") or spec.get("branch") or spec.get("path")
-        if spec.get("rev") != want:
+        if not (spec.get("rev") and same(other, spec["rev"], want)):
             found.append(f"patch {crate} -> {rev}, manifest {other} is {want}")
     for pkg in lock_packages(cargo_lock):
         crate, source = pkg["name"], pkg.get("source", "")
@@ -118,12 +127,36 @@ def stale_findings(name: str, fork: dict, manifest: dict, cargo_toml: str, cargo
         want = forks[other]["commit"]
         if source.startswith("git+"):
             sha = source.rsplit("#", 1)[-1]
-            if sha != want:
+            if not same(other, sha, want):
                 found.append(f"Cargo.lock {crate} {pkg['version']} at {sha[:12]}, manifest {other} is {want[:12]}")
         else:
             found.append(f"Cargo.lock {crate} {pkg['version']} from {source.split('+')[0]}, "
                          f"not the {other} fork at {want[:12]}")
     return found
+
+
+PATCH_SECTION = re.compile(r"^\[patch\.crates-io\]\s*$.*?(?=^\[|\Z)", re.M | re.S)
+
+
+def lock_only_repin(path: str, a: str, b: str) -> bool:
+    """Whether commits `a` and `b` of the fork at `path` hold the same source:
+    every file identical except Cargo.lock and Cargo.toml's [patch.crates-io]
+    section (a lock-only re-pin, e.g. iroh-gossip 0.101.1 -> 0.101.1-p1)."""
+    if a == b:
+        return True
+    if not (has_commit(path, a) and has_commit(path, b)):
+        return False
+    diff = subprocess.run(["git", "-C", path, "diff", "--quiet", a, b, "--", ".",
+                           ":(exclude)Cargo.lock", ":(exclude)Cargo.toml"],
+                          capture_output=True).returncode
+    if diff != 0:
+        return False
+    def toml(c: str) -> list[str]:
+        # The rest of Cargo.toml, ignoring blank lines (adding a patch block
+        # where there was none also adds a separating blank line).
+        rest = PATCH_SECTION.sub("", git("show", f"{c}:Cargo.toml", cwd=path))
+        return [line.rstrip() for line in rest.splitlines() if line.strip()]
+    return toml(a) == toml(b)
 
 
 def depends_on(cargo_toml: str, manifest: dict) -> set[str]:
@@ -217,7 +250,10 @@ def main(argv: list[str]) -> int:
         toml_text = git("show", f"{fork['commit']}:Cargo.toml", cwd=path)
         lock_text = git("show", f"{fork['commit']}:Cargo.lock", cwd=path, check=False)
         deps[name] = depends_on(toml_text, head)
-        findings = stale_findings(name, fork, head, toml_text, lock_text)
+        findings = stale_findings(
+            name, fork, head, toml_text, lock_text,
+            equivalent=lambda other, rev, want: lock_only_repin(os.path.join(root, other), rev, want),
+        )
         if findings:
             stale[name] = findings
         print(f"  {name} {fork['tag']} @ {fork['commit'][:12]}: "
