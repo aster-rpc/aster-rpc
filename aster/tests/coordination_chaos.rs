@@ -94,6 +94,9 @@ const FAULT_PERCENT: u8 = 28;
 /// replication to two peers, so this is the run's message volume.
 const COMMIT_ROUNDS: u8 = 20;
 
+/// Further commits allowed while a fault kind has not fired yet.
+const TOP_UP_ROUNDS: u16 = 200;
+
 /// Generous: every retry under this schedule costs at least one election
 /// timeout, and `election_timeout_max` is 3 s. A hang still fails rather than
 /// waits forever.
@@ -250,6 +253,24 @@ async fn a_group_makes_progress_through_a_seeded_faulty_network() {
         );
     }
     clock.mark("20 commit rounds");
+
+    // The schedule is seeded per message slot, but which messages fill the
+    // slots depends on timing, so a run can end its fixed rounds before a
+    // rarer kind has fired (one candidate saw `reordered: 0`). Keep committing
+    // through the same faults until every kind has, capped; the tally
+    // assertion below still fails a schedule that never gets there.
+    let mut top_up = 0u16;
+    while !combined_tally(&voters).every_kind_fired() && top_up < TOP_UP_ROUNDS {
+        let key = [b't', (top_up >> 8) as u8, top_up as u8];
+        let committed = commit_somewhere(&voters, next(&key), "a top-up commit").await;
+        assert_eq!(
+            outcome_of(&committed),
+            (GRANT_UPDATED, 0),
+            "top-up round {top_up} commits (seed {SEED:#x})"
+        );
+        top_up += 1;
+    }
+    clock.mark("top-up commit rounds");
 
     // Lost leadership, at a moment the schedule did not choose — the phase
     // §S3-F names last, and the one a purely message-level fault never reaches.
