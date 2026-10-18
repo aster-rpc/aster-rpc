@@ -50,8 +50,8 @@ async fn read_to_trailer(recv: &CoreRecvStream) -> Result<()> {
 async fn the_next_call_may_arrive_before_the_writer_task_completes() -> Result<()> {
     const ROUNDS: usize = 20;
 
-    let server = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let client = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
+    let server = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let client = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
     let (handle, feeder) = create_reactor(&tokio::runtime::Handle::current(), 256);
     let srv = server.clone();
     let accept = tokio::spawn(async move {
@@ -78,7 +78,7 @@ async fn the_next_call_may_arrive_before_the_writer_task_completes() -> Result<(
     });
 
     let conn = client
-        .connect(server.endpoint_id(), TEST_ALPN.to_vec())
+        .connect_node_addr(server.loopback_addr()?, TEST_ALPN.to_vec())
         .await?;
     let (send, recv) = conn.open_streaming_substream().await?;
 

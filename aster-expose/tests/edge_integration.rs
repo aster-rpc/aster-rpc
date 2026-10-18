@@ -100,11 +100,13 @@ struct Harness {
 }
 
 async fn harness() -> Result<Harness> {
-    let server = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let client = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let server_id = server.endpoint_id();
+    let server = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let client = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let server_addr = server.loopback_addr()?;
     let (reactor, accept_task, server_conns) = start_server_reactor(server.clone()).await;
-    let client_conn = client.connect(server_id, TEST_ALPN.to_vec()).await?;
+    let client_conn = client
+        .connect_node_addr(server_addr, TEST_ALPN.to_vec())
+        .await?;
     let server_conn = wait_for_one_server_conn(&server_conns).await?;
     Ok(Harness {
         client_conn,

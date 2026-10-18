@@ -61,11 +61,13 @@ async fn setup_pair() -> Result<(
     ReactorHandle,
     ServerConns,
 )> {
-    let server = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let client = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let server_id = server.endpoint_id();
+    let server = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let client = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let server_addr = server.loopback_addr()?;
     let (reactor, accept_task, server_conns) = start_server_reactor(server.clone()).await;
-    let conn = client.connect(server_id, TEST_ALPN.to_vec()).await?;
+    let conn = client
+        .connect_node_addr(server_addr, TEST_ALPN.to_vec())
+        .await?;
     Ok((conn, server, client, accept_task, reactor, server_conns))
 }
 
@@ -196,16 +198,18 @@ async fn tunnel_redeem_is_one_shot() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tunnel_ticket_is_per_connection() -> Result<()> {
     // Stand up one server, two clients.
-    let server = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let client_a = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let client_b = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let server_id = server.endpoint_id();
+    let server = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let client_a = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let client_b = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let server_addr = server.loopback_addr()?;
     let (_reactor, _accept, server_conns) = start_server_reactor(server.clone()).await;
 
     let conn_a = client_a
-        .connect(server_id.clone(), TEST_ALPN.to_vec())
+        .connect_node_addr(server_addr.clone(), TEST_ALPN.to_vec())
         .await?;
-    let conn_b = client_b.connect(server_id, TEST_ALPN.to_vec()).await?;
+    let conn_b = client_b
+        .connect_node_addr(server_addr, TEST_ALPN.to_vec())
+        .await?;
 
     // Wait for both server-side connections to register.
     for _ in 0..50 {

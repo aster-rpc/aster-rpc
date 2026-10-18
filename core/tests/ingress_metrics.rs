@@ -104,11 +104,13 @@ async fn setup_capped_pair() -> Result<(
     CoreNetClient,
     CoreNetClient,
 )> {
-    let server = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let client = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let server_id = server.endpoint_id();
+    let server = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let client = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let server_addr = server.loopback_addr()?;
     let (reactor, accept_task) = start_capped_reactor(server.clone()).await;
-    let conn = client.connect(server_id, TEST_ALPN.to_vec()).await?;
+    let conn = client
+        .connect_node_addr(server_addr, TEST_ALPN.to_vec())
+        .await?;
     Ok((conn, reactor, accept_task, server, client))
 }
 

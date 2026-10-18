@@ -77,16 +77,18 @@ async fn start_node_reactor(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn node_level_expose_reachable_after_attach() -> Result<()> {
-    let server = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let client = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let server_id = server.endpoint_id();
+    let server = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let client = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let server_addr = server.loopback_addr()?;
 
     // Register once on the node, before any connection exists.
     let node = ExposeNode::new();
     node.expose_http("web", allow_all(), echo_handler());
 
     let (_reactor, _accept, _conns) = start_node_reactor(server.clone(), node.clone()).await;
-    let client_conn = client.connect(server_id, TEST_ALPN.to_vec()).await?;
+    let client_conn = client
+        .connect_node_addr(server_addr, TEST_ALPN.to_vec())
+        .await?;
 
     let resp = timeout(
         STEP_TIMEOUT,

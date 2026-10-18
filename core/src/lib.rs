@@ -2902,6 +2902,38 @@ impl CoreNetClient {
         })
     }
 
+    /// A direct-only endpoint for peers on the same host (tests, sidecars):
+    /// bound to `127.0.0.1`, no relay, no address lookup, no port mapping, so
+    /// start-up never waits on the network. Peers dial it at
+    /// [`loopback_addr`](Self::loopback_addr).
+    pub async fn create_loopback(alpn: Vec<u8>) -> Result<Self> {
+        Self::create_with_config(CoreEndpointConfig {
+            relay_mode: Some("disabled".into()),
+            alpns: vec![alpn],
+            bind_addr: Some("127.0.0.1:0".into()),
+            discovery: Some("none".into()),
+            portmapper_config: Some("disabled".into()),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// This endpoint's id with its bound `127.0.0.1` socket: the address a
+    /// same-host peer dials with [`connect_node_addr`](Self::connect_node_addr).
+    pub fn loopback_addr(&self) -> Result<CoreNodeAddr> {
+        let socket = self
+            .endpoint
+            .bound_sockets()
+            .into_iter()
+            .find(|a| a.is_ipv4() && a.ip().is_loopback())
+            .ok_or_else(|| anyhow!("endpoint is not bound to 127.0.0.1"))?;
+        Ok(CoreNodeAddr {
+            endpoint_id: self.endpoint_id(),
+            relay_url: None,
+            direct_addresses: vec![socket.to_string()],
+        })
+    }
+
     pub async fn create_with_config(config: CoreEndpointConfig) -> Result<Self> {
         let relay_mode = relay_mode_from_config(&config)?;
         let mut builder = build_endpoint_config(&config)?;

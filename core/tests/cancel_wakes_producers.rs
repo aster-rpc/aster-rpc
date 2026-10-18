@@ -31,9 +31,9 @@ use aster_transport_core::{CoreConnection, CoreNetClient};
 const TEST_ALPN: &[u8] = b"aster/cancel-test/1";
 
 async fn setup() -> Result<(CoreConnection, CoreNetClient, CoreNetClient, ReactorPair)> {
-    let server = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let client = CoreNetClient::create(TEST_ALPN.to_vec()).await?;
-    let server_id = server.endpoint_id();
+    let server = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let client = CoreNetClient::create_loopback(TEST_ALPN.to_vec()).await?;
+    let server_addr = server.loopback_addr()?;
 
     let (handle, feeder) = create_reactor(&tokio::runtime::Handle::current(), 256);
     let srv = server.clone();
@@ -43,7 +43,9 @@ async fn setup() -> Result<(CoreConnection, CoreNetClient, CoreNetClient, Reacto
         }
     });
 
-    let conn = client.connect(server_id, TEST_ALPN.to_vec()).await?;
+    let conn = client
+        .connect_node_addr(server_addr, TEST_ALPN.to_vec())
+        .await?;
     Ok((conn, server, client, ReactorPair { handle, accept }))
 }
 
