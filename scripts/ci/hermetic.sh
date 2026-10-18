@@ -33,6 +33,14 @@
 # forge.emrul.dev).
 set -euo pipefail
 
+# Test binaries open many endpoints in parallel. CI job containers start with a
+# soft open-file limit of 1024, which coordination_client and enrollment_flood
+# exceed there ("Too many open files"). Raise the soft limit to the hard limit,
+# capped, for every command this wrapper runs.
+hard_nofile=$(ulimit -Hn)
+if [[ "$hard_nofile" == unlimited || "$hard_nofile" -gt 65536 ]]; then hard_nofile=65536; fi
+ulimit -n "$hard_nofile" 2>/dev/null || true
+
 usage() { sed -n '2,8p' "$0" >&2; exit 2; }
 [[ $# -gt 0 ]] || usage
 
