@@ -556,9 +556,18 @@ impl Corridor {
 
     /// The committed voter set, as corridor positions.
     async fn committed_voters(&self, client: &CoordinationClient) -> Vec<usize> {
-        let status = within("group_status", client.reads().group_status())
-            .await
-            .expect("the status cut");
+        // A read during an election or a loaded start can find no member
+        // ready to serve it; that is a transient refusal, so retry it.
+        let deadline = tokio::time::Instant::now() + PATIENCE;
+        let status = loop {
+            match within("group_status", client.reads().group_status()).await {
+                Ok(status) => break status,
+                Err(_) if tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(error) => panic!("the status cut: {error:?}\n{}", self.diagnose()),
+            }
+        };
         let mut positions: Vec<usize> = status
             .voters
             .iter()
