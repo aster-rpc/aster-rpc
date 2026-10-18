@@ -1355,8 +1355,8 @@ async fn an_unresolvable_journalled_request_stops_reconciliation() {
     ];
     let journal = tempfile::tempdir().expect("a directory");
     // The client is seeded with voter 0 alone, so every routing walk speaks
-    // to exactly one live, promptly-refusing member — the test's timing
-    // never depends on dial timeouts to dead nodes.
+    // to exactly one live member — the test's timing never depends on dial
+    // timeouts to dead nodes.
     let node = Node::start(
         AsterConfig::builder()
             .relay(RelayMode::Disabled)
@@ -1376,6 +1376,13 @@ async fn an_unresolvable_journalled_request_stops_reconciliation() {
                 .expect("a canonical ticket"),
         ])
         .journal_dir(journal.path())
+        // Once the quorum is gone, voter 0 doesn't refuse promptly: each
+        // attempt runs to its deadline. A drive is eight attempts plus about
+        // 12 s of backoff, which at the defaults sat close to PATIENCE and
+        // missed it on a CI runner. Short attempts and backoff keep each
+        // drive near 25 s.
+        .deadlines_for_testing(Duration::from_secs(3), Duration::from_secs(60))
+        .retry_backoff_for_testing(Duration::from_millis(50))
         .build()
         .expect("the client builds");
 
