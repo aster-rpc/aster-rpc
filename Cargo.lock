@@ -3223,7 +3223,7 @@ dependencies = [
 [[package]]
 name = "iroh-gossip"
 version = "0.101.1"
-source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=aed725d1a6fef4e60dbe952b524c5478ec125186#aed725d1a6fef4e60dbe952b524c5478ec125186"
+source = "git+https://forge.emrul.dev/Aster/iroh-gossip.git?rev=c0e4a1f2a05ed721122f9289eb27ad8330a9182f#c0e4a1f2a05ed721122f9289eb27ad8330a9182f"
 dependencies = [
  "blake3",
  "bytes",
@@ -3385,7 +3385,7 @@ dependencies = [
 [[package]]
 name = "iroh-util"
 version = "0.6.3"
-source = "git+https://forge.emrul.dev/Aster/iroh-util.git?rev=6c42d23881459fdd07feb31287616c87c4676833#6c42d23881459fdd07feb31287616c87c4676833"
+source = "git+https://forge.emrul.dev/Aster/iroh-util.git?rev=eb76016080ea037464a7de71196b6de2999736b2#eb76016080ea037464a7de71196b6de2999736b2"
 dependencies = [
  "derive_more 2.1.1",
  "iroh",
@@ -4285,7 +4285,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 1.3.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

@@ -23,7 +23,7 @@ iroh        = { version = "=1.3.2", registry = "aster", git = "https://forge.emr
 iroh-relay  = { version = "=1.3.2", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh.git", rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-blobs  = { version = "0.103.10", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-blobs.git", rev = "bcd00bb2a888f3d6990ac32d9fab1d8e2d9d73f4" }
 iroh-docs   = { version = "0.101.6", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-docs.git", rev = "573efc68c76fdd9663c2c4e740b0c37c25480613" }
-iroh-gossip = { version = "0.101.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
+iroh-gossip = { version = "0.101.1", registry = "aster", git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "c0e4a1f2a05ed721122f9289eb27ad8330a9182f" }
 iroh-tickets = { version = "=1.0.0", registry = "aster", git = "https://github.com/n0-computer/iroh-tickets", rev = "4899684e1209dea29ed28aa2314450927557b037" }
 # mDNS lookup moved to a separate crate in iroh 1.0.0-rc.0.
 iroh-mdns-address-lookup = { version = "=0.4.0", registry = "aster", git = "https://github.com/n0-computer/iroh-address-lookups", rev = "87fdd7ea1a902845695f8f685c1905f096b3d02d" }
@@ -62,7 +62,7 @@ iroh-base   = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4
 iroh-relay  = { git = "https://forge.emrul.dev/Aster/iroh.git",        rev = "a4a9a76b01bcfbad573dfc3186b014efa1c2532d" }
 iroh-blobs  = { git = "https://forge.emrul.dev/Aster/iroh-blobs.git",  rev = "bcd00bb2a888f3d6990ac32d9fab1d8e2d9d73f4" }
 iroh-docs   = { git = "https://forge.emrul.dev/Aster/iroh-docs.git",   rev = "573efc68c76fdd9663c2c4e740b0c37c25480613" }
-iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "aed725d1a6fef4e60dbe952b524c5478ec125186" }
+iroh-gossip = { git = "https://forge.emrul.dev/Aster/iroh-gossip.git", rev = "c0e4a1f2a05ed721122f9289eb27ad8330a9182f" }
 noq         = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
 noq-udp     = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
 noq-proto   = { git = "https://forge.emrul.dev/Aster/noq.git",         rev = "e75f3a5550feae0f40df0ffde8bf438f213a5156" }
@@ -74,7 +74,7 @@ netwatch                 = { git = "https://github.com/n0-computer/net-tools",  
 portmapper               = { git = "https://github.com/n0-computer/net-tools",            rev = "0030e57fc70981895bb86212ff0f059cc41c8a4e" }
 iroh-mdns-address-lookup = { git = "https://github.com/n0-computer/iroh-address-lookups", rev = "87fdd7ea1a902845695f8f685c1905f096b3d02d" }
 iroh-tickets             = { git = "https://github.com/n0-computer/iroh-tickets",         rev = "4899684e1209dea29ed28aa2314450927557b037" }
-iroh-util                = { git = "https://forge.emrul.dev/Aster/iroh-util.git",         rev = "6c42d23881459fdd07feb31287616c87c4676833" }
+iroh-util                = { git = "https://forge.emrul.dev/Aster/iroh-util.git",         rev = "eb76016080ea037464a7de71196b6de2999736b2" }
 
 # ──────────────────────────────────────────────────────────────────────────
 # Aster Salvo fork (HTTP transport — see docs/_internal/working_ideas/aster-http3-transport.md)
