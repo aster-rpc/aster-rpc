@@ -655,9 +655,11 @@ func TestCoordinationLive_LeaseRenewsInRustMutatesAndHandsOff(t *testing.T) {
 	g.grant(t, rootC, "lease", contender)
 	w := g.open(t, worker, g.journal(t, "worker"))
 
-	// Renew every 100 ms so the CompareAndSet and the final handoff land while
-	// renewals are in flight.
-	lease, err := w.AcquireLease(ctx, coordNS, []byte("lease"), LeaseOptions{TTL: 6 * time.Second, RenewEvery: 100 * time.Millisecond, HolderMargin: 300 * time.Millisecond})
+	// Renew every 500 ms so the CompareAndSet and the final handoff land while
+	// renewals are in flight. The 20 s TTL rides out a stall of several
+	// seconds on a loaded host (a 6 s TTL lost the lease at load ~59; the
+	// server then refused the write correctly, but the test could not go on).
+	lease, err := w.AcquireLease(ctx, coordNS, []byte("lease"), LeaseOptions{TTL: 20 * time.Second, RenewEvery: 500 * time.Millisecond, HolderMargin: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -681,7 +683,7 @@ func TestCoordinationLive_LeaseRenewsInRustMutatesAndHandsOff(t *testing.T) {
 	}
 
 	// Outlive the TTL: the renew loop keeps it.
-	time.Sleep(7 * time.Second)
+	time.Sleep(21 * time.Second)
 	if f, ok := lease.Fence(); !ok || f.Epoch != first.Epoch {
 		t.Fatalf("lease lost after a TTL: %+v, %v", f, ok)
 	}
