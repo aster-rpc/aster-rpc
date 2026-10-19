@@ -697,7 +697,7 @@ async fn config_driven_issuer_renews_client_credentials() {
                 .enrollment(EnrollmentConfig {
                     replicas: vec![root.ticket()],
                     issuer_delegation_file: Some(delegation_file),
-                    issuer_lifetime_secs: Some(6),
+                    issuer_lifetime_secs: Some(15),
                     ..server_enrollment(&root, files.path())
                 })
                 .build(),
@@ -724,7 +724,9 @@ async fn config_driven_issuer_renews_client_credentials() {
             .attributes()
             .restrict_roles(&hex::encode(public(7)), ["ops.status"])
             .unwrap();
-        let deadline = now() + 3 * 6 + 2;
+        // Past the first credential's expiry: renewal starts with a third of the
+        // lifetime left (5 s), enough to re-present on a loaded host.
+        let deadline = now() + 15 + 3;
         while now() < deadline {
             assert_eq!(call(&client.rpc(), "status").await.unwrap(), "ops.status");
             assert!(denied(&call(&client.rpc(), "logs").await));

@@ -38,7 +38,9 @@ func TestLeaseGrantor_GoSerializerBehindStartServer(t *testing.T) {
 	}
 	defer serB.Close()
 
-	lease, err := serA.Acquire(ctx, "db/primary", idA, LeaseOptions{TTL: 3 * time.Second})
+	// A TTL that survives a stall on a loaded host; renewals every 500 ms so
+	// the check below sees one.
+	lease, err := serA.Acquire(ctx, "db/primary", idA, LeaseOptions{TTL: 10 * time.Second, RenewEvery: 500 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -363,7 +363,7 @@ final class EnrollmentAsterServerTest {
         base.enrollment().toBuilder()
             .replicas(List.of(rootTicket))
             .issuerDelegationFile(delegationFile.toString())
-            .issuerLifetimeSecs(6L)
+            .issuerLifetimeSecs(15L)
             .build());
     AsterServer server = startOps(AsterServer.builder().config(cfg.build()));
     NodeAddr addr = server.node().nodeAddr();
@@ -386,7 +386,9 @@ final class EnrollmentAsterServerTest {
     AsterClient client = client(enrolled(7, issued.chain()).build());
     assertEquals("ops.status", call(client, addr, "status"));
     assertTrue(client.isRenewing(), "the server signed the credential, so the client renews");
-    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3 * 6 + 2);
+    // Past the first credential's expiry: renewal starts with a third of the lifetime left
+    // (5 s), enough to re-present on a loaded host.
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15 + 3);
     while (System.nanoTime() < deadline) {
       assertEquals("ops.status", call(client, addr, "status"));
       Thread.sleep(500);

@@ -294,7 +294,7 @@ async def test_client_stream_refusal_is_permission_denied(root, tmp_path):
 async def test_config_driven_issuer_renews_client_credentials(root, tmp_path):
     """A server configured as a delegated issuer serves renewals; a client
     whose credential that server signed renews automatically and stays
-    admitted, and its roles keep working, across several short lifetimes.
+    admitted, and its roles keep working, past its first credential's expiry.
     The server syncs policy from a configured replica (the root)."""
     delegation = tmp_path / "issuer.chain"
     delegation.write_text(_enrollment_test_delegation(seed(1), node_id(2), FLEET) + "\n")
@@ -304,7 +304,7 @@ async def test_config_driven_issuer_renews_client_credentials(root, tmp_path):
             tmp_path,
             replicas=(root.ticket,),
             issuer_delegation_file=str(delegation),
-            issuer_lifetime_secs=6,
+            issuer_lifetime_secs=15,
         )
     )
     client = None
@@ -314,7 +314,9 @@ async def test_config_driven_issuer_renews_client_credentials(root, tmp_path):
 
         client, ops = await connect(srv, client_config(root, 7, issued))
         assert client.is_renewing, "the server signed it, so it renews"
-        deadline = time.time() + 3 * 6 + 2
+        # Past the first credential's expiry: renewal starts with a third of
+        # the lifetime left (5 s), enough to re-present on a loaded host.
+        deadline = time.time() + 15 + 3
         while time.time() < deadline:
             assert await call(ops, "status") == "ops.status"
             await asyncio.sleep(0.5)

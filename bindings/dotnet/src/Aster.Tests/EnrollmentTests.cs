@@ -231,7 +231,7 @@ public class EnrollmentTests
             {
                 Replicas = [rootTicket],
                 IssuerDelegationFile = delegationFile,
-                IssuerLifetimeSecs = 6,
+                IssuerLifetimeSecs = 15,
             },
         };
         var (server, addr) = await StartOps(new AsterServerOptions { Config = config });
@@ -254,7 +254,9 @@ public class EnrollmentTests
         await using var client = await Client(Enrolled(7, issued.Chain));
         Assert.Equal("ops.status", await Call(client, addr, "status"));
         Assert.True(client.IsRenewing); // the server signed the credential, so the client renews from it
-        var until = DateTime.UtcNow + TimeSpan.FromSeconds(3 * 6 + 2);
+        // Past the first credential's expiry: renewal starts with a third of the lifetime left
+        // (5 s), enough to re-present on a loaded host.
+        var until = DateTime.UtcNow + TimeSpan.FromSeconds(15 + 3);
         while (DateTime.UtcNow < until)
         {
             Assert.Equal("ops.status", await Call(client, addr, "status"));

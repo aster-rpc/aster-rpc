@@ -37,7 +37,8 @@ import {
 } from '@aster-rpc/aster';
 
 const OFFLINE = { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } as const;
-const FAST = { ttlMs: 600, renewIntervalMs: 150, holderMarginMs: 100 };
+// Fast renewals; a TTL that survives a stall on a loaded host.
+const FAST = { ttlMs: 3000, renewIntervalMs: 150, holderMarginMs: 100 };
 
 async function ready(node: Node): Promise<void> {
   for (let i = 0; i < 200 && node.directAddresses().length === 0; i++) {
@@ -104,7 +105,7 @@ describe('lease backend in JavaScript', () => {
     using ser = new ForeignLeaseSerializer(backend);
     const lease = granted(await ser.acquire('tree/42', 'n1', FAST));
     expect(lease).toMatchObject({ resource: 'tree/42', epoch: 1, holder: 'n1', status: 'held' });
-    expect(backend.ops[0]).toEqual({ resource: 'tree/42', op: { kind: 'acquire', actor: 'n1', ttlMs: 600 } });
+    expect(backend.ops[0]).toEqual({ resource: 'tree/42', op: { kind: 'acquire', actor: 'n1', ttlMs: 3000 } });
 
     const denied = await ser.acquire('tree/42', 'n2', FAST);
     expect(denied.granted).toBe(false);
@@ -114,7 +115,7 @@ describe('lease backend in JavaScript', () => {
     }
 
     // Renewals run in Rust and land in the JS backend.
-    await sleep(800); // > ttl
+    await sleep(3200); // > ttl
     expect(lease.status).toBe('held');
     expect(backend.ops.filter((o) => o.op.kind === 'renew').length).toBeGreaterThanOrEqual(2);
     expect(backend.ops.find((o) => o.op.kind === 'renew')?.op).toEqual({ kind: 'renew', actor: 'n1', epoch: 1 });
@@ -361,7 +362,7 @@ describe('lease grantor over a JavaScript backend', () => {
     const remote = await a.leaseGrantor(grantor.id);
     const lease = granted(await remote.acquire('db/primary', FAST));
     expect(lease.holder).toBe(a.id);
-    expect(backend.ops[0].op).toEqual({ kind: 'acquire', actor: a.id, ttlMs: 600 });
+    expect(backend.ops[0].op).toEqual({ kind: 'acquire', actor: a.id, ttlMs: 3000 });
     await sleep(600);
     expect(lease.status).toBe('held');
     expect(backend.ops.some((o) => o.op.kind === 'renew' && o.op.actor === a.id)).toBe(true);
@@ -532,11 +533,13 @@ describe('topology admitted filter in JavaScript', () => {
       async () => ((await nodes[1].topology().myCluster())?.members.length ?? 0) === 3,
       30_000,
     );
+    // Two members alone may predate the banned producer's first sighting:
+    // wait until the filter was asked about it too.
     const filtered = await until(
-      'filtered cluster of two',
+      'filtered cluster of two after the banned producer was asked about',
       async () => {
         const c = await nodes[0].topology().myCluster();
-        return c && c.members.length === 2 ? c : undefined;
+        return c && c.members.length === 2 && batches.flat().includes(ids[2]) ? c : undefined;
       },
       30_000,
     );

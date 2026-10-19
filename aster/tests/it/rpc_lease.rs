@@ -238,7 +238,7 @@ async fn lease_handle_renews_over_rpc() {
     ));
 
     let opts = LeaseOptions {
-        ttl: Duration::from_secs(2),
+        ttl: Duration::from_secs(8),
         renew_interval: Duration::from_millis(500),
         holder_margin: Duration::from_millis(250),
     };
@@ -256,7 +256,7 @@ async fn lease_handle_renews_over_rpc() {
     };
 
     // Live past 2.5 × ttl — only possible if renewals flow over the wire.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
     assert_eq!(lease.status(), LeaseStatus::Held);
     assert!(lease.fence().is_some());
 

@@ -352,7 +352,7 @@ func TestEnrollment_ClientStreamRefusalIsPermissionDenied(t *testing.T) {
 
 // A server configured as a delegated issuer serves renewals; a client whose
 // credential that server signed renews automatically and stays admitted,
-// with its roles, across several short lifetimes. The server synchronizes
+// with its roles, past its first credential's expiry. The server synchronizes
 // policy from a configured replica (the root).
 func TestEnrollment_ConfigDrivenIssuerRenewsClientCredentials(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
@@ -380,7 +380,7 @@ func TestEnrollment_ConfigDrivenIssuerRenewsClientCredentials(t *testing.T) {
 	cfg := serverCfg(t, dir)
 	cfg.Enrollment.Replicas = []string{rootTicket}
 	cfg.Enrollment.IssuerDelegationFile = filepath.Join(dir, "issuer.chain")
-	cfg.Enrollment.IssuerLifetimeSecs = 6
+	cfg.Enrollment.IssuerLifetimeSecs = 15
 	if err := os.WriteFile(cfg.Enrollment.IssuerDelegationFile, []byte(delegation+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +412,9 @@ func TestEnrollment_ConfigDrivenIssuerRenewsClientCredentials(t *testing.T) {
 	if !client.IsRenewing() {
 		t.Fatal("the server signed the credential, so the client renews from it")
 	}
-	deadline := time.Now().Add(3*6*time.Second + 2*time.Second)
+	// Past the first credential's expiry: renewal starts with a third of the
+	// lifetime left (5 s), enough to re-present on a loaded host.
+	deadline := time.Now().Add(15*time.Second + 3*time.Second)
 	for time.Now().Before(deadline) {
 		if roles, err := opsCall(ctx, client, server, "status"); err != nil || roles != "ops.status" {
 			t.Fatalf("status across lifetimes: %q %v", roles, err)

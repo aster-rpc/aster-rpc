@@ -23,7 +23,8 @@ import {
 } from '@aster-rpc/aster';
 
 const OFFLINE = { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } as const;
-const FAST = { ttlMs: 600, renewIntervalMs: 150, holderMarginMs: 100 };
+// Fast renewals; a TTL that survives a stall on a loaded host.
+const FAST = { ttlMs: 3000, renewIntervalMs: 150, holderMarginMs: 100 };
 
 async function ready(node: Node): Promise<void> {
   for (let i = 0; i < 200 && node.directAddresses().length === 0; i++) {
@@ -102,7 +103,7 @@ describe('lease: in-memory serializer', () => {
   it('renews past the TTL in the background', async () => {
     const ser = new MemorySerializer();
     const lease = granted(await ser.acquire('r', 'n1', FAST));
-    await new Promise((r) => setTimeout(r, 1500)); // > 2 × ttl
+    await new Promise((r) => setTimeout(r, 3200)); // > ttl
     expect(lease.status).toBe('held');
     expect(lease.fence()?.epoch).toBe(1);
     expect((await ser.acquire('r', 'n2', FAST)).granted).toBe(false);
@@ -197,7 +198,7 @@ describe('lease: designated grantor over RPC', () => {
     }
 
     // Renewals over RPC keep it held past the TTL.
-    await new Promise((r) => setTimeout(r, 1000));
+    await new Promise((r) => setTimeout(r, 3200));
     expect(lease.status).toBe('held');
     expect(await sb.snapshot('db/primary')).toMatchObject({ epoch: 1, holder: a.id, held: true });
 

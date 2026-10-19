@@ -725,7 +725,7 @@ func TestCoordinationLive_LeaseRenewsInRustMutatesAndHandsOff(t *testing.T) {
 	}
 
 	// Graceful Release, and Close (free without releasing) lapses by TTL.
-	again, err := w.AcquireLease(ctx, coordNS, []byte("lease"), LeaseOptions{TTL: 5 * time.Second})
+	again, err := w.AcquireLease(ctx, coordNS, []byte("lease"), LeaseOptions{TTL: 20 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -760,7 +760,7 @@ func TestCoordinationLive_CloseAndReleaseWithOperationsInFlight(t *testing.T) {
 	g.grant(t, rootC, "inflight", worker)
 	journal := g.journal(t, "worker")
 	w := g.open(t, worker, journal)
-	lease, err := w.AcquireLease(ctx, coordNS, []byte("inflight"), LeaseOptions{TTL: 5 * time.Second, RenewEvery: 100 * time.Millisecond})
+	lease, err := w.AcquireLease(ctx, coordNS, []byte("inflight"), LeaseOptions{TTL: 20 * time.Second, RenewEvery: 100 * time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
