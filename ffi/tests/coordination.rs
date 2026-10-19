@@ -1155,6 +1155,148 @@ fn coordination_lease_lifecycle() {
     }
 }
 
+/// The Rust renew loop keeps a C-ABI lease held past its TTL: the holder
+/// sees HELD and presents the same fence throughout, the group records the
+/// renewals (`lease_revision` advances, the epoch does not), and a contender
+/// is still denied after a full TTL has gone by. The short TTL is the
+/// protocol floor, so the test's run time is set by it.
+#[test]
+fn coordination_lease_is_renewed_past_its_ttl() {
+    use aster::coordination::model::limits::MIN_TTL_MS;
+    unsafe {
+        let Shared { rt, .. } = *shared();
+        let root = grant_root();
+        let (w1_node, w2_node) = (
+            start_node(rt, actor_secret()),
+            start_node(rt, actor_secret()),
+        );
+        let (d1, d2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (w1, w2) = (
+            open(rt, w1_node, Some(d1.path())),
+            open(rt, w2_node, Some(d2.path())),
+        );
+        let r = res("ffi.renew", "leader");
+        grant(rt, root, &r, local_id(rt, w1));
+        grant(rt, root, &r, local_id(rt, w2));
+
+        // short-wait-ok: the TTL under test; MIN_TTL_MS (5 s) is the shortest the group accepts
+        let ttl_ms = MIN_TTL_MS;
+        let ttl = Duration::from_millis(ttl_ms);
+        let mut op = 0;
+        assert_eq!(
+            aster_coordination_lease_acquire(
+                rt,
+                w1,
+                bytes(b"ffi.renew"),
+                bytes(b"leader"),
+                ttl_ms,
+                0,
+                0,
+                0,
+                &mut op
+            ),
+            OK
+        );
+        let ev = finish(rt, op).expect(E_LEASE);
+        let granted_at = Instant::now();
+        let lease = ev.ev.handle;
+        assert_ne!(lease, 0);
+        let fence = codec::decode_coordination_fence(&ev.data).unwrap();
+        assert_eq!(fence.holder, local_id(rt, w1).to_vec());
+
+        let snapshot = || {
+            codec::decode_read_reply(&read(rt, w2, &ReadRequest::ReadLinearizable(r.clone())))
+                .unwrap()
+        };
+        let first = snapshot();
+        assert!(first.held);
+        assert_eq!(first.epoch, fence.epoch);
+        assert_eq!(first.ttl_ms, ttl_ms);
+
+        // Hold for one and a half TTLs. Without a renewal the group would
+        // expire the lease after one TTL and the holder's self-limit would
+        // stop presenting the fence before that.
+        let hold_for = ttl + ttl / 2;
+        let mut last = first.clone();
+        let mut buf = vec![0u8; 256];
+        while granted_at.elapsed() < hold_for {
+            let mut st = 9;
+            assert_eq!(aster_coordination_lease_status(rt, lease, &mut st), OK);
+            assert_eq!(
+                st,
+                aster_lease_status_t::ASTER_LEASE_STATUS_HELD as u32,
+                "the lease stopped being held {:?} after the grant",
+                granted_at.elapsed()
+            );
+            let mut len = 0usize;
+            assert_eq!(
+                aster_coordination_lease_fence(rt, lease, buf.as_mut_ptr(), buf.len(), &mut len),
+                OK,
+                "the fence stopped being presentable {:?} after the grant",
+                granted_at.elapsed()
+            );
+            assert_eq!(
+                codec::decode_coordination_fence(&buf[..len]).unwrap(),
+                fence
+            );
+
+            let now = snapshot();
+            assert!(now.held, "the group expired the lease: {now:?}");
+            assert_eq!(now.epoch, fence.epoch, "a renewal never changes the epoch");
+            assert_eq!(now.holder, first.holder);
+            assert!(now.lease_revision >= last.lease_revision);
+            last = now;
+            // A poll tick between checks, not a wait for anything.
+            std::thread::sleep(Duration::from_millis(250));
+        }
+        assert!(
+            last.lease_revision > first.lease_revision,
+            "no renewal committed in {hold_for:?}: {first:?} -> {last:?}"
+        );
+
+        // Past a full TTL a contender is still denied: the group saw the
+        // renewals, not just the holder.
+        assert!(granted_at.elapsed() > ttl);
+        assert_eq!(
+            aster_coordination_lease_acquire(
+                rt,
+                w2,
+                bytes(b"ffi.renew"),
+                bytes(b"leader"),
+                ttl_ms,
+                0,
+                0,
+                0,
+                &mut op
+            ),
+            OK
+        );
+        let denied = finish(rt, op).expect(E_LEASE);
+        assert_eq!(denied.ev.handle, 0);
+        match ucv1::decode_transition_outcome(&denied.data).unwrap() {
+            TransitionOutcome::Denied(reason, snap) => {
+                assert_eq!(reason, DenyReason::HeldByOther);
+                assert!(snap.held);
+                assert_eq!(snap.epoch, fence.epoch);
+            }
+            other => panic!("expected a denial, got {other:?}"),
+        }
+
+        assert_eq!(aster_coordination_lease_release(rt, lease, 0, &mut op), OK);
+        finish(rt, op).expect(E_UNIT);
+        let mut st = 9;
+        assert_eq!(
+            aster_coordination_lease_status(rt, lease, &mut st),
+            NOT_FOUND
+        );
+        assert!(!snapshot().held);
+
+        for c in [w1, w2] {
+            assert_eq!(aster_coordination_client_free(rt, c), OK);
+        }
+    }
+}
+
 // ── close with handles and operations outstanding ───────────────────────────
 
 #[test]

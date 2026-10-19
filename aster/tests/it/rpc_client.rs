@@ -11,15 +11,18 @@
 #![cfg(feature = "rpc")]
 
 use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use aster::rpc::{
-    Call, CallOptions, RpcConnection, RpcStatus, SerializationMode, Server, ServiceDispatch,
-    StatusCode, StreamHeader, RPC_ALPN,
+    Call, CallOptions, CircuitBreaker, RpcConnection, RpcStatus, SerializationMode, Server,
+    ServiceDispatch, StatusCode, StreamHeader, RPC_ALPN,
 };
 use aster::{AsterConfig, Node, RelayMode};
+use aster_transport_core::test_support::wait_budget;
 
 // ── test service ────────────────────────────────────────────────────────────
 
@@ -32,6 +35,12 @@ struct Seen {
     producer_stopped: AtomicUsize,
     /// `hold` calls that reached their handler.
     hold_started: AtomicUsize,
+    /// `echo` calls that reached their handler.
+    echoed: AtomicUsize,
+    /// Signalled when a `gate` call reaches its handler.
+    gate_entered: tokio::sync::Notify,
+    /// Lets one waiting `gate` call answer.
+    gate_open: tokio::sync::Notify,
 }
 
 struct Svc {
@@ -80,12 +89,13 @@ impl ServiceDispatch for Svc {
     fn methods(&self) -> &[&str] {
         &[
             "echo", "empty", "fail", "meta", "hang", "park", "count", "forever", "sum", "hold",
-            "chat",
+            "chat", "gate",
         ]
     }
     async fn dispatch(&self, method: &str, mut call: Call) {
         match method {
             "echo" => {
+                self.seen.echoed.fetch_add(1, Ordering::SeqCst);
                 let req = call.recv_request().await.unwrap_or_default();
                 let _ = call.respond(req, &RpcStatus::ok()).await;
             }
@@ -194,6 +204,19 @@ impl ServiceDispatch for Svc {
                 }
                 cancelled.armed = false;
                 let _ = call.finish(&RpcStatus::ok()).await;
+            }
+            "gate" => {
+                // Holds its stream until the test opens the gate; reports a
+                // cancel (flag or being dropped) that ends it first.
+                let req = call.recv_request().await.unwrap_or_default();
+                let mut cancelled = CountOnDrop::new(&self.seen.cancelled);
+                self.seen.gate_entered.notify_one();
+                tokio::select! {
+                    _ = self.seen.gate_open.notified() => {}
+                    _ = wait_cancelled(&call) => return,
+                }
+                cancelled.armed = false;
+                let _ = call.respond(req, &RpcStatus::ok()).await;
             }
             _ => {}
         }
@@ -534,6 +557,248 @@ async fn the_shared_pool_bound_is_configurable() {
     }
     #[cfg(feature = "binding-support")]
     assert!(f.conn.core_connection().pool().open_count(&None) <= 2);
+    f.shutdown().await;
+}
+
+// ── saturation, cancellation and peer isolation ─────────────────────────────
+
+/// Poll `fut` once.
+async fn poll_once<F: Future>(mut fut: Pin<&mut F>) -> Poll<F::Output> {
+    std::future::poll_fn(move |cx| Poll::Ready(fut.as_mut().poll(cx))).await
+}
+
+/// Wait (within the wait budget) for the next `gate` call to reach its handler.
+async fn gate_entered(seen: &Seen, what: &str) {
+    tokio::time::timeout(wait_budget(), seen.gate_entered.notified())
+        .await
+        .unwrap_or_else(|_| panic!("{what}: the gate call never reached its handler"));
+}
+
+/// Wait (within the wait budget) until `cond` holds.
+async fn settles(what: &str, cond: impl Fn() -> bool) {
+    tokio::time::timeout(wait_budget(), async {
+        while !cond() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
+}
+
+/// A one-stream pool owned by a call in its handler, sixteen unary calls
+/// parked in the pool's waiter queue, then all sixteen cancelled (dropped):
+/// none reaches the server, the owner is unaffected, the released stream
+/// skips the dead waiters and goes straight to a live call queued behind
+/// them, and the pool serves later calls normally.
+#[tokio::test]
+async fn cancelled_queued_acquisitions_leave_a_saturated_pool_reusable() {
+    let f = Fixture::new().await;
+    f.conn.set_shared_pool_size(1);
+    let owner = {
+        let conn = f.conn.clone();
+        tokio::spawn(async move { conn.unary(&h("gate"), vec![0xAA]).await })
+    };
+    gate_entered(&f.seen, "the pool owner").await;
+
+    // A unary call's first await is its stream acquire, so one poll parks it
+    // in the waiter queue (FIFO) of the saturated pool.
+    let echo = h("echo");
+    let mut queued: Vec<_> = (0..16u8)
+        .map(|i| Box::pin(f.conn.unary(&echo, vec![i])))
+        .collect();
+    for q in &mut queued {
+        assert!(poll_once(q.as_mut()).await.is_pending());
+    }
+    let mut behind = {
+        let conn = f.conn.clone();
+        Box::pin(async move { conn.unary(&h("echo"), vec![99]).await })
+    };
+    assert!(poll_once(behind.as_mut()).await.is_pending());
+
+    drop(queued);
+    assert_eq!(f.seen.echoed.load(Ordering::SeqCst), 0);
+    assert!(!owner.is_finished(), "the owner must still hold the stream");
+
+    f.seen.gate_open.notify_one();
+    let owned = tokio::time::timeout(wait_budget(), owner)
+        .await
+        .expect("the owner answers")
+        .unwrap();
+    assert_eq!(owned.unwrap(), vec![0xAA]);
+    // Waiting out the dead waiters would end in the pool's 5 s acquire
+    // timeout (UNAVAILABLE); the hand-off skips them instead.
+    let served = tokio::time::timeout(wait_budget(), behind)
+        .await
+        .expect("the live waiter is served");
+    assert_eq!(served.unwrap(), vec![99]);
+
+    for i in 0..16u8 {
+        assert_eq!(
+            within(f.conn.unary(&h("echo"), vec![i])).await.unwrap(),
+            vec![i]
+        );
+    }
+    assert_eq!(f.seen.echoed.load(Ordering::SeqCst), 17);
+    assert_eq!(f.seen.cancelled.load(Ordering::SeqCst), 0);
+    assert_eq!(f.conn.shared_pool_size(), 1);
+    #[cfg(feature = "binding-support")]
+    {
+        let pool = f.conn.core_connection().pool();
+        assert_eq!(pool.open_count(&None), 1);
+        assert_eq!(pool.free_count(&None), 1, "the stream is back in the pool");
+    }
+    f.shutdown().await;
+}
+
+/// One client endpoint with connections to two peers. While a call to the
+/// first peer is stalled in its handler, and after that connection is closed,
+/// calls to the second peer keep completing; the stalled call fails, its
+/// handler ends, and a fresh connection to the first peer works again.
+#[cfg(feature = "binding-support")]
+#[tokio::test]
+async fn a_healthy_peer_progresses_beside_a_stalled_and_disconnected_peer() {
+    async fn serve() -> (Node, Arc<Seen>, aster::rpc::ServerHandle) {
+        let node = Node::start_with_alpns(cfg(), vec![RPC_ALPN.to_vec()])
+            .await
+            .unwrap();
+        wait_for_addr(&node).await;
+        let seen = Arc::new(Seen::default());
+        let handle = Server::new(&node)
+            .register(Svc { seen: seen.clone() })
+            .serve();
+        (node, seen, handle)
+    }
+    let (bad, bad_seen, _bad_handle) = serve().await;
+    let (good, good_seen, _good_handle) = serve().await;
+    let client = Node::start(cfg()).await.unwrap();
+    wait_for_addr(&client).await;
+    for srv in [&bad, &good] {
+        client.add_peer(srv).unwrap();
+        srv.add_peer(&client).unwrap();
+    }
+    let to_bad = within(client.rpc_connect(&bad.id())).await.unwrap();
+    let to_good = within(client.rpc_connect(&good.id())).await.unwrap();
+
+    let stalled = {
+        let conn = to_bad.clone();
+        tokio::spawn(async move { conn.unary(&h("gate"), vec![1]).await })
+    };
+    gate_entered(&bad_seen, "the stalled peer").await;
+
+    // Three calls to the healthy peer, each within the wait budget.
+    let healthy_round = |phase: &'static str, from: u8| {
+        let conn = to_good.clone();
+        async move {
+            for i in from..from + 3 {
+                let reply = tokio::time::timeout(wait_budget(), conn.unary(&h("echo"), vec![i]))
+                    .await
+                    .unwrap_or_else(|_| panic!("{phase}: the healthy peer stopped answering"));
+                assert_eq!(reply.unwrap(), vec![i]);
+            }
+        }
+    };
+
+    healthy_round("stalled", 0).await;
+    assert!(
+        !stalled.is_finished(),
+        "the stalled call must still be pending"
+    );
+    assert_eq!(bad_seen.cancelled.load(Ordering::SeqCst), 0);
+
+    to_bad
+        .core_connection()
+        .close(0, b"test closes the stalled peer".to_vec())
+        .unwrap();
+    let failed = tokio::time::timeout(wait_budget(), stalled)
+        .await
+        .expect("the stalled call fails once its connection closes")
+        .unwrap();
+    assert!(failed.is_err(), "the stalled call failed: {failed:?}");
+    let seen = bad_seen.clone();
+    settles("the stalled handler ends", || {
+        seen.cancelled.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    healthy_round("disconnected", 3).await;
+    assert_eq!(good_seen.echoed.load(Ordering::SeqCst), 6);
+    assert_eq!(good_seen.cancelled.load(Ordering::SeqCst), 0);
+    assert_eq!(bad_seen.echoed.load(Ordering::SeqCst), 0);
+
+    // The closed peer is reachable again over a fresh connection.
+    let recovered = within(client.rpc_connect(&bad.id())).await.unwrap();
+    assert_eq!(
+        within(recovered.unary(&h("echo"), vec![7])).await.unwrap(),
+        vec![7]
+    );
+    assert_eq!(bad_seen.echoed.load(Ordering::SeqCst), 1);
+
+    drop((to_bad, to_good, recovered));
+    client.shutdown().await;
+    bad.shutdown().await;
+    good.shutdown().await;
+}
+
+/// A half-open probe that is admitted, reaches the peer and is then
+/// abandoned (dropped) neither closes nor wedges the circuit breaker: once
+/// the recovery window passes again a new probe is admitted, its success
+/// closes the breaker, and a later single failure (below the threshold)
+/// leaves calls admitted at once.
+#[tokio::test]
+async fn an_abandoned_half_open_probe_leaves_the_breaker_recoverable() {
+    let f = Fixture::new().await;
+    // short-wait-ok: the breaker's recovery window under test
+    let recovery = Duration::from_millis(200);
+    let conn = f
+        .conn
+        .clone()
+        .with_circuit_breaker(CircuitBreaker::new(2, recovery));
+
+    for _ in 0..2 {
+        assert_eq!(
+            code_of(within(conn.unary(&h("fail"), vec![1])).await),
+            StatusCode::FailedPrecondition
+        );
+    }
+    // Open: refused without reaching the peer.
+    assert_eq!(
+        code_of(within(conn.unary(&h("echo"), vec![1])).await),
+        StatusCode::Unavailable
+    );
+    assert_eq!(f.seen.echoed.load(Ordering::SeqCst), 0);
+
+    tokio::time::sleep(recovery).await;
+    let probe = {
+        let conn = conn.clone();
+        tokio::spawn(async move { conn.unary(&h("gate"), vec![2]).await })
+    };
+    gate_entered(&f.seen, "the half-open probe").await;
+    probe.abort();
+    assert!(probe.await.unwrap_err().is_cancelled());
+    let seen = f.seen.clone();
+    settles("the abandoned probe's handler sees the cancel", || {
+        seen.cancelled.load(Ordering::SeqCst) == 1
+    })
+    .await;
+
+    // The probe's admission restarted the window; once it passes, a new
+    // probe is admitted and its success closes the breaker.
+    tokio::time::sleep(recovery).await;
+    assert_eq!(
+        within(conn.unary(&h("echo"), vec![3])).await.unwrap(),
+        vec![3]
+    );
+    assert_eq!(f.seen.echoed.load(Ordering::SeqCst), 1);
+
+    assert_eq!(
+        code_of(within(conn.unary(&h("fail"), vec![1])).await),
+        StatusCode::FailedPrecondition
+    );
+    assert_eq!(
+        within(conn.unary(&h("echo"), vec![4])).await.unwrap(),
+        vec![4]
+    );
+    assert_eq!(f.seen.echoed.load(Ordering::SeqCst), 2);
     f.shutdown().await;
 }
 
