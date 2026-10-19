@@ -198,6 +198,36 @@ class RuntimeGates(unittest.TestCase):
             bundled = root / 'bindings/java/aster-runtime/src/main/resources/native' / f'{system}-{arch}' / name
             self.assertEqual(bundled.read_bytes(), native.read_bytes())
 
+    def test_macos_ffi_runs_platform_checks_and_linux_keeps_full_suites(self):
+        workflow = (ROOT / '.forgejo/workflows/linux.yml').read_text()
+
+        def job(name):
+            body = workflow.split(f'\n  {name}:\n', 1)[1]
+            return re.split(r'\n  [\w-]+:\n', body, maxsplit=1)[0]
+
+        macos, go, java = job('ffi-macos'), job('ffi-go'), job('ffi-java')
+        # Full suites stay on Linux.
+        self.assertIn('go test -count=1 -timeout 600s ./...', go)
+        self.assertIn('mvn -B package -Dnative.classifier=linux-x86_64', java)
+        self.assertNotIn('-Dtest=', java)
+        # macOS runs only the selected platform checks.
+        self.assertNotIn('./...\n', macos.replace('go vet ./...\n', '').replace('CGO_ENABLED=0 go test ./...\n', ''))
+        self.assertNotIn('go run ./cmd', macos)
+        run = re.search(r"-run '\^\(TestABI_\|(TestEndpoint_ConnectAccept)\$\|(TestRPC_AllPatterns)\$\)'", macos)
+        self.assertIsNotNone(run, 'Go platform-check filter')
+        self.assertIn('"$passed" -lt 7', macos)
+        go_sources = ''.join(p.read_text() for p in (ROOT / 'bindings/go').glob('*_test.go'))
+        self.assertEqual(len(re.findall(r'^func TestABI_\w+\(t \*testing\.T\)', go_sources, re.M)), 5)
+        for name in run.groups():
+            self.assertRegex(go_sources, rf'(?m)^func {name}\(t \*testing\.T\)')
+        self.assertIn("-Dtest='AbiContractTest,DispatchServerE2ETest#allFourPatternsAndErrors'", macos)
+        self.assertIn('check site.aster.AbiContractTest 9', macos)
+        self.assertIn('check site.aster.server.DispatchServerE2ETest 1', macos)
+        tests = ROOT / 'bindings/java/aster-runtime/src/test/java/site/aster'
+        self.assertEqual((tests / 'AbiContractTest.java').read_text().count('@Test'), 9)
+        self.assertIn('void allFourPatternsAndErrors()', (tests / 'server/DispatchServerE2ETest.java').read_text())
+        self.assertIn('site.aster.ffi.IrohLibrary.getInstance()', macos)
+
     def test_qualifying_pytest_has_no_retries_or_sibling_cleanup(self):
         workflow = (ROOT / '.forgejo/workflows/linux.yml').read_text()
         commands = [line for line in workflow.splitlines() if '.venv/bin/pytest ' in line or '-m pytest ' in line]

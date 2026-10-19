@@ -11,7 +11,7 @@ using Aster.Rpc;
 
 namespace Aster.Tests;
 
-/// <summary>Breaker state machine without a network.</summary>
+/// <summary>Breaker state machine without a network, on a <see cref="ManualClock"/>.</summary>
 public class CircuitBreakerUnitTests
 {
     private static readonly RpcError Unavailable = new(StatusCode.Unavailable, "x");
@@ -19,13 +19,16 @@ public class CircuitBreakerUnitTests
     [Fact]
     public void Opens_After_Threshold_Then_Half_Opens_And_Closes_On_Success()
     {
-        var b = new CircuitBreakerInterceptor(failureThreshold: 2, recoveryTimeout: 0.15);
+        var clock = new ManualClock();
+        var b = new CircuitBreakerInterceptor(failureThreshold: 2, recoveryTimeout: 0.15, timeProvider: clock);
         b.BeforeCall(); b.RecordFailure(Unavailable);
         b.BeforeCall(); b.RecordFailure(Unavailable);
         Assert.Equal(CircuitBreakerInterceptor.StateOpen, b.State);
         var e = Assert.Throws<RpcError>(b.BeforeCall);
         Assert.Equal(StatusCode.Unavailable, e.Code);
-        Thread.Sleep(250);
+        clock.Advance(TimeSpan.FromMilliseconds(149));
+        Assert.Throws<RpcError>(b.BeforeCall);               // still inside the recovery timeout
+        clock.Advance(TimeSpan.FromMilliseconds(1));
         b.BeforeCall();                                      // the probe
         Assert.Equal(CircuitBreakerInterceptor.StateHalfOpen, b.State);
         Assert.Throws<RpcError>(b.BeforeCall);               // probe budget used
@@ -37,12 +40,14 @@ public class CircuitBreakerUnitTests
     [Fact]
     public void Failed_Probe_Reopens()
     {
-        var b = new CircuitBreakerInterceptor(failureThreshold: 1, recoveryTimeout: 0.1);
+        var clock = new ManualClock();
+        var b = new CircuitBreakerInterceptor(failureThreshold: 1, recoveryTimeout: 0.1, timeProvider: clock);
         b.RecordFailure(Unavailable);
-        Thread.Sleep(200);
+        clock.Advance(TimeSpan.FromMilliseconds(100));
         b.BeforeCall();
         b.RecordFailure(Unavailable);
         Assert.Equal(CircuitBreakerInterceptor.StateOpen, b.State);
+        Assert.Throws<RpcError>(b.BeforeCall);               // re-opened: the recovery timeout starts again
     }
 
     [Fact]
@@ -63,9 +68,10 @@ public class CircuitBreakerUnitTests
     [Fact]
     public void A_NonTripping_Failure_Frees_The_Half_Open_Probe_Slot()
     {
-        var b = new CircuitBreakerInterceptor(failureThreshold: 1, recoveryTimeout: 0.05);
+        var clock = new ManualClock();
+        var b = new CircuitBreakerInterceptor(failureThreshold: 1, recoveryTimeout: 0.05, timeProvider: clock);
         b.RecordFailure(Unavailable);
-        Thread.Sleep(120);
+        clock.Advance(TimeSpan.FromMilliseconds(50));
         b.BeforeCall();                                      // probe 1 (half-open)
         b.RecordFailure(new RpcError(StatusCode.InvalidArgument, "x"));
         b.BeforeCall();                                      // slot was freed: not stuck half-open
@@ -295,13 +301,14 @@ public class ClientInterceptorTests : IAsyncLifetime
     public async Task Cancelling_During_Backoff_Stops_The_Call_And_Is_Not_A_Breaker_Failure()
     {
         _flakyFailUntil = int.MaxValue;
+        var clock = new ManualClock();
         var breaker = new CircuitBreakerInterceptor(failureThreshold: 10);
-        var conn = _conn.WithInterceptors([breaker, new RetryInterceptor(5, initialMs: 5000, maxMs: 5000, jitter: 0.0)]);
-        // short-wait-ok: the cancel lands inside the 5 s retry backoff; the cancellation is the behaviour under test
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
-        var sw = Stopwatch.StartNew();
-        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req(), Idem, cts.Token));
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"took {sw.Elapsed}");
+        var conn = _conn.WithInterceptors([breaker, new RetryInterceptor(5, initialMs: 5000, maxMs: 5000, jitter: 0.0, timeProvider: clock)]);
+        using var cts = new CancellationTokenSource();
+        var call = conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req(), Idem, cts.Token);
+        Assert.True(await clock.WaitForTimerAsync(), "the call never entered its 5 s back-off");
+        cts.Cancel();                                        // inside the back-off; the clock never reaches it
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => call);
         Assert.Equal(1, breaker.FailureCount);               // the one real failure, not the cancellation
         Assert.Equal(1, _flakyCalls);
     }
@@ -312,7 +319,8 @@ public class ClientInterceptorTests : IAsyncLifetime
     public async Task Breaker_Opens_Fails_Fast_Then_Recovers()
     {
         _flakyFailUntil = int.MaxValue;
-        var breaker = new CircuitBreakerInterceptor(failureThreshold: 2, recoveryTimeout: 0.3);
+        var clock = new ManualClock();
+        var breaker = new CircuitBreakerInterceptor(failureThreshold: 2, recoveryTimeout: 0.3, timeProvider: clock);
         var conn = _conn.WithInterceptors([breaker]);
         for (int i = 0; i < 2; i++)
             Assert.Equal(StatusCode.Unavailable,
@@ -325,7 +333,7 @@ public class ClientInterceptorTests : IAsyncLifetime
         Assert.Equal(2, _flakyCalls);                        // the open circuit never reached the server
 
         _flakyFailUntil = 0;
-        await Task.Delay(450);
+        clock.Advance(TimeSpan.FromMilliseconds(300));
         var reply = await conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req());
         Assert.Equal(3, reply.Count);
         Assert.Equal(CircuitBreakerInterceptor.StateClosed, breaker.State);
@@ -362,7 +370,8 @@ public class ClientInterceptorTests : IAsyncLifetime
     {
         _flakyFailUntil = 1;
         var first = new CircuitBreakerInterceptor(failureThreshold: 1, recoveryTimeout: 0);
-        var second = new CircuitBreakerInterceptor(failureThreshold: 1, recoveryTimeout: 0.15);
+        var clock = new ManualClock();
+        var second = new CircuitBreakerInterceptor(failureThreshold: 1, recoveryTimeout: 0.15, timeProvider: clock);
         var conn = _conn.WithInterceptors(cancelProbe ? [first] : [first, second]);
         var seed = await Assert.ThrowsAsync<RpcError>(() => conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req()));
         Assert.Equal(StatusCode.Unavailable, seed.Code);
@@ -372,7 +381,7 @@ public class ClientInterceptorTests : IAsyncLifetime
             var pending = conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "slow", Req(), cancellationToken: cancel.Token);
             try
             {
-                var until = DateTime.UtcNow.AddSeconds(3);
+                var until = DateTime.UtcNow + WaitBudget.Value;
                 while (Volatile.Read(ref _slowCalls) == 0)
                 {
                     Assert.True(DateTime.UtcNow < until, "probe did not reach peer");
@@ -388,7 +397,7 @@ public class ClientInterceptorTests : IAsyncLifetime
             var refusal = await Assert.ThrowsAsync<RpcError>(() => conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req()));
             Assert.Equal(StatusCode.Unavailable, refusal.Code);
             Assert.Equal(1, _flakyCalls);
-            await Task.Delay(180);
+            clock.Advance(TimeSpan.FromMilliseconds(150));
         }
         Assert.Equal(CircuitBreakerInterceptor.StateHalfOpen, first.State);
         Assert.Equal(1, first.FailureCount);
@@ -404,28 +413,39 @@ public class ClientInterceptorTests : IAsyncLifetime
     [Fact]
     public async Task Deadline_Bounds_Retries_To_The_Original_Budget()
     {
-        var conn = _conn.WithInterceptors([new DeadlineInterceptor(), FastRetry(5, StatusCode.DeadlineExceeded)]);
-        var sw = Stopwatch.StartNew();
-        var e = await Assert.ThrowsAsync<RpcError>(() =>
-            conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "slow", Req(), new CallOptions { Idempotent = true, Deadline = TimeSpan.FromSeconds(1) }));
+        // The call loop on a fake clock: the attempt uses the whole 1 s budget, so the retryable
+        // DeadlineExceeded is not retried. Native deadline enforcement is
+        // Native_Deadline_Still_Applies_Without_A_Deadline_Interceptor.
+        var clock = new ManualClock();
+        var chain = new ClientInterceptors([new DeadlineInterceptor(timeProvider: clock),
+            new RetryInterceptor(5, [StatusCode.DeadlineExceeded], 1, 5, 2.0, 0.0, clock)]);
+        var options = new CallOptions { Idempotent = true, Deadline = TimeSpan.FromSeconds(1) };
+        var ctx = chain.NewContext("Flaky", "slow", options, "unary", null);
+        var given = new List<TimeSpan?>();
+        var e = await Assert.ThrowsAsync<RpcError>(() => chain.RunAsync<int, int>(ctx, 0, options, true, (_, o) =>
+        {
+            given.Add(o.Deadline);
+            clock.Advance(TimeSpan.FromSeconds(1));
+            throw new RpcError(StatusCode.DeadlineExceeded, "deadline exceeded");
+        }, CancellationToken.None));
         Assert.Equal(StatusCode.DeadlineExceeded, e.Code);
-        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"took {sw.Elapsed}");
-        Assert.Equal(1, _slowCalls);                         // no time left for a second attempt
+        Assert.Equal(new TimeSpan?[] { TimeSpan.FromSeconds(1) }, given);     // one attempt, given the whole budget
     }
 
     [Fact]
     public async Task Deadline_Interceptor_Passes_The_Remaining_Time_To_Each_Attempt()
     {
-        // The first attempt fails fast; the retry waits 2.5 s. The server reports the time left on the
-        // deadline it received, which travels in whole seconds (rounded up): with a deadline interceptor
-        // the retry is sent ~7.5 s of the 10 s budget, so its header says 8 s and the handler can never
-        // see more than that. A full-deadline attempt says 10 s. The handler measures when it runs, so
-        // dispatch delay under a loaded parallel suite (seen at ~1 s on CI) is subtracted from both;
-        // the thresholds leave 1.5 s for it.
+        // The first attempt fails fast; the retry waits 2.5 s on a fake clock. The server reports the
+        // time left on the deadline it received, which travels in whole seconds (rounded up): with a
+        // deadline interceptor the retry is sent 7.5 s of the 10 s budget, so its header says 8 s and
+        // the handler can never see more than that. A full-deadline attempt says 10 s. The handler
+        // measures when it runs, so dispatch delay under a loaded parallel suite (seen at ~1 s on CI)
+        // is subtracted from both; the thresholds leave 1.5 s for it.
         var o = new CallOptions { Idempotent = true, Deadline = TimeSpan.FromSeconds(10) };
         _flakyFailUntil = 1;
-        var bounded = _conn.WithInterceptors([new DeadlineInterceptor(), new RetryInterceptor(2, null, 2500, 2500, 2.0, 0.0)]);
-        await bounded.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req(), o);
+        var clock = new ManualClock();
+        var bounded = _conn.WithInterceptors([new DeadlineInterceptor(timeProvider: clock), new RetryInterceptor(2, null, 2500, 2500, 2.0, 0.0, clock)]);
+        await AfterBackoff(clock, bounded.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req(), o));
         var seen = _flakyRemaining.ToArray();
         Assert.Equal(2, seen.Length);
         Assert.True(seen[0] > 8.5, $"first {seen[0]}");
@@ -435,11 +455,19 @@ public class ClientInterceptorTests : IAsyncLifetime
         _flakyCalls = 0;
         _flakyFailUntil = 1;
         while (_flakyRemaining.TryDequeue(out _)) { }
-        var plain = _conn.WithInterceptors([new RetryInterceptor(2, null, 2500, 2500, 2.0, 0.0)]);
-        await plain.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req(), o);
+        var plain = _conn.WithInterceptors([new RetryInterceptor(2, null, 2500, 2500, 2.0, 0.0, clock)]);
+        await AfterBackoff(clock, plain.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req(), o));
         seen = _flakyRemaining.ToArray();
         Assert.Equal(2, seen.Length);
         Assert.True(seen.All(s => s > 8.5), string.Join(",", seen));
+    }
+
+    /// <summary>Waits for <paramref name="call"/> to enter its 2.5 s back-off, moves the clock past it, and awaits the call.</summary>
+    private static async Task AfterBackoff(ManualClock clock, Task<EchoReply> call)
+    {
+        Assert.True(await clock.WaitForTimerAsync(), "the call never entered its back-off");
+        clock.Advance(TimeSpan.FromSeconds(2.5));
+        await call;
     }
 
     [Fact]

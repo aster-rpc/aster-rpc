@@ -14,9 +14,10 @@ import (
 	"time"
 )
 
-// C ABI 4.3 streaming consumer relay, ported from ffi/tests/expose.rs
-// (relay_stream_*): full duplex, early answers, abort before the head, close
-// before the end, clean end, refusal codes, cancellation.
+// C ABI 4.3 streaming consumer relay wiring: the Go upload pump (full
+// duplex, source failures, close before the end), refusal codes and context
+// cancellation. Relay behaviour (backpressure, early answers, a body read to
+// its end, concurrent waiters) is ffi/tests/expose.rs relay_stream_*.
 
 func (r *exposeRig) stream(req RelayStreamRequest) (*RelayResponse, error) {
 	r.t.Helper()
@@ -85,76 +86,6 @@ func TestRelayStream_FullDuplexPingPongAndCleanEnd(t *testing.T) {
 	if err := resp.Body.Close(); err != nil {
 		t.Fatal(err)
 	}
-	rig.waitClosed()
-}
-
-func TestRelayStream_LargeUploadAndDownloadWithBackpressure(t *testing.T) {
-	rig := newExposeRig(t, true)
-	const size = 3 << 20
-	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
-		w.(http.Flusher).Flush()
-		io.Copy(w, r.Body)
-	}, &ExposeHTTPOptions{ResponseBuffer: 2, MaxChunk: 64 << 10})
-	data := pattern(size)
-	resp, err := rig.stream(RelayStreamRequest{Body: bytes.NewReader(data), UploadCapacity: 1, MaxChunk: 16 << 10})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer resp.Body.Close()
-	var got bytes.Buffer
-	buf := make([]byte, 7000) // slow, odd-sized reader
-	for {
-		n, err := resp.Body.Read(buf)
-		got.Write(buf[:n])
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if !bytes.Equal(got.Bytes(), data) {
-		t.Fatalf("echo mismatch: %d bytes", got.Len())
-	}
-}
-
-// An early answer arrives while the upload is still being produced; closing
-// the response abandons the exchange and stops the pump.
-func TestRelayStream_EarlyAnswerWhileUploading(t *testing.T) {
-	rig := newExposeRig(t, true)
-	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
-		buf := make([]byte, 4096)
-		for {
-			if _, err := r.Body.Read(buf); err != nil {
-				if errors.Is(err, ErrBodyTooLarge) {
-					w.WriteHeader(http.StatusRequestEntityTooLarge)
-				}
-				return
-			}
-		}
-	}, &ExposeHTTPOptions{MaxRequestBody: 20000})
-	var produced atomic.Int64
-	endless := readerFunc(func(p []byte) (int, error) {
-		time.Sleep(time.Millisecond)
-		produced.Add(int64(len(p)))
-		return len(p), nil
-	})
-	resp, err := rig.stream(RelayStreamRequest{Body: endless})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.Status != 413 {
-		t.Fatalf("status %d, want 413", resp.Status)
-	}
-	if err := resp.Body.Close(); err != nil {
-		t.Fatal(err)
-	}
-	// The pump stopped: production no longer advances.
-	eventually(t, "the upload pump to stop", func() bool {
-		a := produced.Load()
-		time.Sleep(50 * time.Millisecond)
-		return produced.Load() == a
-	})
 	rig.waitClosed()
 }
 
@@ -342,44 +273,6 @@ func TestRelayStream_CloseBeforeTheEndResetsTheUpload(t *testing.T) {
 	rig.waitClosed()
 }
 
-func TestRelayStream_BodyReadToItsEndLeavesTheUploadToFinish(t *testing.T) {
-	rig := newExposeRig(t, true)
-	got := make(chan []byte, 1)
-	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
-		// 202-then-read: the whole response ends first, the request body is
-		// consumed afterwards.
-		w.WriteHeader(http.StatusAccepted)
-		w.(http.Flusher).Flush()
-		io.WriteString(w, "accepted")
-		w.(http.Flusher).Flush()
-		b, _ := io.ReadAll(r.Body)
-		got <- b
-	}, nil)
-	up := newFeed()
-	var uploadErrs atomic.Int64
-	resp, err := rig.stream(RelayStreamRequest{Body: up, OnUploadError: func(error) { uploadErrs.Add(1) }})
-	if err != nil || resp.Status != 202 {
-		t.Fatalf("%+v, %v", resp, err)
-	}
-	// The response only ends when the handler returns, which needs the whole
-	// body: feed it, then finish.
-	go func() {
-		up.pw.Write([]byte("late body"))
-		up.pw.Close()
-	}()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil || string(body) != "accepted" {
-		t.Fatalf("%q, %v", body, err)
-	}
-	resp.Body.Close()
-	if b := <-got; string(b) != "late body" {
-		t.Fatalf("handler got %q", b)
-	}
-	if uploadErrs.Load() != 0 {
-		t.Fatal("clean upload reported an error")
-	}
-}
-
 func TestRelayStream_RefusalsHaveStableCodes(t *testing.T) {
 	rig := newExposeRig(t, true)
 	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "in") }, nil)
@@ -482,35 +375,4 @@ func TestRelayStream_ContextCancelAfterTheHeadFailsReads(t *testing.T) {
 	if _, err := resp.Body.Read(make([]byte, 8)); err == nil {
 		t.Fatal("read survived a cancelled context")
 	}
-}
-
-// Stress: concurrent full-duplex exchanges (-race, -count=20).
-func TestRelayStream_ConcurrentExchanges(t *testing.T) {
-	rig := newExposeRig(t, true)
-	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
-		w.(http.Flusher).Flush()
-		io.Copy(w, r.Body)
-	}, &ExposeHTTPOptions{ResponseBuffer: 2, MaxChunk: 32 << 10})
-	done := make(chan struct{})
-	const n = 16
-	for i := 0; i < n; i++ {
-		go func(i int) {
-			defer func() { done <- struct{}{} }()
-			data := pattern(1000 + i*40000)
-			resp, err := rig.stream(RelayStreamRequest{Body: bytes.NewReader(data)})
-			if err != nil {
-				t.Errorf("exchange %d: %v", i, err)
-				return
-			}
-			defer resp.Body.Close()
-			got, err := io.ReadAll(resp.Body)
-			if err != nil || !bytes.Equal(got, data) {
-				t.Errorf("exchange %d: %d bytes, %v", i, len(got), err)
-			}
-		}(i)
-	}
-	for i := 0; i < n; i++ {
-		<-done
-	}
-	rig.waitClosed()
 }

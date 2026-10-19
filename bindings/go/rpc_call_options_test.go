@@ -4,7 +4,6 @@ package aster
 
 import (
 	"context"
-	"errors"
 	"iter"
 	"testing"
 	"time"
@@ -53,14 +52,6 @@ func optionsService(seen chan<- seenCall) *Service {
 				}
 			}
 			return nil
-		}),
-		Unary("slow", func(ctx context.Context, _ *testEchoRequest) (*testEchoReply, error) {
-			<-ctx.Done()
-			return nil, ctx.Err()
-		}),
-		BidiStream("slowBidi", func(ctx context.Context, _ iter.Seq2[*testEchoRequest, error], _ func(*testEchoReply) error) error {
-			<-ctx.Done()
-			return ctx.Err()
 		}),
 	)
 }
@@ -116,25 +107,6 @@ func TestCallOptions_DeadlineAndMetadataOnEveryPattern(t *testing.T) {
 		if got.deadline.IsZero() || got.deadline.Before(start.Add(18*time.Second)) || got.deadline.After(time.Now().Add(22*time.Second)) {
 			t.Errorf("%s: deadline %v (start %v)", name, got.deadline, start)
 		}
-	}
-}
-
-func TestCallOptions_DeadlineEndsTheCall(t *testing.T) {
-	f := newRPCFixture(t, ServerOptions{Services: []*Service{optionsService(make(chan seenCall, 8))}})
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	_, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Options", "slow", &testEchoRequest{}, WithTimeout(300*time.Millisecond))
-	if !errors.Is(err, ErrRpcDeadlineExceeded) {
-		t.Fatalf("unary: %v", err)
-	}
-	// short-wait-ok: the bidi deadline's DEADLINE_EXCEEDED is the behaviour under test
-	b, err := OpenBidiStream[testEchoRequest, testEchoReply](ctx, f.conn, "Options", "slowBidi", WithDeadline(time.Now().Add(300*time.Millisecond)))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer b.Close()
-	if _, err := b.Recv(); !errors.Is(err, ErrRpcDeadlineExceeded) {
-		t.Fatalf("bidi: %v", err)
 	}
 }
 

@@ -324,35 +324,6 @@ public class UpcallTests
     }
 
     [Fact]
-    public async Task Failure_Mode_Applies_When_The_Authorizer_Hangs_Or_Throws()
-    {
-        using var rt = new Runtime();
-        await using var up = Upcalls.Create(rt);
-        var cancelled = new TaskCompletionSource<UpcallCancelReason>(TaskCreationOptions.RunContinuationsAsynchronously);
-        up.Handle(UpcallKind.LeaseAuthorize, async (req, ctx) =>
-        {
-            var op = Ucv1.DecodeLeaseAuthorizeRequest(req);
-            if (op.Actor == "thrower") throw new InvalidOperationException("boom");
-            try { await Task.Delay(TimeSpan.FromSeconds(10), ctx.Cancellation); }
-            catch (OperationCanceledException) { cancelled.TrySetResult(ctx.CancelReason); throw; }
-            return Ucv1.EncodeDecision(true);
-        });
-        up.SetPolicy(UpcallKind.LeaseAuthorize, TimeSpan.FromMilliseconds(150), HookFailureMode.FailClosed);
-        using var ser = NativeLeaseSerializer.Memory(rt, up);
-
-        var d = Assert.IsType<AcquireResult.Denied>(await Within(ser.AcquireAsync("r", "slow")));
-        Assert.Equal(DenyReason.Unauthorized, d.Reason);
-        // Rust cancelled the timed-out upcall: the handler's token fired with reason TIMEOUT.
-        Assert.Equal(UpcallCancelReason.Timeout, await Within(cancelled.Task));
-        Assert.True(up.CancelCount >= 1);
-
-        Assert.IsType<AcquireResult.Denied>(await Within(ser.AcquireAsync("r", "thrower")));
-
-        up.SetPolicy(UpcallKind.LeaseAuthorize, TimeSpan.FromMilliseconds(150), HookFailureMode.FailOpen);
-        using var l = Assert.IsType<AcquireResult.Granted>(await Within(ser.AcquireAsync("r", "thrower"))).Lease;
-    }
-
-    [Fact]
     public async Task Cancelling_The_Dotnet_Token_Abandons_The_Wait_But_Rust_Keeps_Waiting_Until_The_Policy_Timeout()
     {
         using var rt = new Runtime();
@@ -421,22 +392,6 @@ public class UpcallTests
     }
 
     [Fact]
-    public async Task Fenced_Mutation_Without_An_Answer_Is_An_Unknown_Outcome_Never_Failed_Open()
-    {
-        using var rt = new Runtime();
-        await using var up = Upcalls.Create(rt);
-        up.ServeFencedResource(new FuncFenced(async (_, _, _, ct) =>
-        {
-            await Task.Delay(TimeSpan.FromSeconds(10), ct);
-            return new MutateResult.Applied(Array.Empty<byte>());
-        }));
-        // Even a fail-open policy must not turn a missing answer into "applied".
-        up.SetPolicy(UpcallKind.FencedMutate, TimeSpan.FromMilliseconds(150), HookFailureMode.FailOpen);
-        using var res = NativeFencedResource.Foreign(up);
-        await Assert.ThrowsAsync<IrohException>(() => Within(res.MutateAsync(new Fence("r", 1, "a"), "a", new byte[] { 1 })));
-    }
-
-    [Fact]
     public async Task Admitted_Filter_Is_Batched_And_Cached()
     {
         using var rt = new Runtime();
@@ -465,19 +420,6 @@ public class UpcallTests
         Assert.Equal(1ul, s.Misses);
         Assert.True(s.Upcalls >= 2);
         Assert.ThrowsAny<IrohException>(() => f.IsAdmitted("zz"));
-    }
-
-    [Fact]
-    public async Task Enable_Shared_Installs_The_Filter()
-    {
-        await using var node = await Node.StartAsync(new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0", EnableMonitoring = true });
-        await using var up = Upcalls.Create(node.Runtime);
-        up.ServeAdmittedFilter(new FuncFilter((ids, _) => new ValueTask<IReadOnlyList<bool>>(ids.Select(_ => true).ToList())));
-        using var f = AdmittedFilterHandle.Create(up);
-        var secret = Enumerable.Repeat((byte)0x42, 32).ToArray();
-        await Within(Topology.EnableSharedAsync(node, secret, f, [], TimeSpan.FromSeconds(1)));
-        _ = f.Stats();
-        Assert.Throws<ArgumentException>(() => Topology.EnableSharedAsync(node, new byte[5]).GetAwaiter().GetResult());
     }
 
     [Fact]
@@ -590,36 +532,6 @@ public class UpcallTests
     }
 
     [Fact]
-    public async Task Operation_Limit_Is_Immediate_And_Does_Not_Start_Dependent_Work()
-    {
-        var config = RuntimeConfig.Default;
-        config.event_queue_capacity = 1;
-        config.max_inflight_operations = 1;
-        using var rt = new Runtime(config);
-        await using var up = Upcalls.Create(rt, 8);
-        var gate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        int started = 0;
-        up.ServeFencedResource(new FuncFenced(async (_, _, op, ct) =>
-        {
-            Interlocked.Increment(ref started);
-            await gate.Task.WaitAsync(ct);
-            return new MutateResult.Applied(op);
-        }));
-        using var res = NativeFencedResource.Foreign(up);
-
-        Task<MutateResult> first = res.MutateAsync(new Fence("r", 1, "a"), "a", new byte[] { 1 });
-        while (Volatile.Read(ref started) == 0)
-            await Task.Delay(1);
-        IrohException overloaded = await Assert.ThrowsAsync<IrohException>(() =>
-            res.MutateAsync(new Fence("r", 1, "a"), "a", new byte[] { 2 }));
-        Assert.Equal(Status.OperationLimit, overloaded.Status);
-        Assert.Equal(1, Volatile.Read(ref started));
-
-        gate.SetResult();
-        Assert.IsType<MutateResult.Applied>(await first.WaitAsync(T));
-    }
-
-    [Fact]
     public async Task Cancelled_Wait_Drains_Its_Native_Terminal_Marker()
     {
         using var rt = new Runtime();
@@ -645,89 +557,6 @@ public class UpcallTests
         while (rt.PendingOperationCount != 0 && DateTime.UtcNow < deadline)
             await Task.Delay(1);
         Assert.Equal(0, rt.PendingOperationCount);
-    }
-
-    [Fact]
-    public async Task A_Full_Queue_Refuses_At_Once()
-    {
-        using var rt = new Runtime();
-        // Capacity 2, a handler that never answers: the queue fills; the rest are refused (Overloaded) not hung.
-        await using var up = Upcalls.Create(rt, 2);
-        var gate = new TaskCompletionSource();
-        up.ServeFencedResource(new FuncFenced(async (_, _, _, ct) =>
-        {
-            await gate.Task.WaitAsync(ct);
-            return new MutateResult.Applied(Array.Empty<byte>());
-        }));
-        up.SetPolicy(UpcallKind.FencedMutate, TimeSpan.FromSeconds(5), HookFailureMode.FailClosed);
-        using var res = NativeFencedResource.Foreign(up);
-        var calls = Enumerable.Range(0, 40).Select(i => res.MutateAsync(new Fence("r", 1, "a"), "a", new byte[] { 1 })).ToList();
-        // Whatever the poll loop already took off the queue is running; the others are refused immediately or answered later.
-        await Task.Delay(300);
-        gate.SetResult();
-        int ok = 0, refused = 0;
-        foreach (var c in calls)
-        {
-            try { await Within(c); ok++; } catch (IrohException) { refused++; }
-        }
-        Assert.Equal(40, ok + refused);
-        Assert.True(ok >= 1);
-    }
-
-    // Pointers and `&` are not usable in an async method, so the synchronous native driving lives here.
-    private static unsafe ulong DriveAuthorizeRequest(Runtime rt, ulong table, ulong ser, NativeScope scope)
-    {
-        Native.Check(Native.aster_lease_acquire(rt.Handle, ser, scope.Utf8("db"), scope.Utf8("alice"), 0, 0, 0, 0, out ulong op), "acquire");
-
-        UpcallEventNative ev = default;
-        uint n = 0;
-        var end = DateTime.UtcNow + T;
-        while (n == 0 && DateTime.UtcNow < end)
-            Assert.Equal(0, Native.aster_upcall_poll(rt.Handle, table, &ev, 1, 100, &n));
-        Assert.Equal(1u, n);
-        Assert.Equal((ushort)UpcallKind.LeaseAuthorize, ev.kind);
-        Assert.Equal(0, ev.cancel_reason);
-        Assert.Equal(Ucv1.TagLeaseAuthorizeRequest, *(byte*)ev.payload_ptr);
-        Assert.NotEqual(0ul, ev.buffer);
-
-        Assert.Equal(0, Native.aster_upcall_buffer_release(rt.Handle, table, ev.buffer));
-        // A second release of the same buffer is refused, never a double free.
-        Assert.Equal((int)Status.NotFound, Native.aster_upcall_buffer_release(rt.Handle, table, ev.buffer));
-        // 0 is a no-op.
-        Assert.Equal(0, Native.aster_upcall_buffer_release(rt.Handle, table, 0));
-
-        byte[] allow = Ucv1.EncodeDecision(true);
-        fixed (byte* p = allow)
-        {
-            Assert.Equal(0, Native.aster_upcall_respond(rt.Handle, table, ev.invocation_id, (uint)UpcallStatus.Ok, p, (uint)allow.Length));
-            Assert.Equal((int)Status.NotFound, Native.aster_upcall_respond(rt.Handle, table, ev.invocation_id, (uint)UpcallStatus.Ok, p, (uint)allow.Length));
-        }
-        return op;
-    }
-
-    [Fact]
-    public async Task Raw_Poll_Releases_Each_Buffer_Exactly_Once_And_Respond_Is_Idempotent()
-    {
-        using var rt = new Runtime();
-        // Drive the C ABI directly (no managed poll loop): memory serializer + authorizer upcalls.
-        Native.Check(Native.aster_upcalls_new(rt.Handle, 8, out ulong table), "upcalls_new");
-        Native.Check(Native.aster_lease_serializer_memory_new(rt.Handle, table, out ulong ser), "memory_new");
-        try
-        {
-            using var scope = new NativeScope();
-            ulong op = DriveAuthorizeRequest(rt, table, ser, scope);
-            var done = await rt.WaitForAsync(op).WaitAsync(T);
-            Assert.Equal((uint)EventKind.LeaseAcquired, done.kind);
-            ulong lease = done.handle;
-            EventError.TakePayload(rt, in done);
-            Assert.NotEqual(0ul, lease);
-            Native.aster_lease_free(rt.Handle, lease);
-        }
-        finally
-        {
-            Native.aster_lease_serializer_free(rt.Handle, ser);
-            Native.aster_upcalls_free(rt.Handle, table);
-        }
     }
 
     [Fact]

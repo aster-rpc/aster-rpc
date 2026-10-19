@@ -6,10 +6,8 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -33,7 +31,6 @@ import site.aster.contract.CapabilityRequirement;
 import site.aster.docs.AuthorId;
 import site.aster.docs.Doc;
 import site.aster.docs.Docs;
-import site.aster.ffi.IrohException;
 import site.aster.interceptors.CallContext;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
@@ -53,6 +50,10 @@ import site.aster.server.spi.UnaryDispatcher;
  * AsterServer} and {@link AsterClient} configured by {@link AsterConfig}'s trust fields and {@code
  * [enrollment]} section. The root is played by {@link TestRoot} (root operations belong to the
  * CLI); everything the application writes is configuration and {@code requires}.
+ *
+ * <p>These are wiring tests. Runtime role restriction and issuer renewal are behaviour, tested once
+ * in Rust ({@code enrollment_aster_server.rs} {@code runtime_restriction_narrows_credential_roles},
+ * {@code config_driven_issuer_renews_client_credentials}).
  */
 @Timeout(value = 180)
 final class EnrollmentAsterServerTest {
@@ -299,101 +300,6 @@ final class EnrollmentAsterServerTest {
     assertNotEquals(AdmissionException.Kind.OTHER, admission.kind());
     // Unaffected peers keep working.
     assertEquals("ops.ingest", call(ingest, addr, "ping"));
-  }
-
-  /**
-   * The credential sets the maximum; runtime settings can only restrict. Restricting a credential's
-   * {@code ops.status,ops.logs} to {@code ops.status} refuses {@code logs} on the next call; {@code
-   * setPeerAttributes} cannot grant an enrolled peer a role; clearing restores the credential
-   * roles; a peer without a session cannot be restricted.
-   */
-  @Test
-  void runtimeRestrictionRefusesTheNextCall() throws Exception {
-    AsterServer server = startOps(AsterServer.builder().config(serverCfg().build()));
-    NodeAddr addr = server.node().nodeAddr();
-    AsterClient session = client(enrolled(5, credentialFor(5, "ops.status,ops.logs")).build());
-    assertEquals("ops.logs,ops.status", call(session, addr, "logs"));
-
-    server.restrictPeerRoles(pub(5), List.of("ops.status"));
-    assertEquals("ops.status", call(session, addr, "status"));
-    assertTrue(denied(callFailure(session, addr, "logs")), "restricted: logs refused");
-
-    IrohException grant =
-        assertThrows(
-            IrohException.class,
-            () -> server.setPeerAttributes(pub(5), Map.of("aster.role", "ops.admin")));
-    assertTrue(grant.getMessage().contains("INVALID_ARGUMENT"), grant.getMessage());
-    assertTrue(denied(callFailure(session, addr, "logs")), "a refused grant grants nothing");
-
-    server.clearPeerRestriction(pub(5));
-    assertEquals("ops.logs,ops.status", call(session, addr, "logs"));
-    IrohException none =
-        assertThrows(
-            IrohException.class, () -> server.restrictPeerRoles(pub(9), List.of("ops.status")));
-    assertTrue(none.getMessage().contains("NOT_FOUND"), none.getMessage());
-  }
-
-  /**
-   * A server configured as a delegated issuer serves renewals; a client whose credential that
-   * server signed renews automatically and stays admitted, with its roles, across several short
-   * lifetimes. The server synchronizes policy from a configured replica (the root).
-   */
-  @Test
-  void configDrivenIssuerRenewsClientCredentials() throws Exception {
-    // The root as a policy replica: it holds the fleet namespace.
-    AsterConfig rootCfg =
-        enrolled(1, credentialFor(1, ""))
-            .enrollment(
-                EnrollmentConfig.builder()
-                    .audience(FLEET)
-                    .fleetNamespace(FLEET_NS)
-                    .statePath(dir.resolve("root.json").toString())
-                    .build())
-            .build();
-    AsterServer rootServer = startOps(AsterServer.builder().config(rootCfg));
-    String rootTicket = rootServer.node().nodeAddr().toTicket();
-
-    Path delegationFile = dir.resolve("issuer.chain");
-    Files.writeString(
-        delegationFile,
-        ROOT.delegation(pub(2), List.of(), List.of("aster.role"), Duration.ofHours(1)) + "\n");
-    AsterConfig.Builder cfg = serverCfg();
-    AsterConfig base = cfg.build();
-    cfg.enrollment(
-        base.enrollment().toBuilder()
-            .replicas(List.of(rootTicket))
-            .issuerDelegationFile(delegationFile.toString())
-            .issuerLifetimeSecs(15L)
-            .build());
-    AsterServer server = startOps(AsterServer.builder().config(cfg.build()));
-    NodeAddr addr = server.node().nodeAddr();
-    EnrollmentIssuer issuer = server.issuer();
-    assertNotNull(issuer, "configured issuer");
-    assertEquals(pub(2), issuer.info().publicKey());
-    // Claims beyond the delegation are refused with a code.
-    IssuerRefusedException refusal =
-        assertThrows(
-            IssuerRefusedException.class,
-            () ->
-                issuer.issue(
-                    pub(7),
-                    new EnrollmentClaims(List.of("deploy"), List.of(), null),
-                    Registration.EPHEMERAL));
-    assertEquals("invalid_credential", refusal.code());
-    IssuedCredential issued =
-        issuer.issue(pub(7), EnrollmentClaims.roles("ops.status"), Registration.EPHEMERAL);
-
-    AsterClient client = client(enrolled(7, issued.chain()).build());
-    assertEquals("ops.status", call(client, addr, "status"));
-    assertTrue(client.isRenewing(), "the server signed the credential, so the client renews");
-    // Past the first credential's expiry: renewal starts with a third of the lifetime left
-    // (5 s), enough to re-present on a loaded host.
-    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(15 + 3);
-    while (System.nanoTime() < deadline) {
-      assertEquals("ops.status", call(client, addr, "status"));
-      Thread.sleep(500);
-    }
-    assertNotEquals(issued.credentialId(), client.enrollment().credential().credentialId());
   }
 
   /** Builder overrides of the policy and role mapping take precedence over the configuration. */

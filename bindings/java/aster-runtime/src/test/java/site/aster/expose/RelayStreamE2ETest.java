@@ -2,7 +2,6 @@ package site.aster.expose;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -32,9 +31,14 @@ import site.aster.ffi.IrohStatus;
 import site.aster.upcall.Ucv1.HttpHeader;
 
 /**
- * C ABI 4.3 streaming consumer relay end to end (ports the {@code relay_stream_*} cases of {@code
- * ffi/tests/expose.rs}): full duplex, early 413, abort before the head, close before the end, clean
- * end, stable failure codes, readiness.
+ * C ABI 4.3 streaming consumer relay end to end: full duplex, an early 413 releasing the Java
+ * source, a Java source failing before the head, stable failure codes, readiness.
+ *
+ * <p>These are wiring tests. The relay's behaviour is tested once in Rust, in {@code
+ * ffi/tests/expose.rs}: closing early, a clean end and a source failing after the head ({@code
+ * relay_stream_keeps_the_full_duplex_contract}), aborting before the head ({@code
+ * relay_stream_failures_have_stable_codes}) and argument checks ({@code
+ * relay_stream_validates_its_arguments}).
  */
 final class RelayStreamE2ETest {
 
@@ -190,108 +194,6 @@ final class RelayStreamE2ETest {
   }
 
   @Test
-  void aSourceThatFailsAfterTheHeadIsReportedNotThrown() throws Exception {
-    try (Rig rig = new Rig()) {
-      Server server = new Server();
-      server.install(rig, null);
-      CountDownLatch fail = new CountDownLatch(1);
-      InputStream source =
-          new InputStream() {
-            int sent;
-
-            @Override
-            public int read() throws IOException {
-              byte[] one = new byte[1];
-              return read(one, 0, 1) < 0 ? -1 : one[0];
-            }
-
-            @Override
-            public int read(byte[] b, int off, int len) throws IOException {
-              if (sent++ == 0) {
-                b[off] = 'a';
-                return 1;
-              }
-              try {
-                fail.await();
-              } catch (InterruptedException e) {
-                throw new IOException(e);
-              }
-              throw new IOException("late failure");
-            }
-          };
-      try (RelayResponse r =
-          await(
-              Expose.relayStream(
-                  rig.conn,
-                  "app",
-                  "POST",
-                  "/duplex",
-                  NO_HEADERS,
-                  source,
-                  RelayOptions.defaults()))) {
-        assertEquals(200, r.status(), "the call itself succeeded");
-        fail.countDown();
-        // The handler sees a failed request body, and the response fails, never a clean end.
-        IOException read =
-            assertThrows(
-                IOException.class,
-                () -> {
-                  while (r.body().read() >= 0) {
-                    // drain
-                  }
-                });
-        assertInstanceOf(HttpBodyException.class, read);
-      }
-      waitFor("handler saw the abort", () -> server.has(l -> l.startsWith("read err")));
-    }
-  }
-
-  @Test
-  void closingTheResponseBeforeTheEndResetsTheUpload() throws Exception {
-    try (Rig rig = new Rig()) {
-      Server server = new Server();
-      server.install(rig, null);
-      Endless source = new Endless();
-      RelayResponse r =
-          await(
-              Expose.relayStream(
-                  rig.conn, "app", "POST", "/duplex", NO_HEADERS, source, RelayOptions.defaults()));
-      byte[] first = new byte[100];
-      assertEquals(100, r.body().readNBytes(first, 0, 100));
-      r.close();
-      r.close(); // idempotent
-      assertTrue(source.closed.await(T, TimeUnit.SECONDS), "the upload stops");
-      waitFor(
-          "handler saw the reset",
-          () -> server.has(l -> l.startsWith("read err") || l.equals("duplex write failed")));
-      assertFalse(server.has(l -> l.equals("duplex done")));
-    }
-  }
-
-  @Test
-  void aBodyReadToItsCleanEndLetsTheUploadFinish() throws Exception {
-    try (Rig rig = new Rig()) {
-      Server server = new Server();
-      server.install(rig, null);
-      RelayResponse r =
-          await(
-              Expose.relayStream(
-                  rig.conn,
-                  "app",
-                  "POST",
-                  "/duplex",
-                  NO_HEADERS,
-                  new ByteArrayInputStream("three".getBytes(StandardCharsets.UTF_8)),
-                  RelayOptions.defaults()));
-      assertEquals("three", new String(r.readBody(-1), StandardCharsets.UTF_8));
-      r.close();
-      waitFor("handler done", () -> server.has(l -> l.equals("duplex done")));
-      assertFalse(server.has(l -> l.startsWith("read err")));
-      waitFor("exchanges to close", () -> rig.expose.bodies().openCount() == 0);
-    }
-  }
-
-  @Test
   void deniedUnknownAndClosedRelaysHaveStableStatuses() throws Exception {
     try (Rig rig = new Rig()) {
       Server server = new Server();
@@ -374,31 +276,6 @@ final class RelayStreamE2ETest {
   }
 
   @Test
-  void abortBeforeTheHeadFailsTheResponseAndTheHandlerSeesAFailedBody() throws Exception {
-    try (Rig rig = new Rig()) {
-      Server server = new Server();
-      server.install(rig, null);
-      Expose.RelayCall call =
-          Expose.relayStreaming(
-              rig.conn, "app", "PUT", "/echo", NO_HEADERS, RelayOptions.defaults());
-      try (RelayUpload up = call.upload()) {
-        up.write(new byte[50_000]);
-        waitFor("handler started", () -> server.has(l -> l.equals("start /echo")));
-        up.abort("changed my mind");
-        assertEquals(
-            HttpBodyException.Kind.FINISHED,
-            assertThrows(HttpBodyException.class, () -> up.abort("again")).kind());
-        assertEquals(
-            HttpBodyException.Kind.FINISHED,
-            assertThrows(HttpBodyException.class, () -> up.write(new byte[1])).kind());
-        ExecutionException e =
-            assertThrows(ExecutionException.class, () -> call.response().get(T, TimeUnit.SECONDS));
-        assertInstanceOf(IrohException.class, rootOf(e));
-      }
-    }
-  }
-
-  @Test
   void lowLevelCallWithReadinessAndBlockingWrite() throws Exception {
     try (Rig rig = new Rig()) {
       Server server = new Server();
@@ -434,22 +311,9 @@ final class RelayStreamE2ETest {
   }
 
   @Test
-  void invalidArgumentsThrowSynchronously() throws Exception {
-    try (Rig rig = new Rig()) {
-      IrohException e =
-          assertThrows(
-              IrohException.class,
-              () ->
-                  Expose.relayStreaming(
-                      rig.conn, "", "GET", "/", NO_HEADERS, RelayOptions.defaults()));
-      assertEquals(IrohStatus.INVALID_ARGUMENT, e.status());
-      assertThrows(IllegalArgumentException.class, () -> new RelayOptions(-1, 0));
-    }
-  }
-
-  @Test
   void statusTablesMatchTheHeader() {
     assertEquals(24, RelayOptions.LAYOUT.byteSize());
+    assertThrows(IllegalArgumentException.class, () -> new RelayOptions(-1, 0));
     assertEquals(IrohStatus.UNAUTHENTICATED, IrohStatus.fromCode(14));
     assertEquals(IrohStatus.PERMISSION_DENIED, IrohStatus.fromCode(15));
     assertEquals(IrohStatus.CREDENTIAL_EXPIRED, IrohStatus.fromCode(16));

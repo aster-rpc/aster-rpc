@@ -41,6 +41,9 @@ public class CallContext
     /// <summary>Current retry attempt number (starts at 1).</summary>
     public int Attempt { get; set; } = 1;
 
+    /// <summary>The clock <see cref="RemainingSeconds"/> reads (the client stack's clock).</summary>
+    internal TimeProvider Clock { get; set; } = TimeProvider.System;
+
     /// <summary>
     /// Returns the remaining seconds until deadline, or null if no deadline is set.
     /// </summary>
@@ -50,7 +53,7 @@ public class CallContext
         {
             if (Deadline is null)
                 return null;
-            var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0;
+            var now = Clock.GetUtcNow().ToUnixTimeMilliseconds() / 1000.0;
             return Math.Max(0.0, Deadline.Value - now);
         }
     }

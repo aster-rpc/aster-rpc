@@ -568,8 +568,12 @@ final class ClientInterceptorsE2ETest {
 
   // ───── retry ────────────────────────────────────────────────────────────
 
-  private static RetryInterceptor retry(int attempts) {
-    return new RetryInterceptor(attempts, Set.of(StatusCode.UNAVAILABLE), 5, 20, 2.0, 0.0);
+  /** The retry and breaker clock: backoff and recovery timeouts run on it, with no real sleeps. */
+  final FakeClock clock = new FakeClock();
+
+  /** Backoff 5 ms, doubling, capped at 20 ms, on {@link #clock}. */
+  private RetryInterceptor retry(int attempts) {
+    return new RetryInterceptor(attempts, Set.of(StatusCode.UNAVAILABLE), 5, 20, 2.0, 0.0, clock);
   }
 
   @Test
@@ -586,6 +590,7 @@ final class ClientInterceptorsE2ETest {
                 CallOptions.DEFAULT.withIdempotent(true)));
     assertEquals(3, out.n());
     assertEquals(3, calls("r1").get());
+    assertEquals(Duration.ofMillis(5 + 10), clock.slept(), "exponential backoff between attempts");
   }
 
   @Test
@@ -594,6 +599,7 @@ final class ClientInterceptorsE2ETest {
     Throwable t = failure(c.<Msg, Msg>call(addr, SVC, "flaky", new Msg("r2", 3), Msg.class));
     assertEquals(StatusCode.UNAVAILABLE, ((RpcError) t).code());
     assertEquals(1, calls("r2").get());
+    assertEquals(Duration.ZERO, clock.slept());
   }
 
   @Test
@@ -610,6 +616,7 @@ final class ClientInterceptorsE2ETest {
                 CallOptions.DEFAULT.withIdempotent(true)));
     assertEquals(StatusCode.UNAVAILABLE, ((RpcError) t).code());
     assertEquals(3, calls("r3").get());
+    assertEquals(Duration.ofMillis(5 + 10), clock.slept(), "no backoff after the last attempt");
   }
 
   @Test
@@ -687,7 +694,7 @@ final class ClientInterceptorsE2ETest {
 
   @Test
   void breakerOpensAfterConsecutiveFailuresThenRecovers() throws Exception {
-    CircuitBreakerInterceptor breaker = new CircuitBreakerInterceptor(3, 0.4, 1);
+    CircuitBreakerInterceptor breaker = new CircuitBreakerInterceptor(3, 0.4, 1, clock);
     AsterClient c = client(breaker);
     for (int i = 0; i < 3; i++) {
       Throwable t = failure(c.<Msg, Msg>call(addr, SVC, "boom", new Msg("b1", 0), Msg.class));
@@ -704,19 +711,24 @@ final class ClientInterceptorsE2ETest {
     assertEquals(
         CircuitBreakerInterceptor.State.OPEN, breaker.state(), "a rejection is not a new failure");
 
+    // still open just before the recovery timeout
+    clock.advance(Duration.ofMillis(399));
+    failure(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("early", 0), Msg.class));
+    assertEquals(CircuitBreakerInterceptor.State.OPEN, breaker.state());
+
     // after the recovery timeout one probe is let through; success closes the circuit
-    Thread.sleep(500);
+    clock.advance(Duration.ofMillis(1));
     get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("probe", 0), Msg.class));
     assertEquals(CircuitBreakerInterceptor.State.CLOSED, breaker.state());
   }
 
   @Test
   void aFailingHalfOpenProbeReopensTheBreaker() throws Exception {
-    CircuitBreakerInterceptor breaker = new CircuitBreakerInterceptor(1, 0.3, 1);
+    CircuitBreakerInterceptor breaker = new CircuitBreakerInterceptor(1, 0.3, 1, clock);
     AsterClient c = client(breaker);
     failure(c.<Msg, Msg>call(addr, SVC, "boom", new Msg("b2", 0), Msg.class));
     assertEquals(CircuitBreakerInterceptor.State.OPEN, breaker.state());
-    Thread.sleep(400);
+    clock.advance(Duration.ofMillis(300));
     failure(c.<Msg, Msg>call(addr, SVC, "boom", new Msg("b2", 0), Msg.class)); // the probe
     assertEquals(2, calls("b2").get());
     assertEquals(CircuitBreakerInterceptor.State.OPEN, breaker.state());
@@ -726,7 +738,7 @@ final class ClientInterceptorsE2ETest {
   void breakerCountsEachRetryAttempt() throws Exception {
     // threshold 2, retry 5: the second UNAVAILABLE opens the circuit and the third attempt is
     // rejected locally (not retried further, the server saw two calls)
-    CircuitBreakerInterceptor breaker = new CircuitBreakerInterceptor(2, 30.0, 1);
+    CircuitBreakerInterceptor breaker = new CircuitBreakerInterceptor(2, 30.0, 1, clock);
     AsterClient c = client(retry(5), breaker);
     Throwable t =
         failure(
@@ -799,11 +811,11 @@ final class ClientInterceptorsE2ETest {
 
   @Test
   void retryBackoffNeverOutlivesTheDeadline() throws Exception {
-    // every attempt fails UNAVAILABLE; a 300 ms deadline must stop the retries
+    // every attempt fails UNAVAILABLE; a 300 ms deadline must stop the retries: one 200 ms backoff,
+    // a second attempt, then the backoff ends at the deadline (on the fake clock).
     RetryInterceptor slowRetry =
-        new RetryInterceptor(50, Set.of(StatusCode.UNAVAILABLE), 200, 200, 1.0, 0.0);
+        new RetryInterceptor(50, Set.of(StatusCode.UNAVAILABLE), 200, 200, 1.0, 0.0, clock);
     AsterClient c = client(slowRetry, new DeadlineInterceptor());
-    long t0 = System.nanoTime();
     Throwable t =
         failure(
             c.<Msg, Msg>call(
@@ -813,17 +825,18 @@ final class ClientInterceptorsE2ETest {
                 new Msg("d1", 99),
                 Msg.class,
                 CallOptions.DEFAULT.withIdempotent(true).withTimeout(Duration.ofMillis(300))));
-    assertInstanceOf(RpcError.class, t);
+    assertEquals(StatusCode.DEADLINE_EXCEEDED, assertInstanceOf(RpcError.class, t).code());
+    assertEquals(2, calls("d1").get(), "bounded by the deadline, not 50 attempts");
+    Duration slept = clock.slept();
     assertTrue(
-        Duration.ofNanos(System.nanoTime() - t0).toSeconds() < 5,
-        "bounded by the deadline, not 50 attempts");
-    assertTrue(calls("d1").get() < 10);
+        slept.compareTo(Duration.ofMillis(200)) > 0 && slept.compareTo(Duration.ofMillis(302)) <= 0,
+        "backed off until the deadline: " + slept);
   }
 
   @Test
   void nativeBreakerRefusalThenHealthyProbe() throws Exception {
     var first = new CircuitBreakerInterceptor(1, 0.0, 1);
-    var second = new CircuitBreakerInterceptor(1, 0.15, 1);
+    var second = new CircuitBreakerInterceptor(1, 0.15, 1, clock);
     var c = client(first, second);
     assertEquals(
         StatusCode.INTERNAL,
@@ -832,7 +845,7 @@ final class ClientInterceptorsE2ETest {
     var refused = failure(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("refused", 0), Msg.class));
     assertEquals(StatusCode.UNAVAILABLE, ((RpcError) refused).code());
     assertEquals(CircuitBreakerInterceptor.State.HALF_OPEN, first.state());
-    Thread.sleep(180);
+    clock.advance(Duration.ofMillis(150));
     assertEquals(
         "echo:healthy-probe|",
         get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("healthy-probe", 0), Msg.class)).text());
@@ -944,8 +957,23 @@ final class ClientInterceptorsE2ETest {
 
   @Test
   void cancelStopsRetriesAndBackoff() throws Exception {
+    // The first backoff parks on the clock until the test has cancelled the call.
+    CountDownLatch backingOff = new CountDownLatch(1);
+    CountDownLatch cancelled = new CountDownLatch(1);
+    AtomicInteger sleeps = new AtomicInteger();
+    FakeClock parking =
+        new FakeClock() {
+          @Override
+          public void sleep(long nanos) throws InterruptedException {
+            if (sleeps.incrementAndGet() == 1) {
+              backingOff.countDown();
+              assertTrue(cancelled.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
+            }
+            super.sleep(nanos);
+          }
+        };
     RetryInterceptor slowRetry =
-        new RetryInterceptor(50, Set.of(StatusCode.UNAVAILABLE), 100, 100, 1.0, 0.0);
+        new RetryInterceptor(50, Set.of(StatusCode.UNAVAILABLE), 100, 100, 1.0, 0.0, parking);
     AsterClient c = client(slowRetry);
     CompletableFuture<Msg> f =
         c.call(
@@ -955,11 +983,13 @@ final class ClientInterceptorsE2ETest {
             new Msg("cr", 999),
             Msg.class,
             CallOptions.DEFAULT.withIdempotent(true));
-    Thread.sleep(300);
+    assertTrue(backingOff.await(WaitBudget.SECONDS, TimeUnit.SECONDS), "the first backoff");
     assertTrue(f.cancel(true));
-    int atCancel = calls("cr").get();
-    Thread.sleep(500);
-    assertTrue(calls("cr").get() <= atCancel + 1, "no further attempts after the cancel");
+    cancelled.countDown();
+    assertEquals(1, calls("cr").get(), "one attempt before the backoff");
+    // The backoff wakes cancelled after its first 20 ms slice: no second slice, no second attempt.
+    assertEquals(1, sleeps.get());
+    assertEquals(1, calls("cr").get(), "no further attempts after the cancel");
   }
 
   @Test
@@ -980,7 +1010,7 @@ final class ClientInterceptorsE2ETest {
 
   @Test
   void concurrentCallsWithInterceptorsCancelsAndRetriesStayConsistent() throws Exception {
-    CircuitBreakerInterceptor breaker = new CircuitBreakerInterceptor(1_000, 5.0, 1);
+    CircuitBreakerInterceptor breaker = new CircuitBreakerInterceptor(1_000, 5.0, 1, clock);
     AsterClient c = client(retry(4), breaker, new DeadlineInterceptor());
     int n = 64;
     List<CompletableFuture<Msg>> futures = new ArrayList<>();

@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -17,10 +16,10 @@ import (
 	"time"
 )
 
-// C ABI 4.2 end to end (ported from ffi/tests/expose.rs): authorize allow /
-// deny / timeout, HTTP exchanges with inline and streamed bodies, handler
-// failures and limits, abort, consumer cancellation, socket targets, route
-// policy, relay_request and request_route.
+// C ABI 4.2 wiring: the net/http adapter over inline and streamed bodies,
+// the raw body API, handler failures, abort, consumer cancellation, route
+// policy and request_route, validation. Expose behaviour (authorize and its
+// failure modes, limits, socket targets, unexpose) is ffi/tests/expose.rs.
 
 const exposeALPN = "aster-expose/go-test"
 const exposeSvc = "svc"
@@ -375,64 +374,6 @@ func TestExpose_RawBodyBackpressureAndTrailers(t *testing.T) {
 	}
 }
 
-func TestExpose_AuthorizeDenyAndFailureModes(t *testing.T) {
-	rig := newExposeRig(t, true)
-	var handled atomic.Int64
-	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
-		handled.Add(1)
-		io.WriteString(w, "in")
-	}, nil)
-
-	rig.allow.Store(false)
-	if _, err := rig.relay(HTTPRelayRequest{}); err == nil {
-		t.Fatal("a denied peer got a response")
-	}
-	if handled.Load() != 0 {
-		t.Fatal("the handler ran for a denied peer")
-	}
-	// The decision is Go's: flip it and a fresh stream is admitted.
-	rig.allow.Store(true)
-	resp, err := rig.relay(HTTPRelayRequest{})
-	if err != nil || string(resp.Body) != "in" {
-		t.Fatalf("allowed: %+v, %v", resp, err)
-	}
-
-	// An authorizer that never answers: the failure mode decides. Admission
-	// is decided once per (connection, service) and an allowed pair is
-	// remembered, so use services not seen on this connection yet.
-	var cancelled atomic.Int64
-	if err := rig.up.ServeExposeAuthorize(func(ctx context.Context, _ ExposeAuthorizeRequest) (bool, error) {
-		<-ctx.Done()
-		cancelled.Add(1)
-		return true, ctx.Err()
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := rig.up.SetPolicy(UpcallExposeAuthorize, 200*time.Millisecond, FailureModeClosed); err != nil {
-		t.Fatal(err)
-	}
-	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "in") })
-	for _, svc := range []string{"hung-closed", "hung-open"} {
-		if err := rig.ex.ExposeHTTP(rig.up, rig.bodies, svc, h, nil); err != nil {
-			t.Fatal(err)
-		}
-	}
-	relayTo := func(svc string) (*HTTPRelayResponse, error) {
-		return rig.conn.RelayRequest(rig.ctx, HTTPRelayRequest{ServiceID: svc, Method: "GET", URI: "/", Body: []byte{}})
-	}
-	if _, err := relayTo("hung-closed"); err == nil {
-		t.Fatal("fail-closed admitted an unanswered request")
-	}
-	eventually(t, "the hung authorizer to be cancelled", func() bool { return cancelled.Load() >= 1 })
-	if err := rig.up.SetPolicy(UpcallExposeAuthorize, 200*time.Millisecond, FailureModeOpen); err != nil {
-		t.Fatal(err)
-	}
-	resp, err = relayTo("hung-open")
-	if err != nil || string(resp.Body) != "in" {
-		t.Fatalf("fail-open: %+v, %v", resp, err)
-	}
-}
-
 func TestExpose_HandlerFailuresBecome5xxStatuses(t *testing.T) {
 	rig := newExposeRig(t, true)
 	cancelled := make(chan struct{}, 1)
@@ -485,45 +426,6 @@ func TestExpose_HandlerFailuresBecome5xxStatuses(t *testing.T) {
 	rig.waitClosed()
 }
 
-func TestExpose_Limits(t *testing.T) {
-	rig := newExposeRig(t, true)
-	var handled atomic.Int64
-	var writeErr atomic.Value
-	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
-		handled.Add(1)
-		switch r.URL.Path {
-		case "/inline-over-cap":
-			w.Write(make([]byte, 2000))
-		case "/streamed-over-cap":
-			w.(http.Flusher).Flush()
-			w.Write(make([]byte, 1000))
-			if _, err := w.Write(make([]byte, 1000)); err != nil {
-				writeErr.Store(err)
-			}
-		}
-	}, &ExposeHTTPOptions{MaxRequestBody: 2000, MaxResponseBody: 1500})
-
-	// A declared length over the cap is a 413 without any upcall.
-	resp, err := rig.relay(HTTPRelayRequest{Method: "POST", Body: make([]byte, 5000)})
-	if err != nil || resp.Status != 413 || handled.Load() != 0 {
-		t.Fatalf("oversized request = %+v, %v (handled %d)", resp, err, handled.Load())
-	}
-	// An inline body over the response cap becomes a 502.
-	resp, err = rig.relay(HTTPRelayRequest{URI: "/inline-over-cap"})
-	if err != nil || resp.Status != 502 {
-		t.Fatalf("inline over cap = %+v, %v", resp, err)
-	}
-	// A streamed one is aborted by the write that crosses the cap.
-	if _, err = rig.relay(HTTPRelayRequest{URI: "/streamed-over-cap"}); err == nil {
-		t.Fatal("an over-cap streamed body must fail the consumer, not truncate")
-	}
-	eventually(t, "the crossing write to fail", func() bool { return writeErr.Load() != nil })
-	if err := writeErr.Load().(error); !errors.Is(err, ErrBodyTooLarge) {
-		t.Fatalf("crossing write = %v, want ErrBodyTooLarge", err)
-	}
-	rig.waitClosed()
-}
-
 func TestExpose_AbortedStreamFailsTheConsumer(t *testing.T) {
 	rig := newExposeRig(t, true)
 	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
@@ -557,44 +459,6 @@ func TestExpose_StreamedResponseWithTrailersAndHead(t *testing.T) {
 	if err != nil || len(resp.Body) != 0 || headerValues(resp.Headers, "content-length")[0] != "5" {
 		t.Fatalf("HEAD = %+v, %v", resp, err)
 	}
-	rig.waitClosed()
-}
-
-func TestExpose_ConsumerGoneBeforeTheHeadCancelsTheHandler(t *testing.T) {
-	rig := newExposeRig(t, true)
-	entered := make(chan struct{})
-	finished := make(chan error, 1)
-	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) {
-		close(entered)
-		select {
-		case <-r.Context().Done():
-			finished <- nil
-		case <-time.After(10 * time.Second):
-			finished <- errors.New("never cancelled")
-		}
-		// A late answer is ignored.
-		io.WriteString(w, "late")
-	}, nil)
-	relayErr := make(chan error, 1)
-	go func() {
-		_, err := rig.relay(HTTPRelayRequest{})
-		relayErr <- err
-	}()
-	select {
-	case <-entered:
-	case <-rig.ctx.Done():
-		t.Fatal("the handler never ran")
-	}
-	if err := rig.conn.Close("cancel"); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-relayErr; err == nil {
-		t.Fatal("the abandoned relay completed")
-	}
-	if err := <-finished; err != nil {
-		t.Fatal(err)
-	}
-	eventually(t, "CANCEL{abandoned}", func() bool { return rig.up.CancelCount() >= 1 })
 	rig.waitClosed()
 }
 
@@ -638,115 +502,17 @@ func TestExpose_ConsumerGoneMidStreamMakesWritesCancelled(t *testing.T) {
 	rig.waitClosed()
 }
 
-func TestExpose_SocketTargetWithAndWithoutAnAuthorizer(t *testing.T) {
+func TestExpose_RoutePolicyGrant(t *testing.T) {
 	rig := newExposeRig(t, true)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	accepted := make(chan net.Conn, 4)
-	go func() {
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
-			}
-			accepted <- c
-		}
-	}()
-	addr := ln.Addr().String()
-
-	// Argument validation.
-	if err := rig.ex.ExposeSocket("sock", "not an addr", nil); !errors.Is(err, ErrInvalidArgument) {
-		t.Errorf("bad addr: %v", err)
-	}
-	if err := rig.ex.ExposeSocket("", addr, nil); !errors.Is(err, ErrInvalidArgument) {
-		t.Errorf("empty service id: %v", err)
-	}
-
-	// Guarded by the authorizer: denied, so nothing is spliced.
-	if err := rig.ex.ExposeSocket("sock", addr, rig.up); err != nil {
-		t.Fatal(err)
-	}
-	rig.allow.Store(false)
-	if _, err := rig.conn.RelayRequest(rig.ctx, HTTPRelayRequest{ServiceID: "sock", Method: "GET", URI: "/", Body: []byte{}}); err == nil {
-		t.Fatal("a denied peer reached the socket")
-	}
-	select {
-	case <-accepted:
-		t.Fatal("the target saw a connection while denied")
-	// short-wait-ok: a denied peer must not reach the target; the bound is the assertion
-	case <-time.After(200 * time.Millisecond):
-	}
-
-	// Allowed: the stream is spliced to the target. The consumer's framing is
-	// not HTTP/1.1, so the relay call ends once the target hangs up.
-	rig.allow.Store(true)
-	relayDone := make(chan error, 1)
-	go func() {
-		_, err := rig.conn.RelayRequest(rig.ctx, HTTPRelayRequest{ServiceID: "sock", Method: "GET", URI: "/", Body: []byte{}})
-		relayDone <- err
-	}()
-	select {
-	case c := <-accepted:
-		_ = c.Close()
-	case <-rig.ctx.Done():
-		t.Fatal("the target never saw a connection")
-	}
-	select {
-	case <-relayDone:
-	case <-rig.ctx.Done():
-		t.Fatal("the relay never ended")
-	}
-
-	// Without an authorizer every peer is admitted and no authorize upcall is made.
-	if err := rig.ex.ExposeSocket("open", addr, nil); err != nil {
-		t.Fatal(err)
-	}
-	before := rig.authz.Load()
-	rig.allow.Store(false)
-	go func() {
-		_, err := rig.conn.RelayRequest(rig.ctx, HTTPRelayRequest{ServiceID: "open", Method: "GET", URI: "/", Body: []byte{}})
-		relayDone <- err
-	}()
-	select {
-	case c := <-accepted:
-		_ = c.Close()
-	case <-rig.ctx.Done():
-		t.Fatal("the open service never reached the target")
-	}
-	<-relayDone
-	if rig.authz.Load() != before {
-		t.Fatal("an authorizer-less service asked the authorizer")
-	}
-}
-
-func TestExpose_RoutePolicyGrantDenyAndFailureMode(t *testing.T) {
-	rig := newExposeRig(t, true)
-	var mu sync.Mutex
-	mode := "grant"
 	type seen struct {
 		peer     string
 		metadata []byte
 		specs    []RouteSpec
 	}
 	seenCh := make(chan seen, 8)
-	policy := func(ctx context.Context, req ExposeRoutePolicyRequest) ([]uint32, error) {
+	policy := func(_ context.Context, req ExposeRoutePolicyRequest) ([]uint32, error) {
 		seenCh <- seen{req.PeerID, req.Metadata, req.Specs}
-		mu.Lock()
-		m := mode
-		mu.Unlock()
-		switch m {
-		case "grant":
-			return []uint32{0, 2}, nil
-		case "deny":
-			return []uint32{}, nil
-		case "out-of-range":
-			return []uint32{1, 9}, nil
-		}
-		<-ctx.Done() // silent
-		return nil, ctx.Err()
+		return []uint32{0, 2}, nil
 	}
 	if err := rig.ex.ExposeRoutePolicy(rig.up, policy); err != nil {
 		t.Fatal(err)
@@ -756,12 +522,11 @@ func TestExpose_RoutePolicyGrantDenyAndFailureMode(t *testing.T) {
 		{Host: "", Port: 8080, Protocol: RouteProtocolTCP, ServiceID: "db"},
 		{Host: "b.example", Port: 0, Protocol: RouteProtocolHTTP, ServiceID: "api"},
 	}
-	setMode := func(m string) { mu.Lock(); mode = m; mu.Unlock() }
 	request := func(meta string) ([]uint32, *RouteRegistration) {
 		t.Helper()
 		g, reg, err := rig.conn.RequestRoute(rig.ctx, specs, []byte(meta))
 		if err != nil {
-			t.Fatalf("RequestRoute(%s): %v", mode, err)
+			t.Fatalf("RequestRoute: %v", err)
 		}
 		return g, reg
 	}
@@ -793,40 +558,8 @@ func TestExpose_RoutePolicyGrantDenyAndFailureMode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Deny: nothing granted.
-	setMode("deny")
-	g, reg = request("")
-	if len(g) != 0 {
-		t.Fatalf("deny granted %v", g)
-	}
-	_ = reg.Close()
-
-	// A malformed answer is "no usable answer": fail-closed grants nothing.
-	setMode("out-of-range")
-	g, reg = request("")
-	if len(g) != 0 {
-		t.Fatalf("out-of-range granted %v", g)
-	}
-	_ = reg.Close()
-
-	// No answer: the failure mode decides; fail-open grants every route.
-	setMode("silent")
-	if err := rig.up.SetPolicy(UpcallExposeRoutePolicy, 300*time.Millisecond, FailureModeOpen); err != nil {
-		t.Fatal(err)
-	}
-	g, reg = request("")
-	if !eq(g, []uint32{0, 1, 2}) {
-		t.Fatalf("fail-open granted %v", g)
-	}
-	_ = reg.Close()
-	if err := rig.up.SetPolicy(UpcallExposeRoutePolicy, 300*time.Millisecond, FailureModeClosed); err != nil {
-		t.Fatal(err)
-	}
-	g, reg = request("")
-	if len(g) != 0 {
-		t.Fatalf("fail-closed granted %v", g)
-	}
-	_ = reg.Close()
+	// Deny, a malformed answer and the failure modes are ffi/tests/expose.rs
+	// route_policy_grant_and_deny.
 
 	// Argument validation happens before anything is sent.
 	for _, bad := range []RouteSpec{
@@ -835,28 +568,6 @@ func TestExpose_RoutePolicyGrantDenyAndFailureMode(t *testing.T) {
 		if _, _, err := rig.conn.RequestRoute(rig.ctx, []RouteSpec{bad}, nil); !errors.Is(err, ErrInvalidArgument) {
 			t.Errorf("spec %+v: %v", bad, err)
 		}
-	}
-}
-
-func TestExpose_UnexposeStopsTheService(t *testing.T) {
-	rig := newExposeRig(t, true)
-	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "up") }, nil)
-	if resp, err := rig.relay(HTTPRelayRequest{}); err != nil || string(resp.Body) != "up" {
-		t.Fatalf("before: %+v, %v", resp, err)
-	}
-	if err := rig.ex.Unexpose(exposeSvc); err != nil {
-		t.Fatal(err)
-	}
-	if err := rig.ex.Unexpose(exposeSvc); err != nil { // idempotent
-		t.Fatal(err)
-	}
-	if _, err := rig.relay(HTTPRelayRequest{}); err == nil {
-		t.Fatal("an unexposed service answered")
-	}
-	// Registering it again brings it back.
-	rig.serveHTTP(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "again") }, nil)
-	if resp, err := rig.relay(HTTPRelayRequest{}); err != nil || string(resp.Body) != "again" {
-		t.Fatalf("after: %+v, %v", resp, err)
 	}
 }
 

@@ -16,10 +16,52 @@ import (
 	"time"
 )
 
+// ─── fake clock ─────────────────────────────────────────────────────────────
+
+// fakeClock is the breakers' injected clock: time moves only on Advance, so
+// recovery windows are crossed without sleeping.
+type fakeClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func newFakeClock() *fakeClock { return &fakeClock{now: time.Unix(1_700_000_000, 0)} }
+
+func (c *fakeClock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.now }
+
+func (c *fakeClock) Advance(d time.Duration) { c.mu.Lock(); c.now = c.now.Add(d); c.mu.Unlock() }
+
+// fakeBreaker is a breaker on clock.
+func fakeBreaker(clock *fakeClock) *CircuitBreakerInterceptor {
+	cb := NewCircuitBreakerInterceptor()
+	cb.clock = clock.Now
+	return cb
+}
+
+// backoffLog records the backoffs a retry asked for instead of sleeping them.
+type backoffLog struct {
+	mu     sync.Mutex
+	delays []time.Duration
+}
+
+func (b *backoffLog) sleep(ctx context.Context, d time.Duration) error {
+	b.mu.Lock()
+	b.delays = append(b.delays, d)
+	b.mu.Unlock()
+	return ctx.Err()
+}
+
+func (b *backoffLog) all() []time.Duration {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.delays)
+}
+
 // ─── unit tests (no network) ────────────────────────────────────────────────
 
 func TestCircuitBreaker_BeforeCallAndHalfOpenSlot(t *testing.T) {
-	cb := NewCircuitBreakerInterceptor()
+	clock := newFakeClock()
+	cb := fakeBreaker(clock)
 	cb.FailureThreshold, cb.RecoveryTimeout = 2, 0.05
 	for i := 0; i < 2; i++ {
 		if err := cb.BeforeCall(); err != nil {
@@ -33,7 +75,11 @@ func TestCircuitBreaker_BeforeCallAndHalfOpenSlot(t *testing.T) {
 	if err := cb.BeforeCall(); !errors.Is(err, ErrRpcUnavailable) || !strings.Contains(err.Error(), "open") {
 		t.Fatalf("open breaker: %v", err)
 	}
-	time.Sleep(70 * time.Millisecond)
+	clock.Advance(49 * time.Millisecond)
+	if err := cb.BeforeCall(); err == nil {
+		t.Fatal("admitted before the recovery timeout")
+	}
+	clock.Advance(time.Millisecond)
 	if err := cb.BeforeCall(); err != nil { // the half-open probe
 		t.Fatal(err)
 	}
@@ -57,7 +103,7 @@ func TestCircuitBreaker_BeforeCallAndHalfOpenSlot(t *testing.T) {
 	cb.FailureThreshold = 1
 	_ = cb.BeforeCall()
 	cb.RecordFailure(&RpcError{Code: StatusInternal})
-	time.Sleep(70 * time.Millisecond)
+	clock.Advance(50 * time.Millisecond)
 	_ = cb.BeforeCall()
 	cb.RecordFailure(&RpcError{Code: StatusUnavailable})
 	if cb.State() != "open" {
@@ -66,7 +112,8 @@ func TestCircuitBreaker_BeforeCallAndHalfOpenSlot(t *testing.T) {
 }
 
 func TestCircuitBreaker_Concurrent(t *testing.T) {
-	cb := NewCircuitBreakerInterceptor()
+	clock := newFakeClock()
+	cb := fakeBreaker(clock)
 	cb.FailureThreshold, cb.RecoveryTimeout, cb.HalfOpenMaxCalls = 5, 0.001, 2
 	var wg sync.WaitGroup
 	for g := 0; g < 16; g++ {
@@ -74,6 +121,7 @@ func TestCircuitBreaker_Concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
+				clock.Advance(100 * time.Microsecond) // crosses the recovery window every 10 calls
 				if cb.BeforeCall() != nil {
 					continue
 				}
@@ -262,10 +310,19 @@ func echo(ctx context.Context, f *clientFixture, msg string, opts ...CallOption)
 	return Call[testEchoRequest, testEchoReply](ctx, f.conn, "Flaky", "echo", &testEchoRequest{Message: msg, Data: []byte{}}, opts...)
 }
 
+// fastRetry retries up to attempts times; its backoffs (1, 2, 4, 5, 5 ... ms)
+// are recorded in the returned log instead of slept.
 func fastRetry(attempts int) *RetryInterceptor {
+	r, _ := fakeRetry(attempts)
+	return r
+}
+
+func fakeRetry(attempts int) (*RetryInterceptor, *backoffLog) {
 	r := NewRetryInterceptor()
 	r.Policy = RetryPolicy{MaxAttempts: attempts, Backoff: ExponentialBackoff{InitialMs: 1, MaxMs: 5, Multiplier: 2}}
-	return r
+	log := &backoffLog{}
+	r.sleep = log.sleep
+	return r, log
 }
 
 func testCtx(t *testing.T) context.Context {
@@ -293,7 +350,8 @@ func (a *attemptSpy) OnRequest(ctx *CallContext, req any) (any, error) {
 
 func TestClientInterceptors_RetryIdempotent(t *testing.T) {
 	spy := &attemptSpy{}
-	f := newClientFixture(t, true, WithClientInterceptors(spy, fastRetry(3)))
+	retry, backoffs := fakeRetry(3)
+	f := newClientFixture(t, true, WithClientInterceptors(spy, retry))
 	f.f.failFirst.Store(2)
 	// The idempotent flag comes from the registered service.
 	if err := f.cl.RegisterService(f.f.service(true)); err != nil {
@@ -308,6 +366,10 @@ func TestClientInterceptors_RetryIdempotent(t *testing.T) {
 	}
 	if !slices.Equal(spy.attempts, []int{1, 2, 3}) {
 		t.Fatalf("attempts %v", spy.attempts)
+	}
+	// Exponential backoff between attempts, on the injected wait.
+	if got := backoffs.all(); !slices.Equal(got, []time.Duration{time.Millisecond, 2 * time.Millisecond}) {
+		t.Fatalf("backoffs %v", got)
 	}
 }
 
@@ -377,18 +439,24 @@ func TestClientInterceptors_RetryOnlyWhereAllowed(t *testing.T) {
 func TestClientInterceptors_RetryBackoffBoundedByContext(t *testing.T) {
 	r := NewRetryInterceptor()
 	r.Policy = RetryPolicy{MaxAttempts: 5, Backoff: ExponentialBackoff{InitialMs: 10_000, MaxMs: 10_000, Multiplier: 1}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var asked []time.Duration
+	// The context ends during the 10 s backoff: the real wait (sleepCtx)
+	// returns the context's failure at once and the call is not retried.
+	r.sleep = func(c context.Context, d time.Duration) error {
+		asked = append(asked, d)
+		cancel()
+		return sleepCtx(c, d)
+	}
 	f := newClientFixture(t, true, WithClientInterceptors(r))
 	f.f.failFirst.Store(100)
-	// short-wait-ok: the deadline must cut the 10 s retry backoff short; its expiry is under test
-	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-	defer cancel()
-	start := time.Now()
 	_, err := echo(ctx, f, "x", WithIdempotent(true))
-	if !errors.Is(err, ErrRpcDeadlineExceeded) || !errors.Is(err, context.DeadlineExceeded) {
+	if !errors.Is(err, ErrRpcCancelled) || !errors.Is(err, context.Canceled) {
 		t.Fatalf("%v", err)
 	}
-	if d := time.Since(start); d > 3*time.Second {
-		t.Fatalf("backoff slept past the deadline: %v", d)
+	if !slices.Equal(asked, []time.Duration{10 * time.Second}) {
+		t.Fatalf("backoffs %v", asked)
 	}
 	if n := f.f.calls.Load(); n != 1 {
 		t.Fatalf("%d calls", n)
@@ -398,7 +466,8 @@ func TestClientInterceptors_RetryBackoffBoundedByContext(t *testing.T) {
 // ─── circuit breaker ────────────────────────────────────────────────────────
 
 func TestClientInterceptors_CircuitBreakerEndToEnd(t *testing.T) {
-	cb := NewCircuitBreakerInterceptor()
+	clock := newFakeClock()
+	cb := fakeBreaker(clock)
 	cb.FailureThreshold, cb.RecoveryTimeout = 2, 0.2
 	f := newClientFixture(t, false, WithClientInterceptors(cb))
 	ctx := testCtx(t)
@@ -422,7 +491,7 @@ func TestClientInterceptors_CircuitBreakerEndToEnd(t *testing.T) {
 	}
 	// After the recovery timeout one probe goes through; success closes it.
 	f.f.healthy.Store(true)
-	time.Sleep(300 * time.Millisecond)
+	clock.Advance(200 * time.Millisecond)
 	if r, err := call(); err != nil || r.Message != "ok" {
 		t.Fatalf("probe: %v %v", r, err)
 	}
@@ -465,7 +534,8 @@ func TestClientInterceptors_BreakerAndRetryTogether(t *testing.T) {
 }
 
 func TestClientInterceptors_BreakerConcurrentRace(t *testing.T) {
-	cb := NewCircuitBreakerInterceptor()
+	clock := newFakeClock()
+	cb := fakeBreaker(clock)
 	cb.FailureThreshold, cb.RecoveryTimeout, cb.HalfOpenMaxCalls = 3, 0.01, 2
 	f := newClientFixture(t, false, WithClientInterceptors(cb, fastRetry(2)))
 	f.f.failFirst.Store(1 << 20)
@@ -476,6 +546,7 @@ func TestClientInterceptors_BreakerConcurrentRace(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 10; i++ {
+				clock.Advance(2 * time.Millisecond) // reopens to half-open every few calls
 				_, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "Flaky", "always_fail", &testEchoRequest{Data: []byte{}}, WithIdempotent(true))
 				if !errors.Is(err, ErrRpcUnavailable) {
 					t.Errorf("%v", err)
@@ -908,7 +979,8 @@ func TestClientInterceptors_NativeBreakerAftermath(t *testing.T) {
 		t.Run(aftermath, func(t *testing.T) {
 			first := NewCircuitBreakerInterceptor()
 			first.FailureThreshold, first.RecoveryTimeout = 1, 0
-			second := NewCircuitBreakerInterceptor()
+			clock := newFakeClock()
+			second := fakeBreaker(clock)
 			second.FailureThreshold, second.RecoveryTimeout = 1, 0.15
 			breakers := []Interceptor{first}
 			if aftermath == "later_refusal" {
@@ -928,7 +1000,7 @@ func TestClientInterceptors_NativeBreakerAftermath(t *testing.T) {
 				if f.f.calls.Load() != 1 {
 					t.Fatal("refused call reached peer")
 				}
-				time.Sleep(180 * time.Millisecond)
+				clock.Advance(150 * time.Millisecond)
 			} else {
 				probeCtx, stop := context.WithCancel(ctx)
 				defer stop()

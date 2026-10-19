@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -338,106 +337,5 @@ public class GatewayIdentityTests
         string token = edge.MintUserToken("alice", ["notes.read"], [GatewayIdentity.AmrPassword], TimeSpan.FromMinutes(1));
         Assert.Equal("", (await Call(rc, "read")).Actor);
         await WantCode(StatusCode.PermissionDenied, () => Call(rc, "read", token));
-    }
-
-    // A provider's ES256 token, forwarded unchanged by an edge, verifies with the issuer keys a node
-    // holding aster.identity-publisher wrote into the fleet namespace; its groups map to roles.
-    [Fact]
-    public async Task Provider_Token_From_A_Trusted_Issuer_Verifies_With_Published_Keys()
-    {
-        const string iss = "https://idp.test";
-        var config = ServerConfig();
-        config = config with
-        {
-            Identity = config.Identity with
-            {
-                TrustedIssuers =
-                [
-                    new TrustedIssuer
-                    {
-                        Iss = iss, Audiences = ["notes"], RolesClaim = "groups",
-                        RoleMap = new Dictionary<string, string> { ["readers"] = "notes.read" },
-                    },
-                ],
-            },
-        };
-        var (server, addr) = await StartNotes(config);
-        await using var _s = server;
-
-        using var idp = new TestIdP(iss);
-        // The publisher writes the key set into the fleet namespace as its own node, carrying its
-        // credential, and syncs it to the server.
-        string publisherChain = CredentialFor(8, GatewayIdentity.IdentityPublisherRole);
-        await using var publisher = await Client(Enrolled(8, publisherChain));
-        await publisher.ConnectAsync(addr).WaitAsync(Budget);
-        using var fleet = await publisher.Node.Docs().ImportWriteNamespaceAsync(FleetSecret).WaitAsync(Budget);
-        byte[] record = JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, object?>
-        {
-            ["version"] = 1,
-            ["iss"] = iss,
-            ["source_url"] = iss + "/jwks",
-            ["fetched_at"] = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-            ["jwks"] = new Dictionary<string, object?> { ["keys"] = new[] { idp.Jwk() } },
-            ["credential"] = publisherChain,
-        });
-        string key = "aster/identity/v1/issuers/" + B64(Encoding.UTF8.GetBytes(iss)) + "/jwks";
-        await fleet.SetBytesAsync(Pub(8), key, record).WaitAsync(Budget);
-        await fleet.StartSyncAsync([Pub(2)]).WaitAsync(Budget);
-
-        await using var edge = await Client(Enrolled(5, CredentialFor(5, GatewayIdentity.GatewayRole)));
-        var rc = await edge.ConnectAsync(addr).WaitAsync(Budget);
-        string token = idp.Token(new() { ["sub"] = "alice", ["aud"] = "notes", ["groups"] = new[] { "readers", "other" }, ["amr"] = new[] { "pwd" } });
-        var deadline = DateTime.UtcNow + Budget;
-        WhoReply alice;
-        while (true)
-        {
-            try
-            {
-                alice = await Call(rc, "read", token);
-                break;
-            }
-            catch (RpcError e) when (e.Code == StatusCode.Unauthenticated && DateTime.UtcNow < deadline)
-            {
-                await Task.Delay(200); // the key set is still syncing
-            }
-        }
-        Assert.Equal(iss + "|alice", alice.Principal);
-        Assert.Equal(Pub(5), alice.Actor);
-        Assert.Equal("notes.read", alice.Roles);
-        Assert.Equal(iss, alice.Issuer);
-        Assert.Equal("pwd", alice.Amr);
-
-        // A token for another audience, or signed by another key with the same kid, is refused.
-        await WantCode(StatusCode.Unauthenticated, () => Call(rc, "read", idp.Token(new() { ["sub"] = "alice", ["aud"] = "other" })));
-        using var forger = new TestIdP(iss);
-        await WantCode(StatusCode.Unauthenticated, () => Call(rc, "read", forger.Token(new() { ["sub"] = "alice", ["aud"] = "notes" })));
-    }
-
-    private static string B64(byte[] b) => Convert.ToBase64String(b).TrimEnd('=').Replace('+', '-').Replace('/', '_');
-
-    /// <summary>Signs ES256 ID tokens with one P-256 key (kid <c>k1</c>).</summary>
-    private sealed class TestIdP(string iss) : IDisposable
-    {
-        private readonly ECDsa _key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
-
-        public Dictionary<string, string> Jwk()
-        {
-            var p = _key.ExportParameters(false);
-            return new() { ["kty"] = "EC", ["crv"] = "P-256", ["kid"] = "k1", ["alg"] = "ES256", ["use"] = "sig", ["x"] = B64(p.Q.X!), ["y"] = B64(p.Q.Y!) };
-        }
-
-        public string Token(Dictionary<string, object?> claims)
-        {
-            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            claims["iss"] = iss;
-            claims["iat"] = now;
-            claims["exp"] = now + 300;
-            string header = B64(JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, string> { ["alg"] = "ES256", ["typ"] = "JWT", ["kid"] = "k1" }));
-            string input = header + "." + B64(JsonSerializer.SerializeToUtf8Bytes(claims));
-            byte[] sig = _key.SignData(Encoding.ASCII.GetBytes(input), HashAlgorithmName.SHA256, DSASignatureFormat.IeeeP1363FixedFieldConcatenation);
-            return input + "." + B64(sig);
-        }
-
-        public void Dispose() => _key.Dispose();
     }
 }

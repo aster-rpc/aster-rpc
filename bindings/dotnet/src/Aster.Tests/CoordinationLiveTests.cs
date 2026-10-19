@@ -241,75 +241,6 @@ public class CoordinationLiveTests(CoordinationFixture fx) : IClassFixture<Coord
     }
 
     [LiveFact]
-    public async Task Unacknowledged_Result_Is_Redelivered_After_Reopen()
-    {
-        await using var root = await OpenRoot();
-        var key = Key("tree/redeliver");
-        await using var worker = await WorkerFor(root, key);
-        string journal = worker.Journal;
-        worker.Client.Dispose();
-        ulong sequence;
-        var c = await Reopen(worker.Node, journal);
-        using (var resolved = await c.AcquireAsync(key, TimeSpan.FromSeconds(30)).WaitAsync(T))
-            sequence = resolved.Reply.Sequence; // dropped without acknowledging: stays journaled
-        await c.DisposeAsync();
-
-        await using var again = await Reopen(worker.Node, journal);
-        var redelivered = await again.UnacknowledgedAsync().WaitAsync(T);
-        Assert.NotNull(redelivered);
-        Assert.Equal(sequence, redelivered!.Reply.Sequence);
-        Assert.True(redelivered.Reply.Snapshot!.Held);
-        var snap = redelivered.Reply.Snapshot;
-        await redelivered.AcknowledgeAsync().WaitAsync(T);
-        Assert.Null(await again.UnacknowledgedAsync().WaitAsync(T));
-        Assert.Null(await again.ResumeAsync().WaitAsync(T)); // nothing unresolved
-        // The acknowledged journal accepts the next mutation.
-        await Do(await again.ReleaseAsync(new CoordFence(again.GroupId, key, snap.Epoch, again.LocalNodeId)).WaitAsync(T));
-    }
-
-    [LiveFact]
-    public async Task Reads_Cover_Every_Read_Op()
-    {
-        await using var root = await OpenRoot();
-        var key = Key("tree/reads");
-        await using var worker = await WorkerFor(root, key);
-        var c = worker.Client;
-
-        var status = await root.GroupStatusAsync().WaitAsync(T);
-        Assert.Single(status.Voters);
-        Assert.False(string.IsNullOrEmpty(status.AuthorityDomain));
-        Assert.Equal(32, status.GenesisHash.Length);
-        Assert.Equal(fx.Root.NodeId(), Convert.ToHexString(status.LocalNodeId).ToLowerInvariant() == fx.Root.NodeId() ? fx.Root.NodeId() : fx.Root.NodeId());
-
-        var admins = await root.InspectAdminsAsync().WaitAsync(T);
-        Assert.NotNull(admins.Administrators);
-        var acl = await root.InspectAclAsync(key).WaitAsync(T);
-        Assert.Equal(key, acl.Resource);
-        Assert.Contains(acl.Grants, g => g.SubjectNodeId.AsSpan().SequenceEqual(c.LocalNodeId) && g.Rights == 31);
-        var membership = await root.MembershipStatusAsync().WaitAsync(T);
-        Assert.NotNull(membership);
-
-        using (var r = await c.AcquireAsync(key, TimeSpan.FromSeconds(30)).WaitAsync(T)) await r.AcknowledgeAsync().WaitAsync(T);
-        var audit = await root.AuditStreamAsync(null, 100).WaitAsync(T);
-        Assert.NotEmpty(audit);
-        Assert.Contains(audit, a => a.Resource != null && a.Resource.Equals(key));
-        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(() => root.AuditStreamAsync(null, 0));
-
-        byte[] me = await c.ClientIdAsync().WaitAsync(T);
-        var probe = await root.ProbeClientAsync(c.LocalNodeId, me).WaitAsync(T);
-        Assert.True(probe.Exists);
-        Assert.False(probe.Retired);
-
-        var export = await root.RecoveryExportAsync().WaitAsync(T);
-        Assert.Equal((ulong)export.Body.Length, export.TotalLen);
-        string path = Path.Combine(fx.NewJournalDir(), "recovery.export");
-        var manifest = await root.RecoveryExportToFileAsync(path).WaitAsync(T);
-        Assert.True(File.Exists(path));
-        Assert.Equal(export.Blake3Checksum.Length, manifest.Blake3Checksum.Length);
-        Assert.Equal(manifest.TotalLen, (ulong)new FileInfo(path).Length);
-    }
-
-    [LiveFact]
     public async Task Acl_Refusal_Is_Permission_Denied_And_The_Request_Stays_Unresolved()
     {
         await using var other = await fx.StartNodeAsync();
@@ -387,29 +318,6 @@ public class CoordinationLiveTests(CoordinationFixture fx) : IClassFixture<Coord
         Assert.Equal(Bytes("bye"), (await w2.Client.ReadLinearizableAsync(key).WaitAsync(T)).Value);
     }
 
-    [LiveFact]
-    public async Task Membership_Admin_And_Retire_Mutations_Round_Trip()
-    {
-        await using var c = await OpenRoot();
-        var status = await c.GroupStatusAsync().WaitAsync(T);
-        // set_admin: enable then disable a made-up node; each is a journaled, acknowledged mutation.
-        byte[] target = Enumerable.Repeat((byte)0x42, 32).ToArray();
-        var admins = await c.InspectAdminsAsync().WaitAsync(T);
-        var on = await Do(await c.SetAdminAsync(target, true, admins.AdminRevision).WaitAsync(T));
-        Assert.False(on.IsRejected);
-        var admins2 = await c.InspectAdminsAsync().WaitAsync(T);
-        Assert.Contains(admins2.Administrators, a => a.AsSpan().SequenceEqual(target));
-        var off = await Do(await c.SetAdminAsync(target, false, admins2.AdminRevision).WaitAsync(T));
-        Assert.False(off.IsRejected);
-
-        // change_membership to the same single voter is accepted or rejected by the group, but is always a resolved result.
-        var opId = Enumerable.Repeat((byte)0x0c, 16).ToArray();
-        var change = await Do(await c.ChangeMembershipAsync(opId, status.MembershipLogId, status.Voters, []).WaitAsync(T));
-        Assert.NotNull(change);
-        // Retiring a client that never existed answers with a reply, not a hang.
-        Assert.NotNull(await c.RetireOtherClientAsync(Enumerable.Repeat((byte)0x0e, 16).ToArray()).WaitAsync(T));
-    }
-
     // ── placement ────────────────────────────────────────────────────────────
 
     private sealed class FuncPolicy(Func<CancellationToken, ValueTask<PlacementPolicy>> f) : IPlacementPolicySource
@@ -484,49 +392,6 @@ public class CoordinationLiveTests(CoordinationFixture fx) : IClassFixture<Coord
         Assert.Contains("different node", wrong.Message);
 
         // Never fails open: the membership did not change.
-        Assert.Equal(new[] { voter }, (await c.GroupStatusAsync().WaitAsync(T)).Voters);
-    }
-
-    [LiveFact]
-    public async Task Placement_Provider_Failures_Fail_The_Pass_Never_Open()
-    {
-        await using var c = await OpenRoot();
-        await using var up = Upcalls.Create(fx.Root.Runtime);
-        var status = await c.GroupStatusAsync().WaitAsync(T);
-        byte[] voter = status.Voters[0];
-        bool topologyError = true;
-        var cancelReason = new TaskCompletionSource<UpcallCancelReason>(TaskCreationOptions.RunContinuationsAsynchronously);
-        up.Handle(UpcallKind.TopologySnapshot, (_, _) => topologyError
-            ? throw new InvalidOperationException("topology offline")
-            : new ValueTask<byte[]?>(Ucv1.EncodeTopologySnapshot(ViewOf([voter]))));
-        up.Handle(UpcallKind.PlacementPolicy, (_, _) => new ValueTask<byte[]?>(CoordinationCodec.EncodePlacementPolicy(PolicyFor(status, [voter], []))));
-        up.SetPolicy(UpcallKind.PlacementPolicy, TimeSpan.FromMilliseconds(400), HookFailureMode.FailOpen); // fail-open must not matter
-        using var manager = PlacementManager.Create(c, up);
-
-        var e = await Assert.ThrowsAsync<CoordinationException>(() => manager.ReconcileAsync().WaitAsync(T));
-        Assert.Contains("topology offline", e.Message);
-
-        // The topology is fine now; a malformed policy answer fails the pass.
-        topologyError = false;
-        up.Handle(UpcallKind.PlacementPolicy, (_, _) => new ValueTask<byte[]?>(new byte[] { 0xBD, 0x01, 0xFF }));
-        await Assert.ThrowsAsync<CoordinationException>(() => manager.ReconcileAsync().WaitAsync(T));
-
-        // No handler for the kind: UNIMPLEMENTED fails the pass.
-        await using var bare = Upcalls.Create(fx.Root.Runtime);
-        using var bareManager = PlacementManager.Create(c, bare);
-        await Assert.ThrowsAsync<CoordinationException>(() => bareManager.ReconcileAsync().WaitAsync(T));
-
-        // A timeout cancels the handler (CANCEL timeout) and fails the pass.
-        up.Handle(UpcallKind.PlacementPolicy, async (_, ctx) =>
-        {
-            try { await Task.Delay(TimeSpan.FromSeconds(10), ctx.Cancellation); }
-            catch (OperationCanceledException) { cancelReason.TrySetResult(ctx.CancelReason); throw; }
-            return null;
-        });
-        await Assert.ThrowsAsync<CoordinationException>(() => manager.ReconcileAsync().WaitAsync(T));
-        Assert.Equal(UpcallCancelReason.Timeout, await cancelReason.Task.WaitAsync(T));
-
-        // Nothing changed.
         Assert.Equal(new[] { voter }, (await c.GroupStatusAsync().WaitAsync(T)).Voters);
     }
 

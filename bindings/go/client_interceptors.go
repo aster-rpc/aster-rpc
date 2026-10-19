@@ -193,17 +193,23 @@ func (ch *callChain) runErrorChain(cc *CallContext, err error) (out error, rpcEr
 	return res, res, false
 }
 
-// retryDelay decides whether a failed attempt is retried, and after how long.
-func (ch *callChain) retryDelay(cc *CallContext, err *RpcError, attempt int) (time.Duration, bool) {
+// retryDelay decides whether a failed attempt is retried, and after how long,
+// and returns the wait to use for it (the retrying interceptor's own, else
+// sleepCtx).
+func (ch *callChain) retryDelay(cc *CallContext, err *RpcError, attempt int) (time.Duration, func(context.Context, time.Duration) error, bool) {
 	var delay float64
+	sleep := sleepCtx
 	retry := false
 	for _, r := range ch.retries {
 		if r.ShouldRetry(cc, err) && attempt < r.Policy.MaxAttempts {
 			retry = true
 			delay = max(delay, r.BackoffSeconds(attempt))
+			if r.sleep != nil {
+				sleep = r.sleep
+			}
 		}
 	}
-	return time.Duration(delay * float64(time.Second)), retry
+	return time.Duration(delay * float64(time.Second)), sleep, retry
 }
 
 // sleepCtx waits d, or fails with the context's failure once it ends.
@@ -248,11 +254,11 @@ func retryLoop[T any](ctx context.Context, ch *callChain, cc *CallContext, o *ca
 		if swallowed {
 			return new(T), nil
 		}
-		delay, retry := ch.retryDelay(cc, re, n)
+		delay, sleep, retry := ch.retryDelay(cc, re, n)
 		if !retry || ctx.Err() != nil {
 			return nil, out
 		}
-		if err := sleepCtx(ctx, delay); err != nil {
+		if err := sleep(ctx, delay); err != nil {
 			return nil, err
 		}
 	}

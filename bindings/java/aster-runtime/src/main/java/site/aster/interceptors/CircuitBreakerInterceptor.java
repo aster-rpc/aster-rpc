@@ -30,6 +30,7 @@ public final class CircuitBreakerInterceptor implements Interceptor {
   private final int failureThreshold;
   private final double recoveryTimeoutSecs;
   private final int halfOpenMaxCalls;
+  private final InterceptorClock clock;
 
   private volatile State state = State.CLOSED;
   private int failureCount;
@@ -45,9 +46,23 @@ public final class CircuitBreakerInterceptor implements Interceptor {
    */
   public CircuitBreakerInterceptor(
       int failureThreshold, double recoveryTimeoutSecs, int halfOpenMaxCalls) {
+    this(failureThreshold, recoveryTimeoutSecs, halfOpenMaxCalls, InterceptorClock.SYSTEM);
+  }
+
+  /**
+   * Creates a circuit breaker interceptor whose recovery timeout runs on {@code clock}.
+   *
+   * @param clock the time source for the recovery timeout
+   */
+  public CircuitBreakerInterceptor(
+      int failureThreshold,
+      double recoveryTimeoutSecs,
+      int halfOpenMaxCalls,
+      InterceptorClock clock) {
     this.failureThreshold = failureThreshold;
     this.recoveryTimeoutSecs = recoveryTimeoutSecs;
     this.halfOpenMaxCalls = halfOpenMaxCalls;
+    this.clock = clock;
   }
 
   /** Creates a circuit breaker with default settings (threshold=3, recovery=5s, halfOpen=1). */
@@ -66,7 +81,7 @@ public final class CircuitBreakerInterceptor implements Interceptor {
    * elapsed.
    */
   public synchronized void beforeCall() {
-    long now = System.nanoTime();
+    long now = clock.nanoTime();
 
     if (state == State.OPEN) {
       double elapsedSecs = (now - openedAtNanos) / 1_000_000_000.0;
@@ -116,7 +131,7 @@ public final class CircuitBreakerInterceptor implements Interceptor {
 
     if (state == State.HALF_OPEN) {
       state = State.OPEN;
-      openedAtNanos = System.nanoTime();
+      openedAtNanos = clock.nanoTime();
       halfOpenCalls = 0;
       return;
     }
@@ -124,7 +139,7 @@ public final class CircuitBreakerInterceptor implements Interceptor {
     failureCount++;
     if (failureCount >= failureThreshold) {
       state = State.OPEN;
-      openedAtNanos = System.nanoTime();
+      openedAtNanos = clock.nanoTime();
     }
   }
 }

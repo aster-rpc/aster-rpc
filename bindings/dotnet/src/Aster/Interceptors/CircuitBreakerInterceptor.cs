@@ -23,9 +23,10 @@ public class CircuitBreakerInterceptor : IInterceptor
     };
 
     private readonly object _gate = new();
+    private readonly TimeProvider _clock;
     private string _state = StateClosed;
     private int _failureCount;
-    private long _openedAtTicks;
+    private long _openedAt;
     private int _halfOpenCalls;
 
     /// <summary>Number of consecutive failures before opening.</summary>
@@ -43,14 +44,20 @@ public class CircuitBreakerInterceptor : IInterceptor
     /// <summary>Consecutive failure count.</summary>
     public int FailureCount { get { lock (_gate) return _failureCount; } }
 
+    /// <param name="failureThreshold">Consecutive failures before opening.</param>
+    /// <param name="recoveryTimeout">Seconds to wait before transitioning from Open to HalfOpen.</param>
+    /// <param name="halfOpenMaxCalls">Max calls allowed in HalfOpen state.</param>
+    /// <param name="timeProvider">The clock the recovery timeout is measured on; <see cref="TimeProvider.System"/> by default (tests pass a fake one).</param>
     public CircuitBreakerInterceptor(
         int failureThreshold = 3,
         double recoveryTimeout = 5.0,
-        int halfOpenMaxCalls = 1)
+        int halfOpenMaxCalls = 1,
+        TimeProvider? timeProvider = null)
     {
         FailureThreshold = failureThreshold;
         RecoveryTimeout = recoveryTimeout;
         HalfOpenMaxCalls = halfOpenMaxCalls;
+        _clock = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>
@@ -61,11 +68,9 @@ public class CircuitBreakerInterceptor : IInterceptor
     {
         lock (_gate)
         {
-            long now = Environment.TickCount64;
-
             if (_state == StateOpen)
             {
-                double elapsed = (now - _openedAtTicks) / 1000.0;
+                double elapsed = _clock.GetElapsedTime(_openedAt).TotalSeconds;
                 if (elapsed >= RecoveryTimeout)
                 {
                     _state = StateHalfOpen;
@@ -134,7 +139,7 @@ public class CircuitBreakerInterceptor : IInterceptor
             if (_state == StateHalfOpen)
             {
                 _state = StateOpen;
-                _openedAtTicks = Environment.TickCount64;
+                _openedAt = _clock.GetTimestamp();
                 _halfOpenCalls = 0;
                 return;
             }
@@ -143,7 +148,7 @@ public class CircuitBreakerInterceptor : IInterceptor
             if (_failureCount >= FailureThreshold)
             {
                 _state = StateOpen;
-                _openedAtTicks = Environment.TickCount64;
+                _openedAt = _clock.GetTimestamp();
             }
         }
     }

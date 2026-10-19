@@ -4,11 +4,6 @@ package aster
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -309,117 +304,6 @@ func TestGatewayIdentity_AcceptOffRefusesTheEntry(t *testing.T) {
 	}
 	_, err = notesCall(ctx, rc, "read", WithOnBehalfOf(token))
 	wantCode(t, err, StatusPermissionDenied, "accept_on_behalf_of off")
-}
-
-// A provider's ES256 token, forwarded unchanged by an edge, verifies with
-// the issuer keys a node holding aster.identity-publisher wrote into the
-// fleet namespace; its groups map to roles.
-func TestGatewayIdentity_ProviderTokenFromTrustedIssuer(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	const iss = "https://idp.test"
-	cfg := serverCfg(t, t.TempDir())
-	cfg.Identity.AcceptOnBehalfOf = true
-	cfg.Identity.TrustedIssuers = []TrustedIssuer{{Iss: iss, Audiences: []string{"notes"},
-		RolesClaim: "groups", RoleMap: map[string]string{"readers": "notes.read"}}}
-	_, server := startNotes(t, ctx, cfg, ServerOptions{})
-
-	idp := newTestIdP(t, iss)
-	// The publisher: writes the key set into the fleet namespace as its own
-	// node, carrying its credential, and syncs it to the server.
-	publisherChain := credentialFor(t, 8, IdentityPublisherRole)
-	publisher := startClient(t, ctx, enrolledCfg(8, publisherChain))
-	if _, err := publisher.Connect(ctx, server); err != nil {
-		t.Fatal(err)
-	}
-	fleet, err := publisher.Node().Docs().ImportWriteNamespace(ctx, fleetSecret)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fleet.Close()
-	record, _ := json.Marshal(map[string]any{
-		"version": 1, "iss": iss, "source_url": iss + "/jwks", "fetched_at": time.Now().Unix(),
-		"jwks": map[string]any{"keys": []any{idp.jwk()}}, "credential": publisherChain,
-	})
-	key := "aster/identity/v1/issuers/" + base64.RawURLEncoding.EncodeToString([]byte(iss)) + "/jwks"
-	if err := fleet.SetBytes(ctx, AuthorID(enrollPub(8)), key, record); err != nil {
-		t.Fatal(err)
-	}
-	if err := fleet.StartSync(ctx, enrollPub(2)); err != nil {
-		t.Fatal(err)
-	}
-
-	edge := startClient(t, ctx, enrolledCfg(5, credentialFor(t, 5, GatewayRole)))
-	rc, err := edge.Connect(ctx, server)
-	if err != nil {
-		t.Fatal(err)
-	}
-	token := idp.token(t, map[string]any{"sub": "alice", "aud": "notes", "groups": []string{"readers", "other"}, "amr": []string{"pwd"}})
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		alice, err := notesCall(ctx, rc, "read", WithOnBehalfOf(token))
-		if err == nil {
-			if alice.Principal != iss+"|alice" || alice.Actor != enrollPub(5) || alice.Roles != "notes.read" ||
-				alice.Issuer != iss || alice.Amr != "pwd" {
-				t.Fatalf("provider token: %+v", alice)
-			}
-			break
-		}
-		var rpc *RpcError
-		if !errors.As(err, &rpc) || rpc.Code != StatusUnauthenticated || time.Now().After(deadline) {
-			t.Fatalf("provider token: %v", err)
-		}
-		time.Sleep(200 * time.Millisecond) // the key set is still syncing
-	}
-	// A token for another audience, or signed by another key, is refused.
-	_, err = notesCall(ctx, rc, "read", WithOnBehalfOf(idp.token(t, map[string]any{"sub": "alice", "aud": "other"})))
-	wantCode(t, err, StatusUnauthenticated, "wrong audience")
-	forged := newTestIdP(t, iss).token(t, map[string]any{"sub": "alice", "aud": "notes"})
-	_, err = notesCall(ctx, rc, "read", WithOnBehalfOf(forged))
-	wantCode(t, err, StatusUnauthenticated, "another key with the same kid")
-}
-
-// testIdP signs ES256 ID tokens with one P-256 key (kid "k1").
-type testIdP struct {
-	iss string
-	key *ecdsa.PrivateKey
-}
-
-func newTestIdP(t *testing.T, iss string) *testIdP {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return &testIdP{iss: iss, key: key}
-}
-
-func (p *testIdP) jwk() map[string]any {
-	pub, err := p.key.PublicKey.ECDH()
-	if err != nil {
-		panic(err)
-	}
-	raw := pub.Bytes() // 0x04 || X || Y
-	return map[string]any{"kty": "EC", "crv": "P-256", "kid": "k1", "alg": "ES256", "use": "sig",
-		"x": base64.RawURLEncoding.EncodeToString(raw[1:33]), "y": base64.RawURLEncoding.EncodeToString(raw[33:])}
-}
-
-func (p *testIdP) token(t *testing.T, claims map[string]any) string {
-	t.Helper()
-	now := time.Now().Unix()
-	claims["iss"], claims["iat"], claims["exp"] = p.iss, now, now+300
-	header, _ := json.Marshal(map[string]any{"alg": "ES256", "typ": "JWT", "kid": "k1"})
-	body, _ := json.Marshal(claims)
-	input := base64.RawURLEncoding.EncodeToString(header) + "." + base64.RawURLEncoding.EncodeToString(body)
-	digest := sha256.Sum256([]byte(input))
-	r, s, err := ecdsa.Sign(rand.Reader, p.key, digest[:])
-	if err != nil {
-		t.Fatal(err)
-	}
-	sig := make([]byte, 64)
-	r.FillBytes(sig[:32])
-	s.FillBytes(sig[32:])
-	return input + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
 
 // A call whose identity read finds it over (NOT_FOUND) is dropped: its

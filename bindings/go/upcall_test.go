@@ -13,11 +13,12 @@ import (
 	"time"
 )
 
-// C ABI 4.1 end to end: Rust lease handles over a Go serializer (with
-// background renewals), a Go authorizer guarding Rust's memory serializer, a
-// Go fenced resource, the topology admission filter, failure modes, timeouts
-// and cancellation, UNIMPLEMENTED, and lifetime (close, goroutine leaks).
-// Ported from the Java UpcallsE2ETest.
+// C ABI 4.1 wiring: Rust lease handles over a Go serializer (with background
+// renewals), a Go fenced resource, the topology admission filter, handler
+// errors and UNIMPLEMENTED, context cancellation, and lifetime (close,
+// goroutine leaks). Upcall policy (authorizer failure modes and timeouts,
+// routing out of order, unknown ids, enable_shared) is ffi/tests/upcalls.rs
+// and aster/tests/it/upcalls.rs.
 
 const upcallWait = 15 * time.Second
 
@@ -308,98 +309,6 @@ func TestUpcalls_GoSerializerBacksRustLeaseHandles(t *testing.T) {
 	_ = b.Close() // idempotent
 }
 
-func TestUpcalls_GoAuthorizerGuardsTheMemorySerializer(t *testing.T) {
-	leakCheck(t)
-	ctx := upCtx(t)
-	rt := testRuntime(t)
-	up := testUpcalls(t, rt)
-	if err := up.ServeLeaseAuthorizer(LeaseAuthorizerFunc(func(_ context.Context, op LeaseOp) (bool, error) {
-		return op.Actor != "mallory", nil
-	})); err != nil {
-		t.Fatal(err)
-	}
-	ser, err := NewMemoryLeaseSerializer(rt, up)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ser.Close()
-	var denied *LeaseDeniedError
-	if _, err := ser.Acquire(ctx, "db", "mallory", LeaseOptions{}); !errors.As(err, &denied) || denied.Reason != DenyUnauthorized {
-		t.Fatalf("mallory: %v", err)
-	}
-	a, err := ser.Acquire(ctx, "db", "alice", LeaseOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = a.Close()
-
-	open, err := NewMemoryLeaseSerializer(rt, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer open.Close()
-	m, err := open.Acquire(ctx, "db2", "mallory", LeaseOptions{})
-	if err != nil {
-		t.Fatalf("open serializer: %v", err)
-	}
-	_ = m.Close()
-}
-
-func TestUpcalls_FailureModeAppliesWhenTheAuthorizerHangsOrFails(t *testing.T) {
-	leakCheck(t)
-	ctx := upCtx(t)
-	rt := testRuntime(t)
-	up := testUpcalls(t, rt)
-	cancelled := make(chan struct{}, 4)
-	if err := up.ServeLeaseAuthorizer(LeaseAuthorizerFunc(func(c context.Context, op LeaseOp) (bool, error) {
-		if op.Actor == "thrower" {
-			return false, errors.New("boom")
-		}
-		select {
-		case <-c.Done(): // Rust gave up on us
-			cancelled <- struct{}{}
-			return false, c.Err()
-		case <-time.After(10 * time.Second):
-			return true, nil
-		}
-	})); err != nil {
-		t.Fatal(err)
-	}
-	if err := up.SetPolicy(UpcallLeaseAuthorize, 150*time.Millisecond, FailureModeClosed); err != nil {
-		t.Fatal(err)
-	}
-	ser, err := NewMemoryLeaseSerializer(rt, up)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ser.Close()
-
-	var denied *LeaseDeniedError
-	if _, err := ser.Acquire(ctx, "r", "slow", LeaseOptions{}); !errors.As(err, &denied) || denied.Reason != DenyUnauthorized {
-		t.Fatalf("hung authorizer, fail-closed: %v", err)
-	}
-	select {
-	case <-cancelled:
-	case <-ctx.Done():
-		t.Fatal("the handler's context was never cancelled")
-	}
-	if up.CancelCount() < 1 {
-		t.Fatalf("CancelCount = %d", up.CancelCount())
-	}
-	if _, err := ser.Acquire(ctx, "r", "thrower", LeaseOptions{}); !errors.As(err, &denied) {
-		t.Fatalf("erroring authorizer, fail-closed: %v", err)
-	}
-
-	if err := up.SetPolicy(UpcallLeaseAuthorize, 150*time.Millisecond, FailureModeOpen); err != nil {
-		t.Fatal(err)
-	}
-	l, err := ser.Acquire(ctx, "r", "thrower", LeaseOptions{})
-	if err != nil {
-		t.Fatalf("erroring authorizer, fail-open: %v", err)
-	}
-	_ = l.Close()
-}
-
 func TestUpcalls_MissingHandlerAndHandlerErrorsFailTheRustCall(t *testing.T) {
 	leakCheck(t)
 	ctx := upCtx(t)
@@ -502,33 +411,9 @@ func TestUpcalls_AcquireGivenUpByContextNeverLeaksALease(t *testing.T) {
 	if s, err := ser2.Snapshot(ctx, "late"); err != nil || s.Held {
 		t.Fatalf("late lease left held: %+v, %v", s, err)
 	}
+	// Racing deadlines around the grant are ffi/tests/upcalls.rs
+	// a_cancelled_acquire_does_not_leave_a_renewing_lease.
 
-	// 3. Racing deadlines around the grant: whatever the outcome, no lease
-	// stays held.
-	gs3 := newGoSerializer()
-	gs3.delay = 100 * time.Millisecond
-	up3 := testUpcalls(t, rt)
-	if err := up3.ServeLeaseSerializer(gs3); err != nil {
-		t.Fatal(err)
-	}
-	ser3, err := NewForeignLeaseSerializer(up3)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ser3.Close()
-	for i := 0; i < 8; i++ {
-		c, cancel := context.WithTimeout(ctx, 90*time.Millisecond+time.Duration(i)*4*time.Millisecond)
-		l, err := ser3.Acquire(c, "race", "a", LeaseOptions{TTL: time.Minute})
-		cancel()
-		if err == nil {
-			_ = l.Release(ctx)
-		}
-	}
-	eventually(t, "every raced acquire to reach the serializer", func() bool { return gs3.count(LeaseAcquire) == 8 })
-	eventually(t, "the race lease to be free", func() bool {
-		s, err := ser3.Snapshot(ctx, "race")
-		return err == nil && !s.Held
-	})
 }
 
 func TestUpcalls_GoFencedResource(t *testing.T) {
@@ -664,42 +549,6 @@ func TestUpcalls_AdmittedFilterIsBatchedAndCached(t *testing.T) {
 	}
 }
 
-func TestUpcalls_EnableSharedInstallsTheGoFilter(t *testing.T) {
-	leakCheck(t)
-	ctx := upCtx(t)
-	cfg := DefaultConfig()
-	cfg.RelayMode = "disabled"
-	cfg.BindAddr = "127.0.0.1:0"
-	cfg.EnableMonitoring = true
-	node, err := StartNode(ctx, cfg, NodeOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// Close order matters: the filter and table before the node (and so its runtime).
-	defer node.Close()
-	up := testUpcalls(t, node.Runtime())
-	if err := up.ServeAdmittedFilter(AdmittedFilterFunc(func(_ context.Context, ids []string) ([]bool, error) {
-		return make([]bool, len(ids)), nil
-	})); err != nil {
-		t.Fatal(err)
-	}
-	f, err := NewAdmittedFilter(up, AdmittedFilterOptions{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-	if err := node.EnableShared(ctx, make([]byte, 31), f, nil, 0); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("short secret: %v", err)
-	}
-	secret := []byte(strings.Repeat("\x42", 32))
-	if err := node.EnableShared(ctx, secret, f, nil, time.Second); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.Stats(); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestUpcalls_CloseFailsPendingUpcallsAndStopsGoroutines(t *testing.T) {
 	leakCheck(t)
 	ctx := upCtx(t)
@@ -770,62 +619,5 @@ func TestUpcalls_PolicyValidation(t *testing.T) {
 	}
 	if err := up.SetDefaultPolicy(2*time.Second, FailureModeClosed); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// A raw consumer: answering an unknown or already answered id is a no-op.
-func TestUpcalls_RespondToUnknownInvocationIsIgnored(t *testing.T) {
-	leakCheck(t)
-	rt := testRuntime(t)
-	up := testUpcalls(t, rt)
-	if up.Respond(999, UpcallStatusOK, []byte{1}) {
-		t.Fatal("respond to a never-issued id was accepted")
-	}
-}
-
-// Stress: many concurrent upcalls answered out of order; every one is
-// answered exactly once (run with -race, -count=20).
-func TestUpcalls_ConcurrentUpcallsAnswerOutOfOrder(t *testing.T) {
-	leakCheck(t)
-	ctx := upCtx(t)
-	rt := testRuntime(t)
-	up := testUpcalls(t, rt)
-	var calls atomic.Int64
-	if err := up.ServeLeaseAuthorizer(LeaseAuthorizerFunc(func(_ context.Context, op LeaseOp) (bool, error) {
-		calls.Add(1)
-		// Later ops answer sooner, so answers come back reversed.
-		time.Sleep(time.Duration(50-op.TTLMs%50) * time.Millisecond / 5)
-		return op.TTLMs%2 == 0, nil
-	})); err != nil {
-		t.Fatal(err)
-	}
-	ser, err := NewMemoryLeaseSerializer(rt, up)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ser.Close()
-	const n = 40
-	var wg sync.WaitGroup
-	for i := 0; i < n; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			res := "res/" + string(rune('a'+i%26)) + string(rune('A'+i/26))
-			l, err := ser.Acquire(ctx, res, "actor", LeaseOptions{TTL: time.Duration(1000+i) * time.Millisecond})
-			even := (1000+i)%2 == 0
-			switch {
-			case even && err != nil:
-				t.Errorf("acquire %d (allowed): %v", i, err)
-			case !even && !errors.Is(err, ErrLeaseDenied):
-				t.Errorf("acquire %d (denied): %v", i, err)
-			}
-			if l != nil {
-				_ = l.Release(ctx)
-			}
-		}(i)
-	}
-	wg.Wait()
-	if calls.Load() < n {
-		t.Fatalf("handler ran %d times, want at least %d", calls.Load(), n)
 	}
 }

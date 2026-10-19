@@ -9,6 +9,7 @@ import site.aster.interceptors.CallContext;
 import site.aster.interceptors.CircuitBreakerInterceptor;
 import site.aster.interceptors.Interceptor;
 import site.aster.interceptors.InterceptorChain;
+import site.aster.interceptors.InterceptorClock;
 import site.aster.interceptors.RetryInterceptor;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
@@ -81,7 +82,11 @@ final class Interception {
       }
       remaining = options.timeout().toNanos() / 1e9;
     }
-    return (int) Math.min(Integer.MAX_VALUE, Math.max(1.0, Math.ceil(remaining * 1000.0)));
+    return wireMs(remaining);
+  }
+
+  private static int wireMs(double remainingSeconds) {
+    return (int) Math.min(Integer.MAX_VALUE, Math.max(1.0, Math.ceil(remainingSeconds * 1000.0)));
   }
 
   static Map<String, String> metadata(CallContext ctx, CallOptions options) {
@@ -117,6 +122,12 @@ final class Interception {
       }
     }
 
+    // The deadline budget runs on the retry clock (the system clock unless a test injects one), so
+    // the backoff and the deadline it is bounded by share one time source.
+    InterceptorClock clock = retries.isEmpty() ? InterceptorClock.SYSTEM : retries.get(0).clock();
+    Double budget = ctx.remainingSeconds();
+    long deadlineAt = budget == null ? 0L : clock.nanoTime() + (long) (budget * 1e9);
+
     RpcError last = null;
     for (int n = 1; n <= maxAttempts; n++) {
       if (cancelled.getAsBoolean()) {
@@ -129,7 +140,8 @@ final class Interception {
             perItem
                 ? requestEach(chain, ctx, (List<Object>) request)
                 : request(chain, ctx, request);
-        T response = attempt.run(current, deadlineMs(ctx, options), ctx.metadata());
+        int wire = budget == null ? 0 : wireMs((deadlineAt - clock.nanoTime()) / 1e9);
+        T response = attempt.run(current, wire, ctx.metadata());
         response = (T) response(chain, ctx, response);
         for (CircuitBreakerInterceptor b : breakers) {
           b.recordSuccess();
@@ -163,7 +175,7 @@ final class Interception {
         if (!retry) {
           throw maybe;
         }
-        sleep(delay, ctx, cancelled);
+        sleep(delay, clock, budget == null ? null : deadlineAt, cancelled);
       }
     }
     throw last != null ? last : new RpcError(StatusCode.INTERNAL, "call failed");
@@ -231,15 +243,20 @@ final class Interception {
     return new RpcError(StatusCode.UNKNOWN, msg == null ? cause.toString() : msg);
   }
 
-  /** Back off for {@code seconds}, never past the deadline, waking early if cancelled. */
-  private static void sleep(double seconds, CallContext ctx, BooleanSupplier cancelled) {
-    long end = System.nanoTime() + (long) (seconds * 1e9);
+  /**
+   * Back off for {@code seconds} of {@code clock}, never past {@code deadlineAt} (a {@code clock}
+   * time; {@code null} = no deadline), waking early if cancelled.
+   */
+  private static void sleep(
+      double seconds, InterceptorClock clock, Long deadlineAt, BooleanSupplier cancelled) {
+    long end = clock.nanoTime() + (long) (seconds * 1e9);
     while (true) {
-      Double remaining = ctx.remainingSeconds();
-      if (remaining != null && remaining <= 0.0) {
+      long now = clock.nanoTime();
+      Long remaining = deadlineAt == null ? null : deadlineAt - now;
+      if (remaining != null && remaining <= 0) {
         throw new RpcError(StatusCode.DEADLINE_EXCEEDED, "deadline exceeded");
       }
-      long left = end - System.nanoTime();
+      long left = end - now;
       if (left <= 0) {
         return;
       }
@@ -248,10 +265,10 @@ final class Interception {
       }
       long slice = Math.min(left, 20_000_000L);
       if (remaining != null) {
-        slice = Math.min(slice, (long) (remaining * 1e9) + 1_000_000L);
+        slice = Math.min(slice, remaining + 1_000_000L);
       }
       try {
-        Thread.sleep(slice / 1_000_000L, (int) (slice % 1_000_000L));
+        clock.sleep(slice);
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
         throw new RpcError(StatusCode.CANCELLED, "interrupted while backing off");

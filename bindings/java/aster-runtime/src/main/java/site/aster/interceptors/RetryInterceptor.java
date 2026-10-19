@@ -20,6 +20,7 @@ public final class RetryInterceptor implements Interceptor {
   private final long maxMs;
   private final double multiplier;
   private final double jitter;
+  private final InterceptorClock clock;
 
   /**
    * Creates a retry interceptor with the given backoff parameters.
@@ -38,6 +39,25 @@ public final class RetryInterceptor implements Interceptor {
       long maxMs,
       double multiplier,
       double jitter) {
+    this(
+        maxAttempts, retryableCodes, initialMs, maxMs, multiplier, jitter, InterceptorClock.SYSTEM);
+  }
+
+  /**
+   * Creates a retry interceptor whose backoff, and the deadline budget it is bounded by, run on
+   * {@code clock}.
+   *
+   * @param clock the time source for the backoff
+   */
+  public RetryInterceptor(
+      int maxAttempts,
+      Set<StatusCode> retryableCodes,
+      long initialMs,
+      long maxMs,
+      double multiplier,
+      double jitter,
+      InterceptorClock clock) {
+    this.clock = clock;
     this.maxAttempts = Math.max(1, maxAttempts);
     this.retryableCodes = retryableCodes != null ? retryableCodes : Set.of(StatusCode.UNAVAILABLE);
     this.initialMs = initialMs;
@@ -49,6 +69,11 @@ public final class RetryInterceptor implements Interceptor {
   /** Creates a retry interceptor with default settings. */
   public RetryInterceptor() {
     this(3, Set.of(StatusCode.UNAVAILABLE), 100, 5000, 2.0, 0.2);
+  }
+
+  /** The time source for the backoff and its deadline budget. */
+  public InterceptorClock clock() {
+    return clock;
   }
 
   /** Maximum attempts including the first. */

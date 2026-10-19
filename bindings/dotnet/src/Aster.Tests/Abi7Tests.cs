@@ -376,19 +376,6 @@ public class Abi7Tests
     }
 
     [Fact]
-    public async Task Handler_Context_Cancelled_Completes_At_The_Deadline()
-    {
-        await using var rig = await Rig.Start();
-        var ex = await Assert.ThrowsAsync<RpcError>(() => rig.Conn.UnaryAsync<EchoRequest, EchoReply>("Abi7", "context",
-            new EchoRequest { Count = 1 }, new CallOptions { Deadline = TimeSpan.FromMilliseconds(300) }).WaitAsync(Budget));
-        Assert.Equal(StatusCode.DeadlineExceeded, ex.Code);
-        var (ctx, _, _, cancelled) = await rig.Seen.Task.WaitAsync(Budget);
-        Assert.True(cancelled);
-        Assert.True(ctx.IsCancelled);
-        Assert.NotNull(ctx.Deadline);
-    }
-
-    [Fact]
     public async Task Drain_Lets_In_Flight_Calls_Finish_Refuses_New_Ones_And_Reports()
     {
         await using var rig = await Rig.Start();

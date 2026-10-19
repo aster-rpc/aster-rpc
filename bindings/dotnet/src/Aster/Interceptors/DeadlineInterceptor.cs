@@ -10,14 +10,19 @@ public class DeadlineInterceptor : IInterceptor
 {
     private readonly int _skewToleranceMs;
 
+    /// <summary>The clock deadlines are read against.</summary>
+    internal TimeProvider Clock { get; }
+
     /// <param name="skewToleranceMs">
     /// Milliseconds of clock-skew tolerance. A request whose deadline has
     /// already passed by more than this tolerance is rejected immediately.
     /// Defaults to 5000 ms (5 seconds).
     /// </param>
-    public DeadlineInterceptor(int skewToleranceMs = 5000)
+    /// <param name="timeProvider">The clock deadlines are read against; <see cref="TimeProvider.System"/> by default (tests pass a fake one).</param>
+    public DeadlineInterceptor(int skewToleranceMs = 5000, TimeProvider? timeProvider = null)
     {
         _skewToleranceMs = skewToleranceMs;
+        Clock = timeProvider ?? TimeProvider.System;
     }
 
     public object OnRequest(CallContext ctx, object request)
@@ -34,7 +39,7 @@ public class DeadlineInterceptor : IInterceptor
     public void CheckDeadline(CallContext ctx)
     {
         if (ctx.Deadline is null) return;
-        long nowEpochMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        long nowEpochMs = Clock.GetUtcNow().ToUnixTimeMilliseconds();
         long deadlineEpochMs = (long)(ctx.Deadline.Value * 1000);
 
         // Reject on receipt if expired beyond skew tolerance (S6.8.1)
@@ -46,7 +51,7 @@ public class DeadlineInterceptor : IInterceptor
         }
 
         // Standard expiry check (no tolerance)
-        if (ctx.IsExpired)
+        if (nowEpochMs >= deadlineEpochMs)
         {
             throw new RpcError(StatusCode.DeadlineExceeded, "deadline exceeded");
         }

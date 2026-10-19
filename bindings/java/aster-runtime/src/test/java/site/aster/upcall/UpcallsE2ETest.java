@@ -1,14 +1,11 @@
 package site.aster.upcall;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -18,29 +15,28 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
-import site.aster.config.AsterConfig;
 import site.aster.handle.IrohRuntime;
 import site.aster.lease.AcquireResult;
 import site.aster.lease.DenyReason;
 import site.aster.lease.Fence;
-import site.aster.lease.FenceRejection;
 import site.aster.lease.Lease;
 import site.aster.lease.LeaseOp;
 import site.aster.lease.LeaseSerializer;
 import site.aster.lease.LeaseSnapshot;
 import site.aster.lease.LeaseStatus;
-import site.aster.lease.MutateResult;
-import site.aster.lease.NativeFencedResource;
 import site.aster.lease.NativeLeaseSerializer;
 import site.aster.lease.TransitionOutcome;
-import site.aster.node.IrohNode;
 
 /**
  * C ABI 4.1 upcalls end to end: Rust lease handles over a Java serializer (with background
- * renewals), a Java authorizer guarding Rust's memory serializer, a Java fenced resource, the
- * topology admission filter, failure modes, timeouts / cancellation and {@code UNIMPLEMENTED}.
+ * renewals), the topology admission filter, failure modes, timeouts / cancellation reaching the
+ * Java handler, and {@code UNIMPLEMENTED}.
+ *
+ * <p>These are wiring tests. The rest is behaviour, tested once in Rust in {@code
+ * ffi/tests/upcalls.rs}: {@code memory_serializer_with_foreign_authorizer}, {@code
+ * fenced_mutate_round_trip}, {@code topology_enable_shared_installs_the_foreign_filter} and {@code
+ * close_fails_pending_upcalls_with_shutdown_cancel}.
  */
 final class UpcallsE2ETest {
 
@@ -188,26 +184,6 @@ final class UpcallsE2ETest {
   }
 
   @Test
-  void javaAuthorizerGuardsTheMemorySerializer() throws Exception {
-    try (IrohRuntime rt = IrohRuntime.create();
-        Upcalls up = Upcalls.create(rt)) {
-      up.serveLeaseAuthorizer(op -> !op.actor().equals("mallory"));
-      try (NativeLeaseSerializer ser = NativeLeaseSerializer.memory(rt, up)) {
-        var m = assertInstanceOf(AcquireResult.Denied.class, get(ser.acquire("db", "mallory")));
-        assertEquals(DenyReason.UNAUTHORIZED, m.reason());
-        Lease a =
-            assertInstanceOf(AcquireResult.Granted.class, get(ser.acquire("db", "alice"))).lease();
-        a.close();
-      }
-      try (NativeLeaseSerializer open = NativeLeaseSerializer.memory(rt, null)) {
-        assertInstanceOf(AcquireResult.Granted.class, get(open.acquire("db", "mallory")))
-            .lease()
-            .close();
-      }
-    }
-  }
-
-  @Test
   void failureModeAppliesWhenTheAuthorizerHangsOrThrows() throws Exception {
     try (IrohRuntime rt = IrohRuntime.create();
         Upcalls up = Upcalls.create(rt)) {
@@ -267,37 +243,6 @@ final class UpcallsE2ETest {
   }
 
   @Test
-  void javaFencedResource() throws Exception {
-    try (IrohRuntime rt = IrohRuntime.create();
-        Upcalls up = Upcalls.create(rt)) {
-      // The resource's own row: epoch 7 held by alice.
-      up.serveFencedResource(
-          (fence, writer, op) -> {
-            FenceRejection rej = FenceRejection.check(7, true, "alice", fence, writer);
-            if (rej != null) {
-              return new MutateResult.Rejected(rej);
-            }
-            return new MutateResult.Applied(
-                new StringBuilder(new String(op, StandardCharsets.UTF_8))
-                    .reverse()
-                    .toString()
-                    .getBytes(StandardCharsets.UTF_8));
-          });
-      try (NativeFencedResource res = NativeFencedResource.foreign(up)) {
-        byte[] abc = "abc".getBytes(StandardCharsets.UTF_8);
-        var ok = get(res.mutate(new Fence("tree/42", 7, "alice"), "alice", abc));
-        assertArrayEquals(
-            "cba".getBytes(StandardCharsets.UTF_8),
-            assertInstanceOf(MutateResult.Applied.class, ok).output());
-        var stale = get(res.mutate(new Fence("tree/42", 6, "alice"), "alice", abc));
-        assertEquals(new MutateResult.Rejected(FenceRejection.staleEpoch(6, 7)), stale);
-        var imp = get(res.mutate(new Fence("tree/42", 7, "alice"), "mallory", abc));
-        assertEquals(new MutateResult.Rejected(FenceRejection.notHolder()), imp);
-      }
-    }
-  }
-
-  @Test
   void admittedFilterIsBatchedAndCached() throws Exception {
     try (IrohRuntime rt = IrohRuntime.create();
         Upcalls up = Upcalls.create(rt)) {
@@ -334,61 +279,6 @@ final class UpcallsE2ETest {
         assertTrue(s.upcalls() >= 2);
         assertThrows(RuntimeException.class, () -> f.isAdmitted("zz"));
       }
-    }
-  }
-
-  @Test
-  void enableSharedInstallsTheJavaFilter() throws Exception {
-    AsterConfig cfg =
-        AsterConfig.builder()
-            .relayMode("disabled")
-            .bindAddr("127.0.0.1:0")
-            .enableMonitoring(true)
-            .build();
-    IrohNode node = IrohNode.start(cfg).get(30, TimeUnit.SECONDS);
-    try (Upcalls up = Upcalls.create(node.runtime())) {
-      AtomicInteger calls = new AtomicInteger();
-      up.serveAdmittedFilter(
-          ids -> {
-            calls.incrementAndGet();
-            return ids.stream().map(id -> true).toList();
-          });
-      try (AdmittedFilterHandle f = AdmittedFilterHandle.create(up)) {
-        byte[] secret = new byte[32];
-        java.util.Arrays.fill(secret, (byte) 0x42);
-        assertNull(get(Topology.enableShared(node, secret, f, List.of(), Duration.ofSeconds(1))));
-        assertNotNull(f.stats());
-      }
-    } finally {
-      node.close();
-    }
-  }
-
-  private static void assertNull(Object o) {
-    org.junit.jupiter.api.Assertions.assertNull(o);
-  }
-
-  @Test
-  void closeFailsPendingUpcalls() throws Exception {
-    IrohRuntime rt = IrohRuntime.create();
-    try {
-      Upcalls up = Upcalls.create(rt);
-      CountDownLatch entered = new CountDownLatch(1);
-      up.handle(
-          UpcallKind.LEASE_TRANSITION,
-          (req, dl) -> {
-            entered.countDown();
-            Thread.sleep(10_000);
-            return new byte[0];
-          });
-      NativeLeaseSerializer ser = NativeLeaseSerializer.foreign(up);
-      var pending = ser.acquire("r", "a");
-      assertTrue(entered.await(T, TimeUnit.SECONDS));
-      up.close();
-      assertThrows(ExecutionException.class, () -> get(pending));
-      ser.close();
-    } finally {
-      rt.close();
     }
   }
 }

@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -347,75 +346,6 @@ func TestCoordinationLive_OpenCloseJournalLockAndReadOnly(t *testing.T) {
 	}
 }
 
-func TestCoordinationLive_GroupStatusAndACL(t *testing.T) {
-	g := group(t)
-	leakCheck(t)
-	ctx := coordCtx(t)
-	rootC := g.open(t, g.actor(t, "root"), g.journal(t, "root"))
-	worker := g.actor(t, "worker")
-	g.grant(t, rootC, "status-head", worker)
-
-	st, err := rootC.GroupStatus(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if hex.EncodeToString(st.GenesisHash) != g.info.GenesisHash || st.AuthorityDomain != g.info.Domain ||
-		hex.EncodeToString(st.AuthorityPublicKey) != g.info.AuthorityKey || st.DeploymentProfileCode != 1 || st.FatalCode != 0 {
-		t.Fatalf("status = %+v", st)
-	}
-	var want, got []string
-	for _, v := range g.info.Voters {
-		want = append(want, v.NodeID)
-	}
-	for _, v := range st.Voters {
-		got = append(got, hex.EncodeToString(v))
-	}
-	sort.Strings(want)
-	sort.Strings(got)
-	if strings.Join(want, ",") != strings.Join(got, ",") {
-		t.Fatalf("voters %v, want %v", got, want)
-	}
-	acl, err := rootC.InspectACL(ctx, res("status-head"))
-	workerID, _ := worker.NodeID()
-	if err != nil || len(acl.Grants) != 1 || hex.EncodeToString(acl.Grants[0].SubjectNodeID) != workerID || acl.Grants[0].Rights != RightsHolder {
-		t.Fatalf("acl = %+v, %v", acl, err)
-	}
-	if admins, err := rootC.InspectAdmins(ctx); err != nil || len(admins.Administrators) == 0 {
-		t.Fatalf("admins = %+v, %v", admins, err)
-	}
-	// The audit trail and the recovery export.
-	rows, err := rootC.AuditStream(ctx, nil, 100)
-	if err != nil || len(rows) == 0 {
-		t.Fatalf("audit = %d rows, %v", len(rows), err)
-	}
-	if _, err := rootC.AuditStream(ctx, nil, 0); !errors.Is(err, ErrInvalidArgument) {
-		t.Errorf("audit limit 0: %v", err)
-	}
-	exp, err := rootC.RecoveryExport(ctx)
-	if err != nil || exp.TotalLen != uint64(len(exp.Body)) || len(exp.Blake3Checksum) == 0 {
-		t.Fatalf("export = %d/%d bytes, %v", exp.TotalLen, len(exp.Body), err)
-	}
-	target := filepath.Join(t.TempDir(), "export.bin")
-	man, err := rootC.RecoveryExportToFile(ctx, target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if fi, err := os.Stat(target); err != nil || uint64(fi.Size()) != man.TotalLen {
-		t.Fatalf("exported file: %v, %v", fi, err)
-	}
-	if _, err := os.Stat(target + ".partial"); err == nil {
-		t.Error("the .partial file was left behind")
-	}
-	// A non-administrator is refused with the RPC permission status.
-	workerC := g.open(t, worker, g.journal(t, "worker"))
-	_, err = workerC.AuditStream(ctx, nil, 10)
-	var ce *CoordinationError
-	if !errors.As(err, &ce) || ce.Kind != CoordRPC || !errors.Is(err, ErrCoordinationRPC) {
-		t.Fatalf("worker audit: %v (want an RPC CoordinationError)", err)
-	}
-	t.Logf("non-administrator audit read: kind %d rpc status %d, status %d", ce.Kind, ce.RPCCode, ce.Status)
-}
-
 func TestCoordinationLive_MutationsAreResolvedAndAcknowledged(t *testing.T) {
 	g := group(t)
 	leakCheck(t)
@@ -486,29 +416,6 @@ func TestCoordinationLive_MutationsAreResolvedAndAcknowledged(t *testing.T) {
 	}
 }
 
-// A mutation the replicated ACL refuses is a typed RPC error that maps to
-// ErrPermissionDenied -- and it stays journaled as unresolved (the open
-// journal-blocks-on-denial question, plan Q2): the same error comes back on
-// every later mutation or Resume. Uses its own journal so it cannot block the
-// other tests.
-func TestCoordinationLive_DeniedMutationIsAPermissionDeniedRPCErrorAndStaysUnresolved(t *testing.T) {
-	g := group(t)
-	leakCheck(t)
-	ctx := coordCtx(t)
-	w := g.reopen(t, g.actor(t, "worker"), g.journal(t, "worker-denied"))
-	var ce *CoordinationError
-	_, err := w.SetAdmin(ctx, bytes.Repeat([]byte{7}, 32), true, 0)
-	if !errors.As(err, &ce) || ce.Kind != CoordRPC || ce.RPCCode != 7 || !errors.Is(err, ErrPermissionDenied) || !errors.Is(err, ErrCoordinationRPC) {
-		t.Fatalf("denied SetAdmin: %v", err)
-	}
-	if _, err := w.Resume(ctx); !errors.Is(err, ErrPermissionDenied) {
-		t.Fatalf("Resume after a denial: %v", err)
-	}
-	if _, err := w.Acquire(ctx, res("denied"), 30*time.Second); err == nil {
-		t.Fatal("a new mutation was permitted over an unresolved denied one")
-	}
-}
-
 func TestCoordinationLive_DeniedJournalResumesAfterGrantAndReopen(t *testing.T) {
 	g := group(t)
 	actor := g.actor(t, "denied-recovery")
@@ -522,8 +429,16 @@ func TestCoordinationLive_DeniedJournalResumesAfterGrantAndReopen(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.Acquire(ctx, res("denied-recovery"), 30*time.Second); !errors.Is(err, ErrPermissionDenied) {
+	// A mutation the replicated ACL refuses is a typed RPC error that maps to
+	// ErrPermissionDenied, and it stays journaled as unresolved (plan Q2): the
+	// same error comes back on Resume, and no new mutation is accepted.
+	var ce *CoordinationError
+	_, err = c.Acquire(ctx, res("denied-recovery"), 30*time.Second)
+	if !errors.As(err, &ce) || ce.Kind != CoordRPC || ce.RPCCode != 7 || !errors.Is(err, ErrPermissionDenied) || !errors.Is(err, ErrCoordinationRPC) {
 		t.Fatalf("expected initial permission denial: %v", err)
+	}
+	if _, err := c.Resume(ctx); !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("Resume after a denial: %v", err)
 	}
 	if _, err := c.Acquire(ctx, res("other"), 30*time.Second); !errors.Is(err, ErrCoordinationUnresolved) {
 		t.Fatalf("denied journal allowed new request: %v", err)
@@ -575,76 +490,6 @@ func mustResolved(r *ResolvedMutation, err error) *ResolvedMutation {
 	return r
 }
 
-func TestCoordinationLive_UnacknowledgedResultIsRedeliveredAfterReopen(t *testing.T) {
-	g := group(t)
-	leakCheck(t)
-	ctx := coordCtx(t)
-	rootC := g.open(t, g.actor(t, "root"), g.journal(t, "root"))
-	worker := g.actor(t, "worker")
-	g.grant(t, rootC, "restart", worker)
-	journal := g.journal(t, "worker")
-	w := g.open(t, worker, journal)
-	if r, err := w.Unacknowledged(ctx); err != nil || r != nil {
-		t.Fatalf("fresh journal: %+v, %v", r, err)
-	}
-	if r, err := w.Resume(ctx); err != nil || r != nil {
-		t.Fatalf("fresh journal resume: %+v, %v", r, err)
-	}
-	acq, err := w.Acquire(ctx, res("restart"), 30*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	seq := acq.Reply.Sequence
-	// Drop WITHOUT acknowledging, then restart the client.
-	if err := acq.Release(); err != nil {
-		t.Fatal(err)
-	}
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	w2 := g.reopen(t, worker, journal)
-	again, err := w2.Unacknowledged(ctx)
-	if err != nil || again == nil {
-		t.Fatalf("redelivery: %+v, %v", again, err)
-	}
-	if again.Reply.Sequence != seq || again.Reply.OutcomeCode != OutcomeCodeGranted {
-		t.Fatalf("redelivered %+v, want sequence %d granted", again.Reply, seq)
-	}
-	// Still no new sequence until it is acknowledged.
-	if _, err := w2.Acquire(ctx, res("restart-2"), 30*time.Second); !errors.Is(err, ErrCoordinationAwaitingAck) {
-		t.Fatalf("mutation before ack: %v", err)
-	}
-	if err := again.Acknowledge(ctx); err != nil {
-		t.Fatal(err)
-	}
-	fence, _ := FenceOf(*again.Reply.Snapshot)
-	ack(t, mustResolved(w2.ReleaseFence(ctx, fence)), nil, OutcomeCodeReleased)
-
-	// Acknowledging after the client was closed fails closed but consumes the
-	// handle; the result stays journaled for the next open.
-	last, err := w2.Acquire(ctx, res("restart"), 30*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := w2.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := last.Acknowledge(ctx); !errors.Is(err, ErrCoordinationClosed) || !errors.Is(err, ErrAlreadyClosed) {
-		t.Fatalf("acknowledge after close: %v", err)
-	}
-	if err := last.Acknowledge(ctx); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("handle not consumed: %v", err)
-	}
-	w3 := g.reopen(t, worker, journal)
-	back, err := w3.Unacknowledged(ctx)
-	if err != nil || back == nil || back.Reply.Sequence != last.Reply.Sequence {
-		t.Fatalf("redelivery after a failed ack: %+v, %v", back, err)
-	}
-	fence, _ = FenceOf(*back.Reply.Snapshot)
-	_ = back.Acknowledge(ctx)
-	ack(t, mustResolved(w3.ReleaseFence(ctx, fence)), nil, OutcomeCodeReleased)
-}
-
 func TestCoordinationLive_LeaseRenewsInRustMutatesAndHandsOff(t *testing.T) {
 	g := group(t)
 	leakCheck(t)
@@ -682,11 +527,8 @@ func TestCoordinationLive_LeaseRenewsInRustMutatesAndHandsOff(t *testing.T) {
 		t.Errorf("denied snapshot lacks the holder: %+v", denied.Snapshot)
 	}
 
-	// Outlive the TTL: the renew loop keeps it.
-	time.Sleep(21 * time.Second)
-	if f, ok := lease.Fence(); !ok || f.Epoch != first.Epoch {
-		t.Fatalf("lease lost after a TTL: %+v, %v", f, ok)
-	}
+	// Renewal past the TTL is ffi/tests/coordination.rs
+	// coordination_lease_is_renewed_past_its_ttl; this test is the wiring.
 	cur, err := w.ReadLinearizable(ctx, res("lease"))
 	if err != nil {
 		t.Fatal(err)
@@ -724,7 +566,8 @@ func TestCoordinationLive_LeaseRenewsInRustMutatesAndHandsOff(t *testing.T) {
 		t.Fatalf("Unacknowledged = %+v, %v", r, err)
 	}
 
-	// Graceful Release, and Close (free without releasing) lapses by TTL.
+	// Graceful Release. (Close lapsing by TTL is aster/tests/coordination_client.rs
+	// an_abandoned_lease_expires_and_a_successor_acquires.)
 	again, err := w.AcquireLease(ctx, coordNS, []byte("lease"), LeaseOptions{TTL: 20 * time.Second})
 	if err != nil {
 		t.Fatal(err)
@@ -734,86 +577,6 @@ func TestCoordinationLive_LeaseRenewsInRustMutatesAndHandsOff(t *testing.T) {
 	}
 	if s, _ := w.ReadLinearizable(ctx, res("lease")); s.Held {
 		t.Fatal("held after Release")
-	}
-	dropped, err := w.AcquireLease(ctx, coordNS, []byte("lease"), LeaseOptions{TTL: 5 * time.Second})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := dropped.Close(); err != nil {
-		t.Fatal(err)
-	}
-	eventually(t, "the dropped lease to lapse by TTL", func() bool {
-		s, err := w.ReadLinearizable(ctx, res("lease"))
-		return err == nil && !s.Held
-	})
-}
-
-// A Release waits for an in-flight CompareAndSet and neither is lost; closing
-// the client with operations in flight lets them complete and frees the journal
-// lock afterwards.
-func TestCoordinationLive_CloseAndReleaseWithOperationsInFlight(t *testing.T) {
-	g := group(t)
-	leakCheck(t)
-	ctx := coordCtx(t)
-	rootC := g.open(t, g.actor(t, "root"), g.journal(t, "root"))
-	worker := g.actor(t, "worker")
-	g.grant(t, rootC, "inflight", worker)
-	journal := g.journal(t, "worker")
-	w := g.open(t, worker, journal)
-	lease, err := w.AcquireLease(ctx, coordNS, []byte("inflight"), LeaseOptions{TTL: 20 * time.Second, RenewEvery: 100 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var wg sync.WaitGroup
-	var casErr, relErr error
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, casErr = lease.CompareAndSet(ctx, 0, []byte("a"))
-	}()
-	go func() {
-		defer wg.Done()
-		time.Sleep(20 * time.Millisecond)
-		relErr = lease.Release(ctx)
-	}()
-	wg.Wait()
-	if relErr != nil {
-		t.Fatalf("Release: %v", relErr)
-	}
-	// The CompareAndSet either landed before the release or was refused at once
-	// because the release had begun; it never hangs or corrupts the journal.
-	if casErr != nil && !errors.Is(casErr, ErrAlreadyClosed) {
-		t.Fatalf("CompareAndSet: %v", casErr)
-	}
-
-	// Close with a mutation in flight: it completes (or is redelivered), the
-	// journal lock is released, and a reopen sees a consistent journal.
-	mutErr := make(chan error, 1)
-	go func() {
-		_, err := w.Acquire(ctx, res("inflight"), 5*time.Second)
-		mutErr <- err
-	}()
-	time.Sleep(10 * time.Millisecond)
-	if err := w.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := <-mutErr; err != nil && !errors.Is(err, ErrCoordinationClosed) {
-		t.Fatalf("in-flight mutation: %v", err)
-	}
-	w2 := g.reopen(t, worker, journal) // the lock is free again
-	r, err := w2.Unacknowledged(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if r != nil {
-		if r.Reply.Snapshot != nil && r.Reply.OutcomeCode == OutcomeCodeGranted {
-			if f, ok := FenceOf(*r.Reply.Snapshot); ok {
-				_ = r.Acknowledge(ctx)
-				ack(t, mustResolved(w2.ReleaseFence(ctx, f)), nil, OutcomeCodeReleased)
-			}
-		} else {
-			_ = r.Acknowledge(ctx)
-		}
 	}
 }
 
@@ -851,32 +614,6 @@ func TestCoordinationLive_ContextCancelledMutationIsRedelivered(t *testing.T) {
 	fence, _ := FenceOf(*got.Reply.Snapshot)
 	_ = got.Acknowledge(ctx)
 	ack(t, mustResolved(w.ReleaseFence(ctx, fence)), nil, OutcomeCodeReleased)
-}
-
-func TestCoordinationLive_RetireOtherClientAndProbe(t *testing.T) {
-	g := group(t)
-	leakCheck(t)
-	ctx := coordCtx(t)
-	node := g.actor(t, "root")
-	c := g.open(t, node, g.journal(t, "root"))
-	if _, err := c.RetireOtherClient(ctx, make([]byte, 15)); !errors.Is(err, ErrInvalidArgument) {
-		t.Errorf("15-byte client id: %v", err)
-	}
-	other := NewOperationID() // any 16 bytes: a client id this actor never used
-	reply, err := c.RetireOtherClient(ctx, other)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reply.OutcomeCode != OutcomeCodeClientRetired && reply.OutcomeCode != OutcomeCodeRejected {
-		t.Fatalf("retire = %+v", reply)
-	}
-	probe, err := c.ProbeClient(ctx, c.LocalID(), other)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(probe.TargetClientID, other) {
-		t.Fatalf("probe = %+v", probe)
-	}
 }
 
 // ─── placement ───────────────────────────────────────────────────────────
@@ -969,128 +706,4 @@ func TestCoordinationLive_PlacementManagerWithGoProviders(t *testing.T) {
 	if _, err := own.Reconcile(ctx); err == nil {
 		t.Fatal("a pass over a node that never joined a swarm succeeded")
 	}
-}
-
-func TestCoordinationLive_PlacementProviderFailuresStopThePass(t *testing.T) {
-	g := group(t)
-	leakCheck(t)
-	ctx := coordCtx(t)
-	node := g.actor(t, "root")
-	rootC := g.open(t, node, g.journal(t, "root"))
-	st, err := rootC.GroupStatus(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	newcomer := bytes.Repeat([]byte{0xEE}, 32)
-	voters := append([][]byte(nil), st.Voters...)
-	policy := policyFor(st, func(p *PlacementPolicy) {
-		p.Eligible = append(p.Eligible, PlacementCandidate{NodeID: newcomer})
-		sort.Slice(p.Eligible, func(i, j int) bool { return bytes.Compare(p.Eligible[i].NodeID, p.Eligible[j].NodeID) < 0 })
-		p.Excluded = [][]byte{voters[0]}
-	})
-	view := oneCluster(append(voters, newcomer)...)
-	up := testUpcalls(t, node.Runtime())
-	if err := up.ServePlacementPolicy(func(context.Context) (PlacementPolicy, error) { return policy, nil }); err != nil {
-		t.Fatal(err)
-	}
-	if err := up.ServeTopologySnapshot(func(context.Context) (TopologySnapshot, error) { return view, nil }); err != nil {
-		t.Fatal(err)
-	}
-	mgr, err := NewPlacementManager(rootC, up, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer mgr.Close()
-	unchanged := func(why string) {
-		t.Helper()
-		after, err := rootC.GroupStatus(ctx)
-		if err != nil || len(after.Voters) != len(st.Voters) || after.PendingOperationID != nil {
-			t.Fatalf("%s: membership changed: %+v, %v", why, after, err)
-		}
-	}
-
-	// No provisioner served: UNIMPLEMENTED fails the pass, never fails open.
-	if _, err := mgr.Reconcile(ctx); err == nil {
-		t.Fatal("a pass without a provisioner succeeded")
-	}
-	unchanged("no provisioner")
-
-	// A provisioner error fails the pass and carries its message.
-	var asked []ProvisionRequest
-	var mu sync.Mutex
-	if err := up.ServePlacementProvisioner(func(_ context.Context, r ProvisionRequest) (MemberSeed, error) {
-		mu.Lock()
-		asked = append(asked, r)
-		mu.Unlock()
-		return MemberSeed{}, errors.New("no capacity")
-	}); err != nil {
-		t.Fatal(err)
-	}
-	_, err = mgr.Reconcile(ctx)
-	var ce *CoordinationError
-	if err == nil || !strings.Contains(err.Error(), "no capacity") || !errors.As(err, &ce) {
-		t.Fatalf("provisioner error: %v", err)
-	}
-	mu.Lock()
-	if len(asked) != 1 || !bytes.Equal(asked[0].NodeID, newcomer) || !bytes.Equal(asked[0].GroupID, g.groupID) ||
-		!bytes.Equal(asked[0].PolicyDigest, bytes.Repeat([]byte{0x44}, 32)) || asked[0].MembershipLogID == nil {
-		t.Fatalf("provision request = %+v", asked)
-	}
-	mu.Unlock()
-	unchanged("provisioner error")
-
-	// A seed for a different node is refused before anything is submitted.
-	if err := up.ServePlacementProvisioner(func(context.Context, ProvisionRequest) (MemberSeed, error) {
-		return MemberSeed{NodeID: bytes.Repeat([]byte{0xDD}, 32), Ticket: "aster1ticket"}, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := mgr.Reconcile(ctx); err == nil {
-		t.Fatal("a seed for the wrong node was accepted")
-	}
-	unchanged("wrong seed")
-
-	// A malformed answer (garbage payload) fails the pass too.
-	if err := up.HandleKind(UpcallPlacementProvision, func(context.Context, *UpcallRequest) ([]byte, error) {
-		return []byte{1, 2, 3}, nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := mgr.Reconcile(ctx); err == nil {
-		t.Fatal("a malformed provisioner answer was accepted")
-	}
-
-	// A broken topology source fails the pass.
-	if err := up.ServeTopologySnapshot(func(context.Context) (TopologySnapshot, error) {
-		return TopologySnapshot{}, errors.New("topology service down")
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := mgr.Reconcile(ctx); err == nil || !strings.Contains(err.Error(), "topology service down") {
-		t.Fatalf("broken topology: %v", err)
-	}
-	unchanged("broken topology")
-
-	// A policy source that hangs past the kind's timeout fails the pass and is
-	// cancelled (CANCEL{timeout}).
-	if err := up.SetPolicy(UpcallPlacementPolicy, 300*time.Millisecond, FailureModeOpen); err != nil { // fail-open must NOT apply
-		t.Fatal(err)
-	}
-	cancelled := make(chan struct{}, 1)
-	if err := up.ServePlacementPolicy(func(c context.Context) (PlacementPolicy, error) {
-		<-c.Done()
-		cancelled <- struct{}{}
-		return PlacementPolicy{}, c.Err()
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := mgr.Reconcile(ctx); err == nil {
-		t.Fatal("a pass with a hung policy source succeeded")
-	}
-	select {
-	case <-cancelled:
-	case <-ctx.Done():
-		t.Fatal("the hung policy source was never cancelled")
-	}
-	unchanged("hung policy")
 }

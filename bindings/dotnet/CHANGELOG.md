@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added: an optional clock for the client retry, breaker and deadline interceptors
+
+`CircuitBreakerInterceptor`, `RetryInterceptor` and `DeadlineInterceptor` take
+an optional `TimeProvider timeProvider` (default `TimeProvider.System`). The
+breaker measures its recovery timeout on it; the client call loop reads
+deadlines and waits retry back-offs on the first non-system clock its deadline
+or retry interceptors carry. Tests use it to run these policies without sleeps.
+
 ### Changed: `EndpointConfigBuilder.EnableDiscovery(false)` turns off all address lookup
 
 It used to turn off only local mDNS, leaving the n0 pkarr/DNS lookups on; it

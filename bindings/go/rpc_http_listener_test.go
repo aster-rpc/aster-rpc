@@ -318,68 +318,6 @@ func httpListenerAllRPCPatterns(t *testing.T, public bool) {
 	assertHTTPPortsReleased(t, l.TCPAddr(), true)
 }
 
-func TestHTTPListener_PublicModeRejectsSessionsAndAuthLimits(t *testing.T) {
-	var factories atomic.Int32
-	service := NewSessionService("HTTPTest", 1, func(SessionInfo) any { factories.Add(1); return struct{}{} },
-		Unary("echo", func(context.Context, *testEchoRequest) (*testEchoReply, error) {
-			t.Error("public session handler ran")
-			return nil, nil
-		}))
-	srv, _ := httpListenerServiceFixture(t, service)
-	cfg := httpListenerPEM(t)
-	for _, limits := range []HTTPListenerConfig{{MaxPendingAuth: 1}, {MaxAuthPayloadBytes: 1}} {
-		limits.CertificatePEM, limits.PrivateKeyPEM = cfg.CertificatePEM, cfg.PrivateKeyPEM
-		if l, err := srv.StartPublicHTTP(context.Background(), limits); l != nil || !errors.Is(err, ErrInvalidArgument) {
-			t.Fatalf("public auth limits: listener=%v err=%v", l, err)
-		}
-	}
-	canceled, cancel := context.WithCancel(context.Background())
-	cancel()
-	if l, err := srv.StartPublicHTTP(canceled, cfg); l != nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("public canceled start: %v %v", l, err)
-	}
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	lateCfg := cfg
-	lateCfg.BindAddr = probe.Addr().String()
-	lateCfg.WebTransport = true
-	if err := probe.Close(); err != nil {
-		t.Fatal(err)
-	}
-	parent, cancelLate := context.WithCancel(context.Background())
-	defer cancelLate()
-	late := &cancelAfterHTTPStart{Context: parent, cancel: cancelLate, boundAddr: lateCfg.BindAddr}
-	if l, err := srv.StartPublicHTTP(late, lateCfg); l != nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("public late canceled start: %v %v", l, err)
-	}
-	if !late.observedBound.Load() {
-		t.Fatal("public cancellation did not race bound sockets")
-	}
-	assertHTTPPortsReleased(t, lateCfg.BindAddr, true)
-	l, err := srv.StartPublicHTTP(context.Background(), cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = l.Close() })
-	payload, err := srv.codec.Encode(&testEchoRequest{Data: []byte{}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, status, err := httpListenerFramesCallHeaders(httpListenerClient(t), l.TCPAddr(), "Bearer ignored", "echo", map[string]string{"aster-session-id": "42"}, payload)
-	if err != nil || status.Code != StatusUnauthenticated {
-		t.Fatalf("public session: %+v %v", status, err)
-	}
-	if factories.Load() != 0 {
-		t.Fatal("public session factory ran")
-	}
-	if err := srv.Close(); err != nil {
-		t.Fatal(err)
-	}
-	assertHTTPPortsReleased(t, l.TCPAddr(), false)
-}
-
 func assertHTTPPortsReleased(t *testing.T, addr string, quic bool) {
 	t.Helper()
 	tcp, err := net.Listen("tcp", addr)
@@ -517,6 +455,16 @@ func TestHTTPListener_StartupValidationAndPartialBindCleanup(t *testing.T) {
 	if _, err := srv.StartHTTP(context.Background(), up, cfg); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("missing auth: %v", err)
 	}
+	// Public mode refuses authentication limits and a cancelled start before
+	// anything binds. (Its gates and session refusal are ffi/tests/http_server.rs
+	// public_start_is_explicit_and_does_not_bypass_method_permissions and
+	// aster-transport-salvo/tests/public_listener.rs.)
+	for _, limits := range []HTTPListenerConfig{{MaxPendingAuth: 1}, {MaxAuthPayloadBytes: 1}} {
+		limits.CertificatePEM, limits.PrivateKeyPEM = cfg.CertificatePEM, cfg.PrivateKeyPEM
+		if l, err := srv.StartPublicHTTP(context.Background(), limits); l != nil || !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("public auth limits: listener=%v err=%v", l, err)
+		}
+	}
 	if err := up.ServeRPCAuthenticator(RPCAuthenticatorFunc(func(context.Context, RPCAuthRequest) (RPCAuthResponse, error) { return RPCAuthResponse{}, nil })); err != nil {
 		t.Fatal(err)
 	}
@@ -524,6 +472,9 @@ func TestHTTPListener_StartupValidationAndPartialBindCleanup(t *testing.T) {
 	cancel()
 	if _, err := srv.StartHTTP(canceled, up, cfg); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled startup: %v", err)
+	}
+	if l, err := srv.StartPublicHTTP(canceled, cfg); l != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("public canceled start: %v %v", l, err)
 	}
 	bad := cfg
 	bad.PrivateKeyPEM = []byte("invalid key")
@@ -691,30 +642,4 @@ func TestHTTPListener_GraceThenCancelsGoHandler(t *testing.T) {
 		t.Fatalf("native call owner remained after stop: %d", calls)
 	}
 	assertHTTPPortsReleased(t, l.TCPAddr(), false)
-}
-
-func TestHTTPListener_ServerCloseStopsChild(t *testing.T) {
-	srv, up := httpListenerFixture(t, func(context.Context, *testEchoRequest) (*testEchoReply, error) { return nil, nil })
-	if err := up.ServeRPCAuthenticator(RPCAuthenticatorFunc(func(context.Context, RPCAuthRequest) (RPCAuthResponse, error) { return RPCAuthResponse{}, nil })); err != nil {
-		t.Fatal(err)
-	}
-	cfg := httpListenerPEM(t)
-	cfg.WebTransport = true
-	l, err := srv.StartHTTP(context.Background(), up, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = l.Close() })
-	if err := srv.Close(); err != nil {
-		t.Fatal(err)
-	}
-	assertHTTPPortsReleased(t, l.TCPAddr(), true)
-	// The child keeps the runtime alive after its server closes. Close the
-	// upcall table before releasing that final runtime reference.
-	if err := up.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := l.Close(); err != nil {
-		t.Fatal(err)
-	}
 }

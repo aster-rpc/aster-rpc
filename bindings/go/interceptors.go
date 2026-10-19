@@ -3,6 +3,7 @@
 package aster
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -697,6 +698,14 @@ type CircuitBreakerInterceptor struct {
 	failureCount  int
 	openedAt      time.Time
 	halfOpenCalls int
+	clock         func() time.Time // nil = time.Now; tests inject a fake clock
+}
+
+func (cb *CircuitBreakerInterceptor) now() time.Time {
+	if cb.clock != nil {
+		return cb.clock()
+	}
+	return time.Now()
 }
 
 // NewCircuitBreakerInterceptor creates a CircuitBreakerInterceptor with
@@ -720,7 +729,7 @@ func (cb *CircuitBreakerInterceptor) State() string {
 // BeforeCall checks the circuit state and rejects if open.
 // Called from OnRequest.
 func (cb *CircuitBreakerInterceptor) beforeCall() error {
-	now := time.Now()
+	now := cb.now()
 
 	if cb.state == circuitOpen {
 		elapsed := now.Sub(cb.openedAt).Seconds()
@@ -796,7 +805,7 @@ func (cb *CircuitBreakerInterceptor) recordFailure(err *RpcError) {
 
 	if cb.state == circuitHalfOpen {
 		cb.state = circuitOpen
-		cb.openedAt = time.Now()
+		cb.openedAt = cb.now()
 		cb.halfOpenCalls = 0
 		return
 	}
@@ -804,7 +813,7 @@ func (cb *CircuitBreakerInterceptor) recordFailure(err *RpcError) {
 	cb.failureCount++
 	if cb.failureCount >= cb.FailureThreshold {
 		cb.state = circuitOpen
-		cb.openedAt = time.Now()
+		cb.openedAt = cb.now()
 	}
 }
 
@@ -906,6 +915,9 @@ type RetryInterceptor struct {
 	BaseInterceptor
 	Policy         RetryPolicy
 	RetryableCodes map[StatusCode]bool
+	// sleep waits out a backoff (nil = sleepCtx: a timer bounded by the
+	// context); tests inject a fake one so no backoff really sleeps.
+	sleep func(context.Context, time.Duration) error
 }
 
 // NewRetryInterceptor creates a RetryInterceptor with sensible defaults.

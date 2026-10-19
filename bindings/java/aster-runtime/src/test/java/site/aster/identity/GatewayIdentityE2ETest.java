@@ -7,20 +7,12 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import java.math.BigInteger;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
-import java.security.KeyPair;
-import java.security.KeyPairGenerator;
-import java.security.Signature;
-import java.security.interfaces.ECPublicKey;
-import java.security.spec.ECGenParameterSpec;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,9 +32,6 @@ import site.aster.codec.ForyCodec;
 import site.aster.config.AsterConfig;
 import site.aster.contract.CapabilityKind;
 import site.aster.contract.CapabilityRequirement;
-import site.aster.docs.AuthorId;
-import site.aster.docs.Doc;
-import site.aster.docs.Docs;
 import site.aster.enrollment.EnrollmentConfig;
 import site.aster.enrollment.EnrollmentLimits;
 import site.aster.enrollment.TestRoot;
@@ -67,6 +56,13 @@ import site.aster.server.spi.UnaryDispatcher;
  * fields and the credentials, mirroring Go's {@code identity_test.go} (and {@code
  * aster/tests/enrollment_gateway_identity.rs}, {@code enrollment_provider_tokens.rs}, {@code
  * node_config.rs}). The handler reads everything from {@link CallContext#current()}.
+ *
+ * <p>These are wiring tests. Refusing the entry when accept_on_behalf_of is off and verifying
+ * provider tokens against published keys are behaviour, tested once in Rust ({@code
+ * enrollment_gateway_identity.rs} {@code
+ * a_server_that_does_not_accept_on_behalf_of_refuses_the_entry}, {@code
+ * enrollment_provider_tokens.rs} {@code
+ * provider_tokens_verify_with_published_keys_rotate_and_follow_node_config}).
  */
 @Timeout(value = 180)
 final class GatewayIdentityE2ETest {
@@ -439,32 +435,6 @@ final class GatewayIdentityE2ETest {
         "forwarding needs aster.gateway");
   }
 
-  /** The builder's acceptOnBehalfOf(false) overrides the config: the entry is refused. */
-  @Test
-  void acceptOffRefusesTheEntry() throws Exception {
-    AsterServer server =
-        start(AsterServer.builder().config(serverCfg().build()).acceptOnBehalfOf(false));
-    NodeAddr addr = server.node().nodeAddr();
-    AsterClient edge =
-        client(
-            enrolled(
-                    5,
-                    credential(
-                        5, claimsWith(GatewayIdentity.GATEWAY_ROLE + ",notes.read", "notes.read")))
-                .build());
-    String token =
-        edge.mintUserToken(
-            "alice",
-            List.of("notes.read"),
-            List.of(GatewayIdentity.AMR_PASSWORD),
-            Duration.ofMinutes(1));
-    assertEquals("", call(edge, addr, "read").actor);
-    wantCode(
-        callFailure(edge, addr, "read", CallOptions.DEFAULT.withOnBehalfOf(token)),
-        StatusCode.PERMISSION_DENIED,
-        "accept_on_behalf_of off");
-  }
-
   /** An audit outbox needs NodeConfig: with [remote_config] enabled = false the start fails. */
   @Test
   void auditOutboxWithNodeConfigOffFailsTheStart() throws Exception {
@@ -479,152 +449,6 @@ final class GatewayIdentityE2ETest {
             .build();
     Throwable t = failure(f);
     assertTrue(String.valueOf(t.getMessage()).contains("UNSUPPORTED"), String.valueOf(t));
-  }
-
-  /**
-   * A provider's ES256 token, forwarded unchanged by an edge, verifies with the issuer keys a node
-   * holding aster.identity-publisher wrote into the fleet namespace; its groups map to roles.
-   */
-  @Test
-  void providerTokenFromTrustedIssuer() throws Exception {
-    String iss = "https://idp.test";
-    AsterServer server =
-        start(
-            AsterServer.builder()
-                .config(
-                    serverCfg()
-                        .trustedIssuer(
-                            TrustedIssuer.of(iss, List.of("notes"))
-                                .withRoles("groups", Map.of("readers", "notes.read")))
-                        .build()));
-    NodeAddr addr = server.node().nodeAddr();
-
-    TestIdp idp = new TestIdp(iss);
-    // The publisher writes the key set into the fleet namespace as its own node, carrying its
-    // credential, and syncs it to the server (Go's test does the same).
-    String publisherChain =
-        credential(8, TestRoot.roleClaims(GatewayIdentity.IDENTITY_PUBLISHER_ROLE));
-    AsterClient publisher = client(enrolled(8, publisherChain).build());
-    publisher.connect(addr).get(30, TimeUnit.SECONDS);
-    Docs docs = new Docs(publisher.endpoint().runtime(), publisher.endpoint().nativeHandle());
-    try (Doc fleet = get(docs.importWriteNamespaceAsync(FLEET_SECRET))) {
-      Map<String, Object> record = new LinkedHashMap<>();
-      record.put("version", 1);
-      record.put("iss", iss);
-      record.put("source_url", iss + "/jwks");
-      record.put("fetched_at", System.currentTimeMillis() / 1000);
-      record.put("jwks", Map.of("keys", List.of(idp.jwk())));
-      record.put("credential", publisherChain);
-      String key =
-          "aster/identity/v1/issuers/"
-              + Base64.getUrlEncoder()
-                  .withoutPadding()
-                  .encodeToString(iss.getBytes(StandardCharsets.UTF_8))
-              + "/jwks";
-      get(
-          fleet.setBytesAsync(
-              AuthorId.of(pub(8)), key, new ObjectMapper().writeValueAsBytes(record)));
-      get(fleet.startSyncAsync(List.of(pub(2))));
-
-      AsterClient edge =
-          client(
-              enrolled(8 + 1, credential(9, TestRoot.roleClaims(GatewayIdentity.GATEWAY_ROLE)))
-                  .build());
-      Map<String, Object> claims = new LinkedHashMap<>();
-      claims.put("sub", "alice");
-      claims.put("aud", "notes");
-      claims.put("groups", List.of("readers", "other"));
-      claims.put("amr", List.of("pwd"));
-      String token = idp.token(claims);
-      long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-      Who alice = null;
-      while (alice == null) {
-        try {
-          alice = call(edge, addr, "read", CallOptions.DEFAULT.withOnBehalfOf(token));
-        } catch (ExecutionException e) {
-          // UNAUTHENTICATED while the key set is still syncing
-          if (!(e.getCause() instanceof RpcError r)
-              || r.code() != StatusCode.UNAUTHENTICATED
-              || System.nanoTime() > deadline) {
-            throw e;
-          }
-          Thread.sleep(200);
-        }
-      }
-      assertEquals(iss + "|alice", alice.principal);
-      assertEquals(pub(9), alice.actor);
-      assertEquals("notes.read", alice.roles);
-      assertEquals(iss, alice.issuer);
-      assertEquals("pwd", alice.amr);
-
-      // A token for another audience, or signed by another key with the same kid, is refused.
-      wantCode(
-          callFailure(
-              edge,
-              addr,
-              "read",
-              CallOptions.DEFAULT.withOnBehalfOf(
-                  idp.token(new LinkedHashMap<>(Map.of("sub", "alice", "aud", "other"))))),
-          StatusCode.UNAUTHENTICATED,
-          "wrong audience");
-      String forged =
-          new TestIdp(iss).token(new LinkedHashMap<>(Map.of("sub", "alice", "aud", "notes")));
-      wantCode(
-          callFailure(edge, addr, "read", CallOptions.DEFAULT.withOnBehalfOf(forged)),
-          StatusCode.UNAUTHENTICATED,
-          "another key with the same kid");
-    }
-  }
-
-  /** Signs ES256 ID tokens with one P-256 key (kid {@code k1}). */
-  static final class TestIdp {
-    private static final Base64.Encoder B64 = Base64.getUrlEncoder().withoutPadding();
-    private final String iss;
-    private final KeyPair key;
-
-    TestIdp(String iss) throws Exception {
-      this.iss = iss;
-      KeyPairGenerator g = KeyPairGenerator.getInstance("EC");
-      g.initialize(new ECGenParameterSpec("secp256r1"));
-      this.key = g.generateKeyPair();
-    }
-
-    Map<String, Object> jwk() {
-      ECPublicKey pub = (ECPublicKey) key.getPublic();
-      Map<String, Object> jwk = new LinkedHashMap<>();
-      jwk.put("kty", "EC");
-      jwk.put("crv", "P-256");
-      jwk.put("kid", "k1");
-      jwk.put("alg", "ES256");
-      jwk.put("use", "sig");
-      jwk.put("x", B64.encodeToString(fixed(pub.getW().getAffineX())));
-      jwk.put("y", B64.encodeToString(fixed(pub.getW().getAffineY())));
-      return jwk;
-    }
-
-    String token(Map<String, Object> claims) throws Exception {
-      ObjectMapper m = new ObjectMapper();
-      long now = System.currentTimeMillis() / 1000;
-      claims.put("iss", iss);
-      claims.put("iat", now);
-      claims.put("exp", now + 300);
-      String input =
-          B64.encodeToString(m.writeValueAsBytes(Map.of("alg", "ES256", "typ", "JWT", "kid", "k1")))
-              + "."
-              + B64.encodeToString(m.writeValueAsBytes(claims));
-      Signature s = Signature.getInstance("SHA256withECDSAinP1363Format");
-      s.initSign(key.getPrivate());
-      s.update(input.getBytes(StandardCharsets.US_ASCII));
-      return input + "." + B64.encodeToString(s.sign());
-    }
-
-    private static byte[] fixed(BigInteger v) {
-      byte[] raw = v.toByteArray();
-      byte[] out = new byte[32];
-      int n = Math.min(raw.length, 32);
-      System.arraycopy(raw, raw.length - n, out, 32 - n, n);
-      return out;
-    }
   }
 
   @Test

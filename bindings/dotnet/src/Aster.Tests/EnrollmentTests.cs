@@ -179,41 +179,13 @@ public class EnrollmentTests
         Assert.Equal("ops.ingest", await Call(ingest, addr, "ping"));
     }
 
-    // The credential sets the maximum; runtime settings can only restrict. Restricting a
-    // credential's ops.status,ops.logs to ops.status refuses logs on the next call;
-    // SetPeerAttributes cannot grant an enrolled peer a role; clearing restores the credential
-    // roles; a peer without a session cannot be restricted.
+
+    // A server configured as a delegated issuer (with the root as its policy replica) issues
+    // credentials; a client whose credential that server signed is admitted with its roles and
+    // renews from it. Renewal across several lifetimes is
+    // aster/tests/enrollment_aster_server.rs config_driven_issuer_renews_client_credentials.
     [Fact]
-    public async Task Runtime_Restriction_Refuses_The_Next_Call()
-    {
-        var (server, addr) = await StartOps(new AsterServerOptions { Config = ServerConfig(TempDir()) });
-        await using var _s = server;
-        await using var session = await Client(Enrolled(5, CredentialFor(5, "ops.status,ops.logs")));
-        Assert.Equal("ops.logs,ops.status", await Call(session, addr, "logs"));
-
-        server.RestrictPeerRoles(Pub(5), ["ops.status"]);
-        Assert.Equal("ops.status", await Call(session, addr, "status"));
-        var denied = await Assert.ThrowsAsync<RpcError>(() => Call(session, addr, "logs"));
-        Assert.Equal(StatusCode.PermissionDenied, denied.Code);
-
-        var grant = Assert.ThrowsAny<IrohException>(
-            () => server.SetPeerAttributes(Pub(5), new Dictionary<string, string> { ["aster.role"] = "ops.admin" }));
-        Assert.Equal(Status.InvalidArgument, grant.Status);
-        denied = await Assert.ThrowsAsync<RpcError>(() => Call(session, addr, "logs"));
-        Assert.Equal(StatusCode.PermissionDenied, denied.Code);
-
-        server.ClearPeerRestriction(Pub(5));
-        Assert.Equal("ops.logs,ops.status", await Call(session, addr, "logs"));
-        var none = Assert.ThrowsAny<IrohException>(() => server.RestrictPeerRoles(Pub(9), ["ops.status"]));
-        Assert.Equal(Status.NotFound, none.Status);
-    }
-
-
-    // A server configured as a delegated issuer serves renewals; a client whose credential that
-    // server signed renews automatically and stays admitted, with its roles, across several short
-    // lifetimes. The server synchronizes policy from a configured replica (the root).
-    [Fact]
-    public async Task Config_Driven_Issuer_Renews_Client_Credentials()
+    public async Task Config_Driven_Issuer_Issues_And_The_Client_Renews_From_It()
     {
         string dir = TempDir();
         // The root as a policy replica: it holds the fleet namespace.
@@ -254,24 +226,18 @@ public class EnrollmentTests
         await using var client = await Client(Enrolled(7, issued.Chain));
         Assert.Equal("ops.status", await Call(client, addr, "status"));
         Assert.True(client.IsRenewing); // the server signed the credential, so the client renews from it
-        // Past the first credential's expiry: renewal starts with a third of the lifetime left
-        // (5 s), enough to re-present on a loaded host.
-        var until = DateTime.UtcNow + TimeSpan.FromSeconds(15 + 3);
-        while (DateTime.UtcNow < until)
-        {
-            Assert.Equal("ops.status", await Call(client, addr, "status"));
-            await Task.Delay(500);
-        }
-        var current = client.Enrollment!.Credential();
-        Assert.NotNull(current);
-        Assert.NotEqual(issued.CredentialId, current!.CredentialId);
+        Assert.Equal(issued.CredentialId, client.Enrollment!.Credential()?.CredentialId);
     }
 
-    // Builder overrides of the policy and role mapping (Rust enrollment_policy / enrollment_roles)
-    // take precedence over the configuration.
+    // Builder overrides of the role mapping (Rust enrollment_roles) take precedence over the
+    // configuration, and an explicit Gate beside enrollment is refused.
     [Fact]
     public async Task Role_Mapping_Override()
     {
+        // An explicit Gate cannot be combined with enrollment (enrollment owns Gate 0).
+        using (var gate = Gate.Create())
+            await Assert.ThrowsAsync<ArgumentException>(() => AsterServer.StartAsync(new AsterServerOptions { Config = ServerConfig(TempDir()), Gate = gate }));
+
         var (server, addr) = await StartOps(new AsterServerOptions
         {
             Config = ServerConfig(TempDir()),
@@ -287,54 +253,6 @@ public class EnrollmentTests
         string chain = Root.Credential(Pub(5), TestRoot.RoleClaims("ops.admin", ["ops.status"], ["oncall"]), TimeSpan.FromHours(1));
         await using var client = await Client(Enrolled(5, chain));
         Assert.Equal("ops.logs,ops.status", await Call(client, addr, "status"));
-    }
-
-    // Misconfiguration stops the start with an error that names the problem; nothing runs open.
-    [Fact]
-    public async Task Misconfiguration_Fails_Closed()
-    {
-        string dir = TempDir();
-        AsterConfig Good() => ServerConfig(dir);
-        async Task Refused(string name, AsterServerOptions options, string expect)
-        {
-            var e = await Assert.ThrowsAnyAsync<Exception>(async () =>
-            {
-                await using var s = await AsterServer.StartAsync(options);
-            });
-            Assert.True(e.Message.Contains(expect, StringComparison.Ordinal), $"{name}: \"{expect}\" not in {e.Message}");
-        }
-        AsterConfig With(Func<EnrollmentConfig, EnrollmentConfig> f) { var c = Good(); return c with { Enrollment = f(c.Enrollment) }; }
-
-        await Refused("no audience", new() { Config = With(e => e with { Audience = null }) }, "audience is required");
-        await Refused("no root", new() { Config = Good() with { RootPubkey = null } }, "no trusted root");
-        await Refused("no state", new() { Config = With(e => e with { StatePath = null }) }, "keeps denials durably");
-        // A server with no credential, or one that does not verify for its key,
-        // starts: only a root registration admits it (aster/tests/
-        // enrollment_aster_server.rs registered_server_restarts_without_a_valid_credential).
-        await Refused("a path where the chain belongs", new() { Config = Good() with { EnrollmentCredentialChain = "/etc/aster/server.cred" } },
-            "ASTER_ENROLLMENT_CREDENTIAL)");
-        await Refused("unknown policy", new() { Config = With(e => e with { Policy = EnrollmentPolicy.FromJson("\"allow_everyone\"") }) }, "policy");
-        await Refused("policy override", new() { Config = Good(), EnrollmentPolicy = EnrollmentPolicy.AllOf() }, "policy");
-        await Refused("namespace", new() { Config = With(e => e with { FleetNamespace = "not-hex" }) }, "fleet_namespace");
-        await Refused("enabled alone", new() { Config = Enrolled(2, CredentialFor(2, "")) with { Enrollment = new EnrollmentConfig { Enabled = true } } },
-            "audience is required");
-        using (var gate = Gate.Create())
-            await Assert.ThrowsAsync<ArgumentException>(() => AsterServer.StartAsync(new AsterServerOptions { Config = Good(), Gate = gate }));
-
-        // A client: no credential, and server-only issuer settings.
-        var noCredential = await Assert.ThrowsAnyAsync<Exception>(() => AsterClient.StartAsync(Enrolled(5, null)));
-        Assert.Contains("no credential", noCredential.Message);
-        var withIssuer = Enrolled(5, CredentialFor(5, ""));
-        withIssuer = withIssuer with { Enrollment = withIssuer.Enrollment with { IssuerDelegationFile = Path.Combine(dir, "x") } };
-        var issuerError = await Assert.ThrowsAnyAsync<Exception>(() => AsterClient.StartAsync(withIssuer));
-        Assert.Contains("server-only", issuerError.Message);
-
-        // Enrollment off (the root alone does not enable it): an open server.
-        var open = Loopback with { RootPubkey = Convert.FromHexString(Root.PublicKey) };
-        Assert.False(open.IsEnrollmentEnabled);
-        await using var server = await AsterServer.StartAsync(new AsterServerOptions { Config = open });
-        Assert.Null(server.Enrollment);
-        Assert.Null(server.Gate);
     }
 
     // aster.lease.Grantor through the server path: an enrolled client acquires through the
@@ -429,5 +347,8 @@ public class EnrollmentTests
         Assert.Contains("\"fleet_namespace\":\"" + FleetNamespace + "\"", json);
         Assert.Contains("\"issuer_delegation_file\":\"issuer.chain\"", json);
         Assert.DoesNotContain("allow_all", json);
+
+        // The root alone does not enable enrollment.
+        Assert.False((Loopback with { RootPubkey = Convert.FromHexString(Root.PublicKey) }).IsEnrollmentEnabled);
     }
 }

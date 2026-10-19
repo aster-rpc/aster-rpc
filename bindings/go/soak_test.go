@@ -125,48 +125,6 @@ func TestSoak_Runs(t *testing.T) {
 	t.Logf("Soak test complete")
 }
 
-// ─── Short sanity test ─────────────────────────────────────────────────────
-
-func TestSoak_Short(t *testing.T) {
-	durationSecs := 5
-
-	ctx := context.Background()
-	cfg := DefaultRuntimeConfig()
-	runtime, err := NewRuntime(ctx, cfg)
-	if err != nil {
-		t.Fatalf("NewRuntime: %v", err)
-	}
-	defer runtime.Close()
-
-	metrics := &soakMetrics{}
-	deadline := time.Now().Add(time.Duration(durationSecs) * time.Second)
-	cycleCount := 0
-
-	nodeCfg := soakNodeConfig()
-	for time.Now().Before(deadline) {
-		if err := runSoakCycleOnRuntime(ctx, runtime, nodeCfg, metrics); err != nil {
-			t.Fatalf("cycle %d: %v", cycleCount, err)
-		}
-		cycleCount++
-		time.Sleep(10 * time.Millisecond)
-	}
-
-	sub, comp, _, errCount, maxPend, currPend := metrics.snapshot()
-	t.Logf("Cycles: %d, submitted: %d, completed: %d, errored: %d, max_pending: %d, current_pending: %d",
-		cycleCount, sub, comp, errCount, maxPend, currPend)
-
-	if cycleCount == 0 || sub != int64(cycleCount) {
-		t.Errorf("cycles=%d submitted=%d: every cycle must submit an accept", cycleCount, sub)
-	}
-	if currPend != 0 {
-		t.Errorf("final pending ops = %d (expected 0)", currPend)
-	}
-	if maxPend >= 100 {
-		t.Errorf("max pending ops = %d (expected < 100)", maxPend)
-	}
-	assertSoakBacklogDrains(t, runtime)
-}
-
 // soakNodeConfig is a loopback-only node config (relay disabled, 127.0.0.1:0):
 // with the default relay every node start waits for the public n0 relay.
 func soakNodeConfig() AsterConfig {

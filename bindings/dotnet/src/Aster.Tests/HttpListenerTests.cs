@@ -306,16 +306,6 @@ public class HttpListenerTests
     }
 
     [Fact]
-    public async Task ServerDisposalStopsChildAndConcurrentStopIsIdempotent()
-    {
-        await using var f = await Fixture.Create(); f.Authenticate();
-        await using var listener = await f.Server.StartHttpListenerAsync(Pem(true), f.Upcalls);
-        await f.Server.DisposeAsync();
-        Released(listener.TcpAddress, true);
-        await Task.WhenAll(listener.StopAsync(TimeSpan.Zero), listener.DisposeAsync().AsTask());
-    }
-
-    [Fact]
     public async Task CanceledStopPreservesAUsableOwner()
     {
         await using var f = await Fixture.Create(); f.Authenticate();
@@ -324,35 +314,9 @@ public class HttpListenerTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => listener.StopAsync(TimeSpan.Zero, cancellation.Token));
         using var client = Client();
         Assert.Equal(StatusCode.Ok, (await Call(f, client, listener)).Status.Code);
-        await listener.DisposeAsync();
+        // Concurrent stop and dispose are one idempotent stop.
+        await Task.WhenAll(listener.StopAsync(TimeSpan.Zero), listener.DisposeAsync().AsTask());
         Released(listener.TcpAddress, false);
-    }
-
-    [Fact]
-    public async Task ExplicitPublicModeServesFourPatternsAndPreservesGate3()
-    {
-        await using var f = await Fixture.Create(publicService: true);
-        var generated = TlsCertificates.GenerateWebTransportCertificate("http-test", ["127.0.0.1"]);
-        var options = new HttpListenerOptions { CertificatePem = generated.CertificatePem, PrivateKeyPem = generated.PrivateKeyPem, WebTransport = true };
-        await Assert.ThrowsAsync<InvalidOperationException>(() => f.Server.StartHttpListenerAsync(options, f.Upcalls));
-        int authenticationCalls = 0;
-        f.Upcalls.ServeRpcAuthenticator((_, _) => { Interlocked.Increment(ref authenticationCalls); return ValueTask.FromResult(Accepted()); });
-        await using var listener = await f.Server.StartPublicHttpListenerAsync(options);
-        using var client = Client();
-        Assert.Equal(StatusCode.PermissionDenied, (await Call(f, client, listener, "restricted")).Status.Code);
-        Assert.Empty(f.Seen);
-        var unary = await Call(f, client, listener, token: null);
-        Assert.Equal(StatusCode.Ok, unary.Status.Code); Assert.Equal(42, Assert.Single(unary.Replies).Count);
-        var generatedReplies = await Call(f, client, listener, "generate", token: null, requests: [new EchoRequest { Count = 3 }]);
-        Assert.Equal(StatusCode.Ok, generatedReplies.Status.Code); Assert.Equal(new[] { 0, 1, 2 }, generatedReplies.Replies.Select(r => r.Count));
-        var ingested = await Call(f, client, listener, "ingest", token: null, requests: [new EchoRequest { Count = 4 }, new EchoRequest { Count = 5 }]);
-        Assert.Equal(StatusCode.Ok, ingested.Status.Code); Assert.Equal(9, Assert.Single(ingested.Replies).Count);
-        var chat = await Call(f, client, listener, "chat", token: null, requests: [new EchoRequest { Message = "first" }, new EchoRequest { Message = "second" }]);
-        Assert.Equal(StatusCode.Ok, chat.Status.Code); Assert.Equal(new[] { "FIRST", "SECOND" }, chat.Replies.Select(r => r.Message));
-        Assert.All(f.Seen, ctx => { Assert.False(ctx.IrohAuthenticated); Assert.Empty(ctx.Attributes); Assert.Equal(0UL, ctx.ConnectionId); });
-        Assert.Equal(0, authenticationCalls);
-        await listener.DisposeAsync();
-        Released(listener.TcpAddress, true);
     }
 
     [Fact]

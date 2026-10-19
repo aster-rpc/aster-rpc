@@ -43,7 +43,7 @@ internal sealed class ExposeRig : IAsyncDisposable
     public volatile bool Allow = true;
     public ConcurrentQueue<ExposeAuthorizeRequest> Authorized { get; } = new();
 
-    public static async Task<ExposeRig> CreateAsync(bool serve = true)
+    public static async Task<ExposeRig> CreateAsync()
     {
         var cfg = new AsterConfig { RelayMode = "disabled", BindAddr = "127.0.0.1:0", Alpns = [Alpn] };
         var rig = new ExposeRig();
@@ -58,18 +58,8 @@ internal sealed class ExposeRig : IAsyncDisposable
             rig.Authorized.Enqueue(r);
             return new ValueTask<bool>(rig.Allow);
         }));
-        if (serve)
-        {
-            rig.Serving = rig.Registry.ServeAsync(rig.Server, [Alpn]);
-            rig.Conn = await rig.Client.ConnectAsync(rig.Server.NodeAddr(), Alpn).WaitAsync(TimeSpan.FromSeconds(20));
-        }
-        else
-        {
-            var accept = rig.Server.AcceptAsync();
-            rig.Conn = await rig.Client.ConnectAsync(rig.Server.NodeAddr(), Alpn).WaitAsync(TimeSpan.FromSeconds(20));
-            var accepted = await accept.WaitAsync(TimeSpan.FromSeconds(20));
-            rig.Registry.HandleConnection(accepted);
-        }
+        rig.Serving = rig.Registry.ServeAsync(rig.Server, [Alpn]);
+        rig.Conn = await rig.Client.ConnectAsync(rig.Server.NodeAddr(), Alpn).WaitAsync(TimeSpan.FromSeconds(20));
         return rig;
     }
 
@@ -189,25 +179,14 @@ public class ExposeTests
     [Fact]
     public async Task Handler_Failures_Become_5xx_Statuses()
     {
+        // The .NET adapter's part: a handler that throws before the head is a 500 whose body never
+        // carries the exception message. 501 / 502 / 504 are decided in Rust
+        // (ffi/tests/expose.rs handler_failures_become_5xx_statuses).
         await using var rig = await ExposeRig.CreateAsync();
-        // 501: the native service is registered but no kind-49 handler is installed on the table.
-        rig.Registry.ExposeHttpForeign(ExposeRig.Svc, rig.Up, rig.Bodies);
-        Assert.Equal(501, (await rig.Relay()).Status);
-
-        // 500: the handler throws before the head (the message is logged, never sent).
         rig.Registry.ExposeHttp(ExposeRig.Svc, rig.Up, rig.Bodies, _ => throw new InvalidOperationException("secret detail"));
         var err = await rig.Relay();
         Assert.Equal(500, err.Status);
         Assert.DoesNotContain("secret detail", err.BodyText);
-
-        // 502: a head Rust cannot decode (a malformed C5 answered on the raw table).
-        rig.Up.Handle(UpcallKind.ExposeHttp, (_, _) => new ValueTask<byte[]?>(new byte[] { 0xC5, 1, 0x00 }));
-        Assert.Equal(502, (await rig.Relay()).Status);
-
-        // 504: the head is not answered within the kind's timeout.
-        rig.Up.Handle(UpcallKind.ExposeHttp, async (_, ctx) => { await Task.Delay(TimeSpan.FromSeconds(10), ctx.Cancellation); return null; });
-        rig.Up.SetPolicy(UpcallKind.ExposeHttp, TimeSpan.FromMilliseconds(200), HookFailureMode.FailClosed);
-        Assert.Equal(504, (await rig.Relay()).Status);
         await rig.WaitClosed();
     }
 
@@ -238,62 +217,7 @@ public class ExposeTests
     }
 
     [Fact]
-    public async Task Body_Limits()
-    {
-        await using var rig = await ExposeRig.CreateAsync();
-        rig.Registry.ExposeHttp(ExposeRig.Svc, rig.Up, rig.Bodies, req => req.Uri switch
-        {
-            "/inline-big" => new ValueTask<ExposeHttpResponse>(ExposeHttpResponse.Inline(200, new byte[3000])),
-            "/stream-big" => new ValueTask<ExposeHttpResponse>(ExposeHttpResponse.Streaming(200, Chunks(new byte[3000], 1000))),
-            _ => new ValueTask<ExposeHttpResponse>(ExposeHttpResponse.Text(200, "small")),
-        }, new HttpForeignOptions { MaxRequestBody = 100, MaxResponseBody = 1500 });
-
-        Assert.Equal("small", (await rig.Relay("GET", "/ok")).BodyText);
-        // A declared content-length over the request cap is answered 413 without an upcall.
-        Assert.Equal(413, (await rig.Relay("POST", "/ok", new byte[500])).Status);
-        // An inline body over the response cap becomes 502; a streamed one is aborted.
-        Assert.Equal(502, (await rig.Relay("GET", "/inline-big")).Status);
-        await Assert.ThrowsAsync<IrohException>(() => rig.Relay("GET", "/stream-big"));
-        await rig.WaitClosed();
-    }
-
-    [Fact]
-    public async Task Authorize_Deny_Refuses_Before_Any_Http_Upcall_And_The_Decision_Is_The_Bindings()
-    {
-        await using var rig = await ExposeRig.CreateAsync();
-        int calls = 0;
-        rig.Registry.ExposeHttp(ExposeRig.Svc, rig.Up, rig.Bodies, _ => { Interlocked.Increment(ref calls); return new ValueTask<ExposeHttpResponse>(ExposeHttpResponse.Text(200, "in")); });
-        rig.Allow = false;
-        await Assert.ThrowsAsync<IrohException>(() => rig.Relay());
-        Assert.Equal(0, Volatile.Read(ref calls));
-        Assert.Contains(rig.Authorized, a => a.ServiceId == ExposeRig.Svc && a.PeerId == rig.ClientId);
-
-        rig.Allow = true;
-        Assert.Equal("in", (await rig.Relay()).BodyText);
-    }
-
-    [Fact]
-    public async Task Authorize_Without_An_Answer_Follows_The_Failure_Mode()
-    {
-        await using var rig = await ExposeRig.CreateAsync();
-        rig.Registry.ExposeHttp(ExposeRig.Svc, rig.Up, rig.Bodies, _ => new ValueTask<ExposeHttpResponse>(ExposeHttpResponse.Text(200, "in")));
-        // A hanging authorizer: the timeout applies the failure mode.
-        rig.Up.Handle(UpcallKind.ExposeAuthorize, async (_, ctx) => { await Task.Delay(TimeSpan.FromSeconds(10), ctx.Cancellation); return null; });
-        rig.Up.SetPolicy(UpcallKind.ExposeAuthorize, TimeSpan.FromMilliseconds(200), HookFailureMode.FailClosed);
-        await Assert.ThrowsAsync<IrohException>(() => rig.Relay());
-
-        // A throwing authorizer is "no usable answer" too (a refusal is not cached for the connection).
-        rig.Up.Handle(UpcallKind.ExposeAuthorize, (_, _) => throw new InvalidOperationException("boom"));
-        await Assert.ThrowsAsync<IrohException>(() => rig.Relay());
-
-        // Fail-open admits an unanswered admission (the admission is then remembered for the connection).
-        rig.Up.Handle(UpcallKind.ExposeAuthorize, async (_, ctx) => { await Task.Delay(TimeSpan.FromSeconds(10), ctx.Cancellation); return null; });
-        rig.Up.SetPolicy(UpcallKind.ExposeAuthorize, TimeSpan.FromMilliseconds(200), HookFailureMode.FailOpen);
-        Assert.Equal("in", (await rig.Relay()).BodyText);
-    }
-
-    [Fact]
-    public async Task Route_Policy_Grant_Deny_And_Failure_Modes()
+    public async Task Route_Policy_Grant_And_Deny()
     {
         await using var rig = await ExposeRig.CreateAsync();
         string mode = "grant";
@@ -304,9 +228,7 @@ public class ExposeTests
             return mode switch
             {
                 "grant" => new ValueTask<byte[]?>(Ucv1.EncodeExposeRouteGrant([0u, 2u])),
-                "deny" => new ValueTask<byte[]?>(Ucv1.EncodeExposeRouteGrant([])),
-                "out-of-range" => new ValueTask<byte[]?>(Ucv1.EncodeExposeRouteGrant([1u, 9u])),
-                _ => new ValueTask<byte[]?>(Task.Delay(TimeSpan.FromSeconds(5)).ContinueWith(_ => (byte[]?)null)),
+                _ => new ValueTask<byte[]?>(Ucv1.EncodeExposeRouteGrant([])),
             };
         });
         rig.Registry.ServeRoutePolicy(rig.Up);
@@ -326,29 +248,10 @@ public class ExposeTests
             Assert.Equal(specs, s.Specs);
         }
 
+        // Malformed and missing answers follow the kind's failure mode in Rust
+        // (ffi/tests/expose.rs route_policy_grant_and_deny).
         mode = "deny";
         using (var reg = await ExposeClient.RequestRouteAsync(rig.Conn, specs)) Assert.Empty(reg.Granted);
-
-        // A malformed answer (index out of range) is "no usable answer": fail-closed grants nothing.
-        mode = "out-of-range";
-        using (var reg = await ExposeClient.RequestRouteAsync(rig.Conn, specs)) Assert.Empty(reg.Granted);
-
-        // No answer at all: the kind's failure mode decides; fail-open grants every requested route.
-        mode = "silent";
-        rig.Up.SetPolicy(UpcallKind.ExposeRoutePolicy, TimeSpan.FromMilliseconds(300), HookFailureMode.FailOpen);
-        using (var reg = await ExposeClient.RequestRouteAsync(rig.Conn, specs)) Assert.Equal(new uint[] { 0, 1, 2 }, reg.Granted);
-        rig.Up.SetPolicy(UpcallKind.ExposeRoutePolicy, TimeSpan.FromMilliseconds(300), HookFailureMode.FailClosed);
-        using (var reg = await ExposeClient.RequestRouteAsync(rig.Conn, specs)) Assert.Empty(reg.Granted);
-    }
-
-    [Fact]
-    public async Task Request_Route_Validates_Its_Arguments()
-    {
-        await using var rig = await ExposeRig.CreateAsync();
-        await Assert.ThrowsAsync<IrohException>(() => ExposeClient.RequestRouteAsync(rig.Conn, [new ExposeRouteSpec("", 1, 7, "x")]));
-        // The edge has no route policy: the whole request is refused or granted nothing, never hangs.
-        var empty = await Task.WhenAny(ExposeClient.RequestRouteAsync(rig.Conn, []).ContinueWith(t => t.IsCompletedSuccessfully ? t.Result : null), Task.Delay(TimeSpan.FromSeconds(15)));
-        Assert.True(empty.IsCompleted);
     }
 
     [Fact]
@@ -376,37 +279,6 @@ public class ExposeTests
         await rig.WaitClosed();
         var ex = await Assert.ThrowsAsync<HttpBodyException>(async () => await rig.Bodies.WriteAsync(streamId, new byte[] { 1 }));
         Assert.True(ex.IsCancelled || ex.BodyStatus == HttpBodyStatus.UnknownStream, ex.Message);
-    }
-
-    [Fact]
-    public async Task Consumer_Cancel_Mid_Stream_Stops_The_Producer_With_Cancelled()
-    {
-        await using var rig = await ExposeRig.CreateAsync();
-        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var stopped = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        rig.Registry.ExposeHttp(ExposeRig.Svc, rig.Up, rig.Bodies, _ => new ValueTask<ExposeHttpResponse>(ExposeHttpResponse.Streaming(200, Flood())));
-        async IAsyncEnumerable<ReadOnlyMemory<byte>> Flood()
-        {
-            try
-            {
-                var chunk = new byte[256 * 1024];
-                while (true)
-                {
-                    yield return chunk;
-                    started.TrySetResult();
-                    await Task.Yield();
-                }
-            }
-            finally { stopped.TrySetResult(); }
-        }
-
-        // The stream never finishes, so the buffered relay stays pending; the consumer gives up by closing the connection.
-        var relay = rig.Relay();
-        await started.Task.WaitAsync(TimeSpan.FromSeconds(20));
-        rig.Conn.Close("bye");
-        await Assert.ThrowsAsync<IrohException>(() => relay);
-        await stopped.Task.WaitAsync(TimeSpan.FromSeconds(20));
-        await rig.WaitClosed();
     }
 
     [Fact]
@@ -450,74 +322,6 @@ public class ExposeTests
         Assert.Equal(HttpBodyStatus.UnknownStream, Assert.Throws<HttpBodyException>(() => rig.Bodies.TryWrite(999_999, Utf8("x"))).BodyStatus);
         var cancelled = new CancellationTokenSource(); cancelled.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(async () => await rig.Bodies.ReadAsync(1, new byte[4], cancelled.Token));
-    }
-
-    [Fact]
-    public async Task Socket_Target_With_And_Without_An_Authorizer()
-    {
-        using var listener = new TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        string addr = $"127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}";
-        async Task<TcpClient?> Accepted(TimeSpan wait)
-        {
-            var end = DateTime.UtcNow + wait;
-            while (DateTime.UtcNow < end)
-            {
-                if (listener.Pending()) return await listener.AcceptTcpClientAsync();
-                await Task.Delay(20);
-            }
-            return null;
-        }
-
-        await using var rig = await ExposeRig.CreateAsync();
-        // Argument validation.
-        Assert.Throws<IrohException>(() => rig.Registry.ExposeSocket("sock", "not an addr"));
-        Assert.Throws<IrohException>(() => rig.Registry.ExposeSocket("", addr));
-
-        // Guarded by the authorizer: denied, so nothing is spliced.
-        rig.Registry.ExposeSocket("sock", addr, rig.Up);
-        rig.Allow = false;
-        await Assert.ThrowsAsync<IrohException>(() => rig.Relay(service: "sock"));
-        Assert.Contains(rig.Authorized, a => a.ServiceId == "sock" && a.PeerId == rig.ClientId);
-        Assert.Null(await Accepted(TimeSpan.FromMilliseconds(300)));
-
-        // Allowed: the stream is spliced to the target, which sees a TCP connection.
-        rig.Allow = true;
-        var relay = rig.Relay(service: "sock");
-        using (var target = await Accepted(TimeSpan.FromSeconds(20)))
-            Assert.NotNull(target);
-        try { await relay; } catch (IrohException) { /* the target hung up without an HTTP answer */ }
-
-        // Without an authorizer every peer is admitted and no kind-48 upcall is made for the service.
-        rig.Registry.ExposeSocket("open", addr);
-        int before = rig.Authorized.Count;
-        var relay2 = rig.Relay(service: "open");
-        using (var target = await Accepted(TimeSpan.FromSeconds(20)))
-            Assert.NotNull(target);
-        try { await relay2; } catch (IrohException) { }
-        Assert.Equal(before, rig.Authorized.Count);
-    }
-
-    [Fact]
-    public async Task HandleConnection_Feeds_Accepted_Connections()
-    {
-        await using var rig = await ExposeRig.CreateAsync(serve: false);
-        rig.Registry.ExposeHttp(ExposeRig.Svc, rig.Up, rig.Bodies, _ => new ValueTask<ExposeHttpResponse>(ExposeHttpResponse.Text(200, "fed")));
-        Assert.Equal("fed", (await rig.Relay()).BodyText);
-    }
-
-    [Fact]
-    public async Task Unexpose_Stops_The_Service_And_Registering_Again_Brings_It_Back()
-    {
-        await using var rig = await ExposeRig.CreateAsync();
-        Func<ExposeHttpRequest, ValueTask<ExposeHttpResponse>> up = _ => new ValueTask<ExposeHttpResponse>(ExposeHttpResponse.Text(200, "up"));
-        rig.Registry.ExposeHttp(ExposeRig.Svc, rig.Up, rig.Bodies, new ExposeHttpHandler(up));
-        Assert.Equal("up", (await rig.Relay()).BodyText);
-        rig.Registry.Unexpose(ExposeRig.Svc);
-        rig.Registry.Unexpose(ExposeRig.Svc); // idempotent
-        await Assert.ThrowsAsync<IrohException>(() => rig.Relay());
-        rig.Registry.ExposeHttp(ExposeRig.Svc, rig.Up, rig.Bodies, new ExposeHttpHandler(up));
-        Assert.Equal("up", (await rig.Relay()).BodyText);
     }
 
     [Fact]

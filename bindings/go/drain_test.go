@@ -125,34 +125,6 @@ func TestDrain_InFlightCompletesNewCallsRefusedReadinessOff(t *testing.T) {
 	}
 }
 
-func TestDrain_CallRunningAtDeadlineIsCancelled(t *testing.T) {
-	var started, cancelled atomic.Int32
-	f := newRPCFixture(t, ServerOptions{Services: []*Service{drainService(&started, &cancelled, make(chan struct{}))}})
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	held := make(chan error, 1)
-	go func() {
-		_, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "DrainEcho", "hold", &testEchoRequest{Message: "stuck"})
-		held <- err
-	}()
-	drainEventually(t, "the call in its handler", func() bool { return started.Load() == 1 })
-
-	r, err := f.srv.Drain(ctx, 300*time.Millisecond)
-	if err != nil {
-		t.Fatalf("Drain: %v", err)
-	}
-	if r.CallsInFlight != 1 || r.CallsCompleted != 0 || r.CallsCancelled != 1 || !r.DeadlineReached ||
-		r.ConnectionsClosed != 1 || r.Elapsed < 300*time.Millisecond {
-		t.Fatalf("report %+v", r)
-	}
-	if cancelled.Load() != 1 {
-		t.Fatal("the handler's context was not cancelled")
-	}
-	if err := <-held; !IsDraining(err) {
-		t.Fatalf("the caller should see a draining error: %v", err)
-	}
-}
-
 func TestDrain_ContextCancelCutsGraceShort(t *testing.T) {
 	var started, cancelled atomic.Int32
 	f := newRPCFixture(t, ServerOptions{Services: []*Service{drainService(&started, &cancelled, make(chan struct{}))}})

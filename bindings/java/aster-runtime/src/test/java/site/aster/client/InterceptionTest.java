@@ -31,8 +31,11 @@ final class InterceptionTest {
     return CallOptions.DEFAULT.withIdempotent(true);
   }
 
-  private static RetryInterceptor retry(int attempts) {
-    return new RetryInterceptor(attempts, Set.of(StatusCode.UNAVAILABLE), 1, 2, 1.0, 0.0);
+  /** Backoff and breaker recovery run on this fake clock: no real sleeps. */
+  private final FakeClock clock = new FakeClock();
+
+  private RetryInterceptor retry(int attempts) {
+    return new RetryInterceptor(attempts, Set.of(StatusCode.UNAVAILABLE), 1, 2, 1.0, 0.0, clock);
   }
 
   @Test
@@ -229,14 +232,16 @@ final class InterceptionTest {
 
   @Test
   void breakerStateMachine() throws Exception {
-    CircuitBreakerInterceptor b = new CircuitBreakerInterceptor(2, 0.1, 1);
+    CircuitBreakerInterceptor b = new CircuitBreakerInterceptor(2, 0.1, 1, clock);
     b.recordFailure(new RpcError(StatusCode.NOT_FOUND, "ignored"));
     b.recordFailure(new RpcError(StatusCode.UNAVAILABLE, "1"));
     assertEquals(CircuitBreakerInterceptor.State.CLOSED, b.state());
     b.recordFailure(new RpcError(StatusCode.INTERNAL, "2"));
     assertEquals(CircuitBreakerInterceptor.State.OPEN, b.state());
     assertThrows(RpcError.class, b::beforeCall);
-    Thread.sleep(150);
+    clock.advance(Duration.ofMillis(99));
+    assertThrows(RpcError.class, b::beforeCall, "still open before the recovery timeout");
+    clock.advance(Duration.ofMillis(1));
     b.beforeCall(); // half-open probe
     assertEquals(CircuitBreakerInterceptor.State.HALF_OPEN, b.state());
     assertThrows(RpcError.class, b::beforeCall, "probe budget spent");
@@ -266,6 +271,78 @@ final class InterceptionTest {
                   throw new RpcError(StatusCode.UNAVAILABLE, "down");
                 }));
     assertEquals(1, calls.get());
+  }
+
+  @Test
+  void cancellingDuringTheBackoffStopsTheRetries() {
+    AtomicBoolean cancelled = new AtomicBoolean();
+    AtomicInteger calls = new AtomicInteger();
+    AtomicInteger sleeps = new AtomicInteger();
+    FakeClock cancelOnSleep =
+        new FakeClock() {
+          @Override
+          public void sleep(long nanos) throws InterruptedException {
+            sleeps.incrementAndGet();
+            cancelled.set(true); // the caller cancels while the call backs off
+            super.sleep(nanos);
+          }
+        };
+    List<Interceptor> retrying =
+        List.of(
+            new RetryInterceptor(
+                50, Set.of(StatusCode.UNAVAILABLE), 100, 100, 1.0, 0.0, cancelOnSleep));
+    CallContext ctx = Interception.context(retrying, "S", "m", 0, "p", "unary", idempotent());
+    assertThrows(
+        CancellationException.class,
+        () ->
+            Interception.execute(
+                retrying,
+                ctx,
+                idempotent(),
+                "r",
+                false,
+                cancelled::get,
+                (req, d, m) -> {
+                  calls.incrementAndGet();
+                  throw new RpcError(StatusCode.UNAVAILABLE, "down");
+                }));
+    assertEquals(1, calls.get(), "no attempt after the cancel");
+    assertEquals(1, sleeps.get(), "the backoff wakes at its first slice");
+    assertEquals(Duration.ofMillis(20), cancelOnSleep.slept());
+  }
+
+  @Test
+  void theBackoffEndsAtTheDeadline() {
+    List<Interceptor> chain =
+        List.of(
+            new RetryInterceptor(50, Set.of(StatusCode.UNAVAILABLE), 200, 200, 1.0, 0.0, clock));
+    CallOptions options = idempotent().withTimeout(Duration.ofMillis(300));
+    CallContext ctx = Interception.context(chain, "S", "m", 0, "p", "unary", options);
+    List<Integer> wire = new java.util.ArrayList<>();
+    RpcError e =
+        assertThrows(
+            RpcError.class,
+            () ->
+                Interception.execute(
+                    chain,
+                    ctx,
+                    options,
+                    "r",
+                    false,
+                    () -> false,
+                    (req, d, m) -> {
+                      wire.add(d);
+                      throw new RpcError(StatusCode.UNAVAILABLE, "down");
+                    }));
+    assertEquals(StatusCode.DEADLINE_EXCEEDED, e.code());
+    // Two attempts: the second carries what is left after one 200 ms backoff.
+    assertEquals(2, wire.size(), wire.toString());
+    assertTrue(wire.get(0) > 200 && wire.get(0) <= 300, wire.toString());
+    assertEquals(wire.get(0) - 200, wire.get(1), 1, wire.toString());
+    Duration slept = clock.slept();
+    assertTrue(
+        slept.compareTo(Duration.ofMillis(200)) > 0 && slept.compareTo(Duration.ofMillis(302)) <= 0,
+        slept.toString());
   }
 
   @Test

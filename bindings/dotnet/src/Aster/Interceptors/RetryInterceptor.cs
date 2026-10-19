@@ -21,20 +21,26 @@ public class RetryInterceptor : IInterceptor
 
     private static Random Rng => Random.Shared;
 
+    /// <summary>The clock the client call loop waits the back-off on.</summary>
+    internal TimeProvider Clock { get; }
+
     /// <param name="maxAttempts">Maximum number of attempts (including the first). Defaults to 3.</param>
     /// <param name="retryableCodes">Status codes considered retryable. Defaults to {Unavailable}.</param>
     /// <param name="initialMs">Initial backoff delay in milliseconds. Defaults to 100.</param>
     /// <param name="maxMs">Maximum backoff delay in milliseconds. Defaults to 30000.</param>
     /// <param name="multiplier">Multiplicative factor per attempt. Defaults to 2.0.</param>
     /// <param name="jitter">Random jitter factor (0.0-1.0). Defaults to 0.1.</param>
+    /// <param name="timeProvider">The clock the back-off waits on; <see cref="TimeProvider.System"/> by default (tests pass a fake one).</param>
     public RetryInterceptor(
         int maxAttempts = 3,
         HashSet<StatusCode>? retryableCodes = null,
         int initialMs = 100,
         int maxMs = 30_000,
         double multiplier = 2.0,
-        double jitter = 0.1)
+        double jitter = 0.1,
+        TimeProvider? timeProvider = null)
     {
+        Clock = timeProvider ?? TimeProvider.System;
         MaxAttempts = maxAttempts;
         RetryableCodes = retryableCodes ?? new HashSet<StatusCode> { StatusCode.Unavailable };
         _initialMs = initialMs;

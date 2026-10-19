@@ -23,7 +23,6 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.Test;
 import site.aster.config.AsterConfig;
@@ -38,10 +37,20 @@ import site.aster.upcall.UpcallKind;
 import site.aster.upcall.Upcalls;
 
 /**
- * C ABI 4.2 expose end to end over real QUIC (loopback, relays off): socket targets with an
- * authorize callback (allow, deny, throw, timeout and its failure modes), HTTP handlers with inline
- * and streamed bodies (backpressure, abort, consumer cancellation), route policy, the buffered
- * relay and request_route, and handle lifetimes. Ports the cases of {@code ffi/tests/expose.rs}.
+ * C ABI 4.2 expose end to end over real QUIC (loopback, relays off): the wiring of a socket target
+ * with a Java authorize callback, Java HTTP handlers with inline and streamed bodies, Java handler
+ * failures as statuses, a Java route policy, handle lifetimes and the body-call error mapping.
+ *
+ * <p>The relay's behaviour is tested once in Rust, in {@code ffi/tests/expose.rs}: authorizer
+ * absence and failure modes ({@code socket_target_with_and_without_a_foreign_authorizer}, {@code
+ * authorize_without_an_answer_follows_the_failure_mode}), size caps ({@code request_body_limits},
+ * {@code response_over_the_cap_fails_the_consumer}), 501 and mid-body aborts ({@code
+ * handler_failures_become_5xx_statuses}, {@code aborted_streamed_response_fails_the_consumer}),
+ * consumer cancellation ({@code consumer_cancel_before_the_head_cancels_the_upcall}, {@code
+ * consumer_cancel_mid_stream_makes_writes_cancelled}), route-policy timeouts ({@code
+ * route_policy_grant_and_deny}), {@code unexpose_stops_the_service}, {@code
+ * handle_connection_feeds_accepted_connections}, {@code request_route_validates_its_arguments} and
+ * {@code relay_request_validates_its_arguments}.
  */
 final class ExposeE2ETest {
 
@@ -166,131 +175,6 @@ final class ExposeE2ETest {
     }
   }
 
-  @Test
-  void socketTargetWithoutAuthorizerAdmitsEveryPeerAndAsksNothing() throws Exception {
-    try (Rig rig = new Rig();
-        ServerSocket target = target()) {
-      AtomicInteger asked = new AtomicInteger();
-      // The kind-48 handler is Expose's; a second service proves nothing is asked for "open".
-      rig.expose.exposeSocket(
-          "guarded",
-          addr(target),
-          (s, p, m) -> {
-            asked.incrementAndGet();
-            return false;
-          });
-      rig.expose.exposeSocket("open", addr(target), null);
-      CompletableFuture<RelayedResponse> pending =
-          Expose.relayRequest(rig.conn, "open", "GET", "/", null);
-      try (Socket spliced = target.accept()) {
-        assertNotNull(spliced);
-      }
-      try {
-        pending.get(T, TimeUnit.SECONDS);
-      } catch (ExecutionException expected) {
-        // see above
-      }
-      assertEquals(0, asked.get());
-    }
-  }
-
-  @Test
-  void authorizeTimeoutIsFailClosedAndCancelsTheCallback() throws Exception {
-    try (Rig rig = new Rig();
-        ServerSocket target = target()) {
-      rig.expose
-          .upcalls()
-          .setPolicy(UpcallKind.EXPOSE_AUTHORIZE, Duration.ofMillis(200), FailureMode.FAIL_CLOSED);
-      CountDownLatch interrupted = new CountDownLatch(1);
-      rig.expose.exposeSocket(
-          "slow",
-          addr(target),
-          (s, p, m) -> {
-            try {
-              Thread.sleep(20_000);
-            } catch (InterruptedException e) {
-              interrupted.countDown();
-              throw e;
-            }
-            return true;
-          });
-      assertThrows(
-          ExecutionException.class,
-          () -> await(Expose.relayRequest(rig.conn, "slow", "GET", "/", null)));
-      assertTrue(interrupted.await(T, TimeUnit.SECONDS), "the callback is interrupted on timeout");
-      target.setSoTimeout(300);
-      assertThrows(SocketTimeoutException.class, target::accept);
-      waitFor("a CANCEL event", () -> rig.expose.upcalls().cancelCount() >= 1);
-    }
-  }
-
-  @Test
-  void authorizeCancelCarriesItsReason() throws Exception {
-    try (Rig rig = new Rig();
-        ServerSocket target = target()) {
-      rig.expose
-          .upcalls()
-          .setPolicy(UpcallKind.EXPOSE_AUTHORIZE, Duration.ofMillis(200), FailureMode.FAIL_CLOSED);
-      rig.expose.exposeSocket("slow", addr(target), (s, p, m) -> true);
-      AtomicInteger reason = new AtomicInteger();
-      CountDownLatch done = new CountDownLatch(1);
-      // Replace the dispatcher with a raw invocation handler to see the cancel reason.
-      rig.expose
-          .upcalls()
-          .handleInvocation(
-              UpcallKind.EXPOSE_AUTHORIZE,
-              inv -> {
-                try {
-                  Thread.sleep(20_000);
-                } catch (InterruptedException e) {
-                  reason.set(inv.cancelReason());
-                  done.countDown();
-                  throw e;
-                }
-              });
-      assertThrows(
-          ExecutionException.class,
-          () -> await(Expose.relayRequest(rig.conn, "slow", "GET", "/", null)));
-      assertTrue(done.await(T, TimeUnit.SECONDS));
-      assertEquals(Upcalls.CANCEL_TIMEOUT, reason.get());
-    }
-  }
-
-  @Test
-  void authorizeExceptionFollowsTheFailureMode() throws Exception {
-    try (Rig rig = new Rig();
-        ServerSocket target = target()) {
-      rig.expose.exposeSocket(
-          "boom",
-          addr(target),
-          (s, p, m) -> {
-            throw new IllegalStateException("backend down");
-          });
-      // Fail-closed (default): an exception denies.
-      assertThrows(
-          ExecutionException.class,
-          () -> await(Expose.relayRequest(rig.conn, "boom", "GET", "/", null)));
-      target.setSoTimeout(300);
-      assertThrows(SocketTimeoutException.class, target::accept);
-
-      // Fail-open: an exception admits.
-      rig.expose
-          .upcalls()
-          .setPolicy(UpcallKind.EXPOSE_AUTHORIZE, Duration.ofSeconds(5), FailureMode.FAIL_OPEN);
-      target.setSoTimeout(15_000);
-      CompletableFuture<RelayedResponse> pending =
-          Expose.relayRequest(rig.conn, "boom", "GET", "/", null);
-      try (Socket spliced = target.accept()) {
-        assertNotNull(spliced);
-      }
-      try {
-        pending.get(T, TimeUnit.SECONDS);
-      } catch (ExecutionException expected) {
-        // see above
-      }
-    }
-  }
-
   // ── HTTP handlers ────────────────────────────────────────────────────────
 
   @Test
@@ -379,20 +263,6 @@ final class ExposeE2ETest {
   }
 
   @Test
-  void requestBodyOverTheCapFailsTheReadAndAnswers413() throws Exception {
-    try (Rig rig = new Rig()) {
-      rig.expose.exposeHttp(
-          "app",
-          req -> HttpResponse.text(200, "unreachable"),
-          ExposeHttpOptions.defaults().withMaxRequestBody(1000),
-          null);
-      // A declared length over the cap is refused without an upcall.
-      RelayedResponse r = await(Expose.relayRequest(rig.conn, "app", "POST", "/", pattern(5000)));
-      assertEquals(413, r.status());
-    }
-  }
-
-  @Test
   void handlerFailuresBecome5xxStatuses() throws Exception {
     try (Rig rig = new Rig()) {
       rig.expose.exposeHttp(
@@ -442,36 +312,6 @@ final class ExposeE2ETest {
   }
 
   @Test
-  void aKindWithoutAHandlerAnswers501() throws Exception {
-    try (Rig rig = new Rig()) {
-      rig.expose.exposeHttp("app", req -> HttpResponse.text(200, "ok"), null);
-      rig.expose.upcalls().removeHandler(UpcallKind.EXPOSE_HTTP);
-      assertEquals(501, await(Expose.relayRequest(rig.conn, "app", "GET", "/", null)).status());
-    }
-  }
-
-  @Test
-  void aStreamedResponseThatFailsMidBodyFailsTheConsumer() throws Exception {
-    try (Rig rig = new Rig()) {
-      rig.expose.exposeHttp(
-          "app",
-          req ->
-              HttpResponse.streaming(
-                  200,
-                  out -> {
-                    out.write(pattern(1000));
-                    throw new IllegalStateException("source broke");
-                  }),
-          null);
-      // The relay resets the stream: the consumer sees a failure, never a truncated body.
-      assertThrows(
-          ExecutionException.class,
-          () -> await(Expose.relayRequest(rig.conn, "app", "GET", "/", null)));
-      waitFor("exchanges to close", () -> rig.expose.bodies().openCount() == 0);
-    }
-  }
-
-  @Test
   void invalidTrailersAbortTheResponse() throws Exception {
     try (Rig rig = new Rig()) {
       rig.expose.exposeHttp(
@@ -491,151 +331,6 @@ final class ExposeE2ETest {
     }
   }
 
-  @Test
-  void responseOverTheCapAbortsTheStreamAndFailsTheConsumer() throws Exception {
-    try (Rig rig = new Rig()) {
-      AtomicReference<HttpBodyException.Kind> kind = new AtomicReference<>();
-      rig.expose.exposeHttp(
-          "app",
-          req ->
-              HttpResponse.streaming(
-                  200,
-                  out -> {
-                    try {
-                      for (int i = 0; i < 100; i++) {
-                        out.write(pattern(1000));
-                      }
-                    } catch (HttpBodyException e) {
-                      kind.set(e.kind());
-                      throw e;
-                    }
-                  }),
-          ExposeHttpOptions.defaults().withMaxResponseBody(5000),
-          null);
-      assertThrows(
-          ExecutionException.class,
-          () -> await(Expose.relayRequest(rig.conn, "app", "GET", "/", null)));
-      waitFor("the cap to surface", () -> kind.get() != null);
-      assertEquals(HttpBodyException.Kind.TOO_LARGE, kind.get());
-    }
-  }
-
-  @Test
-  void consumerLeavingBeforeTheHeadCancelsTheHandler() throws Exception {
-    try (Rig rig = new Rig()) {
-      CountDownLatch started = new CountDownLatch(1);
-      AtomicInteger reason = new AtomicInteger();
-      CountDownLatch cancelled = new CountDownLatch(1);
-      rig.expose.exposeHttp("app", req -> HttpResponse.text(200, "unused"), null);
-      // Raw handler so the test can read the cancel reason.
-      rig.expose
-          .upcalls()
-          .handleInvocation(
-              UpcallKind.EXPOSE_HTTP,
-              inv -> {
-                started.countDown();
-                try {
-                  Thread.sleep(30_000);
-                } catch (InterruptedException e) {
-                  reason.set(inv.cancelReason());
-                  cancelled.countDown();
-                  throw e;
-                }
-              });
-      CompletableFuture<RelayedResponse> pending =
-          Expose.relayRequest(rig.conn, "app", "GET", "/", null);
-      assertTrue(started.await(T, TimeUnit.SECONDS));
-      rig.conn.close();
-      assertThrows(ExecutionException.class, () -> pending.get(T, TimeUnit.SECONDS));
-      assertTrue(cancelled.await(T, TimeUnit.SECONDS), "the handler is interrupted");
-      assertEquals(Upcalls.CANCEL_ABANDONED, reason.get());
-      waitFor("exchanges to close", () -> rig.expose.bodies().openCount() == 0);
-    }
-  }
-
-  @Test
-  void consumerLeavingMidStreamMakesWritesCancelled() throws Exception {
-    try (Rig rig = new Rig()) {
-      AtomicReference<HttpBodyException.Kind> kind = new AtomicReference<>();
-      CountDownLatch streaming = new CountDownLatch(1);
-      rig.expose.exposeHttp(
-          "app",
-          req ->
-              HttpResponse.streaming(
-                  200,
-                  out -> {
-                    // Flood the exchange: the bounded buffer fills, so a write is parked when the
-                    // consumer disappears and wakes with CANCELLED.
-                    byte[] chunk = new byte[256 * 1024];
-                    long end = System.nanoTime() + TimeUnit.SECONDS.toNanos(T);
-                    try {
-                      while (System.nanoTime() < end) {
-                        out.write(chunk);
-                        streaming.countDown();
-                      }
-                    } catch (HttpBodyException e) {
-                      kind.set(e.kind());
-                      throw e;
-                    }
-                  }),
-          null);
-      CompletableFuture<RelayedResponse> pending =
-          Expose.relayRequest(rig.conn, "app", "GET", "/", null);
-      assertTrue(streaming.await(T, TimeUnit.SECONDS));
-      rig.conn.close();
-      assertThrows(ExecutionException.class, () -> pending.get(T, TimeUnit.SECONDS));
-      waitFor("the writer to notice", () -> kind.get() != null);
-      assertEquals(HttpBodyException.Kind.CANCELLED, kind.get());
-      waitFor("exchanges to close", () -> rig.expose.bodies().openCount() == 0);
-    }
-  }
-
-  @Test
-  void unexposeStopsTheServiceAndReRegisteringBringsItBack() throws Exception {
-    try (Rig rig = new Rig()) {
-      rig.expose.exposeHttp("app", req -> HttpResponse.text(200, "up"), null);
-      assertEquals("up", await(Expose.relayRequest(rig.conn, "app", "GET", "/", null)).bodyText());
-      rig.expose.unexpose("app");
-      rig.expose.unexpose("app"); // idempotent
-      rig.expose.unexpose("never-exposed");
-      assertThrows(
-          ExecutionException.class,
-          () -> await(Expose.relayRequest(rig.conn, "app", "GET", "/", null)));
-      rig.expose.exposeHttp("app", req -> HttpResponse.text(200, "again"), null);
-      assertEquals(
-          "again", await(Expose.relayRequest(rig.conn, "app", "GET", "/", null)).bodyText());
-    }
-  }
-
-  @Test
-  void handleConnectionFeedsAcceptedConnections() throws Exception {
-    // No serve loop: the node's endpoint accepts and the connection is fed by hand.
-    IrohNode server = startNode();
-    IrohNode client = startNode();
-    try (Expose expose = Expose.create(server)) {
-      expose.exposeHttp("app", req -> HttpResponse.text(200, "fed"), null);
-      var addr = server.nodeAddr();
-      for (int i = 0; i < 100 && addr.directAddresses().isEmpty(); i++) {
-        Thread.sleep(50);
-        addr = server.nodeAddr();
-      }
-      CompletableFuture<IrohConnection> accepted =
-          IrohEndpoint.ofNode(server.runtime(), server.nodeHandle()).acceptAsync();
-      IrohConnection conn =
-          await(
-              IrohEndpoint.ofNode(client.runtime(), client.nodeHandle())
-                  .connectNodeAddrAsync(addr, ALPN));
-      IrohConnection inbound = await(accepted);
-      expose.handle(inbound);
-      assertEquals("fed", await(Expose.relayRequest(conn, "app", "GET", "/", null)).bodyText());
-      conn.close();
-      inbound.close();
-    } finally {
-      client.close();
-      server.close();
-    }
-  }
-
   // ── route policy + request_route ─────────────────────────────────────────
 
   private static List<RouteSpec> specs() {
@@ -646,7 +341,7 @@ final class ExposeE2ETest {
   }
 
   @Test
-  void routePolicyGrantsDeniesAndFailsClosed() throws Exception {
+  void routePolicyGrantsAndDenies() throws Exception {
     try (Rig rig = new Rig()) {
       AtomicReference<String> mode = new AtomicReference<>("grant");
       List<String> seen = new CopyOnWriteArrayList<>();
@@ -661,11 +356,8 @@ final class ExposeE2ETest {
                 return List.of();
               case "unrequested":
                 return List.of(new RouteSpec("evil.example", 0, RouteSpec.Protocol.HTTP, "x"));
-              case "throw":
-                throw new IllegalStateException("policy backend down");
               default:
-                Thread.sleep(20_000); // "silent"
-                return requested;
+                throw new IllegalStateException("policy backend down");
             }
           });
 
@@ -690,55 +382,11 @@ final class ExposeE2ETest {
         }
       }
 
-      // No answer in time: the failure mode decides; fail-open grants every route.
-      rig.expose
-          .upcalls()
-          .setPolicy(UpcallKind.EXPOSE_ROUTE_POLICY, Duration.ofMillis(300), FailureMode.FAIL_OPEN);
-      mode.set("silent");
-      try (RouteRegistration reg = await(Expose.requestRoute(rig.conn, specs(), null))) {
-        assertEquals(List.of(0, 1, 2), reg.grantedIndexes());
-      }
-      rig.expose
-          .upcalls()
-          .setPolicy(
-              UpcallKind.EXPOSE_ROUTE_POLICY, Duration.ofMillis(300), FailureMode.FAIL_CLOSED);
-      try (RouteRegistration reg = await(Expose.requestRoute(rig.conn, specs(), null))) {
-        assertEquals(List.of(), reg.grantedIndexes());
-      }
-
       // serveRoutes again replaces the policy.
       rig.expose.serveRoutes((peer, metadata, requested) -> requested);
       try (RouteRegistration reg = await(Expose.requestRoute(rig.conn, specs(), null))) {
         assertEquals(List.of(0, 1, 2), reg.grantedIndexes());
       }
-    }
-  }
-
-  @Test
-  void requestRouteWithoutAnEdgeIsRefusedAndSpecsAreValidated() throws Exception {
-    try (Rig rig = new Rig()) {
-      // No route policy installed: fail-closed grants nothing or the request is refused; both are
-      // "nothing routed".
-      try (RouteRegistration reg = await(Expose.requestRoute(rig.conn, specs(), null))) {
-        assertEquals(List.of(), reg.grantedIndexes());
-      } catch (ExecutionException refused) {
-        // a refusal of the whole request
-      }
-      assertThrows(
-          IllegalArgumentException.class,
-          () -> new RouteSpec("h", 70_000, RouteSpec.Protocol.HTTP, "s"));
-    }
-  }
-
-  @Test
-  void relayRequestValidatesItsArguments() throws Exception {
-    try (Rig rig = new Rig()) {
-      assertThrows(
-          ExecutionException.class,
-          () -> await(Expose.relayRequest(rig.conn, "", "GET", "/", null)));
-      assertThrows(
-          ExecutionException.class,
-          () -> await(Expose.relayRequest(rig.conn, "svc", "", "/", null)));
     }
   }
 

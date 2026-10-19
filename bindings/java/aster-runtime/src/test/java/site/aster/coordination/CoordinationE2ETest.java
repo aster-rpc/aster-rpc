@@ -12,15 +12,12 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -28,21 +25,27 @@ import site.aster.coordination.Coordination.*;
 import site.aster.coordination.CoordinationClient.LeaseAcquisition;
 import site.aster.coordination.Placement.Candidate;
 import site.aster.coordination.Placement.PlacementPolicy;
-import site.aster.ffi.IrohStatus;
 import site.aster.lease.DenyReason;
 import site.aster.lease.LeaseStatus;
 import site.aster.node.IrohNode;
-import site.aster.upcall.FailureMode;
 import site.aster.upcall.Ucv1;
 import site.aster.upcall.UpcallKind;
 import site.aster.upcall.Upcalls;
 
 /**
  * The C ABI 4.4 coordination client against a real voter group in its own process (see {@link
- * VoterFixture}): open / close / journal lock, mutation + acknowledge, redelivery after reopen,
- * reads, leases (granted, denied, compare-and-set, release), admission refusals, the placement
- * manager over Java providers, and close with operations in flight. Skipped when the voter binary
- * is not built.
+ * VoterFixture}): open / close / journal lock, redelivery after reopen, a lease (granted, denied,
+ * compare-and-set, release), retiring an earlier journal, and the placement manager over Java
+ * providers. Skipped when the voter binary is not built.
+ *
+ * <p>These are wiring tests; reply and error decoding is in {@link CoordinationVectorsTest}. The
+ * behaviour is tested once in Rust, in {@code ffi/tests/coordination.rs}: read-only clients ({@code
+ * read_only_client_reads_and_refuses_the_journal}), the acknowledge rule and reads ({@code
+ * durable_client_mutations_reads_and_redelivery}), ACL refusals ({@code
+ * an_acl_refusal_is_permission_denied}), close with leases and operations in flight ({@code
+ * close_retires_handles_and_keeps_the_delivery_contract}), concurrency ({@code
+ * concurrent_reads_share_one_client}, {@code a_release_waits_for_an_in_flight_compare_and_set}) and
+ * the placement manager's failure modes ({@code placement_manager_over_foreign_providers}).
  */
 final class CoordinationE2ETest {
 
@@ -160,24 +163,6 @@ final class CoordinationE2ETest {
   }
 
   @Test
-  void aReadOnlyClientReadsAndRefusesJournaledCalls() throws Exception {
-    ResourceKey none = res("none");
-    try (CoordinationClient admin = reopen(rootDir())) {
-      grant(admin, none, idOf(rootNode));
-    }
-    try (CoordinationClient ro = get(CoordinationClient.open(rootNode, group.readOnly()))) {
-      assertEquals(VoterFixture.DOMAIN, get(ro.groupStatus()).authorityDomain());
-      ResourceSnapshot s = get(ro.readLinearizable(none));
-      assertFalse(s.held());
-      CoordinationException e = assertCoordFailure(ro.acquire(res("x"), 5_000));
-      assertEquals(CoordinationException.Kind.UNSUPPORTED, e.kind());
-      assertEquals(IrohStatus.UNSUPPORTED, e.status());
-      assertEquals(
-          CoordinationException.Kind.UNSUPPORTED, assertCoordFailure(ro.clientId()).kind());
-    }
-  }
-
-  @Test
   void callsAfterCloseAreRefused() throws Exception {
     CoordinationClient c = openRoot(journal());
     ResourceKey closing = res("closing");
@@ -194,27 +179,6 @@ final class CoordinationE2ETest {
   }
 
   // ── mutation -> acknowledge, redelivery ──────────────────────────────────
-
-  @Test
-  void aMutationMustBeAcknowledgedBeforeTheNext() throws Exception {
-    try (CoordinationClient root = reopen(rootDir())) {
-      ResourceKey r = res("ack");
-      AclStatus acl = get(root.inspectAcl(r));
-      byte[] actor = idOf(rootNode);
-      try (ResolvedMutation m = get(root.setGrant(r, actor, RIGHTS, acl.aclRevision()))) {
-        assertEquals(6, m.reply().outcomeCode());
-        CoordinationException e = assertCoordFailure(root.acquire(r, 5_000));
-        assertEquals(CoordinationException.Kind.AWAITING_ACK, e.kind());
-        assertEquals(IrohStatus.INVALID_ARGUMENT, e.status());
-        get(m.acknowledge());
-        assertEquals(
-            CoordinationException.Kind.NOT_FOUND, assertCoordFailure(m.acknowledge()).kind());
-      }
-      // The next sequence may run now; a stale expectation is a typed rejection, a result.
-      MutationReply stale = ack(root.setGrant(r, actor, RIGHTS, 99));
-      assertTrue(stale.outcomeCode() != 6, "a stale ACL revision is rejected: " + stale);
-    }
-  }
 
   @Test
   void anUnacknowledgedResultIsRedeliveredAfterReopening() throws Exception {
@@ -249,40 +213,6 @@ final class CoordinationE2ETest {
 
     Optional1(java.util.Optional<ResolvedMutation> o) {
       value = o.orElse(null);
-    }
-  }
-
-  // ── reads ────────────────────────────────────────────────────────────────
-
-  @Test
-  void readsReflectCommittedState() throws Exception {
-    try (CoordinationClient root = reopen(rootDir())) {
-      ResourceKey r = res("reads");
-      byte[] actor = idOf(rootNode);
-      grant(root, r, actor);
-      AclStatus acl = get(root.inspectAcl(r));
-      assertTrue(
-          acl.grants().stream().anyMatch(g -> java.util.Arrays.equals(g.subjectNodeId(), actor)));
-      assertTrue(acl.aclRevision() >= 1);
-      AdminStatus admins = get(root.inspectAdmins());
-      assertFalse(admins.administrators().isEmpty());
-      assertNotNull(get(root.membershipStatus(null)));
-      ClientProbe probe = get(root.probeClient(actor, get(root.clientId())));
-      assertTrue(probe.exists());
-      assertTrue(probe.lastSequence() >= 1);
-      List<AuditRecord> audit = get(root.auditStream(null, 100));
-      assertFalse(audit.isEmpty());
-      assertInstanceOf(
-          IllegalArgumentException.class,
-          assertThrows(ExecutionException.class, () -> root.auditStream(null, 0).get()).getCause());
-
-      RecoveryExport export = get(root.recoveryExport());
-      assertEquals(export.totalLen(), export.body().length);
-      Path file = Files.createTempDirectory("aster-export").resolve("export.bin");
-      RecoveryManifest manifest = get(root.recoveryExportToFile(file));
-      assertTrue(Files.exists(file));
-      assertEquals(manifest.totalLen(), Files.size(file));
-      assertArrayEquals(export.blake3Checksum(), manifest.blake3Checksum());
     }
   }
 
@@ -350,80 +280,7 @@ final class CoordinationE2ETest {
     }
   }
 
-  @Test
-  void aClientsLeaseIsInertOnceItsClientIsClosed() throws Exception {
-    IrohNode a = VoterFixture.node(VoterFixture.actorSecret());
-    try (CoordinationClient root = reopen(rootDir())) {
-      CoordinationClient ca = get(CoordinationClient.open(a, group.durable(journal())));
-      ResourceKey r = res("inert");
-      grant(root, r, idOf(a));
-      CoordinationLease lease =
-          ((LeaseAcquisition.Granted) get(ca.acquireLease(r.namespace(), r.key(), 5_000, 0, 0)))
-              .lease();
-      assertTrue(lease.fence().isPresent());
-      ca.close();
-      assertEquals(LeaseStatus.RELEASED, lease.status());
-      assertTrue(lease.fence().isEmpty());
-      assertEquals(
-          CoordinationException.Kind.CLOSED,
-          assertCoordFailure(lease.compareAndSet(0, new byte[] {1})).kind());
-      lease.close();
-    } finally {
-      a.close();
-    }
-  }
-
-  // ── admission ────────────────────────────────────────────────────────────
-
-  @Test
-  void anActorWithoutRightsIsPermissionDenied() throws Exception {
-    IrohNode stranger = VoterFixture.node(VoterFixture.actorSecret());
-    Path dir = journal();
-    ResourceKey key = res("forbidden");
-    byte[] originalId;
-    try {
-      try (CoordinationClient c = get(CoordinationClient.open(stranger, group.durable(dir)))) {
-        originalId = get(c.clientId());
-        CoordinationException e = assertCoordFailure(c.acquire(key, 5_000));
-        assertEquals(CoordinationException.Kind.RPC, e.kind());
-        assertTrue(e.isPermissionDenied(), "status " + e.status() + " rpc " + e.rpcCode());
-        assertEquals(IrohStatus.PERMISSION_DENIED, e.status());
-        assertEquals(7, e.rpcCode());
-        // The denied sequence stays journaled as unresolved until resumed (inherited behaviour).
-        assertEquals(
-            CoordinationException.Kind.UNRESOLVED,
-            assertCoordFailure(c.acquire(res("again"), 5_000)).kind());
-      }
-      try (CoordinationClient root = reopen(rootDir())) {
-        grant(root, key, idOf(stranger));
-      }
-      try (CoordinationClient reopened =
-          get(CoordinationClient.open(stranger, group.durable(dir)))) {
-        assertArrayEquals(originalId, get(reopened.clientId()));
-        try (ResolvedMutation resumed = get(reopened.resume()).orElseThrow()) {
-          assertNotNull(resumed);
-          MutationReply reply = resumed.reply();
-          assertEquals(1, reply.outcomeCode());
-          assertTrue(reply.snapshot().held());
-          assertArrayEquals(originalId, reply.clientId());
-          try (ResolvedMutation replay = get(reopened.resume()).orElseThrow()) {
-            assertNotNull(replay);
-            assertEquals(reply.sequence(), replay.reply().sequence());
-            assertArrayEquals(reply.requestHash(), replay.reply().requestHash());
-          }
-          get(resumed.acknowledge());
-          MutationReply released =
-              ack(
-                  reopened.release(
-                      new Fence(group.groupId, key, reply.snapshot().epoch(), idOf(stranger))));
-          assertEquals(reply.sequence() + 1, released.sequence());
-          assertFalse(released.snapshot().held());
-        }
-      }
-    } finally {
-      stranger.close();
-    }
-  }
+  // ── retire ───────────────────────────────────────────────────────────────
 
   @Test
   void retireOtherClientRetiresAnEarlierJournal() throws Exception {
@@ -505,7 +362,7 @@ final class CoordinationE2ETest {
   }
 
   @Test
-  void placementOverJavaProvidersAndItsFailureModes() throws Exception {
+  void placementOverJavaProviders() throws Exception {
     try (CoordinationClient root = reopen(rootDir())) {
       GroupStatus st = get(root.groupStatus());
       byte[] voter = st.voters().get(0);
@@ -559,204 +416,6 @@ final class CoordinationE2ETest {
         assertArrayEquals(VoterFixture.filled(0x44), provisioned.get(0).policyDigest());
         assertArrayEquals(group.groupId, provisioned.get(0).groupId());
       }
-
-      // 3. A provisioner answering for a different node fails the pass.
-      try (Managed m =
-          managed(
-              root,
-              () -> policy(st, List.of(voter, newcomer), List.of(voter)),
-              req -> new MemberSeed(VoterFixture.filled(0x7b), "t", null),
-              () -> view(List.of(voter, newcomer)))) {
-        CoordinationException e = assertCoordFailure(m.manager().reconcile());
-        assertTrue(e.getMessage().contains("different node"), e.getMessage());
-      }
-
-      // 4. Provider failures never fail open.
-      try (Managed topologyDown =
-          managed(
-              root,
-              () -> policy(st, List.of(voter), List.of()),
-              null,
-              () -> {
-                throw new IllegalStateException("topology offline");
-              })) {
-        assertTrue(
-            assertCoordFailure(topologyDown.manager().reconcile())
-                .getMessage()
-                .contains("topology offline"));
-      }
-      try (Managed policyDown =
-          managed(
-              root,
-              () -> {
-                throw new IllegalStateException("policy store down");
-              },
-              null,
-              () -> view(List.of(voter)))) {
-        assertTrue(
-            assertCoordFailure(policyDown.manager().reconcile())
-                .getMessage()
-                .contains("policy store down"));
-      }
-      CountDownLatch interrupted = new CountDownLatch(1);
-      try (Managed slow =
-          managed(
-              root,
-              () -> {
-                try {
-                  Thread.sleep(20_000);
-                } catch (InterruptedException e) {
-                  interrupted.countDown();
-                  throw e;
-                }
-                return policy(st, List.of(voter), List.of());
-              },
-              null,
-              () -> view(List.of(voter)))) {
-        // The policy kind is a placement kind, not a decision: even FAIL_OPEN does not apply.
-        slow.table()
-            .setPolicy(UpcallKind.PLACEMENT_POLICY, Duration.ofMillis(300), FailureMode.FAIL_OPEN);
-        assertCoordFailure(slow.manager().reconcile());
-        assertTrue(interrupted.await(T, TimeUnit.SECONDS), "the policy callback sees the timeout");
-      }
-      // An undecodable answer fails the pass too.
-      try (Upcalls raw = Upcalls.create(rootNode.runtime());
-          PlacementManager m =
-              PlacementManager.create(
-                  root,
-                  raw,
-                  () -> policy(st, List.of(voter), List.of()),
-                  null,
-                  () -> view(List.of(voter)))) {
-        raw.handle(
-            UpcallKind.PLACEMENT_POLICY, (req, dl) -> new byte[] {(byte) 0xBD, 1, (byte) 0xFF});
-        assertCoordFailure(m.reconcile());
-      }
-
-      // 5. A closed client retires its manager.
-      CoordinationClient doomed = openRoot(journal());
-      Managed retired =
-          managed(
-              doomed,
-              () -> policy(st, List.of(voter), List.of()),
-              null,
-              () -> view(List.of(voter)));
-      doomed.close();
-      assertEquals(
-          CoordinationException.Kind.CLOSED,
-          assertCoordFailure(retired.manager().reconcile()).kind());
-      retired.close();
-      retired.close();
-      try (Upcalls u = Upcalls.create(rootNode.runtime())) {
-        assertEquals(
-            CoordinationException.Kind.CLOSED,
-            assertThrows(
-                    CoordinationException.class,
-                    () ->
-                        PlacementManager.create(
-                            doomed, u, () -> null, null, () -> view(List.of(voter))))
-                .kind());
-      }
-    }
-  }
-
-  // ── close with operations in flight ──────────────────────────────────────
-
-  @Test
-  void closeWithOperationsInFlightLosesNothing() throws Exception {
-    Path dir = journal();
-    ResourceKey r = res("inflight");
-    CoordinationClient root = openRoot(dir);
-    try (CoordinationClient admin = reopen(rootDir())) {
-      grant(admin, r, idOf(rootNode));
-    }
-    AclStatus acl = get(root.inspectAcl(r));
-    // Reads in flight complete normally or fail CLOSED; none hang.
-    List<CompletableFuture<?>> reads = new ArrayList<>();
-    for (int i = 0; i < 8; i++) {
-      reads.add(root.readLinearizable(r));
-    }
-    CompletableFuture<ResolvedMutation> mutation =
-        root.setGrant(r, idOf(rootNode), RIGHTS, acl.aclRevision());
-    root.close();
-    for (CompletableFuture<?> f : reads) {
-      try {
-        f.get(T, TimeUnit.SECONDS);
-      } catch (ExecutionException e) {
-        assertEquals(
-            CoordinationException.Kind.CLOSED,
-            assertInstanceOf(CoordinationException.class, e.getCause()).kind());
-      }
-    }
-    // The mutation resolves exactly once: handed out now, or redelivered after reopening.
-    boolean handedOut;
-    byte[] reply = null;
-    try {
-      ResolvedMutation m = get(mutation);
-      handedOut = true;
-      reply = CoordinationCodec.encodeMutationReply(m.reply());
-      m.close();
-    } catch (ExecutionException e) {
-      handedOut = false;
-      assertEquals(
-          CoordinationException.Kind.CLOSED,
-          assertInstanceOf(CoordinationException.class, e.getCause()).kind());
-    }
-    try (CoordinationClient again = reopen(dir)) {
-      var redelivered = get(again.unacknowledged());
-      if (!handedOut || reply != null) {
-        // Either way the result is journaled and unacknowledged: it comes back.
-        assertTrue(redelivered.isPresent(), "handedOut=" + handedOut);
-        if (reply != null) {
-          assertArrayEquals(
-              reply, CoordinationCodec.encodeMutationReply(redelivered.get().reply()));
-        }
-        get(redelivered.get().acknowledge());
-      }
-    }
-  }
-
-  @Test
-  void concurrentClientsDoNotInterfere() throws Exception {
-    int n = 4;
-    List<IrohNode> nodes = new ArrayList<>();
-    try (CoordinationClient root = reopen(rootDir())) {
-      List<CompletableFuture<Void>> work = new ArrayList<>();
-      AtomicInteger granted = new AtomicInteger();
-      List<ResourceKey> keys = new ArrayList<>();
-      for (int i = 0; i < n; i++) {
-        IrohNode a = VoterFixture.node(VoterFixture.actorSecret());
-        nodes.add(a);
-        ResourceKey r = res("conc" + i);
-        keys.add(r);
-        grant(root, r, idOf(a));
-      }
-      for (int i = 0; i < n; i++) {
-        IrohNode a = nodes.get(i);
-        ResourceKey r = keys.get(i);
-        work.add(
-            CompletableFuture.runAsync(
-                () -> {
-                  try (CoordinationClient c =
-                      get(CoordinationClient.open(a, group.durable(journal())))) {
-                    var lease =
-                        ((LeaseAcquisition.Granted)
-                                get(c.acquireLease(r.namespace(), r.key(), 20_000, 0, 0)))
-                            .lease();
-                    get(lease.compareAndSet(0, new byte[] {7}));
-                    get(lease.release());
-                    granted.incrementAndGet();
-                  } catch (Exception e) {
-                    throw new IllegalStateException(e);
-                  }
-                }));
-      }
-      for (CompletableFuture<Void> f : work) {
-        f.get(T, TimeUnit.SECONDS);
-      }
-      assertEquals(n, granted.get());
-    } finally {
-      nodes.forEach(IrohNode::close);
     }
   }
 }

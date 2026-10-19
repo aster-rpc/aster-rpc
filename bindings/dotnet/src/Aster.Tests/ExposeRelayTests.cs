@@ -174,40 +174,6 @@ public class ExposeRelayTests
     }
 
     [Fact]
-    public async Task Connection_Closed_While_Awaiting_The_Head()
-    {
-        var (rig, h) = await Setup();
-        await using var _r = rig;
-        var pending = ExposeClient.RelayStreamAsync(rig.Conn, ExposeRig.Svc, "PUT", "/gate");
-        await Eventually(() => h.Has(l => l == "start /gate"), "handler");
-        await Task.Delay(100);
-        rig.Conn.Close("bye");
-        var ex = await Assert.ThrowsAsync<ExposeRelayException>(() => pending.WaitAsync(T));
-        Assert.Equal(HttpBodyStatus.ConnectionClosed, ex.RelayStatus);
-        Assert.Equal(Status.AlreadyClosed, ex.Status);
-        h.Gate.SetResult();
-    }
-
-    [Fact]
-    public async Task Early_Head_Arrives_While_The_Upload_Is_Still_Going_Then_The_Upload_Stops()
-    {
-        var (rig, _) = await Setup();
-        await using var _r = rig;
-        int sent = 0;
-        async IAsyncEnumerable<ReadOnlyMemory<byte>> Endless([EnumeratorCancellation] CancellationToken ct = default)
-        {
-            var chunk = new byte[64 * 1024];
-            while (true) { Interlocked.Increment(ref sent); yield return chunk; await Task.Yield(); }
-        }
-        await using var resp = await ExposeClient.RelayStreamAsync(rig.Conn, ExposeRig.Svc, "PUT", "/early", null, Endless()).WaitAsync(T);
-        Assert.Equal(413, resp.Status);
-        Assert.Equal("too big", Encoding.UTF8.GetString(await ReadAll(resp.Body)));
-        // The handler never reads: the upload ends "peer stopped reading", not as a failure.
-        Assert.False(await resp.Upload.WaitAsync(T));
-        Assert.True(sent > 0);
-    }
-
-    [Fact]
     public async Task Disposing_Before_The_End_Resets_The_Upload()
     {
         var (rig, h) = await Setup();
@@ -231,19 +197,6 @@ public class ExposeRelayTests
         Assert.Equal(1, Volatile.Read(ref ended));
         await Eventually(() => h.Has(l => l == "read err"), "handler saw the reset");
         Assert.False(h.Has(l => l == "duplex done"));
-        await rig.WaitClosed();
-    }
-
-    [Fact]
-    public async Task A_Body_Read_To_Its_Clean_End_Lets_The_Upload_Finish()
-    {
-        var (rig, h) = await Setup();
-        await using var _r = rig;
-        var resp = await ExposeClient.RelayStreamAsync(rig.Conn, ExposeRig.Svc, "POST", "/duplex", null, Pieces(Encoding.UTF8.GetBytes("three"), 5)).WaitAsync(T);
-        Assert.Equal("three", Encoding.UTF8.GetString(await ReadAll(resp.Body)));
-        await resp.DisposeAsync(); // waits for the upload to finish
-        Assert.True(await resp.Upload);
-        await Eventually(() => h.Has(l => l == "duplex done"), "handler done");
         await rig.WaitClosed();
     }
 

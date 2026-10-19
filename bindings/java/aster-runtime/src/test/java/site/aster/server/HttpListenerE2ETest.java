@@ -23,7 +23,6 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -47,7 +46,19 @@ import site.aster.upcall.Ucv1;
 import site.aster.upcall.UpcallKind;
 import site.aster.upcall.Upcalls;
 
-/** Real ABI 4.11 TLS listeners, typed authentication and owned shutdown. */
+/**
+ * Real ABI 4.11 TLS listeners, typed authentication and owned shutdown: the Java wiring.
+ *
+ * <p>Listener behaviour is tested once in Rust: the topology role gate ({@code
+ * ffi/tests/dispatch_server.rs} {@code
+ * topology_opt_in_requires_monitoring_and_enforces_native_role_gate}), patterns over HTTP ({@code
+ * aster-transport-salvo/tests/streaming.rs} {@code streaming_patterns_over_http}), cancelling
+ * pending authentication and joining child ports on stop, close and racing starts ({@code
+ * ffi/tests/http_server.rs} {@code server_destroy_cancels_pending_auth_and_joins_child_ports},
+ * {@code runtime_close_joins_live_listener_and_start_race_does_not_publish_late_owner}) and the
+ * authentication timeout ({@code aster/tests/it/foreign_auth.rs} {@code
+ * timeout_and_closed_upcalls_fail_closed_and_settle_pending_work}).
+ */
 final class HttpListenerE2ETest {
   static byte[] certificate;
   static byte[] key;
@@ -271,55 +282,6 @@ final class HttpListenerE2ETest {
   }
 
   @Test
-  void topologyBaselineIsExplicitAndNativeRoleGated() throws Exception {
-    for (boolean enabled : List.of(false, true)) {
-      var server =
-          AsterServer.builder()
-              .config(
-                  AsterConfig.builder()
-                      .relayMode("disabled")
-                      .bindAddr("127.0.0.1:0")
-                      .enableMonitoring(true)
-                      .build())
-              .builtinTopology(enabled)
-              .topologyRequires(
-                  new site.aster.contract.CapabilityRequirement(
-                      site.aster.contract.CapabilityKind.ROLE, List.of("operator")))
-              .build()
-              .get(20, TimeUnit.SECONDS);
-      try (var rt = server.node().runtime();
-          server;
-          var up = Upcalls.create(rt);
-          var client = client()) {
-        up.serveRpcAuthenticator(
-            (request, invocation) ->
-                new Ucv1.RpcAuthResponse(
-                    true,
-                    "alice",
-                    request.metadata().getOrDefault("authorization", "").equals("Bearer operator")
-                        ? Map.of("aster.role", "operator")
-                        : Map.of()));
-        try (var listener = server.startHttp(up, config(false))) {
-          for (String role : List.of("none", "operator")) {
-            var request =
-                HttpRequest.newBuilder(
-                        URI.create(
-                            "https://" + listener.tcpAddress() + "/aster/aster.net.Topology/peers"))
-                    .timeout(Duration.ofSeconds(5))
-                    .header("authorization", "Bearer " + role)
-                    .POST(HttpRequest.BodyPublishers.ofByteArray(frame(new byte[0], 0x40)))
-                    .build();
-            var response =
-                reply(client.send(request, HttpResponse.BodyHandlers.ofByteArray()).body());
-            assertEquals(enabled ? (role.equals("operator") ? 0 : 7) : 5, response.status().code());
-            if (enabled && role.equals("operator")) assertFalse(response.payloads().isEmpty());
-          }
-        }
-      }
-    }
-  }
-
-  @Test
   void topologyBaselineRequiresMonitoring() throws Exception {
     var failure =
         assertThrows(
@@ -391,48 +353,6 @@ final class HttpListenerE2ETest {
         listener.close();
         assertTrue(listener.isClosed());
         released(listener.tcpAddress(), true);
-      }
-    }
-  }
-
-  @Test
-  void allFourRpcPatternsWorkOverAuthenticatedHttps() throws Exception {
-    try (Fixture f = new Fixture();
-        HttpClient client = client()) {
-      f.authenticate();
-      try (HttpListener listener = f.server.startHttp(f.upcalls, config(false))) {
-        assertNull(listener.quicAddress());
-        Reply unary =
-            call(client, listener.tcpAddress(), "echo", "alice", f.body(new Msg("hello", 1)));
-        assertEquals(RpcStatus.OK, unary.status().code());
-        assertEquals(
-            "echo:hello", ((Msg) f.codec.decode(unary.payloads().getFirst(), Msg.class)).text());
-        Reply count =
-            call(client, listener.tcpAddress(), "count", "alice", f.body(new Msg("n", 3)));
-        assertEquals(RpcStatus.OK, count.status().code());
-        assertEquals(3, count.payloads().size());
-        Reply sum =
-            call(
-                client,
-                listener.tcpAddress(),
-                "sum",
-                "alice",
-                f.body(new Msg("", 1), new Msg("", 2), new Msg("", 3)));
-        assertEquals(RpcStatus.OK, sum.status().code());
-        assertEquals(6, ((Msg) f.codec.decode(sum.payloads().getFirst(), Msg.class)).n());
-        Reply chat =
-            call(
-                client,
-                listener.tcpAddress(),
-                "chat",
-                "alice",
-                f.body(new Msg("x", 0), new Msg("y", 0)));
-        assertEquals(RpcStatus.OK, chat.status().code());
-        assertEquals(
-            List.of("re:x", "re:y"),
-            chat.payloads().stream()
-                .map(b -> ((Msg) f.codec.decode(b, Msg.class)).text())
-                .toList());
       }
     }
   }
@@ -553,90 +473,6 @@ final class HttpListenerE2ETest {
   }
 
   @Test
-  void stopCancelsPendingAuthAndSuppressesLateAnswer() throws Exception {
-    try (Fixture f = new Fixture();
-        HttpClient client = client()) {
-      CountDownLatch entered = new CountDownLatch(1);
-      CountDownLatch cancelled = new CountDownLatch(1);
-      AtomicReference<Upcalls.Invocation> invocation = new AtomicReference<>();
-      f.upcalls.serveRpcAuthenticator(
-          (request, inv) -> {
-            invocation.set(inv);
-            entered.countDown();
-            try {
-              Thread.sleep(30_000);
-            } catch (InterruptedException e) {
-              cancelled.countDown();
-              throw e;
-            }
-            return Ucv1.RpcAuthResponse.rejected();
-          });
-      try (HttpListener listener = f.server.startHttp(f.upcalls, config(true))) {
-        var pending =
-            client.sendAsync(
-                request(listener.tcpAddress(), "echo", "alice", f.body(new Msg("", 0))),
-                HttpResponse.BodyHandlers.ofByteArray());
-        assertTrue(entered.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
-        listener.stop(Duration.ZERO);
-        assertTrue(
-            cancelled.await(WaitBudget.SECONDS, TimeUnit.SECONDS),
-            "native cancellation interrupts auth worker");
-        assertTrue(invocation.get().isCancelled());
-        assertFalse(
-            invocation
-                .get()
-                .respond(
-                    Upcalls.STATUS_OK,
-                    Ucv1.encodeRpcAuthResponse(new Ucv1.RpcAuthResponse(true, "late", Map.of()))));
-        pending.handle((response, error) -> null).get(WaitBudget.SECONDS, TimeUnit.SECONDS);
-        assertTrue(f.calls.isEmpty());
-        released(listener.tcpAddress(), true);
-      }
-    }
-  }
-
-  @Test
-  void authTimeoutFailsClosedAndInterruptsWorker() throws Exception {
-    try (Fixture f = new Fixture();
-        HttpClient client = client()) {
-      CountDownLatch interrupted = new CountDownLatch(1);
-      f.upcalls.setPolicy(
-          UpcallKind.RPC_AUTHENTICATE, Duration.ofMillis(50), FailureMode.FAIL_OPEN);
-      f.upcalls.serveRpcAuthenticator(
-          (request, inv) -> {
-            try {
-              Thread.sleep(30_000);
-            } catch (InterruptedException e) {
-              interrupted.countDown();
-              throw e;
-            }
-            return new Ucv1.RpcAuthResponse(true, "late", Map.of());
-          });
-      try (HttpListener listener = f.server.startHttp(f.upcalls, config(false))) {
-        Reply reply = call(client, listener.tcpAddress(), "echo", "alice", f.body(new Msg("", 0)));
-        assertEquals(RpcStatus.UNAVAILABLE, reply.status().code());
-        assertTrue(interrupted.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
-        assertTrue(f.calls.isEmpty());
-      }
-    }
-  }
-
-  @Test
-  void parentCloseJoinsListenersAndRejectsFurtherStarts() throws Exception {
-    try (Fixture f = new Fixture()) {
-      f.authenticate();
-      HttpListener listener = f.server.startHttp(f.upcalls, config(true));
-      assertThrows(IllegalArgumentException.class, () -> listener.stop(Duration.ofMillis(-1)));
-      assertFalse(listener.isClosed());
-      f.server.close();
-      released(listener.tcpAddress(), true);
-      assertThrows(IrohException.class, () -> f.server.startHttp(f.upcalls, config(false)));
-      listener.close();
-      assertTrue(listener.isClosed());
-    }
-  }
-
-  @Test
   void runtimeShutdownInterruptsManagedAuthAndReleasesNativeOwners() throws Exception {
     try (Fixture f = new Fixture();
         HttpClient client = client()) {
@@ -679,46 +515,6 @@ final class HttpListenerE2ETest {
         listener.close();
         assertTrue(f.calls.isEmpty());
       }
-    }
-  }
-
-  @Test
-  void concurrentStartAndServerCloseCannotLeaveChildPorts() throws Exception {
-    try (Fixture f = new Fixture()) {
-      f.authenticate();
-      int port;
-      try (ServerSocket available =
-          new ServerSocket(0, 1, java.net.InetAddress.getByName("127.0.0.1"))) {
-        port = available.getLocalPort();
-      }
-      String address = "127.0.0.1:" + port;
-      CountDownLatch ready = new CountDownLatch(1);
-      CompletableFuture<HttpListener> result = new CompletableFuture<>();
-      Thread starter =
-          Thread.ofPlatform()
-              .start(
-                  () -> {
-                    ready.countDown();
-                    try {
-                      result.complete(
-                          f.server.startHttp(
-                              f.upcalls,
-                              new HttpListenerConfig(address, certificate, key, true, 0, 0)));
-                    } catch (Throwable e) {
-                      result.completeExceptionally(e);
-                    }
-                  });
-      assertTrue(ready.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
-      f.server.close();
-      try {
-        HttpListener listener = result.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
-        listener.close();
-      } catch (java.util.concurrent.ExecutionException e) {
-        assertInstanceOf(IrohException.class, e.getCause());
-      }
-      starter.join(WaitBudget.duration());
-      assertFalse(starter.isAlive());
-      released(address, true);
     }
   }
 }

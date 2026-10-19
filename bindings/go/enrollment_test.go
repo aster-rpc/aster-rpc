@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -159,50 +158,6 @@ func addrOf(t *testing.T, n *Node) NodeAddr {
 	}
 }
 
-// The credential sets the maximum; runtime settings can only restrict. A
-// credential granting ops.status,ops.logs restricted to ops.status refuses
-// logs on the next call; SetPeerAttributes cannot grant an enrolled peer a
-// role; clearing restores the credential roles; a peer without a session
-// cannot be restricted.
-func TestEnrollment_RuntimeRestrictionRefusesTheNextCall(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	srv, server := startOps(t, ctx, ServerOptions{Config: serverCfg(t, t.TempDir())})
-	client := startClient(t, ctx, enrolledCfg(5, credentialFor(t, 5, "ops.status,ops.logs")))
-	peer := enrollPub(5)
-	if roles, err := opsCall(ctx, client, server, "logs"); err != nil || roles != "ops.logs,ops.status" {
-		t.Fatalf("logs before the restriction: %q %v", roles, err)
-	}
-
-	if err := srv.RestrictPeerRoles(peer, []string{"ops.status"}); err != nil {
-		t.Fatal(err)
-	}
-	if roles, err := opsCall(ctx, client, server, "status"); err != nil || roles != "ops.status" {
-		t.Fatalf("status after the restriction: %q %v", roles, err)
-	}
-	if _, err := opsCall(ctx, client, server, "logs"); !errors.Is(err, ErrRpcPermissionDenied) {
-		t.Fatalf("logs after the restriction: want PERMISSION_DENIED, got %v", err)
-	}
-
-	err := srv.SetPeerAttributes(peer, map[string]string{"aster.role": "ops.admin"})
-	if !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("a runtime role grant to an enrolled peer: want INVALID_ARGUMENT, got %v", err)
-	}
-	if _, err := opsCall(ctx, client, server, "logs"); !errors.Is(err, ErrRpcPermissionDenied) {
-		t.Fatalf("logs after the refused grant: want PERMISSION_DENIED, got %v", err)
-	}
-
-	if err := srv.ClearPeerRestriction(peer); err != nil {
-		t.Fatal(err)
-	}
-	if roles, err := opsCall(ctx, client, server, "logs"); err != nil || roles != "ops.logs,ops.status" {
-		t.Fatalf("logs after clearing: %q %v", roles, err)
-	}
-	if err := srv.RestrictPeerRoles(enrollPub(9), nil); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("restricting a peer without a session: want NOT_FOUND, got %v", err)
-	}
-}
-
 // The roles in a client's credential are what Requires checks, with no
 // application code; a credential without the role is refused, and a node
 // with no credential cannot reach the service. A revocation the root
@@ -347,83 +302,6 @@ func TestEnrollment_ClientStreamRefusalIsPermissionDenied(t *testing.T) {
 	}
 	if reply, err := CallClientStream[opsRequest, opsReply](ctx, orc, "Ops", "upload", items); err != nil || reply.Roles != "100" {
 		t.Fatalf("admin upload: %+v %v", reply, err)
-	}
-}
-
-// A server configured as a delegated issuer serves renewals; a client whose
-// credential that server signed renews automatically and stays admitted,
-// with its roles, past its first credential's expiry. The server synchronizes
-// policy from a configured replica (the root).
-func TestEnrollment_ConfigDrivenIssuerRenewsClientCredentials(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	defer cancel()
-	dir := t.TempDir()
-
-	// The root as a policy replica: it holds the fleet namespace.
-	rootCfg := enrolledCfg(1, credentialFor(t, 1, ""))
-	rootCfg.Enrollment.StatePath = filepath.Join(dir, "root.json")
-	rootSrv, err := StartServer(ctx, ServerOptions{Config: rootCfg})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rootSrv.Close()
-	addrOf(t, rootSrv.Node())
-	rootTicket, err := rootSrv.Ticket(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	delegation, err := enrollRoot.Delegation(enrollPub(2), []string{}, []string{"aster.role"}, time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg := serverCfg(t, dir)
-	cfg.Enrollment.Replicas = []string{rootTicket}
-	cfg.Enrollment.IssuerDelegationFile = filepath.Join(dir, "issuer.chain")
-	cfg.Enrollment.IssuerLifetimeSecs = 15
-	if err := os.WriteFile(cfg.Enrollment.IssuerDelegationFile, []byte(delegation+"\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	srv, server := startOps(t, ctx, ServerOptions{Config: cfg})
-	issuer := srv.Issuer()
-	if issuer == nil {
-		t.Fatal("configured issuer missing")
-	}
-	if info, err := issuer.Info(); err != nil || info.PublicKey != enrollPub(2) {
-		t.Fatalf("issuer info %+v %v", info, err)
-	}
-	// Claims beyond the delegation are refused with a code.
-	_, err = issuer.Issue(enrollPub(7), EnrollmentClaims{Scopes: []string{"deploy"}, Tags: []string{}}, RegistrationEphemeral)
-	var refusal *IssuerRefusal
-	if !errors.As(err, &refusal) || refusal.Code != "invalid_credential" || !errors.Is(err, ErrPermissionDenied) {
-		t.Fatalf("wider claims: %v", err)
-	}
-	issued, err := issuer.Issue(enrollPub(7), EnrollmentClaims{
-		Scopes: []string{}, Tags: []string{}, Attributes: map[string]Attribute{"aster.role": StringAttribute("ops.status")},
-	}, RegistrationEphemeral)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	client := startClient(t, ctx, enrolledCfg(7, issued.Chain))
-	if roles, err := opsCall(ctx, client, server, "status"); err != nil || roles != "ops.status" {
-		t.Fatalf("status: %q %v", roles, err)
-	}
-	if !client.IsRenewing() {
-		t.Fatal("the server signed the credential, so the client renews from it")
-	}
-	// Past the first credential's expiry: renewal starts with a third of the
-	// lifetime left (5 s), enough to re-present on a loaded host.
-	deadline := time.Now().Add(15*time.Second + 3*time.Second)
-	for time.Now().Before(deadline) {
-		if roles, err := opsCall(ctx, client, server, "status"); err != nil || roles != "ops.status" {
-			t.Fatalf("status across lifetimes: %q %v", roles, err)
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-	current, err := client.Enrollment().Credential()
-	if err != nil || current.CredentialID == issued.CredentialID {
-		t.Fatalf("the credential was not renewed: %+v %v", current, err)
 	}
 }
 

@@ -38,6 +38,7 @@ internal sealed class ClientInterceptors
     private readonly CircuitBreakerInterceptor[] _breakers;
     private readonly DeadlineInterceptor[] _deadlines;
     private readonly int _maxAttempts;
+    private readonly TimeProvider _clock;
 
     public ClientInterceptors(IEnumerable<IInterceptor> interceptors)
     {
@@ -46,6 +47,10 @@ internal sealed class ClientInterceptors
         _breakers = [.. _all.OfType<CircuitBreakerInterceptor>()];
         _deadlines = [.. _all.OfType<DeadlineInterceptor>()];
         _maxAttempts = _retries.Length == 0 ? 1 : Math.Max(1, _retries.Max(r => r.MaxAttempts));
+        // One clock for deadlines and back-off: the first one a deadline or retry interceptor was
+        // given that is not the system clock (tests inject a fake one), else the system clock.
+        _clock = _deadlines.Select(d => d.Clock).Concat(_retries.Select(r => r.Clock))
+            .FirstOrDefault(c => c != TimeProvider.System) ?? TimeProvider.System;
     }
 
     public IReadOnlyList<IInterceptor> All => _all;
@@ -63,11 +68,12 @@ internal sealed class ClientInterceptors
             Idempotent = options?.Idempotent ?? false,
             SessionId = options is { SessionId: not 0 } ? options.SessionId.ToString() : null,
             Peer = peer,
+            Clock = _clock,
         };
         if (options?.Metadata is { } md)
             foreach (var kv in md) ctx.Metadata[kv.Key] = kv.Value;
         if (options?.Deadline is { } d && d > TimeSpan.Zero)
-            ctx.Deadline = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / 1000.0 + d.TotalSeconds;
+            ctx.Deadline = _clock.GetUtcNow().ToUnixTimeMilliseconds() / 1000.0 + d.TotalSeconds;
         return ctx;
     }
 
@@ -157,7 +163,7 @@ internal sealed class ClientInterceptors
                     if (left <= 0.0) throw new RpcError(StatusCode.DeadlineExceeded, "deadline exceeded");
                     delay = Math.Min(delay, left);
                 }
-                await Task.Delay(TimeSpan.FromSeconds(delay), ct).ConfigureAwait(false);
+                await Task.Delay(TimeSpan.FromSeconds(delay), _clock, ct).ConfigureAwait(false);
             }
         }
         throw new RpcError(StatusCode.Internal, "call failed");

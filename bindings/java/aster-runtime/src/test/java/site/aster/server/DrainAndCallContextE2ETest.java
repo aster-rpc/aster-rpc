@@ -2,17 +2,12 @@ package site.aster.server;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
@@ -29,8 +24,6 @@ import site.aster.client.AsterClient;
 import site.aster.client.CallOptions;
 import site.aster.codec.Codec;
 import site.aster.codec.ForyCodec;
-import site.aster.ffi.IrohException;
-import site.aster.ffi.IrohStatus;
 import site.aster.interceptors.CallContext;
 import site.aster.interceptors.RpcError;
 import site.aster.interceptors.StatusCode;
@@ -46,6 +39,12 @@ import site.aster.server.spi.UnaryDispatcher;
 /**
  * ABI 7.2 server drain and the ABI 7.5 handler context (transport peer vs principal, call ids,
  * metadata, deadline, {@code current()}, {@code cancelled()}), over Iroh with a typed client.
+ *
+ * <p>These are wiring tests: the context reaches the handler, and a drain's deadline cancellation
+ * reaches it and maps to a {@link DrainReport}. Letting in-flight calls finish, refusing new ones
+ * and turning readiness off are behaviour, tested once in Rust ({@code aster/tests/it/rpc_drain.rs}
+ * {@code in_flight_calls_of_every_pattern_finish_within_grace}, {@code aster/tests/health.rs}
+ * {@code drain_reports_not_ready_while_in_flight_work_finishes}).
  */
 final class DrainAndCallContextE2ETest {
 
@@ -134,17 +133,18 @@ final class DrainAndCallContextE2ETest {
 
   record Fixture(AsterServer server, AsterClient client, NodeAddr addr, Svc svc)
       implements AutoCloseable {
-    static Fixture start(boolean health) throws Exception {
+    static Fixture start() throws Exception {
       ForyCodec serverCodec = new ForyCodec();
       register(serverCodec.fory());
       ForyCodec clientCodec = new ForyCodec();
       register(clientCodec.fory());
       Svc svc = new Svc();
-      AsterServer.Builder b = AsterServer.builder().codec(serverCodec).service(new Impl(), svc);
-      if (health) {
-        b.health("127.0.0.1", 0);
-      }
-      AsterServer server = b.build().get(20, TimeUnit.SECONDS);
+      AsterServer server =
+          AsterServer.builder()
+              .codec(serverCodec)
+              .service(new Impl(), svc)
+              .build()
+              .get(20, TimeUnit.SECONDS);
       AsterClient client =
           AsterClient.builder().codec(clientCodec).build().get(20, TimeUnit.SECONDS);
       return new Fixture(server, client, server.node().nodeAddr(), svc);
@@ -170,20 +170,9 @@ final class DrainAndCallContextE2ETest {
     throw new AssertionError("timed out waiting for " + what);
   }
 
-  static int readyz(HttpClient http, String address) {
-    try {
-      return http.send(
-              HttpRequest.newBuilder(URI.create("http://" + address + "/readyz")).build(),
-              HttpResponse.BodyHandlers.discarding())
-          .statusCode();
-    } catch (Exception e) {
-      return -1;
-    }
-  }
-
   @Test
   void handlerContextCarriesIdentityIdsMetadataAndDeadline() throws Exception {
-    try (Fixture f = Fixture.start(false)) {
+    try (Fixture f = Fixture.start()) {
       Msg out =
           f.call(
                   "whoami",
@@ -223,58 +212,8 @@ final class DrainAndCallContextE2ETest {
   }
 
   @Test
-  void drainLetsInFlightFinishRefusesNewCallsAndTurnsReadinessOff() throws Exception {
-    try (Fixture f = Fixture.start(true);
-        HttpClient http = HttpClient.newHttpClient()) {
-      String health = f.server().health().address();
-      assertEquals(200, readyz(http, health));
-      assertFalse(f.server().isDraining());
-      CompletableFuture<Msg> held = f.call("hold", CallOptions.DEFAULT);
-      eventually("the held call in its handler", () -> f.svc().started.get() == 1);
-
-      CompletableFuture<DrainReport> drained =
-          CompletableFuture.supplyAsync(() -> f.server().drain(Duration.ofSeconds(30)));
-      AtomicReference<Throwable> refused = new AtomicReference<>();
-      eventually(
-          "a new call refused as draining",
-          () -> {
-            try {
-              f.call("ping", CallOptions.DEFAULT).get(10, TimeUnit.SECONDS);
-              return false;
-            } catch (Exception e) {
-              refused.set(e);
-              return true;
-            }
-          });
-      assertTrue(f.server().isDraining());
-      assertTrue(RpcError.isDraining(refused.get()), String.valueOf(refused.get()));
-      RpcError e = assertInstanceOf(RpcError.class, refused.get().getCause());
-      assertEquals(StatusCode.UNAVAILABLE, e.code());
-      assertTrue(e.isDraining());
-      eventually("readiness off", () -> readyz(http, health) != 200);
-      assertFalse(drained.isDone(), "drain waits for the held call");
-
-      f.svc().release.complete(null);
-      assertEquals("held", held.get(20, TimeUnit.SECONDS).text());
-      DrainReport r = drained.get(30, TimeUnit.SECONDS);
-      assertTrue(r.callsInFlight() >= 1, r.toString());
-      assertEquals(r.callsInFlight(), r.callsCompleted(), r.toString());
-      assertEquals(0, r.callsCancelled(), r.toString());
-      assertTrue(r.callsRefused() >= 1, r.toString());
-      assertEquals(1, r.connectionsClosed(), r.toString());
-      assertFalse(r.deadlineReached());
-      assertTrue(r.elapsed().compareTo(Duration.ofSeconds(30)) < 0);
-      assertEquals(0, f.svc().cancelled.get());
-
-      IrohException closed =
-          assertThrows(IrohException.class, () -> f.server().drain(Duration.ZERO));
-      assertEquals(IrohStatus.ALREADY_CLOSED, closed.status());
-    }
-  }
-
-  @Test
   void callRunningAtTheDeadlineIsCancelledAndSeesCancelled() throws Exception {
-    try (Fixture f = Fixture.start(false)) {
+    try (Fixture f = Fixture.start()) {
       CompletableFuture<Msg> held = f.call("hold", CallOptions.DEFAULT);
       eventually("the held call in its handler", () -> f.svc().started.get() == 1);
       DrainReport r = f.server().drain(Duration.ofMillis(200));

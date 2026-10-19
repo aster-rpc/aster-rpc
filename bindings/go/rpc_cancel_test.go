@@ -5,7 +5,6 @@ package aster
 import (
 	"context"
 	"errors"
-	"fmt"
 	"iter"
 	"testing"
 	"time"
@@ -89,63 +88,10 @@ func TestRPC_CancellableUnaryAndBoundedRecv(t *testing.T) {
 		t.Fatal("unary handler did not observe the cancel")
 	}
 
-	// Ten cancelled at once: eight on the SHARED pool's streams, two waiting
-	// for one. Every started handler sees its cancel, and the pool is whole
-	// again: sixteen concurrent calls on the connection succeed.
-	cctx, ccancel = context.WithCancel(ctx)
-	errs := make(chan error, 10)
-	for range 10 {
-		go func() {
-			_, err := Call[testEchoRequest, testEchoReply](cctx, f.conn, "CancelTest", "block", &testEchoRequest{Data: []byte{}})
-			errs <- err
-		}()
-	}
-	for range 8 {
-		select {
-		case <-unaryStarted:
-		case <-time.After(10 * time.Second):
-			t.Fatal("the pool's eight streams never all carried a call")
-		}
-	}
-	ccancel()
-	for range 10 {
-		if err := <-errs; !errors.Is(err, context.Canceled) {
-			t.Fatalf("pooled cancel: %v", err)
-		}
-	}
-	for range 8 {
-		select {
-		case err := <-unaryDone:
-			if !errors.Is(err, context.Canceled) {
-				t.Fatalf("handler: %v", err)
-			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("a parked handler did not observe the cancel")
-		}
-	}
-	// The two queued calls may or may not have started before the cancel.
-	for len(unaryStarted) > 0 {
-		<-unaryStarted
-		if err := <-unaryDone; !errors.Is(err, context.Canceled) {
-			t.Fatalf("late handler: %v", err)
-		}
-	}
-	done := make(chan error, 16)
-	for i := range 16 {
-		go func() {
-			msg := fmt.Sprintf("after%d", i)
-			r, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "CancelTest", "echo", &testEchoRequest{Message: msg, Data: []byte{}})
-			if err == nil && r.Message != msg {
-				err = fmt.Errorf("got %q", r.Message)
-			}
-			done <- err
-		}()
-	}
-	for range 16 {
-		if err := <-done; err != nil {
-			t.Fatalf("echo after cancels: %v", err)
-		}
-	}
+	// Cancelling many pooled calls at once and the pool staying reusable is
+	// aster/tests/it/rpc_client.rs
+	// cancelled_queued_acquisitions_leave_a_saturated_pool_reusable and
+	// ffi/tests/dispatch_server.rs unary_cancel_token_while_the_pool_opens_streams.
 
 	// A server handler blocked pulling client-stream requests observes the
 	// peer cancel (bounded aster_dispatch_recv + call context).
