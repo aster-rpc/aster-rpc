@@ -31,7 +31,8 @@ use aster::coordination::contract::{
     ActionV1, ChangeMembershipActionV1, ClientCommandV1, CommandReplyV1, CommandV1, MemberSeedV1,
     NodeIdV1,
 };
-use aster::coordination::testing::Schedule;
+use aster::coordination::ids::CoordinationNodeId;
+use aster::coordination::testing::{Committed, Schedule};
 
 mod common;
 use common::{
@@ -48,10 +49,43 @@ const MEMBERSHIP_ACCEPTED: i32 = 8;
 /// The candidate's identity. Outside the genesis, so it joins on a permit.
 const CANDIDATE: [u8; 32] = [0x4Au8; 32];
 
-fn outcome_of(committed: &aster::coordination::testing::Committed) -> (i32, i32) {
+fn outcome_of(committed: &Committed) -> (i32, i32) {
     match &committed.reply {
         CommandReplyV1::Client(reply) => (reply.outcome_code, reply.reason_code),
         other => panic!("a membership plan must answer with a Client reply, got {other:?}"),
+    }
+}
+
+/// Propose `command` at whichever voter currently leads (outside `excluded`),
+/// resending the identical command on any error until `PATIENCE`.
+///
+/// A single attempt with a fixed timeout is a wait on one leader staying put.
+/// Resending is safe because a membership plan is idempotent: the same
+/// operation id with an unchanged request returns the existing intent
+/// (`model/membership.rs`), so a copy that already committed is not a second
+/// change. Same shape as `commit_at_leader` in `coordination_membership.rs`,
+/// which does not share this file's fixture.
+async fn commit_at_leader(
+    voters: &[ChaoticVoter],
+    excluded: &[CoordinationNodeId],
+    command: CommandV1,
+    what: &str,
+) -> Committed {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let leader = await_leader_other_than(voters, excluded, PATIENCE, what).await;
+        match voters[leader]
+            .coordination()
+            .propose_for_testing_within(command.clone(), Duration::from_secs(20))
+            .await
+        {
+            Ok(committed) => return committed,
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                eprintln!("{what}: {error:?}; retrying at the current leader");
+            }
+            Err(error) => panic!("{what}: {error:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -130,11 +164,7 @@ async fn a_joiner_survives_leadership_moving_outside_its_bootstrap_senders() {
             .to_vec(),
         action,
     });
-    let accepted = voters[leader]
-        .coordination()
-        .propose_for_testing_within(plan, Duration::from_secs(20))
-        .await
-        .expect("the plan commits");
+    let accepted = commit_at_leader(&voters, &[], plan, "the add-learner plan").await;
     assert_eq!(
         outcome_of(&accepted),
         (MEMBERSHIP_ACCEPTED, 0),
@@ -205,11 +235,13 @@ async fn a_joiner_survives_leadership_moving_outside_its_bootstrap_senders() {
             .to_vec(),
         action: follow_on,
     });
-    let committed = voters[successor]
-        .coordination()
-        .propose_for_testing_within(second, Duration::from_secs(30))
-        .await
-        .expect("the successor commits");
+    let committed = commit_at_leader(
+        &voters,
+        &[voters[leader].id],
+        second,
+        "the successor's follow-on plan",
+    )
+    .await;
 
     let deadline = tokio::time::Instant::now() + PATIENCE;
     loop {

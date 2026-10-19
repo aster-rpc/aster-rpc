@@ -18,7 +18,3 @@
 3 tests/python/test_docs.py
 2 tests/python/test_dumbpipe.py
 14 tests/python/test_http_listener.py
-# L2 single-attempt proposals (fixed 20 s / 30 s, no retry): the add-learner
-# plan and the successor's follow-on plan. Convert both to a resend-at-the-
-# current-leader helper like commit_at_leader in coordination_membership.rs.
-2 aster/tests/coordination_join.rs
