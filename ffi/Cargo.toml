@@ -40,6 +40,10 @@ hex = "0.4"
 base64 = "0.22"
 # Note: aster_ffi.h is regenerated externally with cbindgen; not a build dep.
 
+[target.'cfg(unix)'.dependencies]
+# pthread_sigmask: runtime threads block SIGPIPE (lib.rs).
+libc = { workspace = true }
+
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 rustls = "0.23"

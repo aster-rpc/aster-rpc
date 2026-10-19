@@ -108,7 +108,11 @@ fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, i32> {
     std::thread::scope(|s| {
         std::thread::Builder::new()
             .name("aster-otel-ffi".into())
-            .spawn_scoped(s, f)
+            // The exporter threads it starts inherit this mask.
+            .spawn_scoped(s, || {
+                crate::block_sigpipe_on_this_thread();
+                f()
+            })
             .map_err(|e| fail(aster_status_t::ASTER_STATUS_INTERNAL, e))?
             .join()
             .map_err(|_| {
@@ -369,6 +373,7 @@ pub extern "C" fn aster_observability_shutdown(timeout_ms: u32) -> i32 {
     let spawned = std::thread::Builder::new()
         .name("aster-otel-shutdown".into())
         .spawn(move || {
+            crate::block_sigpipe_on_this_thread();
             drop(handle);
             let _ = tx.send(());
         });

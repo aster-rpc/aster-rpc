@@ -1024,6 +1024,24 @@ struct OperationState {
     completion: Mutex<Option<tokio::sync::OwnedSemaphorePermit>>,
 }
 
+/// Blocks SIGPIPE on the calling thread, so a write to a closed socket or
+/// pipe fails with `EPIPE` instead of raising the signal. Rust ignores SIGPIPE
+/// only in its own binaries, and a vectored write (`writev`) still raises it;
+/// a Go host does not ignore it, and one raised on a thread Go doesn't own
+/// terminates the process (Go `os/signal`, "non-Go thread"). Threads spawned
+/// from a blocked thread inherit the mask.
+pub(crate) fn block_sigpipe_on_this_thread() {
+    #[cfg(unix)]
+    // SAFETY: the set is initialised by `sigemptyset` before use, and
+    // `pthread_sigmask` changes only the calling thread's mask.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGPIPE);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+}
+
 impl BridgeRuntime {
     fn new(worker_threads: u32, queue_capacity: u32, max_inflight_operations: u32) -> Result<Self> {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -1034,6 +1052,7 @@ impl BridgeRuntime {
         }
 
         builder.thread_name("iroh-ffi");
+        builder.on_thread_start(block_sigpipe_on_this_thread);
 
         let runtime = builder.build()?;
 
@@ -9507,5 +9526,33 @@ mod doc_event_receiver_tests {
             assert_eq!(aster_doc_event_receiver_free(f.runtime, f.receiver), 0);
             assert_eq!(f.bridge.doc_event_receivers.count(), 0);
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod sigpipe_tests {
+    use super::BridgeRuntime;
+
+    fn sigpipe_blocked() -> bool {
+        // SAFETY: a null new set only reads the calling thread's mask.
+        unsafe {
+            let mut current: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut current);
+            libc::sigismember(&current, libc::SIGPIPE) == 1
+        }
+    }
+
+    #[test]
+    fn runtime_threads_block_sigpipe() {
+        let bridge = BridgeRuntime::new(2, 0, 0).expect("runtime");
+        let handle = bridge.runtime.handle().clone();
+        let worker = handle
+            .block_on(handle.spawn(async { sigpipe_blocked() }))
+            .unwrap();
+        let blocking = handle
+            .block_on(handle.spawn_blocking(sigpipe_blocked))
+            .unwrap();
+        assert!(worker, "a worker thread must not raise SIGPIPE");
+        assert!(blocking, "a blocking-pool thread must not raise SIGPIPE");
     }
 }
