@@ -34,7 +34,7 @@ use aster::coordination::contract::{
     ActionV1, ChangeMembershipActionV1, ClientCommandV1, CommandV1, MemberSeedV1, NodeIdV1,
 };
 use aster::coordination::ids::CoordinationNodeId;
-use aster::coordination::testing::GroupFixture;
+use aster::coordination::testing::{GroupFixture, ProposeError};
 use aster::rpc::AsterServer;
 
 const DOMAIN: &str = "membership.test";
@@ -298,20 +298,35 @@ async fn departing_voters_are_retained_as_learners_and_can_return() {
     let before = coordination
         .last_applied_for_testing()
         .expect("an applied index");
-    let accepted = coordination
-        .propose_for_testing_within(
-            plan(
-                &fixture,
-                voters[leader].index,
-                b"grow",
-                coordination.membership_log_id_for_testing(),
-                &all,
-                &[],
-            ),
-            Duration::from_secs(20),
-        )
-        .await
-        .expect("the restoring plan commits");
+    // Leadership may move once the group has shrunk, so propose at whichever
+    // voter leads now. Only a refusal is retried: it never committed, whereas
+    // a timed-out plan may have, and a second copy would be refused.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let accepted = loop {
+        let proposer = &voters[await_leader(&voters, "for the grow").await];
+        let at = proposer.coordination();
+        match at
+            .propose_for_testing_within(
+                plan(
+                    &fixture,
+                    proposer.index,
+                    b"grow",
+                    at.membership_log_id_for_testing(),
+                    &all,
+                    &[],
+                ),
+                Duration::from_secs(20),
+            )
+            .await
+        {
+            Ok(committed) => break committed,
+            Err(ProposeError::Rejected(rejection)) if tokio::time::Instant::now() < deadline => {
+                eprintln!("the grow was refused, retrying at the current leader: {rejection:?}")
+            }
+            Err(error) => panic!("the restoring plan commits: {error:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     assert_eq!(
         outcome_of(&accepted).0,
         MEMBERSHIP_ACCEPTED,
@@ -465,16 +480,31 @@ async fn a_genesis_replay_survives_a_membership_change() {
     // The committed voter set is now three; the genesis names five. Under the
     // old ordering this is the point at which the founding document became
     // fatal.
-    let coordination = voters[leader].coordination();
-    let replay = coordination
-        .propose_for_testing_within(
-            CommandV1::Genesis(GenesisCommandV1 {
-                signed_genesis: fixture.signed_genesis(),
-            }),
-            Duration::from_secs(20),
-        )
-        .await
-        .expect("an exact replay commits after the membership changed");
+    //
+    // Leadership may move once the group has shrunk (it did on a loaded
+    // runner), so propose at whichever voter leads now, retrying a forward:
+    // the replay is idempotent.
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    let replay = loop {
+        let leader = await_leader(&voters, "for the replay").await;
+        match voters[leader]
+            .coordination()
+            .propose_for_testing_within(
+                CommandV1::Genesis(GenesisCommandV1 {
+                    signed_genesis: fixture.signed_genesis(),
+                }),
+                Duration::from_secs(20),
+            )
+            .await
+        {
+            Ok(committed) => break committed,
+            Err(error) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "an exact replay commits after the membership changed: {error:?}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
     match &replay.reply {
         aster::coordination::contract::CommandReplyV1::System(reply) => assert_eq!(
             reply.system_result_code, 8,
