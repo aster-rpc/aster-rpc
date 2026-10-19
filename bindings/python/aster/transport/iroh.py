@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
+from aster._aster import CancelToken
 from aster.codec import ForyCodec, ForyConfig
 from aster.rpc_types import SerializationMode
 from aster.status import RpcError, StatusCode
@@ -140,16 +141,25 @@ class IrohTransport(Transport):
         deadline_secs: float = 0,
         serialization_mode: int | None = None,
     ) -> Any:
-        response = await self._client.unary(
-            service,
-            method,
-            self._codec.encode(request),
-            version=self._version_of(service),
-            session_id=self._session_id,
-            deadline=float(deadline_secs),
-            serialization_mode=self._resolve_mode(serialization_mode),
-            metadata=_metadata(metadata),
-        )
+        # A synchronous cancel signal: asyncio's own cancellation reaches the
+        # native future a loop iteration late, long enough for a call queued
+        # for a pool slot to be dequeued and sent.
+        token = CancelToken()
+        try:
+            response = await self._client.unary(
+                service,
+                method,
+                self._codec.encode(request),
+                version=self._version_of(service),
+                session_id=self._session_id,
+                deadline=float(deadline_secs),
+                serialization_mode=self._resolve_mode(serialization_mode),
+                metadata=_metadata(metadata),
+                cancel_token=token,
+            )
+        except asyncio.CancelledError:
+            token.cancel()
+            raise
         if not response:
             # OK trailer without a response frame (e.g. a handler that
             # returns nothing). Surface None and let the caller decide.

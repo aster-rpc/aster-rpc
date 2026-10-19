@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll, Waker};
 use std::time::Duration;
@@ -27,6 +28,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use pyo3_async_runtimes::tokio::future_into_py;
+use tokio::sync::Notify;
 
 use aster::binding_support::dispatch::{
     CallHandle, CancelReason, DispatchEvent, InboundTrace, PeerAttributes, RingConsumer, RingSink,
@@ -1088,6 +1090,49 @@ impl<'py> IntoPyObject<'py> for BytesList {
 
 // ── client ──────────────────────────────────────────────────────────────────
 
+/// A synchronous cancel signal for one queued call. `cancel` runs on the
+/// Python thread the moment the awaiting task is cancelled, so it beats the
+/// asyncio done-callback round trip that `future_into_py` cancellation
+/// takes; a call still waiting for a pool slot then never reaches the wire.
+/// A cancel before the call starts sticks.
+#[pyclass(frozen, module = "aster._aster")]
+pub struct CancelToken {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+#[pymethods]
+impl CancelToken {
+    #[new]
+    fn new() -> Self {
+        Self {
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    /// Cancel the call this token was passed to (idempotent).
+    fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+impl CancelToken {
+    /// Resolves once cancelled. The waiter is registered before the flag is
+    /// read, so a concurrent `cancel` is never missed.
+    async fn cancelled(&self) {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 /// Map a client-side `aster::Error` onto the Python exceptions the
 /// transport has always raised: `RpcError` (by status code) for RPC
 /// failures, `ConnectionLostError` for broken streams and connections,
@@ -1227,7 +1272,9 @@ impl RpcClient {
     /// Unary call: returns the (decompressed) response payload; `b""` when
     /// the server answered OK without a response frame. `deadline` is the
     /// total budget in seconds (0 = none).
-    #[pyo3(signature = (service, method, payload, *, version=1, session_id=0, deadline=0.0, serialization_mode=0, metadata=None))]
+    /// `cancel_token`, when given, abandons the call at once (CANCELLED) if
+    /// it is cancelled before the call completes, including while queued.
+    #[pyo3(signature = (service, method, payload, *, version=1, session_id=0, deadline=0.0, serialization_mode=0, metadata=None, cancel_token=None))]
     #[allow(clippy::too_many_arguments)]
     fn unary<'py>(
         &self,
@@ -1240,15 +1287,29 @@ impl RpcClient {
         deadline: f64,
         serialization_mode: i8,
         metadata: Option<Vec<(String, String)>>,
+        cancel_token: Option<Py<CancelToken>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let conn = self.conn.clone();
         let header = make_header(service, method, version, serialization_mode, metadata);
         let options = make_options(session_id, deadline);
         future_into_py(py, async move {
-            conn.unary_with(&header, payload, &options)
-                .await
-                .map(PyBytesResult)
-                .map_err(client_err)
+            let call = conn.unary_with(&header, payload, &options);
+            let result = match cancel_token {
+                // Cancel first: a queued call whose slot frees as the
+                // cancel lands is dropped, not sent.
+                Some(token) => {
+                    tokio::select! {
+                        biased;
+                        () = token.get().cancelled() => Err(aster::Error::rpc(
+                            aster::rpc::StatusCode::Cancelled,
+                            "call cancelled",
+                        )),
+                        r = call => r,
+                    }
+                }
+                None => call.await,
+            };
+            result.map(PyBytesResult).map_err(client_err)
         })
     }
 
@@ -1506,6 +1567,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add_class::<ServerCall>()?;
     m.add_class::<RpcClient>()?;
+    m.add_class::<CancelToken>()?;
     m.add_class::<ClientResponseStream>()?;
     m.add_class::<ClientRequestSink>()?;
     m.add_class::<ClientResponseFuture>()?;
