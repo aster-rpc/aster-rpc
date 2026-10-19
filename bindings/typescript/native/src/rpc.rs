@@ -905,6 +905,154 @@ impl From<aster::rpc::DrainReport> for DrainReport {
     }
 }
 
+/// Who a connected peer is, as verified when its first connection was
+/// admitted.
+#[napi(object)]
+pub struct PeerIdentity {
+    /// The peer's verified endpoint id.
+    pub endpoint_id: String,
+    /// The principal its credential names; absent unless the peer has a live
+    /// enrollment session.
+    pub principal: Option<String>,
+    /// Roles its credential grants (sorted); empty without enrollment.
+    pub roles: Vec<String>,
+}
+
+impl From<aster::rpc::PeerIdentity> for PeerIdentity {
+    fn from(i: aster::rpc::PeerIdentity) -> Self {
+        Self {
+            endpoint_id: i.endpoint_id,
+            principal: i.principal,
+            roles: i.roles,
+        }
+    }
+}
+
+/// A peer connected when `peerEvents()` was called.
+#[napi(object)]
+pub struct PeerSnapshot {
+    pub peer: String,
+    /// ALPN of its first admitted connection (`"aster/1"`).
+    pub alpn: String,
+    /// How many admitted connections it has now.
+    pub connections: f64,
+    pub identity: PeerIdentity,
+}
+
+impl From<aster::rpc::PeerSnapshot> for PeerSnapshot {
+    fn from(p: aster::rpc::PeerSnapshot) -> Self {
+        Self {
+            peer: p.peer,
+            alpn: String::from_utf8_lossy(&p.alpn).into_owned(),
+            connections: p.connections as f64,
+            identity: p.identity.into(),
+        }
+    }
+}
+
+/// One wire-level peer event; the package turns it into a discriminated
+/// union.
+#[napi(object)]
+pub struct PeerEventWire {
+    #[napi(ts_type = "'connected' | 'disconnected' | 'lagged'")]
+    pub kind: String,
+    /// `connected` and `disconnected`.
+    pub peer: Option<String>,
+    /// `connected`: ALPN of the connection.
+    pub alpn: Option<String>,
+    /// `connected`.
+    pub identity: Option<PeerIdentity>,
+    /// `disconnected`: why the last connection ended.
+    #[napi(ts_type = "'closed' | 'timed_out' | 'revoked' | 'drained' | 'error'")]
+    pub reason: Option<String>,
+    /// `lagged`: how many events were dropped.
+    pub missed: Option<f64>,
+}
+
+fn peer_event_wire(
+    event: std::result::Result<aster::rpc::PeerEvent, tokio::sync::broadcast::error::RecvError>,
+) -> Option<PeerEventWire> {
+    use aster::rpc::{DisconnectReason as R, PeerEvent};
+    use tokio::sync::broadcast::error::RecvError;
+    let blank = |kind: &str| PeerEventWire {
+        kind: kind.to_string(),
+        peer: None,
+        alpn: None,
+        identity: None,
+        reason: None,
+        missed: None,
+    };
+    match event {
+        Ok(PeerEvent::Connected {
+            peer,
+            alpn,
+            identity,
+        }) => Some(PeerEventWire {
+            peer: Some(peer),
+            alpn: Some(String::from_utf8_lossy(&alpn).into_owned()),
+            identity: Some(identity.into()),
+            ..blank("connected")
+        }),
+        Ok(PeerEvent::Disconnected { peer, reason }) => Some(PeerEventWire {
+            peer: Some(peer),
+            reason: Some(
+                match reason {
+                    R::Closed => "closed",
+                    R::TimedOut => "timed_out",
+                    R::Revoked => "revoked",
+                    R::Drained => "drained",
+                    R::Error => "error",
+                }
+                .to_string(),
+            ),
+            ..blank("disconnected")
+        }),
+        Err(RecvError::Lagged(missed)) => Some(PeerEventWire {
+            missed: Some(missed as f64),
+            ..blank("lagged")
+        }),
+        Err(RecvError::Closed) => None,
+    }
+}
+
+/// Receiver of server peer events. `next()` resolves to the next event, or
+/// `null` once `close()` was called or the server has ended. A cancelled
+/// `next()` consumes nothing (the broadcast receive is cancellation-safe).
+#[napi]
+pub struct PeerEventReceiver {
+    snapshot: Mutex<Option<Vec<PeerSnapshot>>>,
+    receiver: Arc<tokio::sync::Mutex<aster::rpc::PeerEventReceiver>>,
+    closed: tokio::sync::watch::Sender<bool>,
+}
+
+#[napi]
+impl PeerEventReceiver {
+    /// The peers connected when this receiver was taken (once; empty after).
+    #[napi]
+    pub fn take_snapshot(&self) -> Vec<PeerSnapshot> {
+        self.snapshot.lock().unwrap().take().unwrap_or_default()
+    }
+
+    /// The next event, or `null` when closed or the server ended.
+    #[napi]
+    pub async fn next(&self) -> Result<Option<PeerEventWire>> {
+        let receiver = self.receiver.clone();
+        let mut closed = self.closed.subscribe();
+        let mut receiver = receiver.lock().await;
+        tokio::select! {
+            biased;
+            _ = closed.wait_for(|c| *c) => Ok(None),
+            event = receiver.recv() => Ok(peer_event_wire(event)),
+        }
+    }
+
+    /// Stop the receiver: a pending and every later `next()` resolves `null`.
+    #[napi]
+    pub fn close(&self) {
+        self.closed.send_replace(true);
+    }
+}
+
 /// The QUIC application close code a draining server closes connections with.
 #[napi]
 pub const DRAIN_CLOSE_CODE: u32 = 503;
@@ -2000,6 +2148,25 @@ impl DispatchServer {
     #[napi(getter)]
     pub fn is_draining(&self) -> bool {
         self.drainer.is_draining()
+    }
+
+    /// The peers connected now and a receiver of every connect and
+    /// disconnect after them, taken together (`aster::rpc::ServerHandle::
+    /// peer_events`; semantics in `aster::rpc::peers`). Read the snapshot
+    /// with `takeSnapshot()`.
+    #[napi]
+    pub async fn peer_events(&self) -> Result<PeerEventReceiver> {
+        let running = self.running.lock().await;
+        let (snapshot, receiver) = match running.as_ref() {
+            Some(Running::Own(server)) => server.peer_events(),
+            Some(Running::Attached(handle)) => handle.peer_events(),
+            None => return Err(Error::new(Status::GenericFailure, "server is closed")),
+        };
+        Ok(PeerEventReceiver {
+            snapshot: Mutex::new(Some(snapshot.into_iter().map(PeerSnapshot::from).collect())),
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            closed: tokio::sync::watch::channel(false).0,
+        })
     }
 
     #[napi]

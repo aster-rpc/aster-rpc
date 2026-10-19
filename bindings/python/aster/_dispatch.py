@@ -504,6 +504,14 @@ class Dispatcher:
     def is_draining(self) -> bool:
         return self._server is not None and self._server.is_draining
 
+    def peer_events(self) -> Any:
+        """`(snapshot, PeerEvents)` (`aster.peer_events`)."""
+        if self._server is None:
+            raise RuntimeError("server is not started")
+        from aster.peer_events import _open
+
+        return _open(self._server)
+
     # -- events ---------------------------------------------------------------
 
     def _on_call(self, call: ServerCall, loop: asyncio.AbstractEventLoop) -> None:

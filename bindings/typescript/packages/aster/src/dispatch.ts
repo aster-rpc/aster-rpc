@@ -23,6 +23,7 @@ import { HttpListener, type HttpListenerOptions, type RpcAuthenticator } from '.
  * aborts it too.
  */
 
+import { openPeerEvents, type PeerEventsResult } from './peer-events.js';
 import type { AsterConfig as NativeAsterConfig, DrainReport, IrohConnection } from '@aster-rpc/transport';
 import { toNativeConfig, type AsterConfig } from './config.js';
 import type { Codec } from './codec.js';
@@ -363,6 +364,12 @@ export class RpcServer {
   /** Whether {@link drain} has started. */
   get isDraining(): boolean {
     return this.native?.isDraining ?? false;
+  }
+
+  /** The peers connected now and a stream of changes after them (see `peer-events.ts`). */
+  async peerEvents(): Promise<PeerEventsResult> {
+    if (!this.native || this.closing) throw new Error('RPC server is not running');
+    return openPeerEvents(await this.native.peerEvents());
   }
 
   /** Stop serving. The node stays up. */

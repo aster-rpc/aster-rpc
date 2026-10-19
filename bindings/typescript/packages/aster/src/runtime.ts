@@ -26,6 +26,7 @@ import type {
   HealthServer,
   IssuerPublishStatus,
 } from '@aster-rpc/transport';
+import type { PeerEventsResult } from './peer-events.js';
 import { ensureObservability } from './observability.js';
 import { DEFAULT_BACKOFF, RpcPattern, RpcScope, type ExponentialBackoff } from './types.js';
 import { createXlangCodec, getXlangForyAndType } from './xlang.js';
@@ -830,6 +831,33 @@ export class AsterServer {
   /** Whether {@link drain} has started. */
   get isDraining(): boolean {
     return this._rpcServer?.isDraining ?? false;
+  }
+
+  /**
+   * The peers connected now and a stream of every connect and disconnect
+   * after them, taken together so a peer connecting during the call is in the
+   * snapshot or in the stream, never both and never neither (Rust
+   * `AsterServer::peer_events`).
+   *
+   * Events are per peer: `connected` on a peer's first admitted `aster/1`
+   * connection (past the node's gates, so a peer enrollment or a drain
+   * refuses never appears), `disconnected` (with a `reason`) when its last
+   * one ends. Whether the peer serves what you need is answered by reading
+   * its `aster.services` NodeInfo attribute on `connected`. A consumer that
+   * falls behind the bounded queue gets `lagged`; its recovery is to call
+   * this again. Close `events` when done.
+   *
+   * ```ts
+   * const { snapshot, events } = await server.peerEvents();
+   * for await (const ev of events) {
+   *   if (ev.kind === 'connected') console.log('peer up', ev.peer);
+   * }
+   * ```
+   */
+  async peerEvents(): Promise<PeerEventsResult> {
+    await this._starting?.catch(() => {});
+    if (this._closed || !this._rpcServer) throw new Error('server is not serving');
+    return this._rpcServer.peerEvents();
   }
 
   /**

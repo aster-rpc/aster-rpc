@@ -620,6 +620,7 @@ module.exports.MemorySerializer = nativeBinding.MemorySerializer
 module.exports.NativeAuditOutbox = nativeBinding.NativeAuditOutbox
 module.exports.Node = nativeBinding.Node
 module.exports.PeerAdmissionStore = nativeBinding.PeerAdmissionStore
+module.exports.PeerEventReceiver = nativeBinding.PeerEventReceiver
 module.exports.PolicyDoc = nativeBinding.PolicyDoc
 module.exports.RawWtCancel = nativeBinding.RawWtCancel
 module.exports.RawWtListenerHandle = nativeBinding.RawWtListenerHandle

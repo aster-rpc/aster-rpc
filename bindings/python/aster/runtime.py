@@ -65,6 +65,7 @@ from .contract.identity import contract_id_from_service
 from .registry.models import ServiceSummary
 from .rpc_types import RpcScope, SerializationMode
 from .server import Server
+from .peer_events import PeerEvents, PeerSnapshot
 from .http import HTTPListener
 from ._aster import ENROLLMENT_ALPN, DispatchServer, DrainReport, EnrollmentPlan
 
@@ -891,6 +892,28 @@ class AsterServer:
         finally:
             await self.close()
         return report
+
+    def peer_events(self) -> "tuple[list[PeerSnapshot], PeerEvents]":
+        """The peers connected now and a stream of every connect and
+        disconnect after them, taken together so a peer connecting during the
+        call is in the snapshot or in the stream, never both and never neither
+        (Rust ``AsterServer::peer_events``).
+
+        Events are per peer: :class:`PeerConnected` on a peer's first admitted
+        ``aster/1`` connection (past the node's gates, so a peer enrollment or
+        a drain refuses never appears), :class:`PeerDisconnected` (with a
+        ``reason``) when its last one ends. Whether the peer serves what you
+        need is answered by reading its ``aster.services`` NodeInfo attribute
+        on ``PeerConnected``. A consumer that falls behind the bounded queue
+        gets :class:`PeerLagged`; its recovery is to call this again.
+        Close the returned :class:`PeerEvents` when done.
+
+        Raises:
+            RuntimeError: the server is closed or not started.
+        """
+        if self._closed or self._server is None:
+            raise RuntimeError("server is closed")
+        return self._server.peer_events()
 
     @property
     def is_draining(self) -> bool:

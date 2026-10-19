@@ -520,6 +520,17 @@ export {
   authorityFingerprint,
   defaultAuthorId,
 } from './data-plane.js';
+export { PeerEvents } from './peer-events.js';
+export type {
+  DisconnectReason,
+  PeerConnected,
+  PeerDisconnected,
+  PeerEvent,
+  PeerEventsResult,
+  PeerIdentity,
+  PeerLagged,
+  PeerSnapshot,
+} from './peer-events.js';
 export type {
   AdmissionRequests,
   AuthorityReport,

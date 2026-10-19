@@ -355,6 +355,14 @@ from .client import (
 )
 from .runtime import AsterServer, AsterClient, ClientSession, AdmissionDeniedError, RPC_ALPN
 from .capabilities import any_of, all_of
+from .peer_events import (
+    PeerConnected,
+    PeerDisconnected,
+    PeerEvents,
+    PeerIdentity,
+    PeerLagged,
+    PeerSnapshot,
+)
 from ._aster import HealthServer, DrainReport, DRAIN_CLOSE_CODE, DRAINING_DETAIL_KEY
 from . import metrics, tracing, observability
 from .interceptors import (
@@ -627,6 +635,12 @@ __all__ = [
     # ── Observability (Rust pipeline; see aster.observability) ──
     "HealthServer",
     "DrainReport",
+    "PeerConnected",
+    "PeerDisconnected",
+    "PeerEvents",
+    "PeerIdentity",
+    "PeerLagged",
+    "PeerSnapshot",
     "DRAIN_CLOSE_CODE",
     "DRAINING_DETAIL_KEY",
     "metrics",

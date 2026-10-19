@@ -5,6 +5,15 @@ the repository; entries under **Unreleased** ship with the next tag.
 
 ## Unreleased
 
+### Added: `AsterServer.peer_events()`
+
+`snapshot, events = server.peer_events()` returns the peers connected now
+(`PeerSnapshot`) and an async iterator of `PeerConnected`, `PeerDisconnected`
+(`reason`: `closed`, `timed_out`, `revoked`, `drained`, `error`) and
+`PeerLagged(missed)`, taken together so no peer falls between them. Events are
+per peer, after admission; a consumer that lags gets `PeerLagged` and recovers
+by calling `peer_events()` again. Close `events` when done.
+
 ### Changed: default maximum forwarded-token lifetime is 3600 s
 
 The default maximum forwarded-token lifetime (`exp - iat` of a token from a

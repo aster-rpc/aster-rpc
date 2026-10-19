@@ -626,6 +626,13 @@ abandon(callId: number): void
 drain(graceMs: number): Promise<DrainReport>
 /** Whether `drain` has started. */
 get isDraining(): boolean
+/**
+ * The peers connected now and a receiver of every connect and
+ * disconnect after them, taken together (`aster::rpc::ServerHandle::
+ * peer_events`; semantics in `aster::rpc::peers`). Read the snapshot
+ * with `takeSnapshot()`.
+ */
+peerEvents(): Promise<PeerEventReceiver>
 close(): Promise<void>
 }
 
@@ -1452,6 +1459,20 @@ export declare class PeerAdmissionStore {
   get size(): number
   /** Remove expired records; returns how many were removed. */
   pruneExpired(): number
+}
+
+/**
+ * Receiver of server peer events. `next()` resolves to the next event, or
+ * `null` once `close()` was called or the server has ended. A cancelled
+ * `next()` consumes nothing (the broadcast receive is cancellation-safe).
+ */
+export declare class PeerEventReceiver {
+  /** The peers connected when this receiver was taken (once; empty after). */
+  takeSnapshot(): Array<PeerSnapshot>
+  /** The next event, or `null` when closed or the server ended. */
+  next(): Promise<PeerEventWire | null>
+  /** Stop the receiver: a pending and every later `next()` resolves `null`. */
+  close(): void
 }
 
 /**
@@ -3780,6 +3801,50 @@ export interface PeerBlobStats {
   servedPlainBytes: number
   /** Fetch attempts against this peer that fell back to plain transport. */
   plainFallbacks: number
+}
+
+/**
+ * One wire-level peer event; the package turns it into a discriminated
+ * union.
+ */
+export interface PeerEventWire {
+  kind: 'connected' | 'disconnected' | 'lagged'
+  /** `connected` and `disconnected`. */
+  peer?: string
+  /** `connected`: ALPN of the connection. */
+  alpn?: string
+  /** `connected`. */
+  identity?: PeerIdentity
+  /** `disconnected`: why the last connection ended. */
+  reason?: 'closed' | 'timed_out' | 'revoked' | 'drained' | 'error'
+  /** `lagged`: how many events were dropped. */
+  missed?: number
+}
+
+/**
+ * Who a connected peer is, as verified when its first connection was
+ * admitted.
+ */
+export interface PeerIdentity {
+  /** The peer's verified endpoint id. */
+  endpointId: string
+  /**
+   * The principal its credential names; absent unless the peer has a live
+   * enrollment session.
+   */
+  principal?: string
+  /** Roles its credential grants (sorted); empty without enrollment. */
+  roles: Array<string>
+}
+
+/** A peer connected when `peerEvents()` was called. */
+export interface PeerSnapshot {
+  peer: string
+  /** ALPN of its first admitted connection (`"aster/1"`). */
+  alpn: string
+  /** How many admitted connections it has now. */
+  connections: number
+  identity: PeerIdentity
 }
 
 /** One peer's proximity view (topology v1). */

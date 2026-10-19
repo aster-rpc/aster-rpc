@@ -372,6 +372,13 @@ class Server:
         logger.info("Drain complete: %r", report)
         return report
 
+    def peer_events(self) -> Any:
+        """The peers connected now and a stream of every connect and
+        disconnect after them (see :mod:`aster.peer_events`)."""
+        if self._dispatcher is None:
+            raise RuntimeError("server is not started")
+        return self._dispatcher.peer_events()
+
     async def close(self) -> None:
         """Stop serving and cancel in-flight handlers."""
         logger.info("Closing server")

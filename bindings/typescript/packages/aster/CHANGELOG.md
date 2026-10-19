@@ -5,6 +5,15 @@ All notable changes to `@aster-rpc/aster` (and its native addon
 
 ## Unreleased
 
+### Added: `AsterServer.peerEvents()`
+
+`const { snapshot, events } = await server.peerEvents()` returns the peers
+connected now and an async iterable of `connected`, `disconnected` (`reason`:
+`closed`, `timed_out`, `revoked`, `drained`, `error`) and `lagged` (`missed`)
+events, taken together so no peer falls between them. Events are per peer,
+after admission; a consumer that lags gets `lagged` and recovers by calling
+`peerEvents()` again. `events.close()` ends the iterator.
+
 ### Changed: default maximum forwarded-token lifetime is 3600 s
 
 The default maximum forwarded-token lifetime (`exp - iat` of a token from a

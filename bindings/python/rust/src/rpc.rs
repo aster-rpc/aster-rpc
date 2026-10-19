@@ -440,6 +440,31 @@ impl DispatchServer {
         })
     }
 
+    /// `(snapshot, stream)`: the peers connected now (dicts: `peer`, `alpn`,
+    /// `connections`, `identity`) and a `PeerEventStream` of every connect and
+    /// disconnect after them, taken together
+    /// (`aster::rpc::ServerHandle::peer_events`; semantics in
+    /// `aster::rpc::peers`).
+    fn peer_events<'py>(&self, py: Python<'py>) -> PyResult<(Bound<'py, PyList>, PeerEventStream)> {
+        let (snapshot, receiver) = self
+            .handle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(ServerHandle::peer_events)
+            .ok_or_else(|| PyRuntimeError::new_err("server is closed"))?;
+        let list = PyList::empty(py);
+        for peer in &snapshot {
+            let item = PyDict::new(py);
+            item.set_item("peer", &peer.peer)?;
+            item.set_item("alpn", alpn_string(&peer.alpn))?;
+            item.set_item("connections", peer.connections)?;
+            item.set_item("identity", identity_dict(py, &peer.identity)?)?;
+            list.append(item)?;
+        }
+        Ok((list, PeerEventStream::new(receiver)))
+    }
+
     /// Whether a drain has started.
     #[getter]
     fn is_draining(&self) -> bool {
@@ -654,6 +679,102 @@ impl Drop for DispatchServer {
         if let Some(handle) = self.handle.get_mut().ok().and_then(Option::take) {
             handle.abort();
         }
+    }
+}
+
+fn alpn_string(alpn: &[u8]) -> String {
+    String::from_utf8_lossy(alpn).into_owned()
+}
+
+fn identity_dict<'py>(
+    py: Python<'py>,
+    identity: &aster::rpc::PeerIdentity,
+) -> PyResult<Bound<'py, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("endpoint_id", &identity.endpoint_id)?;
+    dict.set_item("principal", identity.principal.as_deref())?;
+    dict.set_item("roles", &identity.roles)?;
+    Ok(dict)
+}
+
+fn reason_name(reason: aster::rpc::DisconnectReason) -> &'static str {
+    use aster::rpc::DisconnectReason as R;
+    match reason {
+        R::Closed => "closed",
+        R::TimedOut => "timed_out",
+        R::Revoked => "revoked",
+        R::Drained => "drained",
+        R::Error => "error",
+    }
+}
+
+/// Receiver of server peer events (`aster::rpc::PeerEventReceiver`). `next()`
+/// resolves to a dict (`type` = `connected` | `disconnected` | `lagged`) or
+/// `None` once closed or the server has ended. A cancelled `next()` consumes
+/// nothing: the broadcast receive is cancellation-safe.
+#[pyclass(frozen, module = "aster._aster")]
+pub struct PeerEventStream {
+    receiver: Arc<tokio::sync::Mutex<aster::rpc::PeerEventReceiver>>,
+    closed: tokio::sync::watch::Sender<bool>,
+}
+
+impl PeerEventStream {
+    fn new(receiver: aster::rpc::PeerEventReceiver) -> Self {
+        Self {
+            receiver: Arc::new(tokio::sync::Mutex::new(receiver)),
+            closed: tokio::sync::watch::channel(false).0,
+        }
+    }
+}
+
+#[pymethods]
+impl PeerEventStream {
+    /// The next event, or `None` once closed.
+    fn next<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use tokio::sync::broadcast::error::RecvError;
+        let receiver = self.receiver.clone();
+        let mut closed = self.closed.subscribe();
+        future_into_py(py, async move {
+            let event = {
+                let mut receiver = receiver.lock().await;
+                tokio::select! {
+                    biased;
+                    _ = closed.wait_for(|c| *c) => return Ok(None),
+                    event = receiver.recv() => event,
+                }
+            };
+            Python::attach(|py| -> PyResult<Option<Py<PyDict>>> {
+                let dict = PyDict::new(py);
+                match event {
+                    Ok(aster::rpc::PeerEvent::Connected {
+                        peer,
+                        alpn,
+                        identity,
+                    }) => {
+                        dict.set_item("type", "connected")?;
+                        dict.set_item("peer", peer)?;
+                        dict.set_item("alpn", alpn_string(&alpn))?;
+                        dict.set_item("identity", identity_dict(py, &identity)?)?;
+                    }
+                    Ok(aster::rpc::PeerEvent::Disconnected { peer, reason }) => {
+                        dict.set_item("type", "disconnected")?;
+                        dict.set_item("peer", peer)?;
+                        dict.set_item("reason", reason_name(reason))?;
+                    }
+                    Err(RecvError::Lagged(missed)) => {
+                        dict.set_item("type", "lagged")?;
+                        dict.set_item("missed", missed)?;
+                    }
+                    Err(RecvError::Closed) => return Ok(None),
+                }
+                Ok(Some(dict.unbind()))
+            })
+        })
+    }
+
+    /// Stop the stream: a pending and every later `next()` resolves to `None`.
+    fn close(&self) {
+        self.closed.send_replace(true);
     }
 }
 
@@ -1560,6 +1681,7 @@ pub fn register(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(dynamic_service_contract_id, m)?)?;
     m.add_class::<DispatchServer>()?;
     m.add_class::<DrainReport>()?;
+    m.add_class::<PeerEventStream>()?;
     m.add("DRAIN_CLOSE_CODE", aster::rpc::drain::DRAIN_CLOSE_CODE)?;
     m.add(
         "DRAINING_DETAIL_KEY",
