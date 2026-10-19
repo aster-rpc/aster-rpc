@@ -50,6 +50,24 @@ fn child() {
     let Ok(case) = std::env::var(CASE) else {
         return;
     };
+    // Lease cases run on a paused clock: lateness and expiry are driven by
+    // `advance`, never by a real stall.
+    if let Some(lease_case) = case.strip_prefix("lease_") {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            match lease_case {
+                "renew_late" => lease::case_renew_late().await,
+                "lost_reasons" => lease::case_lost_reasons().await,
+                other => panic!("unknown lease case {other}"),
+            }
+        });
+        println!("case-ok");
+        return;
+    }
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -1137,4 +1155,124 @@ fn trace_context_passes_through_two_hops_with_traces_off() {
 #[test]
 fn trace_context_passes_through_two_hops_with_the_rpc_span_filtered_out() {
     run("passthrough_span_filtered");
+}
+
+// ── lease metrics ───────────────────────────────────────────────────────────
+
+mod lease {
+    use super::*;
+    use aster::lease::{
+        revoke, AcquireOutcome, LeaseHandle, LeaseOp, LeaseOptions, LeaseSerializer, LeaseSnapshot,
+        LeaseStatus, MemorySerializer, TransitionOutcome,
+    };
+    use std::sync::Arc;
+
+    fn opts() -> LeaseOptions {
+        LeaseOptions {
+            ttl: Duration::from_secs(30),
+            renew_interval: Duration::from_secs(10),
+            holder_margin: Duration::from_secs(1),
+        }
+    }
+
+    /// A serializer whose renewals fail (the backend is unreachable).
+    struct RenewFails(MemorySerializer);
+
+    #[async_trait::async_trait]
+    impl LeaseSerializer for RenewFails {
+        async fn transition(
+            &self,
+            resource: &str,
+            op: LeaseOp,
+        ) -> anyhow::Result<TransitionOutcome> {
+            if matches!(op, LeaseOp::Renew { .. }) {
+                anyhow::bail!("backend unreachable");
+            }
+            self.0.transition(resource, op).await
+        }
+        async fn snapshot(&self, resource: &str) -> anyhow::Result<LeaseSnapshot> {
+            self.0.snapshot(resource).await
+        }
+    }
+
+    async fn held(s: Arc<dyn LeaseSerializer>, resource: &str) -> LeaseHandle {
+        match LeaseHandle::acquire(s, resource, "holder", opts())
+            .await
+            .unwrap()
+        {
+            AcquireOutcome::Granted(h) => h,
+            AcquireOutcome::Denied(reason, _) => panic!("expected a grant, got {reason:?}"),
+        }
+    }
+
+    /// Let the spawned renew loop run to its next await.
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub async fn case_renew_late() {
+        let t = TestExporters::new();
+        let _h = aster_otel::init(test_cfg(&t)).unwrap();
+        let lease = held(Arc::new(MemorySerializer::new()), "r").await;
+        settle().await;
+        // The renew timer is due at +10 s; the clock jumps 400 ms past it,
+        // as a throttled or frozen process would observe.
+        tokio::time::advance(Duration::from_millis(10_400)).await;
+        settle().await;
+        aster_otel::flush(Duration::from_secs(10)).unwrap();
+        let p = point(&t, "aster.lease.renew_late", &[]).expect("renew_late recorded");
+        assert_eq!(p.count, 1, "{p:?}");
+        assert_eq!(p.value, 400.0, "the renewal was 400 ms late: {p:?}");
+        assert_eq!(lease.status(), LeaseStatus::Held);
+        assert!(
+            t.metric_points("aster.lease.lost").is_empty(),
+            "a late but successful renewal loses nothing"
+        );
+    }
+
+    pub async fn case_lost_reasons() {
+        let t = TestExporters::new();
+        let _h = aster_otel::init(test_cfg(&t)).unwrap();
+        let mem = Arc::new(MemorySerializer::new());
+
+        // fenced: the authority revoked the lease; the next renewal is refused.
+        let fenced = held(mem.clone(), "fenced").await;
+        settle().await;
+        revoke(&*mem, "fenced", "authority").await.unwrap();
+        // expired: one renewal arrives after the serializer's TTL ran out.
+        let expired = held(mem.clone(), "expired").await;
+        // self_limit: renewals fail until the holder's own limit passes.
+        let limit = held(Arc::new(RenewFails(MemorySerializer::new())), "limit").await;
+        settle().await;
+
+        // Expiry first, in one jump past the TTL: both the expired and the
+        // revoked lease see their (late) renewal refused.
+        tokio::time::advance(Duration::from_secs(31)).await;
+        settle().await;
+        assert_eq!(fenced.status(), LeaseStatus::Fenced);
+        assert_eq!(expired.status(), LeaseStatus::Fenced);
+        assert_eq!(limit.status(), LeaseStatus::Lost);
+
+        aster_otel::flush(Duration::from_secs(10)).unwrap();
+        for (reason, n) in [("expired", 1.0), ("fenced", 1.0), ("self_limit", 1.0)] {
+            assert_eq!(
+                value(&t, "aster.lease.lost", &[("reason", reason)]),
+                n,
+                "reason {reason}: {:?}",
+                t.metric_points("aster.lease.lost")
+            );
+        }
+    }
+}
+
+#[test]
+fn lease_renew_late_is_recorded() {
+    run("lease_renew_late");
+}
+
+#[test]
+fn lease_lost_counts_by_reason() {
+    run("lease_lost_reasons");
 }

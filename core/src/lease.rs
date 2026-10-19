@@ -719,10 +719,12 @@ async fn renew_loop(
     #[cfg(feature = "test-hooks")]
     let mut sequence = 0u64;
     loop {
-        #[cfg(feature = "test-hooks")]
+        #[cfg(any(feature = "otel", feature = "test-hooks"))]
         let expected_wake = Instant::now() + opts.renew_interval;
         tokio::time::sleep(opts.renew_interval).await;
         let send = Instant::now();
+        #[cfg(feature = "otel")]
+        metrics::renew_late(send.saturating_duration_since(expected_wake));
         #[cfg(feature = "test-hooks")]
         {
             sequence += 1;
@@ -743,12 +745,19 @@ async fn renew_loop(
             Ok(TransitionOutcome::Renewed) => {
                 *self_limit.lock().unwrap() = send + opts.ttl - opts.holder_margin;
             }
-            Ok(TransitionOutcome::Denied(..)) => {
+            Ok(TransitionOutcome::Denied(_reason, _)) => {
+                #[cfg(feature = "otel")]
+                metrics::lost(match _reason {
+                    DenyReason::Expired => "expired",
+                    _ => "fenced",
+                });
                 status.send_replace(LeaseStatus::Fenced);
                 return;
             }
             Ok(other) => {
                 tracing::error!(resource = %fence.resource, ?other, "unexpected renew outcome");
+                #[cfg(feature = "otel")]
+                metrics::lost("fenced");
                 status.send_replace(LeaseStatus::Fenced);
                 return;
             }
@@ -759,10 +768,86 @@ async fn renew_loop(
             }
         }
         if Instant::now() >= *self_limit.lock().unwrap() {
+            #[cfg(feature = "otel")]
+            metrics::lost("self_limit");
             status.send_replace(LeaseStatus::Lost);
             #[cfg(feature = "test-hooks")]
             tracing::debug!(target: "aster::lease::diagnostic", resource = %fence.resource, epoch = fence.epoch, sequence, reason = "self_limit", "renew status lost");
             return;
+        }
+    }
+}
+
+/// Lease instruments (`otel` feature): how late each renewal was sent, and
+/// how many leases a holder lost, by reason. Recorded here, in the one renew
+/// loop every binding drives, so each binding reports them by construction.
+/// A record takes one uncontended lock (renewals are seconds apart).
+#[cfg(feature = "otel")]
+mod metrics {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use aster_otel::opentelemetry::metrics::{Counter, Histogram};
+    use aster_otel::opentelemetry::{global, KeyValue};
+
+    /// Lateness buckets, in milliseconds.
+    const LATE_BUCKETS_MS: [f64; 12] = [
+        1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0,
+    ];
+
+    #[derive(Clone)]
+    struct Instruments {
+        renew_late: Histogram<f64>,
+        lost: Counter<u64>,
+    }
+
+    /// The instruments for the current provider generation (rebuilt when a
+    /// pipeline comes or goes), or `None` with no metrics pipeline.
+    fn instruments() -> Option<Instruments> {
+        static CACHE: Mutex<Option<(u64, Option<Instruments>)>> = Mutex::new(None);
+        let generation = aster_otel::generation();
+        let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((g, i)) = cache.as_ref() {
+            if *g == generation {
+                return i.clone();
+            }
+        }
+        let built = match aster_otel::state() {
+            Some(s) if s.generation == generation && s.metrics => {
+                let m = global::meter(aster_otel::SCOPE_NAME);
+                Some(Instruments {
+                    renew_late: m
+                        .f64_histogram("aster.lease.renew_late")
+                        .with_description(
+                            "How late a lease renewal was sent relative to its schedule",
+                        )
+                        .with_unit("ms")
+                        .with_boundaries(LATE_BUCKETS_MS.to_vec())
+                        .build(),
+                    lost: m
+                        .u64_counter("aster.lease.lost")
+                        .with_description("Leases a holder lost, by reason")
+                        .build(),
+                })
+            }
+            _ => None,
+        };
+        *cache = Some((generation, built.clone()));
+        built
+    }
+
+    pub(super) fn renew_late(late: Duration) {
+        if let Some(i) = instruments() {
+            i.renew_late.record(late.as_secs_f64() * 1000.0, &[]);
+        }
+    }
+
+    /// `reason`: `fenced` (a renewal was refused), `expired` (refused because
+    /// the serializer's clock had already expired the lease), or `self_limit`
+    /// (no renewal succeeded before the holder's own limit).
+    pub(super) fn lost(reason: &'static str) {
+        if let Some(i) = instruments() {
+            i.lost.add(1, &[KeyValue::new("reason", reason)]);
         }
     }
 }

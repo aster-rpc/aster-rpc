@@ -555,6 +555,7 @@ name = "aster_transport_core"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "aster-otel",
  "async-trait",
  "aws-lc-rs",
  "base64 0.22.1",

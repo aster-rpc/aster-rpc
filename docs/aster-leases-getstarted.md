@@ -322,6 +322,13 @@ Never replay the old fence. Count these events: a holder that is fenced
 repeatedly is undersized, and the fix is a larger `ttl` or less CPU
 contention, not a retry loop.
 
+**Watch the early-warning metrics.** `aster.lease.renew_late` (ms) shows how
+late renewals are sent; a tail approaching `ttl - holder_margin - renew_interval`
+means stalls are eroding the lease before it costs you one. `aster.lease.lost`
+counts leases lost, by `reason` (`fenced`, `expired`, `self_limit`). Both are in
+the [observability guide](aster-observability-getstarted.md) and need the `otel`
+feature (every binding has it).
+
 ## 9. Next steps
 
 Use the [coordination guide](aster-coordination-getstarted.md) for replicated

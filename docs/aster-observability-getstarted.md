@@ -76,11 +76,21 @@ application numbers.
 | `aster.rpc.streams.active` | up-down counter | none |
 | `aster.server.connections.active`, `aster.server.connections.opened` | up-down counter, counter | none |
 | `aster.admission.decisions`, `aster.admission.duration` | counter, histogram (ms) | `aster.role`, `aster.result` |
+| `aster.lease.renew_late` | histogram (ms) | none |
+| `aster.lease.lost` | counter | `reason` (`fenced`, `expired`, `self_limit`) |
 | `aster.transport.bytes` | observable counter | `aster.path` (`ipv4`, `ipv6`, `relay`), `aster.direction` |
 | `aster.transport.connections` | observable gauge | none |
 | `aster.upcall.issued`, `aster.upcall.timeouts`, `aster.upcall.fallbacks` | counters | `aster.upcall.kind` |
 | `aster.log.records_dropped`, `aster.log.audit_dropped` | counters | none |
 | `aster.health.ready`, `aster.health.healthy`, `process.uptime` | observable gauges | none |
+
+Lease metrics are recorded by the Rust renew loop that every binding's leases run
+on, so they need no per-binding setup. `aster.lease.renew_late` is how late each
+renewal was sent against its schedule, with no resource label (resource names are
+unbounded). `aster.lease.lost` counts a holder losing its lease: `fenced` (a
+renewal was refused), `expired` (refused because the serializer had already
+expired it) or `self_limit` (no renewal succeeded before the holder's own limit).
+See [Sizing leases for production](aster-leases-getstarted.md#8-sizing-leases-for-production).
 
 Client metrics use the same `rpc.service` / `rpc.method` names as the server's.
 They carry no peer by default, since peer ids are unbounded. To add an

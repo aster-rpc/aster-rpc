@@ -51,7 +51,13 @@ socket2 = "0.6"
 rustls = { version = "0.23", default-features = false, features = ["std"] }
 rustls-pki-types = { version = "1.12", features = ["std"] }
 
+# Lease metrics (`aster.lease.renew_late`, `aster.lease.lost`) through the OTel
+# API that `aster-otel` re-exports; a no-op with no metrics pipeline. Enabled by
+# `aster`'s `otel` feature.
+aster-otel = { path = "../aster-otel", version = "=0.3.0", registry = "aster", optional = true, default-features = false }
+
 [features]
+otel = ["dep:aster-otel"]
 # Delegation chains: bundled compact JWS links verified offline in one call.
 # See docs/_internal/ownership-attestations.md.
 delegation = ["dep:aws-lc-rs"]

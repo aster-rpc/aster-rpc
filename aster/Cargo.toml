@@ -85,7 +85,7 @@ health = [
 # and exporters stay in `aster-otel` (D1), and with no pipeline initialised
 # every record is a no-op. `scripts/check-otel-deps.sh` keeps the SDK out of
 # the graphs that do not enable this.
-otel = ["rpc", "dep:aster-otel", "dep:arc-swap"]
+otel = ["rpc", "dep:aster-otel", "dep:arc-swap", "aster_transport_core/otel"]
 # Language-binding support (PyO3, NAPI, C ABI). Adds no new crate (async-trait
 # is already in the graph through the transport core; the upcall adapters
 # implement its traits). It exposes
