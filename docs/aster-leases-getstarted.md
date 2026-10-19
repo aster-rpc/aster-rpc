@@ -270,7 +270,59 @@ These per-acquire options control renewal and takeover timing:
 All three are per-acquire (`LeaseOptions`), so different resources can run
 different tempos against the same grantor.
 
-## 8. Next steps
+## 8. Sizing leases for production
+
+Fencing keeps a stalled holder safe: whatever the cause of the stall, its
+stale epoch is rejected at the resource. This section is about availability,
+meaning how often a healthy holder loses a lease it still wants.
+
+**Set `ttl` to at least 3× the worst stall you expect.** A stall is any
+period where the holder cannot run its renew loop: CPU throttling, a GC
+pause, node pressure, a frozen or migrating VM. Renewal runs every
+`renew_interval`, and `fence()` returns `None` once the self-limit
+(`ttl - holder_margin`, counted from when the last renewal was sent) passes.
+A stall that outlasts it costs you the lease, and the next renewal is
+refused. With the defaults (30 s `ttl`, 1 s `holder_margin`) that tolerates
+stalls of a few seconds; if your worst case is 20 s, use at least 60 s:
+
+```rust
+LeaseOptions {
+    ttl: Duration::from_secs(60),
+    renew_interval: Duration::from_secs(20), // keep at ~ttl/3
+    holder_margin: Duration::from_secs(1),
+}
+```
+
+A longer `ttl` delays takeover after a real crash by the same amount, so
+size it against both numbers. A graceful `release()` skips the wait.
+
+**On Kubernetes, give lease-holding pods CPU requests and no CPU limit.**
+A CPU limit is enforced by CFS throttling, which can freeze every thread of
+the pod for most of each accounting period once the limit is hit, including the
+renew loop. Set requests and leave the limit unset, or set requests equal to
+limits for memory and CPU so the pod gets Guaranteed QoS (and run it on a node
+with CPU manager `static` if you need exclusive cores). Also keep the node
+from running hot: lease holders should not share a saturated node with batch
+work.
+
+**Treat `NotHeld` and `EpochMismatch` as "re-acquire, then retry or step
+down".** A renewal or release refused with `DenyReason::NotHeld` or
+`DenyReason::EpochMismatch` (and a resource refusing a write with
+`FenceRejection::NotHeld` or `StaleEpoch`) means someone else holds a newer
+epoch, or nobody holds the row. It is not a transient error to retry in
+place:
+
+1. Stop protected work. `lease.watch()` reports `Fenced` or `Lost`, and
+   `fence()` returns `None`.
+2. Call `LeaseHandle::acquire` again, with jittered backoff on `Denied`.
+3. If you win, retry the interrupted action with the new fence. If you are
+   `Denied`, step down and treat the other node as the holder.
+
+Never replay the old fence. Count these events: a holder that is fenced
+repeatedly is undersized, and the fix is a larger `ttl` or less CPU
+contention, not a retry loop.
+
+## 9. Next steps
 
 Use the [coordination guide](aster-coordination-getstarted.md) for replicated
 fenced registers and leases. The [Python guide](aster-python-getstarted.md)
