@@ -1079,7 +1079,7 @@ iss = "https://accounts.example.com"
 audiences = ["odata-core"]       # required: start-up fails without it
 roles_claim = "groups"           # an array, or a space-separated string such as "scope"
 role_map = { "data-readers" = "data.read", "data-admins" = "data.admin" }
-max_token_lifetime_secs = 900    # default
+max_token_lifetime_secs = 3600   # default
 ```
 
 The service checks the signature (RS256, PS256 or ES256; `none`, `HS*` and an

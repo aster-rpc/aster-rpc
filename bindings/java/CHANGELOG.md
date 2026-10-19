@@ -5,6 +5,14 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Changed: default maximum forwarded-token lifetime is 3600 s
+
+The default maximum forwarded-token lifetime (`exp - iat` of a token from a
+trusted issuer) is now 3600 s (was 900 s), so hour-long access tokens are
+accepted. Config key: `[[identity.trusted_issuers]] max_token_lifetime_secs`
+(`TrustedIssuer.maxTokenLifetimeSecs`; also inside `ASTER_IDENTITY_TRUSTED_ISSUERS`). Set it explicitly to keep
+the old 900 s limit; the cap stays 86400 s.
+
 ### Changed: native C ABI 7.7; gateway identity
 
 The native library must be C ABI **7.7** or a later 7.x

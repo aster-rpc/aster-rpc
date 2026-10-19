@@ -15,7 +15,7 @@ import java.util.Map;
  * @param rolesClaim the claim roles are read from (an array of strings or one space-separated
  *     string); {@code null} = the tokens grant no roles
  * @param roleMap claim values to Aster roles; unmapped values are dropped
- * @param maxTokenLifetimeSecs the longest {@code exp - iat} accepted; {@code null} = 900
+ * @param maxTokenLifetimeSecs the longest {@code exp - iat} accepted; {@code null} = 3600
  */
 public record TrustedIssuer(
     String iss,

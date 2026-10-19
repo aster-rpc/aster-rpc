@@ -5,6 +5,14 @@ the repository; entries under **Unreleased** ship with the next tag.
 
 ## Unreleased
 
+### Changed: default maximum forwarded-token lifetime is 3600 s
+
+The default maximum forwarded-token lifetime (`exp - iat` of a token from a
+trusted issuer) is now 3600 s (was 900 s), so hour-long access tokens are
+accepted. Config key: `[[identity.trusted_issuers]] max_token_lifetime_secs`
+(`TrustedIssuer.max_token_lifetime_secs`; also inside `ASTER_IDENTITY_TRUSTED_ISSUERS`). Set it explicitly to keep
+the old 900 s limit; the cap stays 86400 s.
+
 ### Changed: `AsterServer.drain` is the Rust drain and returns a `DrainReport`
 
 `drain(grace_period)` now runs `aster::AsterServer::drain`: the ops listener

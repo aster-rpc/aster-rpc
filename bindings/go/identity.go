@@ -75,7 +75,7 @@ type TrustedIssuer struct {
 	RolesClaim string `json:"roles_claim,omitempty"`
 	// RoleMap maps claim values to Aster roles; unmapped values are dropped.
 	RoleMap map[string]string `json:"role_map,omitempty"`
-	// MaxTokenLifetimeSecs is the longest exp - iat accepted; 0 = 900.
+	// MaxTokenLifetimeSecs is the longest exp - iat accepted; 0 = 3600.
 	MaxTokenLifetimeSecs uint64 `json:"max_token_lifetime_secs,omitempty"`
 }
 

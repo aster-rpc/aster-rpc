@@ -546,8 +546,17 @@ async fn provider_tokens_verify_with_published_keys_rotate_and_follow_node_confi
         claims["exp"] = (now() + 600).into();
         unauthenticated(a_rs.token("a-rs", claims), "nbf beyond leeway").await;
         let mut claims = user_claims(ISS_A);
-        claims["exp"] = (now() + 3600).into();
-        unauthenticated(a_rs.token("a-rs", claims), "lifetime above 900 s").await;
+        claims["iat"] = (now() - 5).into();
+        claims["exp"] = (now() - 5 + 3601).into();
+        unauthenticated(a_rs.token("a-rs", claims), "lifetime above 3600 s").await;
+        // Exactly the default maximum is accepted (an hour-long access token).
+        let mut claims = user_claims(ISS_A);
+        claims["iat"] = (now() - 5).into();
+        claims["exp"] = (now() - 5 + 3600).into();
+        data(&edge, &a_rs.token("a-rs", claims))
+            .read()
+            .await
+            .unwrap();
         unauthenticated(b_es.token("b-es", user_claims(ISS_B)), "B not trusted").await;
 
         // A peer without aster.gateway may not forward even a valid token.

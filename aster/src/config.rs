@@ -122,7 +122,7 @@ pub const SETTING_CLOCK_LEEWAY: &str = "identity.clock_leeway_secs";
 pub const SETTING_MAX_KEY_SET_AGE: &str = "identity.max_key_set_age_secs";
 
 /// Default `[[identity.trusted_issuers]] max_token_lifetime_secs`.
-pub const DEFAULT_PROVIDER_TOKEN_LIFETIME_SECS: u64 = 900;
+pub const DEFAULT_PROVIDER_TOKEN_LIFETIME_SECS: u64 = 3600;
 /// Default `[identity] edge_token_max_lifetime_secs`, also its maximum.
 pub const DEFAULT_EDGE_TOKEN_MAX_LIFETIME_SECS: u64 = 300;
 /// Default `[identity] clock_leeway_secs`.
@@ -351,7 +351,7 @@ fn check_jwks_url(url: &str) -> std::result::Result<(), String> {
 /// audiences = ["odata-core"]                 # required
 /// roles_claim = "groups"
 /// role_map = { "data-readers" = "data.read", "data-admins" = "data.admin" }
-/// max_token_lifetime_secs = 900              # default
+/// max_token_lifetime_secs = 3600             # default
 /// ```
 ///
 /// Validated at start-up (and as a whole on a NodeConfig override; see
@@ -3827,7 +3827,7 @@ mod binding_knob_tests {
         );
         assert_eq!(
             file.identity_trusted_issuers[0].max_token_lifetime_secs,
-            900
+            3600
         );
         assert_eq!(file.identity_edge_token_max_lifetime_secs, 120);
         assert_eq!(file.identity_clock_leeway_secs, 10);

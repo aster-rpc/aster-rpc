@@ -73,7 +73,7 @@ public sealed record TrustedIssuer
     public string? RolesClaim { get; init; }
     /// <summary>Maps claim values to Aster roles; unmapped values are dropped.</summary>
     public IReadOnlyDictionary<string, string>? RoleMap { get; init; }
-    /// <summary>The longest <c>exp - iat</c> accepted; null = 900.</summary>
+    /// <summary>The longest <c>exp - iat</c> accepted; null = 3600.</summary>
     public ulong? MaxTokenLifetimeSecs { get; init; }
 }
 

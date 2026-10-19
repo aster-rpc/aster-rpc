@@ -238,7 +238,7 @@ describe('gateway identity config', () => {
       expect(id.acceptOnBehalfOf).toBe(true);
       expect(id.trustedIssuers).toHaveLength(1);
       expect(id.trustedIssuers![0]!.roleMap).toEqual({ readers: 'notes.read' });
-      expect(id.trustedIssuers![0]!.maxTokenLifetimeSecs).toBe(900);
+      expect(id.trustedIssuers![0]!.maxTokenLifetimeSecs).toBe(3600);
       expect(id.clockLeewaySecs).toBe(0);
       expect(id.edgeTokenMaxLifetimeSecs).toBe(300);
       expect(id.publisher?.refreshSecs).toBe(600);

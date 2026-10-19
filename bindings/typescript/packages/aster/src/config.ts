@@ -397,7 +397,7 @@ export interface TrustedIssuer {
   rolesClaim?: string;
   /** Claim value → Aster role; unmapped values are dropped. */
   roleMap?: Record<string, string>;
-  /** Longest `exp - iat` accepted, 1–86400 s (default 900). */
+  /** Longest `exp - iat` accepted, 1–86400 s (default 3600). */
   maxTokenLifetimeSecs?: number | bigint;
 }
 

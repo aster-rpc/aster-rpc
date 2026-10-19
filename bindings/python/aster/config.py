@@ -328,7 +328,7 @@ class TrustedIssuer:
     """The claim roles are read from (an array, or space-separated text)."""
     role_map: Mapping[str, str] = dc_field(default_factory=dict)
     """Claim value -> Aster role; unmapped values grant nothing."""
-    max_token_lifetime_secs: int = 900
+    max_token_lifetime_secs: int = 3600
     """Longest ``exp - iat`` accepted."""
 
     def __post_init__(self) -> None:

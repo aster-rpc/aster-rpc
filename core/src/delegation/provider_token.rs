@@ -48,7 +48,7 @@ pub const MAX_HEADER_SEGMENT_BYTES: usize = 1024;
 /// Largest decoded signature (an RSA-8192 signature).
 pub const MAX_SIGNATURE_BYTES: usize = 1024;
 /// Default longest `exp - iat` of a provider token.
-pub const DEFAULT_PROVIDER_TOKEN_LIFETIME_SECONDS: u64 = 900;
+pub const DEFAULT_PROVIDER_TOKEN_LIFETIME_SECONDS: u64 = 3600;
 /// The cap on a configured `max_token_lifetime_secs`.
 pub const MAX_PROVIDER_TOKEN_LIFETIME_SECONDS: u64 = 86_400;
 /// Most entries in one JWK set.
@@ -1013,6 +1013,12 @@ mod tests {
             verify(with(|c| c["iat"] = (NOW + 61).into())),
             Err(ProviderTokenError::NotYetValid)
         );
+        assert_eq!(DEFAULT_PROVIDER_TOKEN_LIFETIME_SECONDS, 3600);
+        verify(with(|c| {
+            c["iat"] = NOW.into();
+            c["exp"] = (NOW + DEFAULT_PROVIDER_TOKEN_LIFETIME_SECONDS).into();
+        }))
+        .unwrap();
         assert_eq!(
             verify(with(|c| {
                 c["iat"] = NOW.into();
