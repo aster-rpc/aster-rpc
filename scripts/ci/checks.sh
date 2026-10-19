@@ -5,7 +5,7 @@
 #
 #   scripts/ci/checks.sh <check>...   run the named checks in order
 #   scripts/ci/checks.sh lint         every check the lint job runs
-#   scripts/ci/checks.sh preflight    lint plus python-collect
+#   scripts/ci/checks.sh preflight    lint plus ffi-header and python-collect
 #   scripts/ci/checks.sh --list       print the check names
 #
 # Run from the repository root. Each check stops on its first failure.
@@ -93,6 +93,15 @@ check() {
       cargo clippy --locked -p aster-expose --features edge --all-targets -- -D warnings ;;
     publish-manifests)
       scripts/release/publish-cargo.sh --check ;;
+    # The `test` job's "FFI header drift" step (linux.yml), which no lint
+    # check covered: a stale ffi/aster_ffi.h passed preflight and failed CI
+    # (d3dc1a8d). Needs the pinned cbindgen; cbindgen reads the sources, so
+    # this does not compile the crate.
+    ffi-header)
+      if [[ "$(cbindgen --version 2>/dev/null)" != "cbindgen 0.29.2" ]]; then
+        RUSTC_WRAPPER= cargo install --locked cbindgen --version 0.29.2
+      fi
+      ffi/scripts/check-header.sh ;;
     # Preflight only: the test job's pytest run, collection only, over a debug
     # build of the native module (CI tests a release wheel).
     python-collect)
@@ -117,9 +126,9 @@ check() {
 names=()
 for arg in "$@"; do
   case "$arg" in
-    --list) printf '%s\n' "${LINT_CHECKS[@]}" python-collect; exit 0 ;;
+    --list) printf '%s\n' "${LINT_CHECKS[@]}" ffi-header python-collect; exit 0 ;;
     lint) names+=("${LINT_CHECKS[@]}") ;;
-    preflight) names+=("${LINT_CHECKS[@]}" python-collect) ;;
+    preflight) names+=("${LINT_CHECKS[@]}" ffi-header python-collect) ;;
     *) names+=("$arg") ;;
   esac
 done
