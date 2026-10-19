@@ -36,6 +36,17 @@ literal under 10 seconds:
             Duration.ofX(N) argument to a call named *wait*/*await*/next*/
             join, and Kotlin withTimeout(ms)
 
+It also finds the shape that failed candidate 20 and that the 10 s floor lets
+through: in Rust, a single-attempt coordination proposal (a call named
+propose*/client_write*) bounded by a fixed literal of 10 s or more, either as
+its own Duration argument (propose_for_testing_within(c, from_secs(20))) or
+as the bound of an enclosing timeout(from_secs(N), ..propose..), with no retry
+around it. A loop (loop/while/for) or a call named *retry*/*eventually*/
+*until*/*backoff* around the proposal is a retry; a named constant or the
+budget is not a literal. Leadership can move or stall under load, so propose
+at the current leader and resend until the wait budget runs out (the
+`commit_at_leader` helper in aster/tests/coordination_membership.rs).
+
 where the bound is a literal (Duration::from_secs(3), TimeSpan.FromSeconds(3),
 3 * time.Second, 3000, 3, ...). A named constant or the budget passes.
 
@@ -203,6 +214,55 @@ def rust_hits(scan: str) -> list[tuple[int, str]]:
     return hits
 
 
+PROPOSAL = re.compile(r"^(?:propose|client_write)\w*$")
+RETRYISH = re.compile(r"(?i)retry|eventually|until|backoff")
+LOOP_HEAD = re.compile(r"\b(?:loop|while|for)\b")
+
+
+def enclosing_retry(scan: str, pos: int) -> bool:
+    """Whether `pos` sits inside a loop body or a call named like a retry."""
+    depth = 0
+    for i in range(pos - 1, -1, -1):
+        c = scan[i]
+        if c in ")]}":
+            depth += 1
+        elif c in "([{":
+            if depth:
+                depth -= 1
+                continue
+            if c == "{":
+                head = scan[max(0, i - 200):i]
+                head = re.split(r"[;{}]", head)[-1]
+                if LOOP_HEAD.search(head):
+                    return True
+            elif c == "(":
+                m = re.search(r"([A-Za-z_]\w*)\s*$", scan[max(0, i - 60):i])
+                if m and RETRYISH.search(m.group(1)):
+                    return True
+    return False
+
+
+def proposal_hits(scan: str) -> list[tuple[int, str]]:
+    """A coordination proposal tried once under a fixed bound of SHORT or more."""
+    hits = []
+    for m in CALL.finditer(scan):
+        short = last_name(m.group("name"))
+        spans = split_args(scan, m.end() - 1)
+        args = [scan[a:b].strip() for a, b in spans]
+        if not args:
+            continue
+        secs, at = None, m.start()
+        if PROPOSAL.match(short):
+            secs = min((s for s in (rust_seconds(a) for a in args) if s is not None), default=None)
+        elif short in ("timeout", "timeout_at") and len(args) > 1 and "." not in m.group("name") \
+                and re.search(r"\b(?:propose|client_write)\w*\s*\(", args[1]):
+            secs = rust_seconds(args[0])
+        if secs is not None and secs >= SHORT and not enclosing_retry(scan, at):
+            hits.append((at, f"single-attempt proposal bounded by a fixed {fmt(secs)}"
+                             " with no retry; resend at the current leader until the wait budget"))
+    return hits
+
+
 def cs_hits(scan: str) -> list[tuple[int, str]]:
     hits = []
     for m in CALL.finditer(scan):
@@ -338,7 +398,7 @@ def brace_hits(path: str, text: str) -> list[tuple[int, str]]:
     lines = text.splitlines()
     scan = blank_comments(strip_strings(text, quotes=not path.endswith((".rs", ".go"))))
     if path.endswith(".rs"):
-        raw = rust_hits(scan)
+        raw = rust_hits(scan) + proposal_hits(scan)
     elif path.endswith(".cs"):
         raw = cs_hits(scan)
     elif path.endswith(".go"):

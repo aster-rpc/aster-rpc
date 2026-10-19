@@ -30,6 +30,16 @@ class Flags(unittest.TestCase):
         self.assertTrue(hits("core/tests/t.rs", "let deadline = Instant::now() + Duration::from_secs(5);"))
         self.assertTrue(hits("core/tests/t.rs", "c.wait_for(path, 1, Duration::from_secs(5));"))
 
+    def test_single_attempt_proposal(self):
+        # The shape that failed candidate 20: one proposal, a fixed 20 s, no retry.
+        before = ("let accepted = coordination\n    .propose_for_testing_within(plan, Duration::from_secs(20))\n"
+                  "    .await\n    .expect(\"the plan commits\");")
+        self.assertTrue(hits("aster/tests/m.rs", before))
+        self.assertTrue(hits("aster/tests/m.rs", "tokio::time::timeout(Duration::from_secs(30), at.propose_for_testing(c)).await"))
+        self.assertTrue(hits("aster/tests/m.rs", "timeout(Duration::from_secs(10), raft.client_write(c)).await"))
+        # A proposal after a loop, not inside it, is a single attempt.
+        self.assertTrue(hits("aster/tests/m.rs", "loop { break; }\nat.propose_for_testing_within(c, Duration::from_secs(20)).await"))
+
     def test_csharp(self):
         self.assertTrue(hits("A.Tests/X.cs", "await t.WaitAsync(TimeSpan.FromSeconds(3));"))
         self.assertTrue(hits("A.Tests/X.cs", "using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));"))
@@ -80,6 +90,21 @@ class LetsThrough(unittest.TestCase):
         self.assertFalse(hits("tests/test_x.py", "await asyncio.wait_for(x, WAIT_BUDGET)\n"))
         self.assertFalse(hits("a/src/test/java/X.java", "f.get(WaitBudget.SECONDS, TimeUnit.SECONDS);"))
         self.assertFalse(hits("tests/x.test.ts", "await within(p, WAIT_BUDGET_MS, 'reply');"))
+
+    def test_proposal_that_retries_or_scales(self):
+        looped = ("loop {\n    match at.propose_for_testing_within(c.clone(), Duration::from_secs(20)).await {\n"
+                  "        Ok(x) => return x,\n        Err(_) => {}\n    }\n}")
+        self.assertFalse(hits("aster/tests/m.rs", looped))
+        self.assertFalse(hits("aster/tests/m.rs", "while Instant::now() < d {\n  let r = at.propose_for_testing_within(c, Duration::from_secs(20)).await;\n}"))
+        self.assertFalse(hits("aster/tests/m.rs", "for _ in 0..3 {\n  at.propose_for_testing_within(c.clone(), Duration::from_secs(20)).await;\n}"))
+        self.assertFalse(hits("aster/tests/m.rs", "retry(|| at.propose_for_testing_within(c.clone(), Duration::from_secs(20))).await"))
+        # A budget-scaled or named bound is not a literal; a wait that is not a proposal is not this rule.
+        self.assertFalse(hits("aster/tests/m.rs", "at.propose_for_testing_within(c, wait_budget()).await"))
+        self.assertFalse(hits("aster/tests/m.rs", "at.propose_for_testing_within(c, PATIENCE).await"))
+        self.assertFalse(hits("aster/tests/m.rs", "timeout(Duration::from_secs(20), coordination.wait_ready()).await"))
+        self.assertFalse(hits("aster/tests/m.rs", "timeout(wait_budget(), at.propose_for_testing(c)).await"))
+        self.assertFalse(hits("aster/tests/m.rs",
+                              "// short-wait-ok: the proposal must stall\nat.propose_for_testing_within(c, Duration::from_secs(20)).await"))
 
     def test_not_waits(self):
         # Sleeps, client options under test, plain sleeps via setTimeout, and
