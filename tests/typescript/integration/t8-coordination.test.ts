@@ -227,9 +227,8 @@ describe.skipIf(!FIXTURE)('coordination client against a live three-voter group'
     }
     rival.close();
 
-    // Outlive the TTL: the renew loop keeps it.
-    await new Promise((r) => setTimeout(r, 7_000));
-    expect(lease.status).toBe('held');
+    // Renewal past the TTL is Rust's: ffi/tests/coordination.rs
+    // coordination_lease_is_renewed_past_its_ttl.
     expect(lease.fence()?.epoch).toBe(first!.epoch);
 
     const current = await worker.reads().readLinearizable(res('lease'));

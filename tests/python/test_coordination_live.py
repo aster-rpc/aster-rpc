@@ -297,9 +297,8 @@ async def test_a_lease_renews_in_rust_mutates_and_hands_off(group):
         assert contender.snapshot.held
     assert rival.closed
 
-    # Outlive the TTL: the renew loop keeps it.
-    await asyncio.sleep(7)
-    assert lease.status == "held"
+    # Renewal past the TTL is Rust's: ffi/tests/coordination.rs
+    # coordination_lease_is_renewed_past_its_ttl.
     assert lease.fence().epoch == first.epoch
 
     current = await worker.reads().read_linearizable(res("lease"))
