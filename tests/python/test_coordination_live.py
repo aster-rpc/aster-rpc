@@ -332,8 +332,24 @@ async def test_a_lease_renews_in_rust_mutates_and_hands_off(group):
 
 
 async def test_streams_the_audit_log_in_ascending_paged_order(group):
+    # The log must not depend on which tests ran first: write the entries
+    # this test asserts on (acquire, compare_and_set, release) itself.
+    await group.grant("audit", group.worker_node)
+    acquired = await group.worker.acquire(res("audit"), 30)
+    assert acquired.outcome == "granted"
+    await acquired.acknowledge()
+    fence = fence_of(acquired.snapshot)
+    current = await group.worker.reads().read_linearizable(res("audit"))
+    written = await group.worker.compare_and_set(fence, current.value_revision, "audit")
+    assert written.outcome == "mutated"
+    await written.acknowledge()
+    released = await group.worker.release(fence)
+    assert released.outcome == "released"
+    await released.acknowledge()
+
     reads = group.root.reads()
     rows = [row async for row in reads.audit_stream()]
+    # The setup grants plus the entries written above.
     assert len(rows) > 5
     indices = [r.log_id.index for r in rows]
     assert indices == sorted(set(indices))
