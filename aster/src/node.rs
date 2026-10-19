@@ -23,6 +23,10 @@ use crate::gossip::Gossip;
 #[derive(Clone)]
 pub struct Node {
     inner: CoreNode,
+    /// The opt-in `aster.peer` label for the client calls of this node's RPC
+    /// connections (see [`AsterConfig::metrics_client_peer_labels`]).
+    #[cfg(feature = "otel")]
+    client_peer_labels: Option<std::sync::Arc<crate::rpc::observe::otel::ClientPeerLabels>>,
 }
 
 impl Node {
@@ -62,7 +66,15 @@ impl Node {
                     .await?
             }
         };
-        Ok(Node { inner: core })
+        Ok(Node {
+            inner: core,
+            #[cfg(feature = "otel")]
+            client_peer_labels: config.metrics_client_peer_labels.then(|| {
+                std::sync::Arc::new(crate::rpc::observe::otel::ClientPeerLabels::new(
+                    config.metrics_peer_label_cap,
+                ))
+            }),
+        })
     }
 
     /// This node's identity.
@@ -200,7 +212,10 @@ impl Node {
                 aster_transport_core::reactor::RPC_ALPN.to_vec(),
             )
             .await?;
-        Ok(crate::rpc::RpcConnection::from_core(conn))
+        let rpc = crate::rpc::RpcConnection::from_core(conn);
+        #[cfg(feature = "otel")]
+        let rpc = rpc.with_peer_labels(self.client_peer_labels.clone());
+        Ok(rpc)
     }
 
     /// Clone of the underlying core node — used by [`rpc::Server`](crate::rpc::Server)
@@ -224,7 +239,11 @@ impl Node {
     #[cfg(feature = "binding-support")]
     #[doc(hidden)]
     pub fn from_core_node(inner: CoreNode) -> Node {
-        Node { inner }
+        Node {
+            inner,
+            #[cfg(feature = "otel")]
+            client_peer_labels: None,
+        }
     }
 
     /// Create an [`Expose`](crate::expose::Expose) handle for publishing local

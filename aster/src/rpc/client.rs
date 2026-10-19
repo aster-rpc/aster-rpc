@@ -174,6 +174,10 @@ impl CallOptions {
 pub struct RpcConnection {
     inner: CoreConnection,
     pipeline: Pipeline,
+    /// The opt-in `aster.peer` label of client call metrics; set by
+    /// [`Node::rpc_connect`](crate::Node::rpc_connect) from the node's config.
+    #[cfg(feature = "otel")]
+    peer_labels: Option<Arc<super::observe::otel::ClientPeerLabels>>,
 }
 
 impl RpcConnection {
@@ -181,7 +185,33 @@ impl RpcConnection {
         Self {
             inner,
             pipeline: Pipeline::default(),
+            #[cfg(feature = "otel")]
+            peer_labels: None,
         }
+    }
+
+    /// Label this connection's client call metrics with `aster.peer`, the
+    /// first `cap` peers a node dials each under its own series and the rest
+    /// under `_OTHER`. Off unless the node's config opts in
+    /// ([`AsterConfig::metrics_client_peer_labels`](crate::AsterConfig::metrics_client_peer_labels)).
+    #[cfg(feature = "otel")]
+    pub(crate) fn with_peer_labels(
+        mut self,
+        labels: Option<Arc<super::observe::otel::ClientPeerLabels>>,
+    ) -> Self {
+        self.peer_labels = labels;
+        self
+    }
+
+    /// Start the telemetry of one call on this connection.
+    fn start_obs(&self, header: &mut StreamHeader) -> ClientObs {
+        #[cfg(feature = "otel")]
+        if self.peer_labels.is_some() {
+            return ClientObs::start_for_peer(header, self.peer_labels.as_deref(), || {
+                self.inner.remote_id()
+            });
+        }
+        ClientObs::start(header)
     }
 
     /// Binding support: wrap a transport-core connection already dialled on
@@ -285,7 +315,7 @@ impl RpcConnection {
         let mut h = options.apply(header, deadline);
         // One client span and one completion per logical call, retries
         // included; it injects the call's trace context into `h`.
-        let mut obs = ClientObs::start(&mut h);
+        let mut obs = self.start_obs(&mut h);
         let r = self
             .unary_attempts(&h, request, deadline)
             .instrument(obs.span())
@@ -594,7 +624,7 @@ impl RpcConnection {
         let deadline = options.deadline;
         let at = deadline.map(|d| Instant::now() + d);
         let mut h = options.apply(header, deadline);
-        let mut obs = ClientObs::start(&mut h);
+        let mut obs = self.start_obs(&mut h);
         let opened = async {
             let mut header_frame = encode_frame(&encode_stream_header(&h)?, FLAG_HEADER)?;
             if let Some(first) = first {

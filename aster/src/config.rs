@@ -787,6 +787,15 @@ pub struct AsterConfig {
     ///
     /// Env: `ASTER_METRICS_PEER_LABEL_CAP`; TOML: `[metrics] peer_label_cap`.
     pub metrics_peer_label_cap: usize,
+    /// Label the client call metrics (`aster.rpc.client.requests_completed`,
+    /// `.duration` and `.in_flight`) with the called peer (`aster.peer`), for
+    /// the RPC connections this node opens. Peer ids are unbounded, so the
+    /// first [`metrics_peer_label_cap`](Self::metrics_peer_label_cap) peers
+    /// keep their own series and every later peer is counted under `_OTHER`.
+    /// Default off.
+    ///
+    /// Env: `ASTER_METRICS_CLIENT_PEER_LABELS`; TOML: `[metrics] client_peer_labels`.
+    pub metrics_client_peer_labels: bool,
 
     /// Extra ALPNs the node accepts inbound connections on, in addition to the
     /// built-in blobs/docs/gossip protocols. Merged (deduplicated) with the
@@ -1127,6 +1136,9 @@ impl AsterConfig {
             if let Some(value) = toml_usize(metrics, "peer_label_cap", label)? {
                 self.metrics_peer_label_cap = value;
             }
+            if let Some(value) = toml_bool(metrics, "client_peer_labels", label)? {
+                self.metrics_client_peer_labels = value;
+            }
         }
 
         Ok(())
@@ -1406,6 +1418,9 @@ impl AsterConfig {
         }
         if let Some(value) = env.usize("ASTER_METRICS_PEER_LABEL_CAP")? {
             self.metrics_peer_label_cap = value;
+        }
+        if let Some(value) = env.bool("ASTER_METRICS_CLIENT_PEER_LABELS")? {
+            self.metrics_client_peer_labels = value;
         }
         self.enrollment.apply_env(&env)?;
 
@@ -1804,6 +1819,7 @@ impl Default for AsterConfig {
             health_enabled: None,
             metrics_peer_labels: false,
             metrics_peer_label_cap: DEFAULT_METRICS_PEER_LABEL_CAP,
+            metrics_client_peer_labels: false,
             alpns: Vec::new(),
             enrollment: EnrollmentConfig::default(),
         }
@@ -2253,6 +2269,14 @@ impl AsterConfigBuilder {
     pub fn metrics_peer_labels(mut self, cap: usize) -> Self {
         self.config.metrics_peer_labels = true;
         self.config.metrics_peer_label_cap = cap;
+        self
+    }
+
+    /// Label client call metrics with the called peer (`aster.peer`), bounded
+    /// by the peer-label cap (see
+    /// [`AsterConfig::metrics_client_peer_labels`]).
+    pub fn metrics_client_peer_labels(mut self, on: bool) -> Self {
+        self.config.metrics_client_peer_labels = on;
         self
     }
 
@@ -2901,6 +2925,7 @@ mod tests {
         "ASTER_HEALTH_ENABLED",
         "ASTER_METRICS_PEER_LABELS",
         "ASTER_METRICS_PEER_LABEL_CAP",
+        "ASTER_METRICS_CLIENT_PEER_LABELS",
     ];
 
     pub(super) fn env_lock() -> &'static Mutex<()> {
@@ -3938,6 +3963,28 @@ mod binding_knob_tests {
         assert!(!cfg.metrics_peer_labels);
         env::remove_var("ASTER_METRICS_PEER_LABELS");
         env::remove_var("ASTER_METRICS_PEER_LABEL_CAP");
+
+        // The client-call peer label: off by default, TOML, env over TOML.
+        assert!(!cfg.metrics_client_peer_labels);
+        fs::write(&path, "[metrics]\nclient_peer_labels = true\n").unwrap();
+        assert!(
+            AsterConfig::from_file(&path)
+                .unwrap()
+                .metrics_client_peer_labels
+        );
+        env::set_var("ASTER_METRICS_CLIENT_PEER_LABELS", "false");
+        assert!(
+            !AsterConfig::from_file(&path)
+                .unwrap()
+                .metrics_client_peer_labels
+        );
+        env::remove_var("ASTER_METRICS_CLIENT_PEER_LABELS");
+        assert!(
+            AsterConfig::builder()
+                .metrics_client_peer_labels(true)
+                .build()
+                .metrics_client_peer_labels
+        );
 
         let cfg = AsterConfig::builder()
             .health(true)

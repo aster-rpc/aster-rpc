@@ -61,6 +61,8 @@ fn child() {
             "pass_through_then_hidden" => case_pass_through_then_hidden().await,
             "init_after_server_start" => case_init_after_server_start().await,
             "shutdown_then_reinit" => case_shutdown_then_reinit().await,
+            "client_metrics" => case_client_metrics(false).await,
+            "client_metrics_peer_labels" => case_client_metrics(true).await,
             "log_bridge_trace_ids" => case_log_bridge_trace_ids().await,
             #[cfg(feature = "binding-support")]
             "foreign_spans" => foreign::case_foreign_spans().await,
@@ -110,10 +112,15 @@ async fn within<F: Future>(f: F) -> F::Output {
 
 /// A server node and a client node that know each other.
 async fn nodes() -> (Node, Node) {
+    nodes_with(node_cfg()).await
+}
+
+/// [`nodes`] with `client_cfg` for the client node.
+async fn nodes_with(client_cfg: AsterConfig) -> (Node, Node) {
     let server = Node::start_with_alpns(node_cfg(), vec![RPC_ALPN.to_vec()])
         .await
         .unwrap();
-    let client = Node::start(node_cfg()).await.unwrap();
+    let client = Node::start(client_cfg).await.unwrap();
     wait_for_addr(&server).await;
     wait_for_addr(&client).await;
     client.add_peer(&server).unwrap();
@@ -213,7 +220,7 @@ impl ServiceDispatch for Echo {
         1
     }
     fn methods(&self) -> &[&str] {
-        &["unary", "fails", "log", "meta"]
+        &["unary", "fails", "log", "meta", "hold"]
     }
     async fn dispatch(&self, method: &str, mut call: Call) {
         let req = call.recv_request().await.unwrap_or_default();
@@ -226,6 +233,8 @@ impl ServiceDispatch for Echo {
                     .finish(&RpcStatus::error(StatusCode::NotFound, "nope"))
                     .await;
             }
+            // Never answers: the caller cancels it.
+            "hold" => std::future::pending::<()>().await,
             "log" => {
                 tracing::info!(target: "aster::test::handler", order = "example-1", "handler-log");
                 let _ = call.respond(req, &RpcStatus::ok()).await;
@@ -409,6 +418,118 @@ async fn case_names_and_attributes() {
             .count,
         1
     );
+    aster_otel::shutdown().unwrap();
+}
+
+/// The client call metrics: `rpc.service` / `rpc.method` (the server's label
+/// names), `aster.rpc.client.in_flight` back to zero after success, error and
+/// cancellation, and `aster.peer` only when the node opts in (bounded by the
+/// peer-label cap, the rest under `_OTHER`).
+async fn case_client_metrics(peer_labels: bool) {
+    const COMPLETED: &str = "aster.rpc.client.requests_completed";
+    const IN_FLIGHT: &str = "aster.rpc.client.in_flight";
+    let t = TestExporters::new();
+    let _h = aster_otel::init(test_cfg(&t)).unwrap();
+    let mut client_cfg = node_cfg();
+    client_cfg.metrics_client_peer_labels = peer_labels;
+    client_cfg.metrics_peer_label_cap = 1;
+    let (server, client) = nodes_with(client_cfg).await;
+    let _handle = Server::new(&server).register(Echo).serve();
+    let conn = connect(&client, &server).await;
+    let svc = ("rpc.service", "test.Echo");
+    let peer = server.id();
+    let peer_attr = peer.as_str();
+    // The label rides on every client series when on, on none when off.
+    let peer_want = |m: &'static str| -> Vec<(&'static str, &str)> {
+        let mut w = vec![svc, ("rpc.method", m)];
+        if peer_labels {
+            w.push(("aster.peer", peer_attr));
+        }
+        w
+    };
+
+    within(conn.unary(&header("test.Echo", "unary"), vec![1]))
+        .await
+        .unwrap();
+    within(conn.unary(&header("test.Echo", "fails"), vec![0]))
+        .await
+        .unwrap_err();
+    // A cancelled call: in flight while held, then dropped.
+    let held = {
+        let conn = conn.clone();
+        tokio::spawn(async move { conn.unary(&header("test.Echo", "hold"), vec![]).await })
+    };
+    let hold = peer_want("hold");
+    let mut in_flight = 0.0;
+    for _ in 0..100 {
+        aster_otel::flush(Duration::from_secs(10)).unwrap();
+        in_flight = value(&t, IN_FLIGHT, &hold);
+        if in_flight == 1.0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(in_flight, 1.0, "a held call counts as in flight");
+    held.abort();
+    let _ = held.await;
+    aster_otel::flush(Duration::from_secs(10)).unwrap();
+
+    for m in ["unary", "fails", "hold"] {
+        let p = point(&t, IN_FLIGHT, &peer_want(m)).unwrap_or_else(|| panic!("{m}: no in_flight"));
+        assert_eq!(p.value, 0.0, "in_flight returns to zero for {m}: {p:?}");
+    }
+    for (m, status) in [
+        ("unary", "OK"),
+        ("fails", "NOT_FOUND"),
+        ("hold", "CANCELLED"),
+    ] {
+        let mut want = peer_want(m);
+        want.push(("aster.status", status));
+        assert_eq!(value(&t, COMPLETED, &want), 1.0, "{m} {status}");
+    }
+    let mut want = peer_want("unary");
+    want.push(("aster.status", "OK"));
+    assert!(point(&t, "aster.rpc.client.duration", &want).is_some());
+
+    let all: Vec<MetricPoint> = [COMPLETED, IN_FLIGHT, "aster.rpc.client.duration"]
+        .into_iter()
+        .flat_map(|m| t.metric_points(m))
+        .collect();
+    assert!(!all.is_empty());
+    for p in &all {
+        assert_eq!(
+            p.attr("aster.peer").is_some(),
+            peer_labels,
+            "peer label presence on {p:?}"
+        );
+    }
+
+    if peer_labels {
+        // Cap 1: a second peer is counted under `_OTHER`, not by its id.
+        let second = Node::start_with_alpns(node_cfg(), vec![RPC_ALPN.to_vec()])
+            .await
+            .unwrap();
+        wait_for_addr(&second).await;
+        client.add_peer(&second).unwrap();
+        let _second_handle = Server::new(&second).register(Echo).serve();
+        let conn2 = connect(&client, &second).await;
+        within(conn2.unary(&header("test.Echo", "unary"), vec![1]))
+            .await
+            .unwrap();
+        aster_otel::flush(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            value(
+                &t,
+                COMPLETED,
+                &[svc, ("aster.peer", "_OTHER"), ("aster.status", "OK")]
+            ),
+            1.0
+        );
+        assert!(t
+            .metric_points(COMPLETED)
+            .iter()
+            .all(|p| p.attr("aster.peer") != Some(second.id().as_str())));
+    }
     aster_otel::shutdown().unwrap();
 }
 
@@ -951,6 +1072,16 @@ mod foreign {
 #[test]
 fn instrument_and_span_names_and_attributes() {
     run("names_and_attributes");
+}
+
+#[test]
+fn client_metrics_carry_labels_and_in_flight_returns_to_zero() {
+    run("client_metrics");
+}
+
+#[test]
+fn client_metrics_peer_label_is_opt_in_and_bounded() {
+    run("client_metrics_peer_labels");
 }
 
 #[test]

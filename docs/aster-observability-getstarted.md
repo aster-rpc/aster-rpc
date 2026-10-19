@@ -72,6 +72,7 @@ application numbers.
 | `aster.rpc.server.duration` | histogram, seconds | service, method, status |
 | `aster.rpc.server.in_flight` | up-down counter | service |
 | `aster.rpc.client.requests_completed`, `aster.rpc.client.duration` | counter, histogram | service, method, status |
+| `aster.rpc.client.in_flight` | up-down counter | service, method |
 | `aster.rpc.streams.active` | up-down counter | none |
 | `aster.server.connections.active`, `aster.server.connections.opened` | up-down counter, counter | none |
 | `aster.admission.decisions`, `aster.admission.duration` | counter, histogram (ms) | `aster.role`, `aster.result` |
@@ -80,6 +81,15 @@ application numbers.
 | `aster.upcall.issued`, `aster.upcall.timeouts`, `aster.upcall.fallbacks` | counters | `aster.upcall.kind` |
 | `aster.log.records_dropped`, `aster.log.audit_dropped` | counters | none |
 | `aster.health.ready`, `aster.health.healthy`, `process.uptime` | observable gauges | none |
+
+Client metrics use the same `rpc.service` / `rpc.method` names as the server's.
+They carry no peer by default, since peer ids are unbounded. To add an
+`aster.peer` attribute to the client series (including `aster.rpc.client.in_flight`),
+set `metrics_client_peer_labels` (`[metrics] client_peer_labels`,
+`ASTER_METRICS_CLIENT_PEER_LABELS`) in Rust. The first
+`metrics_peer_label_cap` peers (default 64) keep their own series and later
+ones are counted under `_OTHER`. It applies to connections opened with
+`Node::rpc_connect` (so `AsterClient`); other bindings do not read it yet.
 
 A call the router could not find is labelled `rpc.service` / `rpc.method` =
 `_OTHER`, so caller-chosen names cannot mint new series.

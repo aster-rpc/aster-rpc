@@ -373,20 +373,39 @@ impl ClientObs {
     pub(crate) fn start(header: &mut StreamHeader) -> Self {
         #[cfg(feature = "otel")]
         {
-            let inner = otel::ClientOtel::start(header);
-            // No client span injected a context: a Rust-native handler's
-            // pass-through context goes out (a binding-written `traceparent`
-            // is left alone).
-            if inner.as_ref().is_none_or(|i| i.span.is_disabled()) {
-                otel::inject_pass(header);
-            }
-            ClientObs { inner }
+            Self::start_labelled(header, None)
         }
         #[cfg(not(feature = "otel"))]
         {
             let _ = header;
             ClientObs {}
         }
+    }
+
+    /// [`start`](ClientObs::start) for a call to a peer: with `labels` (the
+    /// node's opt-in) the call's metrics carry an `aster.peer` label.
+    #[cfg(feature = "otel")]
+    pub(crate) fn start_for_peer(
+        header: &mut StreamHeader,
+        labels: Option<&otel::ClientPeerLabels>,
+        peer: impl FnOnce() -> String,
+    ) -> Self {
+        Self::start_labelled(header, labels.map(|l| l.label(&peer())))
+    }
+
+    #[cfg(feature = "otel")]
+    fn start_labelled(
+        header: &mut StreamHeader,
+        peer: Option<aster_otel::opentelemetry::KeyValue>,
+    ) -> Self {
+        let inner = otel::ClientOtel::start(header, peer);
+        // No client span injected a context: a Rust-native handler's
+        // pass-through context goes out (a binding-written `traceparent`
+        // is left alone).
+        if inner.as_ref().is_none_or(|i| i.span.is_disabled()) {
+            otel::inject_pass(header);
+        }
+        ClientObs { inner }
     }
 
     /// The client span, or a disabled one.

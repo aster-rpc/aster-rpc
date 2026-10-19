@@ -42,6 +42,9 @@ const PATTERN: &str = "aster.pattern";
 const STATUS: &str = "aster.status";
 const ROLE: &str = "aster.role";
 const RESULT: &str = "aster.result";
+/// The opt-in peer label on client call metrics (the same key as
+/// `aster.peer.bytes`).
+const PEER: &str = "aster.peer";
 #[cfg(feature = "binding-support")]
 const UPCALL_KIND: &str = "aster.upcall.kind";
 /// The label for a service or method the server does not know (refused
@@ -78,6 +81,7 @@ pub(crate) struct Instruments {
     server_in_flight: UpDownCounter<i64>,
     client_completed: Counter<u64>,
     client_duration: Histogram<f64>,
+    client_in_flight: UpDownCounter<i64>,
     streams_active: UpDownCounter<i64>,
     connections_active: UpDownCounter<i64>,
     connections_opened: Counter<u64>,
@@ -121,6 +125,10 @@ impl Instruments {
                 .with_description("Time from issuing a call to its final status")
                 .with_unit("s")
                 .with_boundaries(SECONDS_BUCKETS.to_vec())
+                .build(),
+            client_in_flight: m
+                .i64_up_down_counter("aster.rpc.client.in_flight")
+                .with_description("RPC calls this process issued and not yet finished")
                 .build(),
             streams_active: m
                 .i64_up_down_counter("aster.rpc.streams.active")
@@ -840,16 +848,70 @@ pub(crate) fn upcall(what: crate::binding_support::upcall::Observed, kind: &'sta
 
 // ── client calls (§5.4) ─────────────────────────────────────────────────────
 
+/// The opt-in `aster.peer` label of client call metrics. Peer ids are
+/// unbounded, so only the first `cap` peers a node calls get their own
+/// series; every later peer is counted under `_OTHER`.
+pub(crate) struct ClientPeerLabels {
+    cap: usize,
+    seen: RwLock<HashMap<Box<str>, KeyValue>>,
+}
+
+impl ClientPeerLabels {
+    pub(crate) fn new(cap: usize) -> Self {
+        ClientPeerLabels {
+            cap,
+            seen: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// The `aster.peer` attribute for `peer`.
+    pub(crate) fn label(&self, peer: &str) -> KeyValue {
+        if let Some(kv) = self
+            .seen
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer)
+        {
+            return kv.clone();
+        }
+        let mut g = self.seen.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(kv) = g.get(peer) {
+            return kv.clone();
+        }
+        if g.len() >= self.cap {
+            return KeyValue::new(PEER, OTHER);
+        }
+        let kv = KeyValue::new(PEER, Arc::<str>::from(peer));
+        g.insert(peer.into(), kv.clone());
+        kv
+    }
+}
+
 /// One client call's OTel state, held by its [`ClientObs`](super::ClientObs).
 pub(crate) struct ClientOtel {
     b: Arc<Builtins>,
     labels: Arc<Labels>,
+    /// The `aster.peer` attribute, when the node opted in.
+    peer: Option<KeyValue>,
     started: Instant,
     pub(crate) span: Span,
 }
 
 impl ClientOtel {
-    pub(crate) fn start(header: &mut StreamHeader) -> Option<Self> {
+    /// Run `f` with the call's metric attributes: service and method, then
+    /// the peer when labelled, then `extra`. Stack arrays: recording a known
+    /// series allocates nothing (§4.2).
+    fn with_attrs<R>(&self, extra: Option<KeyValue>, f: impl FnOnce(&[KeyValue]) -> R) -> R {
+        let (s, m) = (self.labels.service.clone(), self.labels.method.clone());
+        match (&self.peer, extra) {
+            (None, None) => f(&[s, m]),
+            (None, Some(e)) => f(&[s, m, e]),
+            (Some(p), None) => f(&[s, m, p.clone()]),
+            (Some(p), Some(e)) => f(&[s, m, p.clone(), e]),
+        }
+    }
+
+    pub(crate) fn start(header: &mut StreamHeader, peer: Option<KeyValue>) -> Option<Self> {
         let b = builtins()?;
         let labels = labels(&header.service, &header.method);
         let span = if b.traces {
@@ -884,24 +946,27 @@ impl ClientOtel {
         } else {
             Span::none()
         };
-        Some(ClientOtel {
+        let this = ClientOtel {
             b,
             labels,
+            peer,
             started: Instant::now(),
             span,
-        })
+        };
+        if let Some(m) = &this.b.metrics {
+            this.with_attrs(None, |a| m.client_in_flight.add(1, a));
+        }
+        Some(this)
     }
 
     pub(crate) fn finish(self, code: StatusCode) {
         if let Some(m) = &self.b.metrics {
-            let attrs = [
-                self.labels.service.clone(),
-                self.labels.method.clone(),
-                KeyValue::new(STATUS, status_name(code)),
-            ];
-            m.client_completed.add(1, &attrs);
-            m.client_duration
-                .record(self.started.elapsed().as_secs_f64(), &attrs);
+            self.with_attrs(None, |a| m.client_in_flight.add(-1, a));
+            self.with_attrs(Some(KeyValue::new(STATUS, status_name(code))), |a| {
+                m.client_completed.add(1, a);
+                m.client_duration
+                    .record(self.started.elapsed().as_secs_f64(), a);
+            });
         }
         if !self.span.is_disabled() {
             span_status(&self.span, code);
