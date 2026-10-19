@@ -114,6 +114,25 @@ public final class AsterServer implements AutoCloseable {
 
   private final boolean ownsHealth;
 
+  private final Set<PeerEvents> peerSubscriptions = ConcurrentHashMap.newKeySet();
+
+  /**
+   * The peers connected now and a subscription to every connect and disconnect after them, taken
+   * together (Rust {@code AsterServer::peer_events}; {@code aster_server_peer_events}). See {@link
+   * PeerEvents} for the event semantics and the lagged recovery. Close the result when done;
+   * closing the server closes it too.
+   *
+   * @throws IrohException {@code ALREADY_CLOSED} if the server is closed
+   */
+  public PeerEvents peerEvents() {
+    if (!running.get()) {
+      throw IrohException.forStatus(site.aster.ffi.IrohStatus.ALREADY_CLOSED, "server closed");
+    }
+    PeerEvents events = PeerEvents.open(dispatch, peerSubscriptions::remove);
+    peerSubscriptions.add(events);
+    return events;
+  }
+
   /** The NodeConfig audit outbox opened for {@link Builder#auditOutbox} (null = none). */
   private final site.aster.audit.AuditOutbox auditOutbox;
 
@@ -483,6 +502,9 @@ public final class AsterServer implements AutoCloseable {
     }
     sessions.clear();
     connections.clear();
+    for (PeerEvents events : peerSubscriptions) {
+      events.close();
+    }
     dispatch.close(); // aster_server_destroy clears the attached listener's ready flag first
     if (grantor != null) {
       grantor.close();

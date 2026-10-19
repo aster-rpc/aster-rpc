@@ -7,7 +7,7 @@ using Aster.Rpc;
 
 namespace Aster.Tests;
 
-/// <summary>C ABI 7.1 – 7.7 (ffi/RENAME_MAP.md "New in 7.x"): layouts, config, metrics, drain, call identity (gateway identity: GatewayIdentityTests).</summary>
+/// <summary>C ABI 7.1 – 7.8 (ffi/RENAME_MAP.md "New in 7.x"): layouts, config, metrics, drain, call identity (gateway identity: GatewayIdentityTests).</summary>
 public class Abi7Tests
 {
     private static readonly AsterConfig Loopback = new() { RelayMode = "disabled", BindAddr = "127.0.0.1:0" };
@@ -16,7 +16,7 @@ public class Abi7Tests
     [Fact]
     public void Layouts_Constants_And_Exports_Match_The_Header()
     {
-        Assert.Equal(7u, Native.RequiredAbiMinor);
+        Assert.Equal(8u, Native.RequiredAbiMinor);
         Assert.Equal(64, Marshal.SizeOf<DrainReportNative>());
         Assert.Equal(96, Marshal.SizeOf<NetworkConfigNative>());
         Assert.Equal(16, Marshal.SizeOf<MetricsConfigNative>());
@@ -49,7 +49,7 @@ public class Abi7Tests
             "aster_config_set_identity", "aster_config_identity", "aster_server_set_audit_outbox", "aster_dispatch_on_behalf_of",
             "aster_server_node_properties", "aster_server_node_config_generation", "aster_enrollment_mint_user_token",
             "aster_enrollment_publisher_notice", "aster_enrollment_publisher_notice_token", "aster_enrollment_publisher_status",
-            "aster_node_config_call",
+            "aster_node_config_call", "aster_server_peer_events", "aster_peer_events_poll", "aster_peer_events_release",
         ]);
         Assert.True(NativeLibrary.TryLoad("aster_transport_ffi", typeof(Native).Assembly, null, out IntPtr lib));
         Assert.True(NativeLibrary.TryGetExport(lib, "aster_audit_outbox_acknowledgements", out _));

@@ -603,6 +603,7 @@ public sealed partial class AsterServer : IAsyncDisposable, IDisposable
             }
             for (int i = 0; i < 50 && Volatile.Read(ref _inFlight) > 0; i++)
                 await Task.Delay(20).ConfigureAwait(false);
+            await DisposePeerStreamsAsync().ConfigureAwait(false);
             await Task.Run(_dispatch.Dispose).ConfigureAwait(false);
             _health?.Dispose();
             foreach (var state in _sessions.Values) DisposeSession(state);

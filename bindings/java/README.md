@@ -1,6 +1,6 @@
 # Java and Kotlin runtime
 
-The Java runtime requires JDK 25 and native Aster C ABI **7.0 or newer** (within major 7). Set
+The Java runtime requires JDK 25 and native Aster C ABI **7.8 or newer** (within major 7). Set
 `IROH_LIB_PATH` or `-Daster.ffi.lib` to the native library when it is not bundled.
 
 ## Enrollment: who may connect, and with which roles

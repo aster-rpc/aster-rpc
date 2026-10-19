@@ -5,6 +5,21 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Added: server peer events (C ABI 7.8 required)
+
+`IrohLibrary.REQUIRED_ABI_MINOR` is now 8; a 7.0 - 7.7 library is refused.
+`AsterServer.peerEvents()` returns a `PeerEvents` (`AutoCloseable`,
+`Iterable<PeerEvent>`): `snapshot()` (the peers connected now: `PeerSnapshot`,
+`PeerIdentity`) and `next(Duration)` (blocking; `null` on timeout,
+`IrohAlreadyClosedException` once closed), taken atomically so no peer falls
+between the two. Events are the sealed `PeerEvent`: `PeerConnected`,
+`PeerDisconnected` (`DisconnectReason`: `CLOSED`, `TIMED_OUT`, `REVOKED`,
+`DRAINED`, `ERROR`) and `PeerLagged(missed)`. Events are per peer (first
+admitted `aster/1` connection to last), only after admission. A consumer that
+falls behind the 1024-event queue gets `PeerLagged` and should call
+`peerEvents()` again. `close()` wakes a pending read; closing the server does
+too. Kotlin uses these classes as they are.
+
 ### Changed: default maximum forwarded-token lifetime is 3600 s
 
 The default maximum forwarded-token lifetime (`exp - iat` of a token from a

@@ -278,6 +278,12 @@ public final class Dispatch implements AutoCloseable {
       h("aster_server_node_config_generation", FunctionDescriptor.of(I64, I64));
   private static final MethodHandle SET_AUDIT_OUTBOX =
       h("aster_server_set_audit_outbox", FunctionDescriptor.of(I32, I64, I64, I64));
+  private static final MethodHandle PEER_EVENTS =
+      h("aster_server_peer_events", FunctionDescriptor.of(I32, I64, PTR, PTR));
+  private static final MethodHandle PEER_EVENTS_POLL =
+      h("aster_peer_events_poll", FunctionDescriptor.of(I32, I64, I64, I32, PTR));
+  private static final MethodHandle PEER_EVENTS_RELEASE =
+      h("aster_peer_events_release", FunctionDescriptor.of(I32, I64));
 
   // ── builder ──────────────────────────────────────────────────────────────
 
@@ -773,6 +779,85 @@ public final class Dispatch implements AutoCloseable {
     } catch (Throwable t) {
       throw rethrow(t);
     }
+  }
+
+  /**
+   * The result of {@link #peerEvents()}: the receiver handle and the snapshot JSON.
+   *
+   * @param receiver the native receiver, released with {@link #peerEventsRelease}
+   * @param snapshotJson the connected peers as a JSON array
+   */
+  public record PeerEventsOpened(long receiver, byte[] snapshotJson) {}
+
+  /**
+   * {@code aster_server_peer_events} (ABI 7.8): the peers connected now and a receiver of every
+   * connect and disconnect after them, taken atomically.
+   */
+  public PeerEventsOpened peerEvents() {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment receiver = arena.allocate(8, 8);
+      MemorySegment out = arena.allocate(16, 8);
+      check((int) PEER_EVENTS.invoke(handle, receiver, out), "aster_server_peer_events");
+      return new PeerEventsOpened(receiver.get(I64, 0), takeOwned(out));
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * One {@code aster_peer_events_poll} result. {@code json} is the event for {@link IrohStatus#OK};
+   * {@code TIMEOUT} is no event yet; {@code NOT_FOUND} and {@code ALREADY_CLOSED} mean the receiver
+   * was released or the server ended.
+   */
+  public record PeerPoll(IrohStatus status, byte[] json) {}
+
+  /**
+   * {@code aster_peer_events_poll} (ABI 7.8): blocks up to {@code timeoutMs} (0: don't wait) for
+   * the next event. Must not run on a tokio thread; a release wakes it with {@code NOT_FOUND}.
+   */
+  public PeerPoll peerEventsPoll(long receiver, int timeoutMs) {
+    try (Arena arena = Arena.ofConfined()) {
+      MemorySegment out = arena.allocate(16, 8);
+      int status = (int) PEER_EVENTS_POLL.invoke(runtimeHandle, receiver, timeoutMs, out);
+      if (status == IrohStatus.OK.code) {
+        return new PeerPoll(IrohStatus.OK, takeOwned(out));
+      }
+      if (status == IrohStatus.TIMEOUT.code
+          || status == IrohStatus.NOT_FOUND.code
+          || status == IrohStatus.ALREADY_CLOSED.code) {
+        return new PeerPoll(IrohStatus.fromCode(status), new byte[0]);
+      }
+      check(status, "aster_peer_events_poll");
+      throw new AssertionError("unreachable");
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /**
+   * {@code aster_peer_events_release} (ABI 7.8): wakes a pending poll; unknown receivers are fine.
+   */
+  public void peerEventsRelease(long receiver) {
+    try {
+      int status = (int) PEER_EVENTS_RELEASE.invoke(receiver);
+      if (status != IrohStatus.NOT_FOUND.code) {
+        check(status, "aster_peer_events_release");
+      }
+    } catch (Throwable t) {
+      throw rethrow(t);
+    }
+  }
+
+  /** Copy a library-owned {@code aster_bytes_t} at {@code out} and release it. */
+  private static byte[] takeOwned(MemorySegment out) throws Throwable {
+    MemorySegment ptr = out.get(PTR, 0);
+    long len = out.get(I64, 8);
+    if (ptr.equals(MemorySegment.NULL) || len == 0) {
+      return new byte[0];
+    }
+    byte[] bytes = ptr.reinterpret(len).toArray(U8);
+    STRING_RELEASE.invoke(ptr, len);
+    return bytes;
   }
 
   private static String utf8(MemorySegment ptr, int len) {

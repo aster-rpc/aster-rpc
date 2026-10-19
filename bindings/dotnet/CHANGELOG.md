@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Added: server peer events (C ABI 7.8 required)
+
+`Native.RequiredAbiMinor` is now 8; a 7.0 - 7.7 library is refused.
+`await server.PeerEventsAsync(cancellationToken)` returns a `PeerEventStream`:
+`Snapshot` (the peers connected now: `PeerSnapshot`, `PeerIdentity`) and an
+`IAsyncEnumerable<PeerEvent>` of `PeerConnected`, `PeerDisconnected`
+(`DisconnectReason`: `Closed`, `TimedOut`, `Revoked`, `Drained`, `Error`) and
+`PeerLagged(Missed)`, taken atomically so no peer falls between the two.
+Events are per peer (first admitted `aster/1` connection to last), only after
+admission. A consumer that falls behind the 1024-event queue gets `PeerLagged`
+and should open a new stream. Dispose the stream (or cancel the token) to
+release the receiver; disposing the server does too.
+
 ### Changed: default maximum forwarded-token lifetime is 3600 s
 
 The default maximum forwarded-token lifetime (`exp - iat` of a token from a

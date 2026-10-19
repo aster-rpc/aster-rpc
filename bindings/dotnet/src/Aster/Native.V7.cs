@@ -3,7 +3,7 @@ using System.Runtime.InteropServices;
 
 namespace Aster;
 
-// P/Invoke declarations for the C ABI 7.2 – 7.7 additions (ffi/RENAME_MAP.md "New in 7.x").
+// P/Invoke declarations for the C ABI 7.2 – 7.8 additions (ffi/RENAME_MAP.md "New in 7.x").
 // 7.1 (audit acknowledgements) lives in Native.Audit.cs. Struct sizes are pinned by AbiContractTests.
 internal static unsafe partial class Native
 {
@@ -81,6 +81,15 @@ internal static unsafe partial class Native
     [LibraryImport(NativeLib, EntryPoint = "aster_node_config_call")]
     public static partial int aster_node_config_call(ulong runtime, ulong connection, uint method, Bytes request_json, ulong user_data,
         out ulong out_operation);
+
+    // ─── 7.8: server peer events ────────────────────────────────────────────
+
+    [LibraryImport(NativeLib, EntryPoint = "aster_server_peer_events")]
+    public static partial int aster_server_peer_events(ulong server, ulong* out_receiver, Bytes* out_snapshot_json);
+    [LibraryImport(NativeLib, EntryPoint = "aster_peer_events_poll")]
+    public static partial int aster_peer_events_poll(ulong runtime, ulong receiver, uint timeout_ms, Bytes* out_json);
+    [LibraryImport(NativeLib, EntryPoint = "aster_peer_events_release")]
+    public static partial int aster_peer_events_release(ulong receiver);
 }
 
 /// <summary><c>aster_drain_report_t</c> (64 bytes, ABI 7.2).</summary>

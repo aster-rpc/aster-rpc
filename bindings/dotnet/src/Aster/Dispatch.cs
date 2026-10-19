@@ -87,6 +87,7 @@ internal sealed class DispatchServer : IDisposable
     private readonly ulong _runtime;
     private readonly ulong _handle;
     internal ulong NativeHandle => _handle;
+    internal ulong NativeRuntime => _runtime;
     private readonly ConcurrentDictionary<ulong, TaskCompletionSource<bool>> _capacityWaiters = new();
     private int _pollThreadId = -1;
     private volatile bool _disposed;
