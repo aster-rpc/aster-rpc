@@ -803,17 +803,34 @@ impl JsAsterConfig {
 
 /// Defaults overlaid with `ASTER_*` environment variables (the Rust
 /// `AsterConfig::from_env` loader). Every field is filled in.
+///
+/// With `env`, the variables come from that map and the process environment
+/// is not read (`AsterConfig::from_env_vars`). The package passes the
+/// `ASTER_*` entries of `process.env`: Bun keeps runtime `process.env` writes
+/// out of the C environment Rust would otherwise read.
 #[napi]
-pub fn aster_config_from_env() -> Result<JsAsterConfig> {
-    let config = RsConfig::from_env().map_err(aster_err)?;
+pub fn aster_config_from_env(env: Option<HashMap<String, String>>) -> Result<JsAsterConfig> {
+    let config = match env {
+        Some(vars) => RsConfig::from_env_vars(vars),
+        None => RsConfig::from_env(),
+    }
+    .map_err(aster_err)?;
     Ok(JsAsterConfig::from_rust(&config))
 }
 
 /// Defaults < `aster.toml` at `path` < `ASTER_*` environment (the Rust
-/// `AsterConfig::from_file` loader). Every field is filled in.
+/// `AsterConfig::from_file` loader). Every field is filled in. `env` as for
+/// `asterConfigFromEnv`.
 #[napi]
-pub fn aster_config_from_file(path: String) -> Result<JsAsterConfig> {
-    let config = RsConfig::from_file(&path).map_err(aster_err)?;
+pub fn aster_config_from_file(
+    path: String,
+    env: Option<HashMap<String, String>>,
+) -> Result<JsAsterConfig> {
+    let config = match env {
+        Some(vars) => RsConfig::from_file_with_env_vars(&path, vars),
+        None => RsConfig::from_file(&path),
+    }
+    .map_err(aster_err)?;
     Ok(JsAsterConfig::from_rust(&config))
 }
 

@@ -34,6 +34,8 @@ def gates(root, temporary):
         ("node", "observability-counts", package, ["node", "../../scripts/check-vitest-count.mjs", str(report), "observability-logs.test.ts=7", "observability-export.test.ts=13", "o7-server-health.test.ts=3"]),
         ("node", "smoke", root, ["node", "tests/typescript/smoke/o7-observability-smoke.mjs"]),
         ("bun", "smoke", root, ["bun", "tests/typescript/smoke/o7-observability-smoke.mjs"]),
+        ("node", "config-env", root, ["node", "tests/typescript/smoke/config-env-smoke.mjs"]),
+        ("bun", "config-env", root, ["bun", "tests/typescript/smoke/config-env-smoke.mjs"]),
         ("bun", "package-load", package, ["bun", "--eval", "const m = await import('./dist/index.js'); for (const k of ['AsterServer', 'encodeStreamHeader']) { if (!(k in m)) throw new Error('missing export ' + k) } console.log('ok')"]),
     ]
 

@@ -15,6 +15,7 @@ import {
   mergeConfig,
   resolveRootPubkey,
 } from '@aster-rpc/aster';
+import { loadNative } from '../../../bindings/typescript/packages/aster/src/native.js';
 
 /** Every ASTER_* variable a test might set or that could leak in from CI. */
 const ENV_KEYS = Object.keys(process.env).filter((k) => k.startsWith('ASTER_'))
@@ -109,6 +110,30 @@ describe('AsterConfig.fromEnv', () => {
   it('refuses a retired consumer-admission variable, naming the replacement', () => {
     process.env.ASTER_ALLOW_ALL_CONSUMERS = 'false';
     expect(() => AsterConfig.fromEnv()).toThrow(/ASTER_ALLOW_ALL_CONSUMERS.*enrollment_credential/);
+  });
+
+  it('sees ASTER_* variables assigned to process.env at run time', () => {
+    // Bun keeps these writes out of the C environment; the package hands its
+    // `process.env` entries to Rust instead (smoke/config-env-smoke.mjs runs
+    // this under Bun).
+    process.env.ASTER_BIND_ADDR = '127.0.0.1:47021';
+    process.env.ASTER_ENROLLMENT_AUDIENCE = 'runtime-audience';
+    const c = AsterConfig.fromEnv();
+    expect(c.bindAddr).toBe('127.0.0.1:47021');
+    expect(c.enrollment?.audience).toBe('runtime-audience');
+    writeFileSync(join(dir, 'aster.toml'), '[network]\nbind_addr = "127.0.0.1:1"\n');
+    expect(AsterConfig.fromFile(join(dir, 'aster.toml')).bindAddr).toBe('127.0.0.1:47021');
+  });
+
+  it('reads only the map it is given, not the process environment', () => {
+    process.env.ASTER_BIND_ADDR = '127.0.0.1:47022';
+    const native = loadNative();
+    expect(native.asterConfigFromEnv({ ASTER_HEALTH_PORT: '9191' })).toMatchObject({
+      healthPort: 9191,
+    });
+    expect(native.asterConfigFromEnv({}).bindAddr ?? undefined).toBeUndefined();
+    // Without a map the loader still reads the process environment.
+    expect(native.asterConfigFromEnv().bindAddr).toBe('127.0.0.1:47022');
   });
 });
 

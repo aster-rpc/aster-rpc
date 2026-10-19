@@ -5,6 +5,23 @@ All notable changes to `@aster-rpc/aster` (and its native addon
 
 ## Unreleased
 
+### Fixed: `AsterConfig.fromEnv` / `fromFile` see runtime `process.env` writes under Bun
+
+Bun keeps `process.env` assignments out of the C environment, so the Rust
+loaders missed any `ASTER_*` variable a program set itself (a server then
+bound and advertised the wrong addresses). The loaders now take the
+`ASTER_*` entries of `process.env`. Native addon:
+`asterConfigFromEnv(env?)` and `asterConfigFromFile(path, env?)` accept the
+variables as a map; without one they read the process environment as before.
+See "Known issues" in the README for the settings still read from the C
+environment.
+
+### Added: `@aster-rpc/aster/native` export
+
+`loadNative`, `tryLoadNative` and the `NativeAddon` type (plus the
+`requireCjs` helper the module already exported) are importable from
+`@aster-rpc/aster/native`.
+
 ### Added: gateway identity (calls on behalf of a user)
 
 On the config-driven path, mirroring Rust and Go:

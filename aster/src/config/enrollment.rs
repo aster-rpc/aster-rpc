@@ -15,10 +15,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use super::{
-    env_bool, env_path, env_string, env_u64, toml_bool, toml_path, toml_section, toml_string,
-    toml_string_list, toml_u64,
-};
+use super::{toml_bool, toml_path, toml_section, toml_string, toml_string_list, toml_u64, EnvVars};
 use crate::error::{Error, Result};
 
 /// The default claim attribute whose comma-separated value lists the peer's
@@ -299,31 +296,31 @@ impl EnrollmentConfig {
         Ok(())
     }
 
-    pub(super) fn apply_env(&mut self) -> Result<()> {
-        if let Some(value) = env_bool("ASTER_ENROLLMENT_ENABLED")? {
+    pub(super) fn apply_env(&mut self, env: &EnvVars<'_>) -> Result<()> {
+        if let Some(value) = env.bool("ASTER_ENROLLMENT_ENABLED")? {
             self.enabled = Some(value);
         }
-        if let Some(value) = env_string("ASTER_ENROLLMENT_AUDIENCE") {
+        if let Some(value) = env.string("ASTER_ENROLLMENT_AUDIENCE") {
             self.audience = Some(value);
         }
-        if let Some(value) = env_string("ASTER_ENROLLMENT_FLEET_NAMESPACE") {
+        if let Some(value) = env.string("ASTER_ENROLLMENT_FLEET_NAMESPACE") {
             self.fleet_namespace = Some(value);
         }
-        if let Some(value) = env_path("ASTER_ENROLLMENT_STATE_PATH") {
+        if let Some(value) = env.path("ASTER_ENROLLMENT_STATE_PATH") {
             self.state_path = Some(value);
         }
-        if let Some(value) = env_string("ASTER_ENROLLMENT_REPLICAS") {
+        if let Some(value) = env.string("ASTER_ENROLLMENT_REPLICAS") {
             self.replicas = split_list(&value);
         }
-        if let Some(value) = env_string("ASTER_ENROLLMENT_POLICY") {
+        if let Some(value) = env.string("ASTER_ENROLLMENT_POLICY") {
             self.policy = Some(serde_json::from_str(&value).map_err(|e| {
                 Error::InvalidArgument(format!("ASTER_ENROLLMENT_POLICY: invalid JSON: {e}"))
             })?);
         }
-        if let Some(value) = env_bool("ASTER_ENROLLMENT_REQUIRE_SYNCHRONIZED_CLOCK")? {
+        if let Some(value) = env.bool("ASTER_ENROLLMENT_REQUIRE_SYNCHRONIZED_CLOCK")? {
             self.require_synchronized_clock = value;
         }
-        if let Some(value) = env_u64("ASTER_ENROLLMENT_ACTIVATION_LEEWAY_SECS")? {
+        if let Some(value) = env.u64("ASTER_ENROLLMENT_ACTIVATION_LEEWAY_SECS")? {
             self.activation_leeway_secs = Some(value);
         }
         let l = &mut self.limits;
@@ -347,33 +344,33 @@ impl EnrollmentConfig {
             ),
             ("ASTER_ENROLLMENT_SYNC_TIMEOUT_MS", &mut l.sync_timeout_ms),
         ] {
-            if let Some(value) = env_u64(key)? {
+            if let Some(value) = env.u64(key)? {
                 *slot = Some(value);
             }
         }
-        if let Ok(value) = std::env::var("ASTER_ENROLLMENT_ROLE_ATTRIBUTE") {
+        if let Some(value) = env.string_allow_empty("ASTER_ENROLLMENT_ROLE_ATTRIBUTE") {
             self.roles.attribute = value.trim().to_string();
         }
-        if let Some(value) = env_bool("ASTER_ENROLLMENT_SCOPES_AS_ROLES")? {
+        if let Some(value) = env.bool("ASTER_ENROLLMENT_SCOPES_AS_ROLES")? {
             self.roles.scopes_as_roles = value;
         }
-        if let Some(value) = env_bool("ASTER_ENROLLMENT_INCLUDE_ATTRIBUTES")? {
+        if let Some(value) = env.bool("ASTER_ENROLLMENT_INCLUDE_ATTRIBUTES")? {
             self.roles.include_attributes = value;
         }
-        if let Some(value) = env_path("ASTER_ENROLLMENT_ISSUER_DELEGATION_FILE") {
+        if let Some(value) = env.path("ASTER_ENROLLMENT_ISSUER_DELEGATION_FILE") {
             self.issuer_delegation_file = Some(value);
         }
-        if let Some(value) = env_string("ASTER_ENROLLMENT_ISSUER_LIFETIME") {
+        if let Some(value) = env.string("ASTER_ENROLLMENT_ISSUER_LIFETIME") {
             self.issuer_lifetime_secs =
                 Some(parse_duration("ASTER_ENROLLMENT_ISSUER_LIFETIME", &value)?);
         }
-        if let Some(value) = env_string("ASTER_ENROLLMENT_RENEW_FROM") {
+        if let Some(value) = env.string("ASTER_ENROLLMENT_RENEW_FROM") {
             self.renew_from = Some(value);
         }
-        if let Some(value) = env_bool("ASTER_ENROLLMENT_RENEW")? {
+        if let Some(value) = env.bool("ASTER_ENROLLMENT_RENEW")? {
             self.renew = Some(value);
         }
-        if let Some(value) = env_bool("ASTER_ENROLLMENT_SYNCHRONIZE")? {
+        if let Some(value) = env.bool("ASTER_ENROLLMENT_SYNCHRONIZE")? {
             self.synchronize = Some(value);
         }
         Ok(())

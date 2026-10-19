@@ -617,6 +617,52 @@ Logs (into pino, winston or your own sink), custom metrics, tracing and the
 `/healthz` / `/readyz` / `/metrics` listener are covered in the
 [observability guide](../../../../docs/aster-observability-getstarted.md).
 
+## Known issues
+
+### Bun: reading stdin stops timers
+
+Under Bun 1.2.15, once data starts arriving on a piped stdin, timers stop
+firing until stdin reaches end of file. This happens with
+`process.stdin.on('data')`, `node:readline` over `process.stdin`,
+`for await (const line of console)` and `Bun.stdin.stream()`. Anything that
+runs on a timer stalls with it, such as heartbeats, deadlines and periodic
+work. It is a Bun behaviour and happens without Aster loaded. Tested on macOS
+arm64 with a pipe that writes one line per second; a pipe that is open but
+idle does not trigger it, and an interactive TTY was not tested. Node is not
+affected.
+
+Workaround: let a child process read stdin and read its stdout instead:
+
+```typescript
+import { spawn } from 'node:child_process';
+import { createInterface } from 'node:readline';
+
+const cat = spawn('cat', [], { stdio: ['inherit', 'pipe', 'inherit'] });
+createInterface({ input: cat.stdout }).on('line', (line) => { /* … */ });
+```
+
+`Bun.spawn(['cat'], { stdin: 'inherit', stdout: 'pipe' })` works too. A
+`node:worker_threads` worker does not, because its `process.stdin` received
+nothing under Bun 1.2.15.
+
+### Bun: `process.env` writes do not reach native code
+
+Bun keeps `process.env` assignments made at run time out of the C
+environment, where native code reads them. `AsterConfig.fromEnv()` and
+`fromFile()` therefore pass the `ASTER_*` entries of `process.env` to the
+Rust loader, so a variable you set in your program applies under Bun as it
+does under Node. Settings that the native layer still reads from the C
+environment only see values that were present when the process started:
+
+- `ASTER_LOG_STDERR` and `ASTER_LOG`, read when the addon loads;
+- the `OTEL_*` and `ASTER_*` variables read by `observabilityInit` (pass
+  explicit options instead);
+- `HOME` (for `~` in paths) and the `HTTP_PROXY` / `HTTPS_PROXY` family used
+  with `proxyFromEnv`.
+
+Under Bun, set these in the environment that launches the process, or pass
+them as explicit configuration.
+
 ## API reference
 
 Generated API docs (TypeDoc): `bun run docs` produces `docs-api/`.

@@ -827,6 +827,37 @@ impl AsterConfig {
         Ok(config)
     }
 
+    /// [`from_env`](Self::from_env), reading `ASTER_*` variables from `vars`
+    /// instead of the process environment. Variables absent from `vars` are
+    /// unset, whatever the process environment holds.
+    pub fn from_env_vars<K, V>(vars: impl IntoIterator<Item = (K, V)>) -> Result<Self>
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let vars = collect_vars(vars);
+        let mut config = Self::default();
+        config.apply_env_from(|key| vars.get(key).cloned())?;
+        Ok(config)
+    }
+
+    /// [`from_file`](Self::from_file), overlaying `ASTER_*` variables from
+    /// `vars` instead of the process environment.
+    pub fn from_file_with_env_vars<K, V>(
+        path: impl AsRef<Path>,
+        vars: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<Self>
+    where
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let vars = collect_vars(vars);
+        let mut config = Self::default();
+        config.apply_file(path)?;
+        config.apply_env_from(|key| vars.get(key).cloned())?;
+        Ok(config)
+    }
+
     /// Apply an `aster.toml` file over the current configuration.
     pub fn apply_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
@@ -1091,22 +1122,34 @@ impl AsterConfig {
 
     /// Apply `ASTER_*` environment variables over the current configuration.
     pub fn apply_env(&mut self) -> Result<()> {
-        if let Some(value) = env_path("ASTER_ROOT_PUBKEY_FILE") {
+        self.apply_env_from(|key| env::var(key).ok())
+    }
+
+    /// Apply `ASTER_*` variables read through `lookup` over the current
+    /// configuration, with the same names and parsing as
+    /// [`apply_env`](Self::apply_env).
+    ///
+    /// For hosts whose environment is not the process environment: Bun keeps
+    /// `process.env` writes in its own map, so a binding there passes its
+    /// `ASTER_*` entries here instead of letting Rust read `environ`.
+    pub fn apply_env_from(&mut self, lookup: impl Fn(&str) -> Option<String>) -> Result<()> {
+        let env = EnvVars(&lookup);
+        if let Some(value) = env.path("ASTER_ROOT_PUBKEY_FILE") {
             self.root_pubkey_file = Some(value);
         }
-        if let Some(value) = env_path("ASTER_ENROLLMENT_CREDENTIAL") {
+        if let Some(value) = env.path("ASTER_ENROLLMENT_CREDENTIAL") {
             self.enrollment_credential_file = Some(value);
         }
-        if let Some(value) = env_string("ASTER_ENROLLMENT_CREDENTIAL_CHAIN") {
+        if let Some(value) = env.string("ASTER_ENROLLMENT_CREDENTIAL_CHAIN") {
             self.enrollment_credential_chain = Some(value);
         }
-        if let Some(value) = env_string("ASTER_NEXT_ROOT_COMMITMENT") {
+        if let Some(value) = env.string("ASTER_NEXT_ROOT_COMMITMENT") {
             self.next_root_commitment = Some(value);
         }
-        if let Some(value) = env_u64("ASTER_ROOT_SEQ")? {
+        if let Some(value) = env.u64("ASTER_ROOT_SEQ")? {
             self.root_seq = value;
         }
-        if let Some(value) = env_string("ASTER_ROOT_ROTATIONS") {
+        if let Some(value) = env.string("ASTER_ROOT_ROTATIONS") {
             self.root_rotations = value
                 .split(',')
                 .map(str::trim)
@@ -1115,42 +1158,42 @@ impl AsterConfig {
                 .collect();
         }
         for key in RETIRED_TRUST_KEYS {
-            if std::env::var_os(key.1).is_some() {
+            if env.is_set(key.1) {
                 return Err(retired_setting(key.1));
             }
         }
-        if let Some(value) = env_string("ASTER_ENDPOINT_ADDR") {
+        if let Some(value) = env.string("ASTER_ENDPOINT_ADDR") {
             self.endpoint_addr = Some(value);
         }
-        if let Some(value) = env_path("ASTER_IDENTITY_FILE") {
+        if let Some(value) = env.path("ASTER_IDENTITY_FILE") {
             self.identity_file = Some(value);
         }
 
-        if let Some(value) = env_string("ASTER_ROOT_PUBKEY") {
+        if let Some(value) = env.string("ASTER_ROOT_PUBKEY") {
             self.root_pubkey = Some(parse_public_key("ASTER_ROOT_PUBKEY", &value)?);
         }
 
-        if let Some(value) = env_path("ASTER_STORAGE_PATH") {
+        if let Some(value) = env.path("ASTER_STORAGE_PATH") {
             self.storage_path = Some(value);
         }
-        if let Some(value) = env_u64("ASTER_GC_INTERVAL_MS")? {
+        if let Some(value) = env.u64("ASTER_GC_INTERVAL_MS")? {
             self.gc_interval = gc_interval_from_ms(value);
         }
-        if let Some(value) = env_string("ASTER_BLOB_ZSTD_LEVEL") {
+        if let Some(value) = env.string("ASTER_BLOB_ZSTD_LEVEL") {
             self.blob_zstd_level = parse_blob_zstd_level("ASTER_BLOB_ZSTD_LEVEL", &value)?;
         }
-        if let Some(value) = env_string_allow_empty("ASTER_SECRET_KEY") {
+        if let Some(value) = env.string_allow_empty("ASTER_SECRET_KEY") {
             if value.trim().is_empty() {
                 self.secret_key = None;
             } else {
                 self.secret_key = Some(parse_secret_key("ASTER_SECRET_KEY", &value)?);
             }
         }
-        if let Some(value) = env_path("ASTER_SECRET_KEY_FILE") {
+        if let Some(value) = env.path("ASTER_SECRET_KEY_FILE") {
             self.secret_key_file = Some(value);
         }
-        let relay_mode = env_string("ASTER_RELAY_MODE");
-        let relay_urls = env_string("ASTER_RELAY_URLS").map(|value| {
+        let relay_mode = env.string("ASTER_RELAY_MODE");
+        let relay_urls = env.string("ASTER_RELAY_URLS").map(|value| {
             value
                 .split(',')
                 .map(str::trim)
@@ -1163,157 +1206,149 @@ impl AsterConfig {
             relay_urls,
             "ASTER_RELAY_MODE/ASTER_RELAY_URLS",
         )?;
-        if let Some(value) = env_string("ASTER_BIND_ADDR") {
+        if let Some(value) = env.string("ASTER_BIND_ADDR") {
             self.bind_addr = Some(value);
         }
-        if let Some(value) = env_string("ASTER_BIND_ADDR_V6") {
+        if let Some(value) = env.string("ASTER_BIND_ADDR_V6") {
             self.bind_addr_v6 = Some(value);
         }
-        if let Some(value) = env_list("ASTER_ADVERTISE_ADDRS") {
+        if let Some(value) = env.list("ASTER_ADVERTISE_ADDRS") {
             self.advertise_addrs = value;
         }
-        if let Some(value) = env_list("ASTER_RELAY_CA_CERTS") {
+        if let Some(value) = env.list("ASTER_RELAY_CA_CERTS") {
             self.relay_ca_certs = value
                 .into_iter()
                 .map(|p| expand_tilde(Path::new(&p)))
                 .collect();
         }
-        if let Some(value) = env_bool("ASTER_RELAY_CA_ONLY")? {
+        if let Some(value) = env.bool("ASTER_RELAY_CA_ONLY")? {
             self.relay_ca_only = value;
         }
         self.apply_discovery(
-            env_string("ASTER_DISCOVERY").as_deref(),
-            env_string("ASTER_DISCOVERY_DNS_ORIGIN"),
-            env_list("ASTER_DISCOVERY_PKARR_RELAYS"),
+            env.string("ASTER_DISCOVERY").as_deref(),
+            env.string("ASTER_DISCOVERY_DNS_ORIGIN"),
+            env.list("ASTER_DISCOVERY_PKARR_RELAYS"),
             "ASTER_DISCOVERY",
         )?;
-        if let Some(value) = env_bool("ASTER_REUSE_LAST_PORT")? {
+        if let Some(value) = env.bool("ASTER_REUSE_LAST_PORT")? {
             self.reuse_last_port = value;
         }
-        if let Some(value) = env_bool("ASTER_LOCAL_DISCOVERY")? {
+        if let Some(value) = env.bool("ASTER_LOCAL_DISCOVERY")? {
             self.local_discovery = value;
         }
-        if let Some(value) = env_bool("ASTER_ENABLE_MONITORING")? {
+        if let Some(value) = env.bool("ASTER_ENABLE_MONITORING")? {
             self.enable_monitoring = value;
         }
-        if let Some(value) = env_bool("ASTER_ENABLE_HOOKS")? {
+        if let Some(value) = env.bool("ASTER_ENABLE_HOOKS")? {
             self.enable_hooks = value;
         }
-        if let Some(value) = env_u64("ASTER_HOOK_TIMEOUT_MS")? {
+        if let Some(value) = env.u64("ASTER_HOOK_TIMEOUT_MS")? {
             self.hook_timeout_ms = value;
         }
-        if let Some(value) = env_string("ASTER_HOOK_FAILURE_MODE") {
+        if let Some(value) = env.string("ASTER_HOOK_FAILURE_MODE") {
             self.hook_failure_mode = parse_hook_failure_mode("ASTER_HOOK_FAILURE_MODE", &value)?;
         }
-        if let Some(value) = env_bool("ASTER_CLEAR_IP_TRANSPORTS")? {
+        if let Some(value) = env.bool("ASTER_CLEAR_IP_TRANSPORTS")? {
             self.clear_ip_transports = value;
         }
-        if let Some(value) = env_bool("ASTER_CLEAR_RELAY_TRANSPORTS")? {
+        if let Some(value) = env.bool("ASTER_CLEAR_RELAY_TRANSPORTS")? {
             self.clear_relay_transports = value;
         }
-        if let Some(value) = env_string("ASTER_PORTMAPPER_CONFIG") {
+        if let Some(value) = env.string("ASTER_PORTMAPPER_CONFIG") {
             self.portmapper_config = Some(parse_portmapper("ASTER_PORTMAPPER_CONFIG", &value)?);
         }
-        if let Some(value) = env_string("ASTER_PROXY_URL") {
+        if let Some(value) = env.string("ASTER_PROXY_URL") {
             self.proxy_url = Some(value);
         }
-        if let Some(value) = env_bool("ASTER_PROXY_FROM_ENV")? {
+        if let Some(value) = env.bool("ASTER_PROXY_FROM_ENV")? {
             self.proxy_from_env = value;
         }
 
         macro_rules! overlay {
             ($field:ident, $parse:ident, $key:literal) => {
-                if let Some(value) = $parse($key)? {
+                if let Some(value) = env.$parse($key)? {
                     self.$field = Some(value);
                 }
             };
         }
         overlay!(
             transport_max_concurrent_bidi_streams,
-            env_u64,
+            u64,
             "ASTER_TRANSPORT_MAX_CONCURRENT_BIDI_STREAMS"
         );
         overlay!(
             transport_max_concurrent_uni_streams,
-            env_u64,
+            u64,
             "ASTER_TRANSPORT_MAX_CONCURRENT_UNI_STREAMS"
         );
         overlay!(
             transport_stream_receive_window,
-            env_u64,
+            u64,
             "ASTER_TRANSPORT_STREAM_RECEIVE_WINDOW"
         );
         overlay!(
             transport_receive_window,
-            env_u64,
+            u64,
             "ASTER_TRANSPORT_RECEIVE_WINDOW"
         );
-        overlay!(
-            transport_send_window,
-            env_u64,
-            "ASTER_TRANSPORT_SEND_WINDOW"
-        );
+        overlay!(transport_send_window, u64, "ASTER_TRANSPORT_SEND_WINDOW");
         overlay!(
             transport_max_idle_timeout_ms,
-            env_u64,
+            u64,
             "ASTER_TRANSPORT_MAX_IDLE_TIMEOUT_MS"
         );
         overlay!(
             transport_keep_alive_interval_ms,
-            env_u64,
+            u64,
             "ASTER_TRANSPORT_KEEP_ALIVE_INTERVAL_MS"
         );
-        overlay!(
-            transport_initial_mtu,
-            env_u16,
-            "ASTER_TRANSPORT_INITIAL_MTU"
-        );
+        overlay!(transport_initial_mtu, u16, "ASTER_TRANSPORT_INITIAL_MTU");
         overlay!(
             transport_datagram_receive_buffer_size,
-            env_usize,
+            usize,
             "ASTER_TRANSPORT_DATAGRAM_RECEIVE_BUFFER_SIZE"
         );
         overlay!(
             transport_datagram_send_buffer_size,
-            env_usize,
+            usize,
             "ASTER_TRANSPORT_DATAGRAM_SEND_BUFFER_SIZE"
         );
         overlay!(
             transport_send_fairness,
-            env_bool,
+            bool,
             "ASTER_TRANSPORT_SEND_FAIRNESS"
         );
         overlay!(
             transport_enable_segmentation_offload,
-            env_bool,
+            bool,
             "ASTER_TRANSPORT_ENABLE_SEGMENTATION_OFFLOAD"
         );
 
-        if let Some(value) = env_string("ASTER_LOG_FORMAT") {
+        if let Some(value) = env.string("ASTER_LOG_FORMAT") {
             self.log_format = value.to_ascii_lowercase();
         }
-        if let Some(value) = env_string("ASTER_LOG_LEVEL") {
+        if let Some(value) = env.string("ASTER_LOG_LEVEL") {
             self.log_level = value.to_ascii_lowercase();
         }
-        if let Some(value) = env_bool("ASTER_LOG_MASK")? {
+        if let Some(value) = env.bool("ASTER_LOG_MASK")? {
             self.log_mask = value;
         }
 
-        if let Some(value) = env_u16("ASTER_HEALTH_PORT")? {
+        if let Some(value) = env.u16("ASTER_HEALTH_PORT")? {
             self.health_port = value;
         }
-        if let Some(value) = env_string("ASTER_HEALTH_HOST") {
+        if let Some(value) = env.string("ASTER_HEALTH_HOST") {
             self.health_host = value;
         }
-        if let Some(value) = env_bool("ASTER_HEALTH_ENABLED")? {
+        if let Some(value) = env.bool("ASTER_HEALTH_ENABLED")? {
             self.health_enabled = Some(value);
         }
-        if let Some(value) = env_bool("ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF")? {
+        if let Some(value) = env.bool("ASTER_IDENTITY_ACCEPT_ON_BEHALF_OF")? {
             self.identity_accept_on_behalf_of = value;
             self.setting_sources
                 .insert(SETTING_ACCEPT_ON_BEHALF_OF.into(), ConfigSource::Env);
         }
-        if let Some(value) = env_string("ASTER_IDENTITY_TRUSTED_ISSUERS") {
+        if let Some(value) = env.string("ASTER_IDENTITY_TRUSTED_ISSUERS") {
             self.identity_trusted_issuers = serde_json::from_str(&value).map_err(|e| {
                 Error::InvalidArgument(format!(
                     "ASTER_IDENTITY_TRUSTED_ISSUERS: expected a JSON array of trusted issuers: {e}"
@@ -1322,22 +1357,22 @@ impl AsterConfig {
             self.setting_sources
                 .insert(SETTING_TRUSTED_ISSUERS.into(), ConfigSource::Env);
         }
-        if let Some(value) = env_u64("ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS")? {
+        if let Some(value) = env.u64("ASTER_IDENTITY_EDGE_TOKEN_MAX_LIFETIME_SECS")? {
             self.identity_edge_token_max_lifetime_secs = value;
             self.setting_sources
                 .insert(SETTING_EDGE_TOKEN_MAX_LIFETIME.into(), ConfigSource::Env);
         }
-        if let Some(value) = env_u64("ASTER_IDENTITY_CLOCK_LEEWAY_SECS")? {
+        if let Some(value) = env.u64("ASTER_IDENTITY_CLOCK_LEEWAY_SECS")? {
             self.identity_clock_leeway_secs = value;
             self.setting_sources
                 .insert(SETTING_CLOCK_LEEWAY.into(), ConfigSource::Env);
         }
-        if let Some(value) = env_u64("ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS")? {
+        if let Some(value) = env.u64("ASTER_IDENTITY_MAX_KEY_SET_AGE_SECS")? {
             self.identity_max_key_set_age_secs = value;
             self.setting_sources
                 .insert(SETTING_MAX_KEY_SET_AGE.into(), ConfigSource::Env);
         }
-        if let Some(value) = env_string("ASTER_IDENTITY_PUBLISHER") {
+        if let Some(value) = env.string("ASTER_IDENTITY_PUBLISHER") {
             self.identity_publisher = Some(serde_json::from_str(&value).map_err(|e| {
                 Error::InvalidArgument(format!(
                     "ASTER_IDENTITY_PUBLISHER: expected a JSON object of [identity.publisher] \
@@ -1345,19 +1380,19 @@ impl AsterConfig {
                 ))
             })?);
         }
-        if let Some(value) = env_bool("ASTER_REMOTE_CONFIG_ENABLED")? {
+        if let Some(value) = env.bool("ASTER_REMOTE_CONFIG_ENABLED")? {
             self.remote_config_enabled = value;
         }
-        if let Some(value) = env_list("ASTER_REMOTE_CONFIG_LOCK") {
+        if let Some(value) = env.list("ASTER_REMOTE_CONFIG_LOCK") {
             self.remote_config_lock = value;
         }
-        if let Some(value) = env_bool("ASTER_METRICS_PEER_LABELS")? {
+        if let Some(value) = env.bool("ASTER_METRICS_PEER_LABELS")? {
             self.metrics_peer_labels = value;
         }
-        if let Some(value) = env_usize("ASTER_METRICS_PEER_LABEL_CAP")? {
+        if let Some(value) = env.usize("ASTER_METRICS_PEER_LABEL_CAP")? {
             self.metrics_peer_label_cap = value;
         }
-        self.enrollment.apply_env()?;
+        self.enrollment.apply_env(&env)?;
 
         Ok(())
     }
@@ -2239,79 +2274,101 @@ impl AsterConfigBuilder {
     }
 }
 
-fn env_string(key: &str) -> Option<String> {
-    env_string_allow_empty(key).and_then(|value| {
-        let value = value.trim().to_string();
-        (!value.is_empty()).then_some(value)
-    })
+/// Where `ASTER_*` variables are read from: the process environment
+/// ([`AsterConfig::apply_env`]) or a caller-supplied lookup
+/// ([`AsterConfig::apply_env_from`]).
+pub(crate) struct EnvVars<'a>(&'a dyn Fn(&str) -> Option<String>);
+
+impl EnvVars<'_> {
+    fn is_set(&self, key: &str) -> bool {
+        (self.0)(key).is_some()
+    }
+
+    pub(crate) fn string_allow_empty(&self, key: &str) -> Option<String> {
+        (self.0)(key)
+    }
+
+    pub(crate) fn string(&self, key: &str) -> Option<String> {
+        self.string_allow_empty(key).and_then(|value| {
+            let value = value.trim().to_string();
+            (!value.is_empty()).then_some(value)
+        })
+    }
+
+    /// A comma-separated list; empty items are dropped. `None` when unset or
+    /// blank.
+    fn list(&self, key: &str) -> Option<Vec<String>> {
+        self.string(key).map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+    }
+
+    // Paths from the environment and TOML expand a leading `~` at load time, so
+    // every consumer sees the real path. systemd and other service managers pass
+    // `~/...` through literally (no shell), so a check like `path.exists()` on the
+    // raw value fails (portal-sync, 2026-10-15: `root_pubkey_file` refused to start).
+    pub(crate) fn path(&self, key: &str) -> Option<PathBuf> {
+        self.string(key)
+            .map(|value| expand_tilde(Path::new(&value)))
+    }
+
+    pub(crate) fn bool(&self, key: &str) -> Result<Option<bool>> {
+        let Some(value) = self.string(key) else {
+            return Ok(None);
+        };
+        match value.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" | "on" => Ok(Some(true)),
+            "false" | "0" | "no" | "off" => Ok(Some(false)),
+            _ => Err(Error::InvalidArgument(format!(
+                "{key}: expected true/false, 1/0, yes/no, or on/off, got {value:?}"
+            ))),
+        }
+    }
+
+    pub(crate) fn u64(&self, key: &str) -> Result<Option<u64>> {
+        self.parse(key)
+    }
+
+    fn u16(&self, key: &str) -> Result<Option<u16>> {
+        self.parse(key)
+    }
+
+    fn usize(&self, key: &str) -> Result<Option<usize>> {
+        self.parse(key)
+    }
+
+    fn parse<T>(&self, key: &str) -> Result<Option<T>>
+    where
+        T: std::str::FromStr,
+        T::Err: std::fmt::Display,
+    {
+        let Some(value) = self.string(key) else {
+            return Ok(None);
+        };
+        value
+            .parse::<T>()
+            .map(Some)
+            .map_err(|e| Error::InvalidArgument(format!("{key}: invalid value {value:?}: {e}")))
+    }
 }
 
-/// A comma-separated list; empty items are dropped. `None` when unset or
-/// blank.
-fn env_list(key: &str) -> Option<Vec<String>> {
-    env_string(key).map(|value| {
-        value
-            .split(',')
-            .map(str::trim)
-            .filter(|item| !item.is_empty())
-            .map(str::to_string)
-            .collect()
-    })
+fn collect_vars<K, V>(vars: impl IntoIterator<Item = (K, V)>) -> BTreeMap<String, String>
+where
+    K: Into<String>,
+    V: Into<String>,
+{
+    vars.into_iter()
+        .map(|(k, v)| (k.into(), v.into()))
+        .collect()
 }
 
 fn non_empty(values: Vec<String>) -> Vec<String> {
     values.into_iter().filter(|v| !v.is_empty()).collect()
-}
-
-fn env_string_allow_empty(key: &str) -> Option<String> {
-    env::var(key).ok()
-}
-
-// Paths from the environment and TOML expand a leading `~` at load time, so
-// every consumer sees the real path. systemd and other service managers pass
-// `~/...` through literally (no shell), so a check like `path.exists()` on the
-// raw value fails (portal-sync, 2026-10-15: `root_pubkey_file` refused to start).
-fn env_path(key: &str) -> Option<PathBuf> {
-    env_string(key).map(|value| expand_tilde(Path::new(&value)))
-}
-
-fn env_bool(key: &str) -> Result<Option<bool>> {
-    let Some(value) = env_string(key) else {
-        return Ok(None);
-    };
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => Ok(Some(true)),
-        "false" | "0" | "no" | "off" => Ok(Some(false)),
-        _ => Err(Error::InvalidArgument(format!(
-            "{key}: expected true/false, 1/0, yes/no, or on/off, got {value:?}"
-        ))),
-    }
-}
-
-fn env_u64(key: &str) -> Result<Option<u64>> {
-    parse_optional_env(key)
-}
-
-fn env_u16(key: &str) -> Result<Option<u16>> {
-    parse_optional_env(key)
-}
-
-fn env_usize(key: &str) -> Result<Option<usize>> {
-    parse_optional_env(key)
-}
-
-fn parse_optional_env<T>(key: &str) -> Result<Option<T>>
-where
-    T: std::str::FromStr,
-    T::Err: std::fmt::Display,
-{
-    let Some(value) = env_string(key) else {
-        return Ok(None);
-    };
-    value
-        .parse::<T>()
-        .map(Some)
-        .map_err(|e| Error::InvalidArgument(format!("{key}: invalid value {value:?}: {e}")))
 }
 
 fn parse_public_key(source: &str, value: &str) -> Result<PublicKey> {
@@ -3085,6 +3142,46 @@ mod tests {
             assert!(err.contains("enrollment_credential"), "{err}");
             env::remove_var(key);
         }
+    }
+
+    #[test]
+    fn from_env_vars_reads_only_the_supplied_variables() {
+        // Bun keeps `process.env` writes out of `environ`, so the TypeScript
+        // binding hands its `ASTER_*` map in; that map is the whole source.
+        let _lock = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvGuard::new();
+        env::set_var("ASTER_BIND_ADDR", "127.0.0.1:1111");
+        env::set_var("ASTER_ENROLLMENT_AUDIENCE", "process-audience");
+
+        let config = AsterConfig::from_env_vars([
+            ("ASTER_ADVERTISE_ADDRS", "192.0.2.10:7000, 192.0.2.11:7000"),
+            ("ASTER_LOCAL_DISCOVERY", "true"),
+            ("ASTER_ENROLLMENT_ROLE_ATTRIBUTE", " team "),
+            ("ASTER_TRANSPORT_INITIAL_MTU", "1300"),
+        ])
+        .unwrap();
+        assert_eq!(config.bind_addr, None);
+        assert_eq!(
+            config.advertise_addrs,
+            vec!["192.0.2.10:7000", "192.0.2.11:7000"]
+        );
+        assert!(config.local_discovery);
+        assert_eq!(config.transport_initial_mtu, Some(1300));
+        assert_eq!(config.enrollment.audience, None);
+        assert_eq!(config.enrollment.roles.attribute, "team");
+
+        let err = AsterConfig::from_env_vars([("ASTER_ALLOW_ALL_CONSUMERS", "false")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ASTER_ALLOW_ALL_CONSUMERS"), "{err}");
+
+        // The process-environment loader is unchanged.
+        let config = AsterConfig::from_env().unwrap();
+        assert_eq!(config.bind_addr.as_deref(), Some("127.0.0.1:1111"));
+        assert_eq!(
+            config.enrollment.audience.as_deref(),
+            Some("process-audience")
+        );
     }
 
     #[test]

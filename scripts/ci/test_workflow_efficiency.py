@@ -31,10 +31,10 @@ class RuntimeGates(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 0)
             output = root / 'out.json'
             self.assertEqual(R.run(root, output, root, invoke), 1)
-            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(calls), 7)
             evidence = json.loads(output.read_text())
             self.assertEqual(evidence['runtimes']['node'][0]['exit_code'], 124)
-            self.assertEqual(len(evidence['runtimes']['bun']), 2)
+            self.assertEqual(len(evidence['runtimes']['bun']), 3)
 
     def test_hung_subprocess_is_terminated(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -68,12 +68,12 @@ class RuntimeGates(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 1 if len(calls) == 1 else 0)
             output = root / 'out.json'
             self.assertEqual(R.run(root, output, root, invoke), 1)
-            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(calls), 7)
             self.assertEqual(calls[0][:5], ['npx', 'vitest', 'run', '--reporter=default', '--reporter=json'])
             self.assertEqual(calls[1][-3:], ['observability-logs.test.ts=7', 'observability-export.test.ts=13', 'o7-server-health.test.ts=3'])
             evidence = json.loads(output.read_text())
-            self.assertEqual(len(evidence['runtimes']['node']), 3)
-            self.assertEqual(len(evidence['runtimes']['bun']), 2)
+            self.assertEqual(len(evidence['runtimes']['node']), 4)
+            self.assertEqual(len(evidence['runtimes']['bun']), 3)
             self.assertEqual(evidence['runtimes']['node'][0]['exit_code'], 1)
 
     def test_missing_node_still_checks_bun_and_fails(self):
@@ -105,7 +105,7 @@ class RuntimeGates(unittest.TestCase):
                 return subprocess.CompletedProcess(argv, 1 if len(calls) == 1 else 0)
             self.assertEqual(R.run(root, output, root, invoke), 1)
             self.assertEqual(retained.read_text(), fresh)
-            self.assertEqual(len(calls), 5)
+            self.assertEqual(len(calls), 7)
             # A later failed invocation without a fresh report cannot retain
             # the previous run's diagnostic as current evidence.
             self.assertEqual(R.run(root, output, root, lambda argv, **kwargs: subprocess.CompletedProcess(argv, 1)), 1)

@@ -1972,14 +1972,20 @@ export interface AsterConfig {
 /**
  * Defaults overlaid with `ASTER_*` environment variables (the Rust
  * `AsterConfig::from_env` loader). Every field is filled in.
+ *
+ * With `env`, the variables come from that map and the process environment
+ * is not read (`AsterConfig::from_env_vars`). The package passes the
+ * `ASTER_*` entries of `process.env`: Bun keeps runtime `process.env` writes
+ * out of the C environment Rust would otherwise read.
  */
-export declare function asterConfigFromEnv(): AsterConfig
+export declare function asterConfigFromEnv(env?: Record<string, string> | undefined | null): AsterConfig
 
 /**
  * Defaults < `aster.toml` at `path` < `ASTER_*` environment (the Rust
- * `AsterConfig::from_file` loader). Every field is filled in.
+ * `AsterConfig::from_file` loader). Every field is filled in. `env` as for
+ * `asterConfigFromEnv`.
  */
-export declare function asterConfigFromFile(path: string): AsterConfig
+export declare function asterConfigFromFile(path: string, env?: Record<string, string> | undefined | null): AsterConfig
 
 /**
  * Whether `config` enables enrollment (Rust

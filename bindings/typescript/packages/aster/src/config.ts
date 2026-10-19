@@ -490,6 +490,23 @@ export function toNativeConfig(config: AsterConfig = {}): NativeAsterConfig {
   return out;
 }
 
+/**
+ * The `ASTER_*` entries of `process.env`, handed to the Rust loaders so they
+ * see what JavaScript sees. Rust would otherwise read the C environment,
+ * which Bun does not update when a program assigns `process.env.X` at run
+ * time (Node does).
+ */
+function asterEnv(): Record<string, string> {
+  // Windows variable names are case-insensitive, as Rust's lookup there was.
+  const fold = process.platform === 'win32';
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    const key = fold ? k.toUpperCase() : k;
+    if (key.startsWith('ASTER_') && v !== undefined) out[key] = v;
+  }
+  return out;
+}
+
 function fromNative(native: NativeAsterConfig): AsterConfig {
   const out: AsterConfig = {};
   for (const [k, v] of Object.entries(native)) {
@@ -503,13 +520,13 @@ function fromNative(native: NativeAsterConfig): AsterConfig {
  * @group Server and Client
  */
 export const AsterConfig = {
-  /** Defaults overlaid with `ASTER_*` environment variables. */
+  /** Defaults overlaid with the `ASTER_*` entries of `process.env`. */
   fromEnv(): AsterConfig {
-    return fromNative(loadNative().asterConfigFromEnv());
+    return fromNative(loadNative().asterConfigFromEnv(asterEnv()));
   },
-  /** Defaults < the `aster.toml` at `path` < `ASTER_*` environment. */
+  /** Defaults < the `aster.toml` at `path` < `ASTER_*` entries of `process.env`. */
   fromFile(path: string): AsterConfig {
-    return fromNative(loadNative().asterConfigFromFile(path));
+    return fromNative(loadNative().asterConfigFromFile(path, asterEnv()));
   },
   /**
    * Validate `config` in Rust and return it with every default filled in.
