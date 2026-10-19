@@ -624,6 +624,15 @@ pub struct AsterConfig {
     ///
     /// Env: `ASTER_REUSE_LAST_PORT`; TOML: `[network] reuse_last_port`.
     pub reuse_last_port: bool,
+    /// How long start-up waits for a home relay connection, in milliseconds
+    /// (default 30000). A node with relay transport does not finish starting
+    /// until it reaches a relay; past this bound start-up fails with
+    /// [`aster_transport_core::RelayOnlineTimeout`], naming the relay URL(s),
+    /// instead of hanging. Must be greater than zero. Direct-only nodes
+    /// (`relay_mode = "disabled"`) never wait for a relay.
+    ///
+    /// Env: `ASTER_ONLINE_TIMEOUT_MS`; TOML: `[network] online_timeout_ms`.
+    pub online_timeout_ms: u64,
     /// Enable local-network peer discovery (mDNS).
     pub local_discovery: bool,
     /// Enable connection monitoring / remote-info tracking.
@@ -977,6 +986,9 @@ impl AsterConfig {
             if let Some(value) = toml_bool(network, "reuse_last_port", label)? {
                 self.reuse_last_port = value;
             }
+            if let Some(value) = toml_u64(network, "online_timeout_ms", label)? {
+                self.online_timeout_ms = value;
+            }
             if let Some(value) = toml_bool(network, "local_discovery", label)? {
                 self.local_discovery = value;
             }
@@ -1232,6 +1244,9 @@ impl AsterConfig {
         )?;
         if let Some(value) = env.bool("ASTER_REUSE_LAST_PORT")? {
             self.reuse_last_port = value;
+        }
+        if let Some(value) = env.u64("ASTER_ONLINE_TIMEOUT_MS")? {
+            self.online_timeout_ms = value;
         }
         if let Some(value) = env.bool("ASTER_LOCAL_DISCOVERY")? {
             self.local_discovery = value;
@@ -1633,6 +1648,7 @@ impl AsterConfig {
                 .as_ref()
                 .map(|dir| dir.to_string_lossy().into_owned()),
             reuse_last_port: self.reuse_last_port,
+            online_timeout_ms: self.online_timeout_ms,
             blob_zstd_level: self.blob_zstd_level.map(i32::from),
         }
     }
@@ -1747,6 +1763,7 @@ impl Default for AsterConfig {
             discovery_dns_origin: None,
             discovery_pkarr_relays: Vec::new(),
             reuse_last_port: true,
+            online_timeout_ms: aster_transport_core::DEFAULT_ONLINE_TIMEOUT_MS,
             local_discovery: false,
             enable_monitoring: false,
             enable_hooks: false,
@@ -1952,6 +1969,13 @@ impl AsterConfigBuilder {
     /// [`AsterConfig::reuse_last_port`].
     pub fn reuse_last_port(mut self, yes: bool) -> Self {
         self.config.reuse_last_port = yes;
+        self
+    }
+
+    /// Bound, in milliseconds, on start-up's wait for a home relay (default
+    /// 30000). See [`AsterConfig::online_timeout_ms`].
+    pub fn online_timeout_ms(mut self, ms: u64) -> Self {
+        self.config.online_timeout_ms = ms;
         self
     }
 
@@ -4369,5 +4393,23 @@ discovery_dns_origin = "dns.example.internal"
             .discovery_pkarr_relay("https://dns.example.internal/pkarr")
             .build();
         assert_eq!(custom.discovery, DiscoveryMode::Custom);
+    }
+
+    #[test]
+    fn online_timeout_defaults_and_is_set_from_toml_and_builder() {
+        let default = AsterConfig::default();
+        assert_eq!(default.online_timeout_ms, 30_000);
+        assert_eq!(default.to_core_endpoint_config().online_timeout_ms, 30_000);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("aster.toml");
+        fs::write(&path, "[network]\nonline_timeout_ms = 1500\n").unwrap();
+        assert_eq!(
+            AsterConfig::from_file(&path).unwrap().online_timeout_ms,
+            1500
+        );
+
+        let built = AsterConfig::builder().online_timeout_ms(250).build();
+        assert_eq!(built.to_core_endpoint_config().online_timeout_ms, 250);
     }
 }

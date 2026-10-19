@@ -213,6 +213,63 @@ pub struct CoreEndpointConfig {
     /// plain ALPN only and fetches plain. Ignored by endpoints that are not
     /// full nodes.
     pub blob_zstd_level: Option<i32>,
+    /// How long start-up waits for a home relay connection when the node has
+    /// relay transport, in milliseconds. Defaults to
+    /// [`DEFAULT_ONLINE_TIMEOUT_MS`]. Past it, start-up fails with
+    /// [`RelayOnlineTimeout`] naming the relay URL(s). Must be greater than
+    /// zero. Not used by direct-only nodes (`relay_mode = "disabled"` or
+    /// `clear_relay_transports`), which never wait for a relay.
+    pub online_timeout_ms: u64,
+}
+
+/// Default for [`CoreEndpointConfig::online_timeout_ms`].
+pub const DEFAULT_ONLINE_TIMEOUT_MS: u64 = 30_000;
+
+/// Start-up gave up waiting for a home relay connection: the relay(s) did not
+/// answer within [`CoreEndpointConfig::online_timeout_ms`]. Returned inside an
+/// `anyhow::Error`; recover it with `downcast_ref::<RelayOnlineTimeout>()`.
+#[derive(Clone, Debug)]
+pub struct RelayOnlineTimeout {
+    /// The relay URL(s) the node was trying to reach.
+    pub relay_urls: Vec<String>,
+    /// The bound that elapsed.
+    pub timeout: Duration,
+}
+
+impl std::fmt::Display for RelayOnlineTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no home relay connection within {} ms (relay: {}); check the relay is reachable, \
+             raise online_timeout_ms, or run direct-only with relay_mode = \"disabled\"",
+            self.timeout.as_millis(),
+            self.relay_urls.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for RelayOnlineTimeout {}
+
+/// Wait for `endpoint` to connect to a home relay, for at most `timeout`.
+async fn wait_online(endpoint: &Endpoint, relay_mode: &RelayMode, timeout: Duration) -> Result<()> {
+    if tokio::time::timeout(timeout, endpoint.online())
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let relay_urls = relay_mode
+        .relay_map()
+        .urls::<Vec<RelayUrl>>()
+        .into_iter()
+        .map(|u| u.to_string())
+        .collect();
+    endpoint.close().await;
+    Err(RelayOnlineTimeout {
+        relay_urls,
+        timeout,
+    }
+    .into())
 }
 
 impl Default for CoreEndpointConfig {
@@ -255,6 +312,7 @@ impl Default for CoreEndpointConfig {
             data_dir: None,
             reuse_last_port: true,
             blob_zstd_level: Some(DEFAULT_BLOB_ZSTD_LEVEL),
+            online_timeout_ms: DEFAULT_ONLINE_TIMEOUT_MS,
         }
     }
 }
@@ -2142,7 +2200,12 @@ async fn build_node_endpoint(
     match config {
         None if preferred.is_empty() => {
             let endpoint = Endpoint::bind(presets::N0).await?;
-            endpoint.online().await;
+            wait_online(
+                &endpoint,
+                &RelayMode::Default,
+                Duration::from_millis(DEFAULT_ONLINE_TIMEOUT_MS),
+            )
+            .await?;
             Ok((endpoint, None, None))
         }
         None => {
@@ -2154,7 +2217,12 @@ async fn build_node_endpoint(
                 ))
             })
             .await?;
-            endpoint.online().await;
+            wait_online(
+                &endpoint,
+                &RelayMode::Default,
+                Duration::from_millis(DEFAULT_ONLINE_TIMEOUT_MS),
+            )
+            .await?;
             Ok((endpoint, None, None))
         }
         Some(config) => {
@@ -2192,7 +2260,9 @@ async fn build_node_endpoint(
             }
 
             if has_relay_transport(&config, &relay_mode) {
-                endpoint.online().await;
+                let timeout =
+                    positive_duration_from_millis("online_timeout_ms", config.online_timeout_ms)?;
+                wait_online(&endpoint, &relay_mode, timeout).await?;
             }
             Ok((endpoint, monitor, hook_receiver))
         }
@@ -2894,7 +2964,12 @@ impl CoreNetClient {
             .alpns(vec![alpn])
             .bind()
             .await?;
-        endpoint.online().await;
+        wait_online(
+            &endpoint,
+            &RelayMode::Default,
+            Duration::from_millis(DEFAULT_ONLINE_TIMEOUT_MS),
+        )
+        .await?;
         let secret_key_bytes = endpoint.secret_key().to_bytes().to_vec();
         Ok(Self {
             endpoint,
@@ -2974,7 +3049,9 @@ impl CoreNetClient {
         }
 
         if has_relay_transport(&config, &relay_mode) {
-            endpoint.online().await;
+            let timeout =
+                positive_duration_from_millis("online_timeout_ms", config.online_timeout_ms)?;
+            wait_online(&endpoint, &relay_mode, timeout).await?;
         }
         let secret_key_bytes = endpoint.secret_key().to_bytes().to_vec();
         Ok(Self {

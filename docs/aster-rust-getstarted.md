@@ -182,6 +182,7 @@ Aster identity](./aster-http-getstarted.md#binding-the-cert-to-your-aster-identi
 | `discovery_mode(DiscoveryMode)` | `ASTER_DISCOVERY` | `[network] discovery` | `default` (n0 pkarr + DNS at `iroh.link`) / `none` / `local` (mDNS only) / `custom` |
 | `discovery_dns_origin(o)` / `discovery_pkarr_relay(u)` | `ASTER_DISCOVERY_DNS_ORIGIN` / `ASTER_DISCOVERY_PKARR_RELAYS` (comma-separated) | `[network] discovery_dns_origin` / `discovery_pkarr_relays = [..]` | your own iroh-dns-server; either selects `custom` |
 | `reuse_last_port(b)` | `ASTER_REUSE_LAST_PORT` | `[network] reuse_last_port` | default `true`: a persistent node re-binds its last ports when free (see below) |
+| `online_timeout_ms(ms)` | `ASTER_ONLINE_TIMEOUT_MS` | `[network] online_timeout_ms` | default `30000`: how long start-up waits for a home relay; past it start-up fails with `RelayOnlineTimeout` naming the relay URL(s) instead of hanging. Direct-only nodes (`relay_mode = "disabled"`) never wait. Rust only so far |
 | `alpn(bytes)` | — | — | extra inbound ALPNs, merged with `Node::start_with_alpns` |
 | `discovery(b)` | `ASTER_LOCAL_DISCOVERY` | `[network] local_discovery` | mDNS |
 | `monitoring(b)` | `ASTER_ENABLE_MONITORING` | `[network] enable_monitoring` | |
