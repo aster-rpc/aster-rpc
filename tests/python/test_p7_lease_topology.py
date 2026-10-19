@@ -1,7 +1,11 @@
-"""Plan P7 behaviour on live nodes: fenced leases (in-memory serializer and a
-designated grantor over RPC), pinned-author policy docs carrying sealed
-grants, and topology v1 / v2 across three local nodes. Offline: loopback
-only, relays disabled.
+"""Plan P7 binding wiring on live nodes: fenced leases (in-memory serializer
+and a designated grantor over RPC), pinned-author policy docs carrying sealed
+grants, and the topology v1 peer view. Offline: loopback only, relays
+disabled.
+
+Lease and topology behaviour (renewal past the TTL, restart, takeover races,
+v2 cluster convergence) is tested once in Rust: ``aster/tests/it/lease.rs``,
+``rpc_lease.rs``, ``topology_shared.rs`` and ``rpc_topology.rs``.
 """
 
 from __future__ import annotations
@@ -18,7 +22,6 @@ import pytest_asyncio
 from aster import (
     AcquireOutcome,
     AsterConfig,
-    ClusterView,
     Fence,
     FenceRejectedError,
     GrantContext,
@@ -33,8 +36,6 @@ from aster import (
     NodeId,
     PeerView,
     PolicyDoc,
-    TopologySnapshot,
-    TopologyTiming,
     docs_client,
     grant_key,
     net_client,
@@ -121,7 +122,13 @@ async def test_acquire_deny_fenced_mutation_release_reacquire():
     assert await ser.snapshot("tree/42") == LeaseSnapshot("tree/42", 4, None, False, None)
 
 
-async def test_mutate_fenced_propagates_callable_errors():
+async def test_lease_handle_api_maps_to_native():
+    """The rest of the handle surface, once each: a Python exception raised
+    inside ``mutate_fenced`` propagates unchanged; ``async with`` releases;
+    ``stop_renewing`` hands back the fence and leaves the row held; a raw
+    transition maps its outcome; invalid options are ValueError. The
+    behaviour is aster/tests/it/lease.rs (stop_renewing_returns_the_fence_
+    without_releasing, restart_rearms_ttl_without_advancing_fence, ...)."""
     ser = MemorySerializer()
     lease = _granted(await ser.acquire("r", "n1", FAST))
 
@@ -132,15 +139,28 @@ async def test_mutate_fenced_propagates_callable_errors():
         ser.mutate_fenced(lease.fence(), "n1", boom)
     await lease.release()
 
+    async with _granted(await ser.acquire("scoped", "n1", FAST)) as scoped:
+        assert scoped.fence() is not None
+    assert (await ser.snapshot("scoped")).held is False
 
-async def test_renews_past_ttl_in_background():
-    ser = MemorySerializer()
-    lease = _granted(await ser.acquire("r", "n1", FAST))
-    await asyncio.sleep(1.5)  # > 2 x ttl
-    assert lease.status == "held"
-    assert lease.fence().epoch == 1
-    assert not (await ser.acquire("r", "n2", FAST)).granted
-    await lease.release()
+    lease = _granted(await ser.acquire("final", "n1", FAST))
+    fence = lease.stop_renewing()
+    assert fence == Fence("final", 1, "n1")
+    assert lease.status == "released"
+    assert lease.stop_renewing() is None
+    assert (await ser.snapshot("final")).held is True
+
+    out = await ser.transition("raw", LeaseOp.acquire("n1", 5.0))
+    assert out.kind == "granted" and out.fence == Fence("raw", 1, "n1")
+    denied = await ser.transition("raw", LeaseOp.acquire("n2", 5.0))
+    assert denied.kind == "denied" and denied.deny_reason == "held_by_other"
+
+    with pytest.raises(ValueError, match="renew_interval"):
+        await ser.acquire("r", "n1", LeaseOptions(ttl=1.0, renew_interval=0.95, holder_margin=0.1))
+    with pytest.raises(ValueError, match="ttl"):
+        await ser.acquire("r", "n1", LeaseOptions(ttl=-1))
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        FAST.ttl = 2  # type: ignore[misc]
 
 
 async def test_revoke_fences_holder_and_status_changes_ends():
@@ -161,42 +181,6 @@ async def test_revoke_fences_holder_and_status_changes_ends():
     assert lease.fence() is None
     # Already terminal: a new iterator yields the status and ends.
     assert [s async for s in lease.status_changes()] == ["fenced"]
-
-
-async def test_async_with_releases_and_stop_renewing_keeps_row_held():
-    ser = MemorySerializer()
-    async with _granted(await ser.acquire("scoped", "n1", FAST)) as lease:
-        assert lease.fence() is not None
-    assert (await ser.snapshot("scoped")).held is False
-
-    lease = _granted(await ser.acquire("final", "n1", FAST))
-    fence = lease.stop_renewing()
-    assert fence == Fence("final", 1, "n1")
-    assert lease.status == "released"
-    assert lease.stop_renewing() is None
-    assert (await ser.snapshot("final")).held is True
-    assert ser.mutate_fenced(fence, "n1", lambda: 1) == 1
-
-
-async def test_raw_transition_and_restart():
-    ser = MemorySerializer()
-    out = await ser.transition("raw", LeaseOp.acquire("n1", 5.0))
-    assert out.kind == "granted" and out.fence == Fence("raw", 1, "n1")
-    denied = await ser.transition("raw", LeaseOp.acquire("n2", 5.0))
-    assert denied.kind == "denied" and denied.deny_reason == "held_by_other"
-    ser.restart()
-    snap = await ser.snapshot("raw")
-    assert (snap.epoch, snap.holder, snap.held) == (1, "n1", True)
-
-
-async def test_validates_options():
-    ser = MemorySerializer()
-    with pytest.raises(ValueError, match="renew_interval"):
-        await ser.acquire("r", "n1", LeaseOptions(ttl=1.0, renew_interval=0.95, holder_margin=0.1))
-    with pytest.raises(ValueError, match="ttl"):
-        await ser.acquire("r", "n1", LeaseOptions(ttl=-1))
-    with pytest.raises(dataclasses.FrozenInstanceError):
-        FAST.ttl = 2  # type: ignore[misc]
 
 
 # -- lease: designated grantor over RPC --------------------------------------
@@ -238,9 +222,8 @@ async def test_grantor_binds_grants_to_authenticated_caller(grantor_trio):
     assert denied.reason == "held_by_other"
     assert denied.snapshot.holder == a.id
 
-    # Renewals over RPC keep it held past the TTL.
-    await asyncio.sleep(1.0)
-    assert lease.status == "held"
+    # Renewal over RPC past the TTL is aster/tests/it/rpc_lease.rs
+    # lease_handle_renews_over_rpc; here only the snapshot mapping.
     snap = await sb.snapshot("db/primary")
     assert (snap.epoch, snap.holder, snap.held) == (1, a.id, True)
 
@@ -369,37 +352,3 @@ async def test_topology_v1_sees_connected_peer_on_same_host(monitored_trio):
     assert any(p.node_id == b.id for p in a.topology().peers())
     assert a.topology().peer("00" * 32) is None
     del held
-
-
-async def test_topology_v2_three_nodes_converge_on_one_cluster(monitored_trio):
-    nodes = monitored_trio
-    with pytest.raises(Exception, match="enable_shared|not joined"):
-        await nodes[0].topology().clusters()
-
-    secret = os.urandom(32)
-    ids = [n.id for n in nodes]
-    for n in nodes:
-        await n.topology().enable_shared(
-            secret,
-            bootstrap=[i for i in ids if i != n.id],
-            position_refresh=0.5,
-            timing=TopologyTiming(min_hold=0, liveness_ttl=60),
-        )
-
-    async def three():
-        c = await nodes[0].topology().my_cluster()
-        return c if c is not None and len(c.members) == 3 else None
-
-    cluster = await _until("one cluster of three", three, timeout=30)
-    assert isinstance(cluster, ClusterView)
-    assert list(cluster.members) == sorted(ids, key=str)
-    assert cluster.bridge in cluster.members
-
-    snap = await nodes[0].topology().snapshot()
-    assert isinstance(snap, TopologySnapshot)
-    assert snap.cluster_of(ids[1]) == cluster
-    assert snap.clusters == (cluster,)
-    assert snap.separated(ids[0], ids[2]) == "connected"
-    assert snap.separated(ids[0], "00" * 32) == "unknown"
-    assert await nodes[0].topology().separated(ids[1], ids[2]) == "connected"
-    assert len(await nodes[0].topology().clusters()) == 1

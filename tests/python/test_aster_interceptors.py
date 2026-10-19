@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import aster.client as client_module
 import aster.interceptors.base as context_module
+import aster.interceptors.circuit_breaker as breaker_module
 import aster.interceptors.deadline as deadline_module
 
 from aster.client import create_client, create_local_client
@@ -44,10 +45,53 @@ class InterceptorService:
     async def echo(self, req: EchoRequest) -> EchoResponse:
         return EchoResponse(message=req.message)
 
-    @rpc(timeout=5.0, idempotent=True)
-    async def slow(self, req: EchoRequest) -> EchoResponse:
-        await asyncio.sleep(2.0)
-        return EchoResponse(message=req.message)
+
+class FakeClock:
+    """Injected clock for the retry, breaker and deadline policy tests: no
+    wall-clock sleeps. It replaces the seams the client already has
+    (``aster.client.time_sleep`` / ``timeouts`` and the ``time`` module the
+    interceptors read). A controlled timeout expires, with ``TimeoutError``,
+    when an advance crosses it."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+        self.deadlines: list[float] = []
+        self.budgets: list[float] = []
+        self.sleeps: list[float] = []
+
+    def time(self) -> float:
+        return self.now
+
+    monotonic = time
+
+    def advance(self, seconds: float) -> None:
+        if self.deadlines and self.now + seconds >= min(self.deadlines):
+            self.now = min(self.deadlines)
+            raise TimeoutError("controlled timeout expired")
+        self.now += seconds
+
+    async def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.advance(seconds)
+
+    @asynccontextmanager
+    async def timeout(self, seconds: float):
+        self.budgets.append(seconds)
+        self.deadlines.append(self.now + seconds)
+        try:
+            yield
+        finally:
+            self.deadlines.pop()
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    clock = FakeClock()
+    for module in (context_module, deadline_module, breaker_module):
+        monkeypatch.setattr(module, "time", clock)
+    monkeypatch.setattr(client_module, "timeouts", clock.timeout)
+    monkeypatch.setattr(client_module, "time_sleep", clock.sleep)
+    return clock
 
 
 class TestPhase7Interceptors:
@@ -66,20 +110,18 @@ class TestPhase7Interceptors:
         assert [e["event"] for e in audit.sink] == ["request", "response"]
 
     @pytest.mark.asyncio
-    async def test_deadline_enforcement(self):
-        client = create_local_client(
-            InterceptorService,
-            InterceptorService(),
-            wire_compatible=True,
-            interceptors=[DeadlineInterceptor()],
-        )
+    async def test_deadline_enforcement(self, fake_clock):
+        # A 2 s handler under a 1 s deadline, on the injected clock.
+        client = self._scripted_client(["slow"], [DeadlineInterceptor()], fake_clock)
 
         with pytest.raises(RpcError) as exc_info:
-            await client.slow(EchoRequest("late"), timeout=1)
+            await client.echo(EchoRequest("late"), timeout=1)
         assert exc_info.value.code == StatusCode.DEADLINE_EXCEEDED
+        assert fake_clock.budgets == [pytest.approx(1.0)]
+        assert fake_clock.now == pytest.approx(1001.0)
 
     @pytest.mark.asyncio
-    async def test_retry_behavior_on_unavailable(self):
+    async def test_retry_behavior_on_unavailable(self, fake_clock):
         attempts = {"count": 0}
 
         class FlakyTransport:
@@ -109,6 +151,10 @@ class TestPhase7Interceptors:
         response = await client.echo(EchoRequest("retry"))
         assert response.message == "ok"
         assert attempts["count"] == 3
+        # Default backoff: 100 ms then 200 ms, each plus up to 10 % jitter.
+        assert len(fake_clock.sleeps) == 2
+        assert 0.1 <= fake_clock.sleeps[0] <= 0.11
+        assert 0.2 <= fake_clock.sleeps[1] <= 0.22
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("enforce_deadline", [True, False])
@@ -196,7 +242,7 @@ class TestPhase7Interceptors:
             await client.close()
 
     @pytest.mark.asyncio
-    async def test_retry_backoff_actual_timeout_is_rpc_deadline_and_recovers(self):
+    async def test_retry_backoff_timeout_is_rpc_deadline_and_recovers(self, fake_clock):
         policy = RetryPolicy(max_attempts=3)
         policy.backoff.initial_ms = 400
         policy.backoff.max_ms = 800
@@ -213,7 +259,10 @@ class TestPhase7Interceptors:
                 await client.echo(EchoRequest("retry"), timeout=1)
             assert failure.value.code == StatusCode.DEADLINE_EXCEEDED
             assert isinstance(failure.value.__cause__, TimeoutError)
-            # The third attempt never starts after the budget expires.
+            # The 0.8 s second backoff crosses the 1 s budget at t+1.0; the
+            # third attempt never starts.
+            assert fake_clock.sleeps == [0.4, 0.8]
+            assert fake_clock.now == pytest.approx(1001.0)
             assert script == ["healthy"]
             assert (await client.echo(EchoRequest("healthy"), timeout=1)).message == "healthy"
             assert script == []
@@ -226,11 +275,11 @@ class TestPhase7Interceptors:
         policy.backoff.initial_ms = policy.backoff.max_ms = 10000
         policy.backoff.jitter = 0
         sleeping = asyncio.Event()
-        original_sleep = client_module.time_sleep
 
         async def observed_sleep(delay):
+            # A backoff that only ends by cancellation: no wall-clock sleep.
             sleeping.set()
-            await original_sleep(delay)
+            await asyncio.Event().wait()
 
         monkeypatch.setattr(client_module, "time_sleep", observed_sleep)
         script = [RpcError(StatusCode.UNAVAILABLE, "first attempt"), "healthy"]
@@ -250,7 +299,7 @@ class TestPhase7Interceptors:
             await client.close()
 
     @pytest.mark.asyncio
-    async def test_circuit_breaker_state_transitions(self):
+    async def test_circuit_breaker_state_transitions(self, fake_clock):
         breaker = CircuitBreakerInterceptor(failure_threshold=2, recovery_timeout=0.01)
 
         class BrokenTransport:
@@ -286,15 +335,17 @@ class TestPhase7Interceptors:
         with pytest.raises(RpcError, match="open"):
             await client.echo(EchoRequest("three"))
 
-        await asyncio.sleep(0.02)
+        fake_clock.advance(0.02)
         with pytest.raises(RpcError):
             await client.echo(EchoRequest("half-open"))
         assert breaker.state == breaker.OPEN
 
     @staticmethod
-    def _scripted_client(script, interceptors):
+    def _scripted_client(script, interceptors, clock=None, hanging=None):
         """A client whose unary calls follow `script`: each entry is an
-        exception to raise, the string "hang", or a response message."""
+        exception to raise, the string "hang" (sets `hanging`, then never
+        answers), "slow" (2 s on the injected `clock`), or a response
+        message."""
 
         class ScriptedTransport:
             async def unary(self, *args, **kwargs):
@@ -302,7 +353,11 @@ class TestPhase7Interceptors:
                 if isinstance(step, BaseException):
                     raise step
                 if step == "hang":
+                    if hanging is not None:
+                        hanging.set()
                     await asyncio.Event().wait()
+                if step == "slow":
+                    await clock.sleep(2.0)
                 return EchoResponse(message=step)
 
             def server_stream(self, *args, **kwargs):
@@ -322,14 +377,14 @@ class TestPhase7Interceptors:
         )
 
     @staticmethod
-    async def _open_then_half_open(client, breaker):
+    async def _open_then_half_open(client, breaker, clock):
         with pytest.raises(RpcError):
             await client.echo(EchoRequest("trip"))
         assert breaker.state == breaker.OPEN
-        await asyncio.sleep(0.02)
+        clock.advance(0.02)
 
     @pytest.mark.asyncio
-    async def test_circuit_breaker_uncounted_error_frees_half_open_probe(self):
+    async def test_circuit_breaker_uncounted_error_frees_half_open_probe(self, fake_clock):
         # A NOT_FOUND probe says nothing about the peer's health: the breaker
         # stays half-open but must admit the next probe, which closes it.
         breaker = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=0.01)
@@ -339,7 +394,7 @@ class TestPhase7Interceptors:
             "ok",
         ]
         client = self._scripted_client(script, [breaker])
-        await self._open_then_half_open(client, breaker)
+        await self._open_then_half_open(client, breaker, fake_clock)
 
         with pytest.raises(RpcError) as exc_info:
             await client.echo(EchoRequest("probe"))
@@ -351,14 +406,15 @@ class TestPhase7Interceptors:
         assert breaker.state == breaker.CLOSED
 
     @pytest.mark.asyncio
-    async def test_circuit_breaker_cancelled_probe_frees_half_open_slot(self):
+    async def test_circuit_breaker_cancelled_probe_frees_half_open_slot(self, fake_clock):
         breaker = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=0.01)
         script = [RpcError(StatusCode.UNAVAILABLE, "down"), "hang", "ok"]
-        client = self._scripted_client(script, [breaker])
-        await self._open_then_half_open(client, breaker)
+        hanging = asyncio.Event()
+        client = self._scripted_client(script, [breaker], hanging=hanging)
+        await self._open_then_half_open(client, breaker, fake_clock)
 
         probe = asyncio.ensure_future(client.echo(EchoRequest("probe")))
-        await asyncio.sleep(0.01)
+        await asyncio.wait_for(hanging.wait(), timeout=WAIT_BUDGET)
         assert breaker.half_open_calls == 1
         probe.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -369,11 +425,11 @@ class TestPhase7Interceptors:
         assert breaker.state == breaker.CLOSED
 
     @pytest.mark.asyncio
-    async def test_circuit_breaker_refused_by_another_breaker_frees_slot(self):
+    async def test_circuit_breaker_refused_by_another_breaker_frees_slot(self, fake_clock):
         first = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=0.01)
         second = CircuitBreakerInterceptor(failure_threshold=1, recovery_timeout=60.0)
         client = self._scripted_client([RpcError(StatusCode.UNAVAILABLE, "down")], [first, second])
-        await self._open_then_half_open(client, first)
+        await self._open_then_half_open(client, first, fake_clock)
         assert second.state == second.OPEN
 
         # `first` admits a probe, `second` (still open) refuses the call:

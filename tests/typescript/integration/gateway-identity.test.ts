@@ -1,16 +1,15 @@
 /**
  * Gateway identity (calls on behalf of a user) through the high-level path
  * only: `AsterServer` and `AsterClientWrapper` configured by `AsterConfig`'s
- * `identity` / `remoteConfig` sections and the Enrollment credentials. The
- * TypeScript port of `bindings/go/identity_test.go` (Rust
- * `aster/tests/enrollment_gateway_identity.rs`, `enrollment_provider_tokens.rs`,
+ * `identity` / `remoteConfig` sections and the Enrollment credentials:
+ * thin TypeScript wiring over the Rust behaviour tests
+ * (`aster/tests/enrollment_gateway_identity.rs`, `enrollment_provider_tokens.rs`,
  * `node_config.rs`).
  *
  * The root is the test-hooks `TestEnrollmentRoot`.
  */
 
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { generateKeyPairSync, sign, type KeyObject } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,7 +23,6 @@ import {
   CONFIG_ADMIN_ROLE,
   CallContext,
   GATEWAY_ROLE,
-  IDENTITY_PUBLISHER_ROLE,
   Rpc,
   RpcError,
   SecretKey,
@@ -158,12 +156,11 @@ function serverEnrollment(): EnrollmentConfig {
   };
 }
 
-async function startNotes(identity: AsterConfig['identity'], extra: { acceptOnBehalfOf?: boolean } = {}) {
+async function startNotes(identity: AsterConfig['identity']) {
   const key = SecretKey.generate();
   const server = new AsterServer({
     services: [new Notes()],
     generated,
-    ...extra,
     config: {
       ...OFFLINE,
       secretKey: key,
@@ -198,7 +195,7 @@ async function connect(server: AsterServer, roles: string, issuable?: string) {
   });
   cleanups.push(() => client.close());
   await client.connect();
-  return { client, id: nodeId, chain, notes: (await client.client(Notes)) as any };
+  return { client, id: nodeId, notes: (await client.client(Notes)) as any };
 }
 
 async function code(p: Promise<unknown>): Promise<number | undefined> {
@@ -341,71 +338,9 @@ describe.skipIf(!available)('gateway identity on AsterServer / AsterClient', () 
     expect(await code(plain.client.nodeConfig().get())).toBe(StatusCode.PERMISSION_DENIED);
     expect(await code(plain.notes.read(req(), { onBehalfOf: token }))).toBe(StatusCode.PERMISSION_DENIED);
   }, 120_000);
-
-  it('acceptOnBehalfOf: false on the server refuses the entry', async () => {
-    const { server } = await startNotes({ acceptOnBehalfOf: true }, { acceptOnBehalfOf: false });
-    const edge = await connect(server, `${GATEWAY_ROLE},notes.read`, 'notes.read');
-    const token = await edge.client.mintUserToken('alice', ['notes.read'], [AMR_PASSWORD], 60);
-    expect((await edge.notes.read(req())).actor).toBe('');
-    expect(await code(edge.notes.read(req(), { onBehalfOf: token }))).toBe(StatusCode.PERMISSION_DENIED);
-  }, 60_000);
-
-  it('a provider ES256 token verifies with a key set a publisher node wrote', async () => {
-    const iss = 'https://idp.test';
-    const { server, id: serverId } = await startNotes({
-      acceptOnBehalfOf: true,
-      trustedIssuers: [{ iss, audiences: ['notes'], rolesClaim: 'groups', roleMap: { readers: 'notes.read' } }],
-    });
-    const idp = testIdP(iss);
-
-    // The publisher writes the key set into the fleet namespace as its own
-    // node, carrying its credential, and syncs it to the server.
-    const publisher = await connect(server, IDENTITY_PUBLISHER_ROLE);
-    const docs = publisher.client.node!.docs() as any;
-    const fleet = await docs.openOrImportWriteNamespace(root.fleetSecret);
-    const record = {
-      version: 1, iss, source_url: `${iss}/jwks`, fetched_at: Math.floor(Date.now() / 1000),
-      jwks: { keys: [idp.jwk] }, credential: publisher.chain,
-    };
-    const key = `aster/identity/v1/issuers/${Buffer.from(iss).toString('base64url')}/jwks`;
-    await fleet.setBytes(await docs.defaultAuthor(), key, Buffer.from(JSON.stringify(record)));
-    await fleet.startSync([serverId]);
-
-    const edge = await connect(server, GATEWAY_ROLE);
-    const token = idp.token({ sub: 'alice', aud: 'notes', groups: ['readers', 'other'], amr: ['pwd'] });
-    const deadline = Date.now() + 30_000;
-    let alice: WhoReply | undefined;
-    while (!alice) {
-      try {
-        alice = await edge.notes.read(req(), { onBehalfOf: token });
-      } catch (e) {
-        // UNAUTHENTICATED until the key set has synced.
-        if (!(e instanceof RpcError) || e.code !== StatusCode.UNAUTHENTICATED || Date.now() > deadline) throw e;
-        await new Promise((r) => setTimeout(r, 200));
-      }
-    }
-    expect(alice).toMatchObject({
-      principal: `${iss}|alice`, actor: edge.id, roles: 'notes.read', issuer: iss, amr: 'pwd',
-    });
-    // Another audience, or another key under the same kid, is refused.
-    expect(await code(edge.notes.read(req(), { onBehalfOf: idp.token({ sub: 'alice', aud: 'other' }) })))
-      .toBe(StatusCode.UNAUTHENTICATED);
-    const forged = testIdP(iss).token({ sub: 'alice', aud: 'notes' });
-    expect(await code(edge.notes.read(req(), { onBehalfOf: forged }))).toBe(StatusCode.UNAUTHENTICATED);
-  }, 120_000);
+  // Behaviour owned by Rust and not repeated here: a server with
+  // acceptOnBehalfOf off refuses the entry (enrollment_gateway_identity.rs
+  // a_server_that_does_not_accept_on_behalf_of_refuses_the_entry); provider
+  // tokens verify against a publisher-written key set (enrollment_provider_tokens.rs
+  // provider_tokens_verify_with_published_keys_rotate_and_follow_node_config).
 });
-
-/** An identity provider signing ES256 tokens with one P-256 key (kid `k1`). */
-function testIdP(iss: string): { jwk: Record<string, string>; token: (claims: Record<string, unknown>) => string } {
-  const { publicKey, privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
-  const pub = publicKey.export({ format: 'jwk' }) as Record<string, string>;
-  const jwk = { kty: 'EC', crv: 'P-256', kid: 'k1', alg: 'ES256', use: 'sig', x: pub.x!, y: pub.y! };
-  const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
-  const token = (claims: Record<string, unknown>): string => {
-    const now = Math.floor(Date.now() / 1000);
-    const input = `${b64({ alg: 'ES256', typ: 'JWT', kid: 'k1' })}.${b64({ ...claims, iss, iat: now, exp: now + 300 })}`;
-    const sig = sign('sha256', Buffer.from(input), { key: privateKey as KeyObject, dsaEncoding: 'ieee-p1363' });
-    return `${input}.${sig.toString('base64url')}`;
-  };
-  return { jwk, token };
-}

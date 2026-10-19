@@ -4,7 +4,11 @@ group (production profile) over loopback Iroh.
 The voters are Rust-only (plan D7), so the group runs in a child process:
 ``aster-coordination-fixture`` (``bindings/typescript/native/fixtures``), built
 from ``aster::coordination::testing::GroupFixture`` -- the same fixture the
-Rust client gates and the TypeScript suite use. Build it with::
+Rust client gates and the TypeScript suite use. These are binding wiring
+tests (result and error mapping, the lease adapter, the PyO3 audit cursor and
+export file, Python placement providers); the coordination behaviour itself
+is tested once in ``ffi/tests/coordination.rs`` and
+``aster/tests/coordination_client.rs``. Build the fixture with::
 
     cargo build -p aster-transport-napi --features coordination-fixture \\
         --bin aster-coordination-fixture
@@ -33,8 +37,6 @@ from aster import (
     ClusterView,
     LeaseOptions,
     Node,
-    NodeId,
-    TopologyTiming,
     TopologyView,
     UpcallError,
 )
@@ -48,18 +50,12 @@ from aster.coordination import (
     CoordinationRejectedError,
     CoordinationRights,
     CoordinationRpcError,
-    CoordinationUnresolvedError,
-    MemberSeed,
     PlacementCandidate,
-    PlacementInput,
     PlacementManager,
     PlacementPolicy,
-    PlacementProvisioner,
     PlacementReport,
-    ProvisionRequest,
     ResourceKey,
     fence_of,
-    placement_plan,
 )
 
 REPO = Path(__file__).resolve().parents[2]
@@ -185,7 +181,7 @@ async def group():
         nodes = [g.root_node, g.worker_node, g.contender_node]
         g.root = await g.connect(g.root_node, "root")
         g.worker = await g.connect(g.worker_node, "worker")
-        for key in ("head", "lease", "restart"):
+        for key in ("head", "lease"):
             await g.grant(key, g.worker_node)
         await g.grant("lease", g.contender_node)
         yield g
@@ -229,6 +225,9 @@ async def test_mutations_are_resolved_and_acknowledged(group):
     # The delivery contract: no new sequence until acknowledged.
     with pytest.raises(CoordinationAwaitingAckError):
         await worker.acquire(res("other"), 30)
+    # One process owns the journal: the native refusal maps to its type.
+    with pytest.raises(CoordinationJournalLockedError):
+        await group.connect(group.worker_node, "worker")
     await acquired.acknowledge()
     assert not acquired.pending
     with pytest.raises(CoordinationClosedError):
@@ -333,105 +332,6 @@ async def test_a_lease_renews_in_rust_mutates_and_hands_off(group):
     assert not (await worker.reads().read_linearizable(res("lease"))).held
 
 
-async def test_a_permission_denial_is_a_typed_rpc_error(group):
-    actor = await group.actor()
-    client = await group.connect(actor, "ungranted")
-    original_id = await client.client_id()
-    try:
-        # No ACL row for this actor: refused before proposal (PERMISSION_DENIED).
-        with pytest.raises(CoordinationRpcError) as denied:
-            await client.acquire(res("head"), 30)
-        assert denied.value.code == 7
-        # Nothing committed; the journaled request stays open until resumed
-        # (the journal-blocking finding recorded by T8).
-        with pytest.raises(CoordinationUnresolvedError):
-            await client.acquire(res("lease"), 30)
-        with pytest.raises(CoordinationRpcError):
-            await client.resume()
-        # The lease adapter surfaces the same typed status.
-        second = await group.connect(actor, "ungranted-lease")
-        try:
-            with pytest.raises(CoordinationRpcError):
-                await second.acquire_lease(res("head"))
-        finally:
-            second.close()
-
-        # Restore permission while the journal is closed, then drive its saved
-        # request rather than replacing the denied operation with a new one.
-        client.close()
-        await group.grant("head", actor)
-        client = await group.connect(actor, "ungranted")
-        resumed = await client.resume()
-        assert resumed is not None and resumed.outcome == "granted"
-        assert resumed.reply.consumed
-        assert await client.client_id() == original_id
-        assert resumed.reply.client_id == original_id
-        assert resumed.snapshot.resource == res("head")
-        replay = await client.resume()
-        assert replay.reply == resumed.reply
-        await resumed.acknowledge()
-        released = await client.release(fence_of(resumed.snapshot))
-        assert released.outcome == "released"
-        assert released.sequence == resumed.sequence + 1
-        assert released.reply.client_id == original_id
-        await released.acknowledge()
-    finally:
-        client.close()
-        await actor.shutdown()
-
-
-async def test_redelivers_an_unacknowledged_result_after_a_restart(group):
-    actor = await group.actor()
-    try:
-        await group.grant("restart", actor)
-
-        first = await group.connect(actor, "restart-client")
-        client_id = await first.client_id()
-        resolved = await first.acquire(res("restart"), 30)
-        assert resolved.outcome == "granted"
-        saved = resolved.reply
-
-        # One process owns the journal.
-        with pytest.raises(CoordinationJournalLockedError):
-            await group.connect(actor, "restart-client")
-
-        # "Crash": close without acknowledging. The handle goes inert.
-        first.close()
-        assert not resolved.pending
-
-        second = await group.connect(actor, "restart-client")
-        assert await second.client_id() == client_id
-        with pytest.raises(CoordinationAwaitingAckError):
-            await second.acquire(res("other"), 30)
-
-        redelivered = await second.unacknowledged()
-        assert redelivered is not None
-        assert redelivered.reply == saved
-        # resume() redelivers the same awaiting result too.
-        via_resume = await second.resume()
-        assert via_resume.reply == saved
-        await redelivered.acknowledge()
-        # The other handle names the same, now-acknowledged entry: refused.
-        with pytest.raises(Exception):
-            await via_resume.acknowledge()
-
-        assert await second.unacknowledged() is None
-        assert await second.resume() is None
-
-        released = await second.release(fence_of(saved.snapshot))
-        assert released.outcome == "released"
-        assert released.sequence == saved.sequence + 1
-        assert released.reply.client_id == client_id
-        await released.acknowledge()
-
-        probe = await second.reads().probe_client(actor.id, client_id)
-        assert probe.exists
-        assert probe.last_sequence == released.sequence
-        second.close()
-    finally:
-        await actor.shutdown()
-
-
 async def test_streams_the_audit_log_in_ascending_paged_order(group):
     reads = group.root.reads()
     rows = [row async for row in reads.audit_stream()]
@@ -458,9 +358,10 @@ async def test_streams_the_audit_log_in_ascending_paged_order(group):
     page = await reads.audit_page(None, 2)
     assert [r.log_id.index for r in page] == indices[:2]
 
-    # The worker is no administrator.
-    with pytest.raises(CoordinationRpcError):
+    # The worker is no administrator: PERMISSION_DENIED, typed.
+    with pytest.raises(CoordinationRpcError) as denied:
         await group.worker.reads().audit_page(None, 10)
+    assert denied.value.code == 7
     with pytest.raises(CoordinationInvalidArgumentError):
         await reads.audit_page(None, 0)
 
@@ -473,39 +374,6 @@ async def test_exports_a_verified_recovery_snapshot(group):
     manifest = await group.root.reads().recovery_export_to_file(target)
     assert target.stat().st_size == manifest.total_len
     assert not Path(f"{target}.partial").exists()
-
-
-async def test_plans_placement_from_the_live_status_cut(group):
-    status = await group.root.reads().group_status()
-    monitor = await Node.start(_offline(enable_monitoring=True))
-    try:
-        await monitor.topology().enable_shared(
-            os.urandom(32), timing=TopologyTiming(min_hold=0, liveness_ttl=60)
-        )
-        snapshot = await monitor.topology().snapshot()
-        rec = placement_plan(
-            PlacementInput(
-                group_id=status.group_id,
-                genesis_hash=status.genesis_hash,
-                deployment_profile_code=status.deployment_profile_code,
-                membership_log_id=status.membership_log_id,
-                current_voters=status.voters,
-                current_learners=status.learners,
-                active_membership_intent=status.pending_operation_id is not None,
-                policy=PlacementPolicy(
-                    revision=1,
-                    digest="44" * 32,
-                    authority_public_key=status.authority_public_key,
-                    authority_domain=status.authority_domain,
-                    target_voters=3,
-                    eligible=tuple(PlacementCandidate(v) for v in status.voters),
-                ),
-            ),
-            snapshot,
-        )
-        assert rec.kind in ("stable", "degraded")
-    finally:
-        await monitor.shutdown()
 
 
 # -- Placement manager with Python providers (plan R6 upcalls) -------------------
@@ -573,57 +441,15 @@ async def test_placement_manager_reconciles_with_python_providers(group):
     with pytest.raises(CoordinationInvalidArgumentError, match="enable_shared"):
         await asyncio.wait_for(fixed.reconcile(), 60)
 
-
-async def test_placement_manager_provider_failures_stop_the_pass(group):
-    status = await group.root.reads().group_status()
-    newcomer = NodeId(os.urandom(32).hex())
-    voters = tuple(status.voters)
-    # One voter excluded, a seedless newcomer eligible: the plan needs a
-    # provisioned seed for the newcomer.
-    policy = _policy_for(
-        status,
-        eligible=tuple(PlacementCandidate(v) for v in voters) + (PlacementCandidate(newcomer),),
-        excluded=(voters[0],),
-    )
-    view = _one_cluster(voters + (newcomer,))
-    asked = []
-
-    class Refusing(PlacementProvisioner):
-        async def provision(self, request):
-            asked.append(request)
-            raise RuntimeError("no capacity")
-
-    manager = PlacementManager(
-        group.root, topology=_Topo(view), policy=_Policy(policy), provisioner=Refusing()
-    )
-    with pytest.raises(UpcallError) as e:
-        await asyncio.wait_for(manager.reconcile(), 60)
-    assert e.value.kind == "foreign" and "no capacity" in str(e.value)
-    assert len(asked) == 1
-    req = asked[0]
-    assert isinstance(req, ProvisionRequest)
-    assert req.group_id == group.group_id and req.policy_digest == "44" * 32
-    assert req.node_id == newcomer
-    assert req.membership_log_id == status.membership_log_id
-
-    class Wrong(PlacementProvisioner):
-        async def provision(self, request):
-            return MemberSeed(NodeId("ee" * 32), "aster1ticket")
-
-    # A seed for a different node is refused before anything is submitted.
-    wrong = PlacementManager(
-        group.root, topology=_Topo(view), policy=_Policy(policy), provisioner=Wrong()
-    )
-    with pytest.raises(CoordinationInvalidArgumentError):
-        await asyncio.wait_for(wrong.reconcile(), 60)
-    after = await group.root.reads().group_status()
-    assert set(after.voters) == set(status.voters) and after.pending_operation_id is None
-
+    # A Python provider's exception fails the pass as a foreign UpcallError.
+    # The provider-failure matrix (provisioner refusals, a seed for the wrong
+    # node, timeouts) is ffi/tests/coordination.rs
+    # placement_manager_over_foreign_providers.
     class BrokenTopology:
         async def snapshot(self):
             raise OSError("topology service down")
 
-    broken = PlacementManager(group.root, topology=BrokenTopology(), policy=_Policy(policy))
+    broken = PlacementManager(group.root, topology=BrokenTopology(), policy=_Policy(_policy_for(status)))
     with pytest.raises(UpcallError) as e:
         await asyncio.wait_for(broken.reconcile(), 60)
-    assert e.value.kind == "foreign"
+    assert e.value.kind == "foreign" and "topology service down" in str(e.value)

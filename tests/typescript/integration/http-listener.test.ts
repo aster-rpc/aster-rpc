@@ -1,3 +1,12 @@
+/**
+ * The HTTP listener through the TypeScript binding: the certificate helpers,
+ * RpcServer / AsterServer starting public and authenticated listeners, the
+ * authenticator's identity reaching CallContext, the four patterns through
+ * the JS dispatch loop, failed authentication, and cancellation of pending
+ * authentication and of a start after native readiness. Listener semantics
+ * (public gates, shutdown draining, child-port joins) are tested once in
+ * Rust: aster-transport-salvo/tests/* and ffi/tests/http_server.rs.
+ */
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -64,16 +73,13 @@ async function fixture() {
   const cancellation = new Promise<void>((r) => cancelled = r);
   const loop = await DispatchLoop.start({
     config: { relayMode: 'disabled', bindAddr: '127.0.0.1:0' }, builtinNodeInfo: false,
-    services: [{ name: 'Listener', version: 1, methods: ['unary', 'server_stream', 'client_stream', 'bidi', 'hang'].map((pattern, i) => ({
-      name: pattern, pattern: i === 4 ? 'unary' : i === 3 ? 'bidi_stream' : pattern as any,
+    services: [{ name: 'Listener', version: 1, methods: ['unary', 'server_stream', 'client_stream', 'bidi'].map((pattern, i) => ({
+      name: pattern, pattern: i === 3 ? 'bidi_stream' : pattern as any,
       request: { hash: 'a1'.repeat(32) }, response: { hash: 'b2'.repeat(32) },
-    })) },
-    { name: 'SessionOnly', version: 1, scope: 'session', methods: [{ name: 'unary', pattern: 'unary', request: { hash: 'a1'.repeat(32) }, response: { hash: 'b2'.repeat(32) } }] },
-    { name: 'IrohOnly', version: 1, iroh_only: true, methods: [{ name: 'unary', pattern: 'unary', request: { hash: 'a1'.repeat(32) }, response: { hash: 'b2'.repeat(32) } }] }],
+    })) }],
     onEvent(ev) { if (ev.kind === DispatchEventKind.Cancelled) cancelled(); },
     async onCall(ev, srv) {
       seen.push(ev);
-      if (ev.methodIdx === 4) return;
       if (ev.methodIdx === 0) { await respondCall(srv, ev.callId, ev.request!); return; }
       if (ev.methodIdx === 1) {
         await sendFrame(srv, ev.callId, Buffer.from([7]));
@@ -120,28 +126,6 @@ describe('explicit public listeners and certificate helpers', () => {
     expect(() => verifyCertificateBinding(generateSelfSignedCertificate().certificatePem, nodeId)).toThrow();
     expect(() => verifyCertificateBinding(Uint8Array.of(1), nodeId)).toThrow();
     expect(() => generateSelfSignedCertificate([], Uint8Array.of(1))).toThrow();
-  });
-
-  it('serves all four public patterns anonymously without an authenticator and joins shutdown', async () => {
-    const f = await fixture();
-    const cert = generateWebTransportCertificate('public', ['127.0.0.1']);
-    const listener = await HttpListener.startPublic(f.loop.native!, { ...cert, webTransport: true });
-    try {
-      expect(await call(listener.tcpAddr, 'unary')).toEqual({ code: 0, data: [[1]] });
-      expect(await call(listener.tcpAddr, 'server_stream')).toEqual({ code: 0, data: [[7], [8]] });
-      expect(await call(listener.tcpAddr, 'client_stream', [[1], [2]])).toEqual({ code: 0, data: [[1, 2]] });
-      expect(await call(listener.tcpAddr, 'bidi', [[1], [2]])).toEqual({ code: 0, data: [[1], [2]] });
-      expect((await call(listener.tcpAddr, 'unary', [[1]], 'ignored', false, 'SessionOnly')).code).toBe(16);
-      expect((await call(listener.tcpAddr, 'unary', [[1]], 'ignored', false, 'IrohOnly')).code).toBe(5);
-      expect(f.seen).toHaveLength(4);
-      for (const event of f.seen) {
-        expect(event.flags & DispatchFlags.IrohAuthenticated).toBe(0);
-        expect(event.attributes ?? {}).toEqual({});
-      }
-      await f.loop.close();
-      await listener.close();
-      await released(listener.tcpAddr);
-    } finally { await listener.close(); await f.loop.close(); }
   });
 
   it('high-level public mode keeps attribute gates and rejects auth-limit configuration', async () => {
@@ -254,17 +238,6 @@ describe('authenticated HTTP listener', () => {
       finally { await l.close(); }
     }
     await f.loop.close();
-  });
-
-  it('server close cancels a pending handler and releases child sockets', async () => {
-    const f = await fixture();
-    const l = await HttpListener.start(f.loop.native, options(), () => ({ principal: 'alice' }));
-    const pending = call(l.tcpAddr, 'hang').catch(() => null); // swallow-ok: the call fails when the listener closes; the test awaits it after
-    while (!f.seen.length) await new Promise((r) => setTimeout(r, 5));
-    await f.loop.close();
-    await pending;
-    await released(l.tcpAddr);
-    await l.close();
   });
 
   it('stop cancels pending authentication and refuses malformed configuration', async () => {

@@ -4,6 +4,7 @@ from typing import AsyncIterator
 
 import pytest
 
+import aster.client as client_module
 from aster.client import create_client
 from aster.codec import wire_type
 from aster.decorators import client_stream, service
@@ -33,8 +34,22 @@ def client(transport):
     return create_client(
         Service,
         transport=transport,
-        interceptors=[RetryInterceptor(RetryPolicy(max_attempts=3, backoff=ExponentialBackoff(initial_ms=0)))],
+        interceptors=[RetryInterceptor(RetryPolicy(max_attempts=3, backoff=ExponentialBackoff(initial_ms=400)))],
     )
+
+
+@pytest.fixture(autouse=True)
+def backoff_sleeps(monkeypatch):
+    """Injected backoff sleep: records each requested delay, never sleeps.
+    A one-shot request source is never retried, so none is requested."""
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(client_module, "time_sleep", fake_sleep)
+    yield sleeps
+    assert sleeps == []
 
 
 async def requests():

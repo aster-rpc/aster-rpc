@@ -1,11 +1,13 @@
 /**
- * R9 expose by upcall, end to end over real (loopback, relay-less) nodes: a
- * JavaScript HTTP handler (`Expose.exposeHttp`, kind 49) behind the
- * authorizer (kind 48), inline and streamed bodies in both directions,
- * HEAD, the failure paths (500 / 501 / 502 / 504 / 413), cancellation (the
- * consumer giving up, the kind's timeout), a response that fails mid-body
- * reaching the consumer as an error, and an edge's route policy
- * (`Expose.serveRoutes`, kind 50) with its fail-closed / fail-open modes.
+ * R9 expose by upcall over real (loopback, relay-less) nodes, binding side
+ * only: a JavaScript HTTP handler (`Expose.exposeHttp`) behind its
+ * authorizer, the request head and bodies (inline and streamed) mapped both
+ * ways, the response shapes JS may return, handler failures and a body that
+ * fails mid-way, the JS pump stopping when the consumer leaves, the request
+ * cap reaching native, and an edge's route policy (`Expose.serveRoutes`).
+ * The relay semantics (HEAD, 501/502/504, timeouts, abandoned upcalls, size
+ * and chunk limits, failure modes) are tested once in Rust:
+ * aster/tests/it/expose_foreign.rs and ffi/tests/expose.rs.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -15,7 +17,6 @@ import {
   HttpBodyStream,
   HttpRequest,
   Node,
-  UpcallCancelledError,
   Upcalls,
   relayHttp,
   requestRoute,
@@ -62,7 +63,7 @@ describe('expose HTTP handlers by upcall', () => {
   const seen: HttpRequest[] = [];
   const contexts: UpcallContext[] = [];
   const asked: Array<{ serviceId: string; peer: NodeId }> = [];
-  const state = { slowStarted: false, streamClosed: false, streamWrites: 0, maxRead: 0 };
+  const state = { streamClosed: false, streamWrites: 0 };
 
   const app = async (request: HttpRequest, ctx: UpcallContext): Promise<HttpResponse | string> => {
     seen.push(request);
@@ -89,8 +90,6 @@ describe('expose HTTP handlers by upcall', () => {
         return { body: [Buffer.from('a'), 'b', new Uint8Array([99])] };
       case '/text':
         return 'plain text';
-      case '/head':
-        return { headers: { 'content-length': '3' }, body: 'abc' };
       case '/boom':
         throw new Error('handler exploded');
       case '/bad':
@@ -117,10 +116,6 @@ describe('expose HTTP handlers by upcall', () => {
         }
         return { body: endless() };
       }
-      case '/slow':
-        state.slowStarted = true;
-        await new Promise<never>(() => {});
-        break;
     }
     return { status: 404 };
   };
@@ -209,14 +204,6 @@ describe('expose HTTP handlers by upcall', () => {
     expect((await relayHttp(conn, 'app', { uri: '/nope' })).status).toBe(404);
   });
 
-  it('answers HEAD with the handler headers and no body', async () => {
-    const resp = await relayHttp(conn, 'app', { method: 'HEAD', uri: '/head' });
-    expect(resp.status).toBe(200);
-    expect(resp.header('content-length')).toBe('3');
-    expect(resp.body.length).toBe(0);
-    expect(seen[seen.length - 1].method).toBe('HEAD');
-  });
-
   it('turns handler failures into 5xx without leaking the message', async () => {
     const boom = await relayHttp(conn, 'app', { uri: '/boom' });
     expect(boom.status).toBe(500);
@@ -228,29 +215,6 @@ describe('expose HTTP handlers by upcall', () => {
     await expect(relayHttp(conn, 'app', { uri: '/midway' })).rejects.toBeInstanceOf(Error);
     // The service keeps working afterwards.
     expect((await relayHttp(conn, 'app', { uri: '/hello' })).status).toBe(200);
-  });
-
-  it('answers 504 when the head is not answered in time and aborts the handler signal', async () => {
-    state.slowStarted = false;
-    const resp = await relayHttp(conn, 'app', { uri: '/slow' });
-    expect(resp.status).toBe(504);
-    const ctx = await until('slow handler context', () => (state.slowStarted ? contexts[contexts.length - 1] : undefined));
-    await until('timeout abort', () => ctx.signal.aborted || undefined);
-    expect(ctx.signal.reason).toBeInstanceOf(UpcallCancelledError);
-    expect((ctx.signal.reason as UpcallCancelledError).reason).toBe('timeout');
-  });
-
-  it('cancels the handler when the consumer gives up before the head', async () => {
-    state.slowStarted = false;
-    const gone = await peer.connect(host.addr, HTTP_ALPN);
-    const pending = relayHttp(gone, 'app', { uri: '/slow' }).catch((e: unknown) => e);
-    await until('slow handler started', () => state.slowStarted || undefined);
-    const ctx = contexts[contexts.length - 1];
-    expect(ctx.signal.aborted).toBe(false);
-    gone.close(0, 'giving up');
-    await until('abandoned abort', () => ctx.signal.aborted || undefined);
-    expect((ctx.signal.reason as UpcallCancelledError).reason).toBe('abandoned');
-    expect(await pending).toBeInstanceOf(Error);
   });
 
   it('closes a streaming handler when the consumer goes away mid-response', async () => {
@@ -273,34 +237,7 @@ describe('expose HTTP handlers by upcall', () => {
     } finally {
       other.close(0, 'done');
     }
-    expect(asked.slice(before).map((a) => a.peer)).toEqual([stranger.id]);
-    // An admitted peer is asked once per (connection, service), however many requests it makes.
-    const fresh = await peer.connect(host.addr, HTTP_ALPN);
-    try {
-      const asks = asked.length;
-      for (let i = 0; i < 3; i++) expect((await relayHttp(fresh, 'app', { uri: '/hello' })).status).toBe(200);
-      expect(asked.length - asks).toBe(1);
-    } finally {
-      fresh.close(0, 'done');
-    }
-  });
-
-  it('fails closed when the authorizer throws, and admits everyone without one', async () => {
-    expose.exposeHttp('broken', () => 'secret', {
-      authorize: () => {
-        throw new Error('authorizer down');
-      },
-    });
-    await expect(relayHttp(conn, 'broken', { uri: '/' })).rejects.toBeInstanceOf(Error);
-    expose.exposeHttp('open', () => 'open to all');
-    const c = await stranger.connect(host.addr, HTTP_ALPN);
-    try {
-      expect((await relayHttp(c, 'open', { uri: '/' })).body.toString()).toBe('open to all');
-    } finally {
-      c.close(0, 'done');
-    }
-    expose.unexpose('broken');
-    expose.unexpose('open');
+    expect(asked.slice(before)).toEqual([{ serviceId: 'app', peer: stranger.id }]);
   });
 
   it('answers 413 for a declared body over maxRequestBody without calling the handler', async () => {
@@ -338,84 +275,20 @@ describe('expose HTTP handlers by upcall', () => {
     expose.unexpose('capped-stream');
   });
 
-  it('enforces maxResponseBody', async () => {
-    expose.exposeHttp(
-      'capped-response',
-      (req) =>
-        req.uri === '/inline'
-          ? { body: Buffer.alloc(5000, 1) }
-          : {
-              body: (async function* () {
-                for (let i = 0; i < 4; i++) yield Buffer.alloc(1000, 2);
-              })(),
-            },
-      { maxResponseBody: 3500 },
-    );
-    // Inline over the cap is a 502; a streamed body that crosses it is aborted (an error, not a short body).
-    expect((await relayHttp(conn, 'capped-response', { uri: '/inline' })).status).toBe(502);
-    await expect(relayHttp(conn, 'capped-response', { uri: '/streamed' })).rejects.toBeInstanceOf(Error);
-    expose.unexpose('capped-response');
-  });
-
-  it('honours maxChunk when reading and splits larger writes', async () => {
-    expose.exposeHttp(
-      'chunks',
-      async (req) => {
-        let longest = 0;
-        for await (const c of req.handle) longest = Math.max(longest, c.length);
-        state.maxRead = longest;
-        return {
-          body: (async function* () {
-            yield Buffer.alloc(100_000, 3);
-          })(),
-        };
-      },
-      { maxChunk: 16 * 1024 },
-    );
-    const resp = await relayHttp(conn, 'chunks', { method: 'POST', body: BIG });
-    expect(resp.body.equals(Buffer.alloc(100_000, 3))).toBe(true);
-    expect(state.maxRead).toBeGreaterThan(0);
-    expect(state.maxRead).toBeLessThanOrEqual(16 * 1024);
-    expose.unexpose('chunks');
-  });
-
-  it('validates registration and answers 501 once the handler is gone', async () => {
+  it('validates registration', () => {
     expect(() => expose.exposeHttp('x', null as never)).toThrow(TypeError);
     expect(() => expose.exposeHttp('x', () => 'x', { maxChunk: 0 })).toThrow(RangeError);
-
-    // A registry on its own table; closing the registry removes its handlers, so the
-    // kind has no handler any more: UNIMPLEMENTED is a 501.
-    const table = new Upcalls();
-    const gone = host.expose({ upcalls: table });
-    gone.exposeHttp('ghost', () => 'boo');
-    const alpn = 'aster-expose/r9-ghost';
-    await using h2 = await Node.start({ ...OFFLINE, alpns: [alpn] });
-    await ready(h2);
-    peer.native.addNodeAddr(h2.native);
-    const srv = h2.serveExpose(gone, [alpn]);
-    try {
-      gone.close();
-      const c = await peer.connect(h2.addr, alpn);
-      try {
-        expect((await relayHttp(c, 'ghost', { uri: '/' })).status).toBe(501);
-      } finally {
-        c.close(0, 'done');
-      }
-    } finally {
-      srv.close();
-      table.close();
-    }
   });
 });
 
 describe('edge route policy by upcall', () => {
-  it('grants what the policy allows, with fail-closed and fail-open on no answer', async () => {
+  it('grants what the policy answers: true, false, indices or a subset of the specs', async () => {
     await using edge = await Node.start({ ...OFFLINE, alpns: [EDGE_ALPN] });
     await using origin = await Node.start(OFFLINE);
     await ready(edge);
     origin.native.addNodeAddr(edge.native);
 
-    const upcalls = new Upcalls({ policies: { expose_route_policy: { timeoutMs: 500 } } });
+    const upcalls = new Upcalls();
     const requests: Array<{ peer: NodeId; metadata: string; specs: readonly RouteSpec[] }> = [];
     const router = new EdgeRouter();
     const expose = edge.expose({ upcalls });
@@ -425,7 +298,6 @@ describe('edge route policy by upcall', () => {
       if (meta === 'all') return true;
       if (meta === 'none') return false;
       if (meta === 'index') return [2];
-      if (meta === 'boom') throw new Error('policy down');
       return specs.filter((s) => s.host.endsWith('.example'));
     });
     const server = edge.serveExpose(expose, [EDGE_ALPN]);
@@ -453,15 +325,6 @@ describe('edge route policy by upcall', () => {
       router.unregister('', 5432);
       expect(router.lookup('', 5432)).toBeNull();
 
-      // No usable answer: fail-closed grants nothing, fail-open everything requested.
-      expect((await requestRoute(conn, specs.slice(0, 1), Buffer.from('boom'))).granted).toEqual([]);
-      upcalls.setPolicy('expose_route_policy', { failureMode: 'fail_open' });
-      expect((await requestRoute(conn, specs.slice(0, 1), Buffer.from('boom'))).granted).toEqual([full[0]]);
-      upcalls.setPolicy('expose_route_policy', { failureMode: 'fail_closed' });
-
-      // A grant naming a route that was not requested is a malformed answer: the failure mode applies.
-      expose.serveRoutes(router, () => [{ host: 'other.example', serviceId: 'web' }]);
-      expect((await requestRoute(conn, specs.slice(0, 1))).granted).toEqual([]);
     } finally {
       conn.close(0, 'done');
       server.close();

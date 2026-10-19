@@ -1,7 +1,8 @@
 /**
  * Enrollment through the high-level path only: `AsterServer` and
  * `AsterClientWrapper` configured by `AsterConfig`'s `enrollment` section.
- * The TypeScript port of `aster/tests/enrollment_aster_server.rs`.
+ * Thin wiring over `aster/tests/enrollment_aster_server.rs`, which owns the
+ * behaviour (restriction rules, issuer renewal across lifetimes, revocation).
  *
  * The root is played by the test-hooks `TestEnrollmentRoot` (root operations
  * belong to the Rust CLI, never a binding); everything the application
@@ -243,6 +244,15 @@ describe.skipIf(!available)('Enrollment on AsterServer / AsterClient from AsterC
         await stranger.close();
       }
 
+      // A runtime restriction reaches the native gate; clearing restores
+      // the credential roles. The narrowing rules themselves are tested in
+      // Rust (enrollment_aster_server.rs runtime_restriction_narrows_credential_roles).
+      const operatorId = operator.client.node!.id;
+      server.restrictPeerRoles(operatorId, ['ops.status']);
+      expect(await denied(role(operator.ops, 'logs'))).toBe(true);
+      expect(server.clearPeerRestriction(operatorId)).toBe(true);
+      expect(await role(operator.ops, 'logs')).toBe('ops.logs,ops.status');
+
       // The root delivers a revocation of the operator into the fleet
       // namespace the server holds.
       await root.revoke(operator.client.node!.id, server.address);
@@ -259,32 +269,6 @@ describe.skipIf(!available)('Enrollment on AsterServer / AsterClient from AsterC
 
       await operator.client.close();
       await ingest.client.close();
-    } finally {
-      await server.close();
-    }
-  }, 120_000);
-
-  it('a runtime restriction refuses the next call; the credential sets the maximum', async () => {
-    const server = await startServer(serverConfig());
-    try {
-      const session = await connect(server, clientConfig('ops.status,ops.logs'));
-      const peer = session.client.node!.id;
-      expect(await role(session.ops, 'logs')).toBe('ops.logs,ops.status');
-
-      server.restrictPeerRoles(peer, ['ops.status']);
-      expect(await role(session.ops, 'status')).toBe('ops.status');
-      expect(await denied(role(session.ops, 'logs'))).toBe(true);
-
-      // A restriction never grants a role the credential lacks.
-      server.restrictPeerRoles(peer, ['ops.admin']);
-      expect(await denied(role(session.ops, 'logs'))).toBe(true);
-      expect(server.peerAttributes(peer)['aster.role']).toBeUndefined();
-
-      expect(server.clearPeerRestriction(peer)).toBe(true);
-      expect(await role(session.ops, 'logs')).toBe('ops.logs,ops.status');
-      expect(() => server.restrictPeerRoles(SecretKey.nodeId(SecretKey.generate()), ['ops.status'])).toThrow();
-
-      await session.client.close();
     } finally {
       await server.close();
     }
@@ -311,40 +295,6 @@ describe.skipIf(!available)('Enrollment on AsterServer / AsterClient from AsterC
       await server.close();
     }
   }, 60_000);
-
-  it('a config-driven issuer renews the credentials it signed, across several lifetimes', async () => {
-    const key = SecretKey.generate();
-    const delegationFile = join(dir, 'issuer.chain');
-    writeFileSync(delegationFile, `${root.delegate(SecretKey.nodeId(key))}\n`);
-    const server = await startServer({
-      ...serverConfig({ secretKey: key, enrollmentCredentialChain: root.issue(SecretKey.nodeId(key)) }),
-      enrollment: serverEnrollment({
-        replicas: [root.ticket],
-        issuerDelegationFile: delegationFile,
-        issuerLifetimeSecs: 6,
-      }),
-    });
-    const nativeServer = (server as any)._rpcServer.dispatchServer;
-    try {
-      // The server's issuer signs this client's credential.
-      const config = clientConfig('ops.status');
-      const nodeId = SecretKey.nodeId(config.secretKey as string);
-      const issued: string = await nativeServer.testIssueCredential(nodeId, 'ops.status');
-      writeFileSync(config.enrollmentCredentialFile!, `${issued}\n`);
-
-      const { client, ops } = await connect(server, config);
-      expect(await client.isRenewing(), 'the server signed it, so it renews').toBe(true);
-      const until = Date.now() + (3 * 6 + 2) * 1000;
-      while (Date.now() < until) {
-        expect(await role(ops, 'status')).toBe('ops.status');
-        await new Promise((r) => setTimeout(r, 500));
-      }
-      expect(await client.credential()).not.toBe(issued);
-      await client.close();
-    } finally {
-      await server.close();
-    }
-  }, 120_000);
 
   it('misconfiguration fails closed with a clear error; nothing runs open', async () => {
     const refusedStart = async (config: Partial<AsterConfig>, expectText: string) => {

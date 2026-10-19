@@ -1,5 +1,7 @@
 /**
- * Graceful drain through the Rust drain (mirror item D) and the handler
+ * Graceful drain through the Rust drain (mirror item D: the report and the
+ * draining status reach JS; cancelling at the deadline is tested once in
+ * aster/tests/it/rpc_drain.rs a_call_running_at_the_deadline_is_cancelled) and the handler
  * `CallContext` additions (item H): principal vs peer, provenance,
  * `isCancelled()` / `cancelled()`, and `CallContext.current()` inside a
  * streaming handler's generator body. Config-driven `AsterServer` /
@@ -138,23 +140,6 @@ describe.skipIf(!available)('AsterServer.drain', () => {
     expect(report.elapsedMs).toBeGreaterThan(0);
     // drain() closes the server afterwards.
     await expect(server.drain(0)).rejects.toThrow(/not serving/);
-  });
-
-  it('cancels what still runs at the deadline; the client sees isDraining', async () => {
-    const { server, client, svc } = await pair();
-    cleanup.push(() => client.close(), () => server.close());
-
-    const inFlight = svc.hold(new Msg({ text: 'b' })).then(() => undefined, (e: unknown) => e);
-    await hooks.entered.promise;
-    const report = await server.drain(100);
-    expect(report.callsInFlight).toBe(1);
-    expect(report.callsCancelled).toBe(1);
-    expect(report.deadlineReached).toBe(true);
-    expect(report.connectionsClosed).toBeGreaterThanOrEqual(1);
-
-    const failure = await inFlight;
-    expect(failure).toBeInstanceOf(RpcError);
-    expect((failure as RpcError).isDraining).toBe(true);
   });
 
   it('rejects a negative grace', async () => {

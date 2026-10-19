@@ -1,8 +1,10 @@
 /**
- * Plan T7 behaviour on live nodes: fenced leases (in-memory serializer and a
+ * Plan T7 wiring on live nodes: fenced leases (in-memory serializer and a
  * designated grantor over RPC), pinned-author policy docs carrying sealed
- * grants, and topology v1 / v2 across three local nodes. Offline: loopback
- * only, relays disabled.
+ * grants, and topology v1 / v2 across three local nodes. The behaviour
+ * (renewal, fencing races, grant delivery, convergence) is tested in Rust:
+ * aster/tests/it/lease.rs, rpc_lease.rs, grants.rs, topology_shared.rs,
+ * rpc_topology.rs. Offline: loopback only, relays disabled.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -99,18 +101,17 @@ describe('lease: in-memory serializer', () => {
     expect(next.epoch).toBe(3);
     await next.release();
     expect(await ser.snapshot('tree/42')).toEqual({ resource: 'tree/42', epoch: 4, held: false });
+
+    // Option validation surfaces as a rejected acquire.
+    await expect(ser.acquire('r', 'n1', { ttlMs: 1000, renewIntervalMs: 950, holderMarginMs: 100 })).rejects.toThrow(
+      /renew_interval/,
+    );
+    await expect(ser.acquire('r', 'n1', { ttlMs: -1 })).rejects.toThrow(/ttlMs/);
   });
 
-  it('renews past the TTL in the background', async () => {
-    const ser = new MemorySerializer();
-    const lease = granted(await ser.acquire('r', 'n1', FAST));
-    await new Promise((r) => setTimeout(r, 3200)); // > ttl
-    expect(lease.status).toBe('held');
-    expect(lease.fence()?.epoch).toBe(1);
-    expect((await ser.acquire('r', 'n2', FAST)).granted).toBe(false);
-    await lease.release();
-  });
-
+  // Renewal past the TTL and the revoke/fencing rules are Rust behaviour
+  // (aster/tests/it/lease.rs renew_loop_keeps_lease_alive,
+  // revoke_fences_running_holder); here only statusChanges' mapping.
   it('a revoke fences the holder; statusChanges reports it and ends', async () => {
     const ser = new MemorySerializer();
     const lease = granted(await ser.acquire('r', 'n1', FAST));
@@ -145,13 +146,6 @@ describe('lease: in-memory serializer', () => {
     expect(ser.mutateFenced(fence!, 'n1', () => 1)).toBe(1);
   });
 
-  it('validates options', async () => {
-    const ser = new MemorySerializer();
-    await expect(ser.acquire('r', 'n1', { ttlMs: 1000, renewIntervalMs: 950, holderMarginMs: 100 })).rejects.toThrow(
-      /renew_interval/,
-    );
-    await expect(ser.acquire('r', 'n1', { ttlMs: -1 })).rejects.toThrow(/ttlMs/);
-  });
 });
 
 describe('lease: designated grantor over RPC', () => {
@@ -198,13 +192,10 @@ describe('lease: designated grantor over RPC', () => {
       expect(denied.snapshot.holder).toBe(a.id);
     }
 
-    // Renewals over RPC keep it held past the TTL.
-    await new Promise((r) => setTimeout(r, 3200));
-    expect(lease.status).toBe('held');
     expect(await sb.snapshot('db/primary')).toMatchObject({ epoch: 1, holder: a.id, held: true });
-
-    // revoke is operator-gated by default.
-    await expect(sa.revoke('db/primary')).rejects.toThrow();
+    // Renewal over RPC past the TTL and the operator gate on revoke are Rust
+    // behaviour (aster/tests/it/rpc_lease.rs lease_handle_renews_over_rpc,
+    // revoke_requires_operator_role).
 
     await lease.release();
     const next = await sb.acquire('db/primary', FAST);
@@ -215,60 +206,56 @@ describe('lease: designated grantor over RPC', () => {
 
 describe('policy doc + sealed grants', () => {
   let root: Node;
-  let member: Node;
 
   beforeAll(async () => {
-    [root, member] = await Promise.all([Node.start(OFFLINE), Node.start(OFFLINE)]);
-    await Promise.all([ready(root), ready(member)]);
-    root.native.addNodeAddr(member.native);
-    member.native.addNodeAddr(root.native);
+    root = await Node.start(OFFLINE);
   });
 
   afterAll(async () => {
-    await Promise.all([root?.close(), member?.close()]);
+    await root?.close();
   });
 
-  it('pins the root author and delivers a namespace grant across nodes', async () => {
+  // Cross-node delivery of a sealed grant is Rust behaviour (aster/tests/it/
+  // grants.rs grant_flow_over_policy_doc, policy_doc_pins_the_author;
+  // topology_shared.rs swarm_converges_with_sealed_grant_distribution).
+  it('pins the root author and opens a namespace grant read through it', async () => {
     const rootDocs = root.docs();
     const rootAuthor = await rootDocs.defaultAuthor();
     const forger = await rootDocs.createAuthor();
     const doc = await rootDocs.create();
     const nsId = doc.docId();
+    const recipient = await Node.start(OFFLINE);
+    try {
+      const topoSecret = randomBytes(32);
+      const ctx: GrantContext = {
+        app: 'ts/topo-grant/v1',
+        granter: root.id,
+        recipient: recipient.id,
+        resource: Buffer.from(nsId, 'hex'),
+        path: grantKey('/ts/v1', recipient.id),
+        role: 'write',
+      };
+      const record = GrantRecord.active('write', 1, sealNamespaceGrant(ctx, NamespaceCapability.write(topoSecret)));
+      await doc.setBytes(rootAuthor, ctx.path, Buffer.from(record.encode()));
+      await doc.setBytes(forger, '/ts/v1/grants/forged', Buffer.from('x'));
 
-    const topoSecret = randomBytes(32);
-    const ctx: GrantContext = {
-      app: 'ts/topo-grant/v1',
-      granter: root.id,
-      recipient: member.id,
-      resource: Buffer.from(nsId, 'hex'),
-      path: grantKey('/ts/v1', member.id),
-      role: 'write',
-    };
-    const record = GrantRecord.active('write', 1, sealNamespaceGrant(ctx, NamespaceCapability.write(topoSecret)));
-    await doc.setBytes(rootAuthor, ctx.path, Buffer.from(record.encode()));
-    await doc.setBytes(forger, '/ts/v1/grants/forged', Buffer.from('x'));
+      const local = PolicyDoc.wrap(doc, rootAuthor);
+      expect(local.author).toBe(rootAuthor);
+      expect((await local.listPrefix('/ts/v1/grants/')).map((e) => Buffer.from(e.key).toString())).toEqual([ctx.path]);
+      expect(await local.get('/ts/v1/grants/forged')).toBeUndefined();
+      expect(await PolicyDoc.wrap(doc, forger).get('/ts/v1/grants/forged')).toBeDefined();
 
-    // Locally: only the pinned author is visible.
-    const local = PolicyDoc.wrap(doc, rootAuthor);
-    expect(local.author).toBe(rootAuthor);
-    expect((await local.listPrefix('/ts/v1/grants/')).map((e) => Buffer.from(e.key).toString())).toEqual([ctx.path]);
-    expect(await local.get('/ts/v1/grants/forged')).toBeUndefined();
-    expect(await PolicyDoc.wrap(doc, forger).get('/ts/v1/grants/forged')).toBeDefined();
-
-    // Remotely: import read-only, sync from the root, reconcile. (The root
-    // only answers sync for a doc it is live-syncing.)
-    await doc.startSync([]);
-    const policy = await PolicyDoc.importReadOnly(member.docs(), nsId, rootAuthor);
-    await policy.doc().startSync([root.id]);
-    const fetched = await until('grant record to sync', () => policy.fetchGrant('/ts/v1', member.id));
-    const outcome = reconcileNamespaceGrant(member.exportSecretKey(), ctx, fetched);
-    expect(outcome.kind).toBe('active');
-    if (outcome.kind === 'active') {
-      expect(outcome.value.canWrite).toBe(true);
-      expect(Buffer.from(outcome.value.exposeSecret()).equals(topoSecret)).toBe(true);
+      const fetched = await local.fetchGrant('/ts/v1', recipient.id);
+      const outcome = reconcileNamespaceGrant(recipient.exportSecretKey(), ctx, fetched);
+      expect(outcome.kind).toBe('active');
+      if (outcome.kind === 'active') {
+        expect(outcome.value.canWrite).toBe(true);
+        expect(Buffer.from(outcome.value.exposeSecret()).equals(topoSecret)).toBe(true);
+      }
+      expect(reconcileNamespaceGrant(root.exportSecretKey(), ctx, fetched).kind).toBe('unopenable');
+    } finally {
+      await recipient.close();
     }
-    // The root's own identity cannot open the member's grant.
-    expect(reconcileNamespaceGrant(root.exportSecretKey(), ctx, fetched).kind).toBe('unopenable');
   });
 });
 

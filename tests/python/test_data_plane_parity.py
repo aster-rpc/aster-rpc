@@ -9,6 +9,17 @@ Blobs: ``read_range``, ``FetchStrategy`` / ``FetchReport`` /
 ``set_bytes_durable``, ``entry_exists``, entry content status, open / import
 namespace, ``ShareMode`` / ``DownloadPolicy``, events as an async iterator.
 Net: ``paths()`` / ``selected_path()`` / ``PathInfo``, stream priority.
+
+This file checks the Python mapping of those calls and types. Their
+behaviour is tested once in Rust: GC and tag refcounting in
+``aster/tests/it/blob_gc.rs`` (``untagged_blob_is_collected``,
+``add_bytes_auto_tag_blocks_collection``), multi-provider and split-children
+fetches in ``aster/tests/it/blob_fetch_multi.rs``
+(``splits_children_across_partial_holders``), authority reports across
+read/write imports in ``aster/tests/it/authority_report.rs``
+(``read_authority_reports_read``,
+``a_read_request_cannot_hide_existing_write_authority``) and transfer
+counters in ``aster/tests/it/transfer_metrics.rs``.
 """
 
 from __future__ import annotations
@@ -78,32 +89,10 @@ async def test_read_range_and_typed_hash_arguments(one):
     await blobs.tag_set("typed/tag", typed, BlobFormat.RAW)
     tag = await blobs.tag_get("typed/tag")
     assert tag.hash == h and tag.format == "raw"
-
-
-@pytest.mark.asyncio
-async def test_tag_delete_prefix(one):
-    blobs = blobs_client(one)
-    h = await blobs.add_bytes(b"tagged")
-    for name in ("app/a", "app/b", "other/c"):
-        await blobs.tag_set(name, h)
-    assert await blobs.tag_delete_prefix("app/") == 2
-    names = {t.name for t in await blobs.tag_list()}
-    assert "other/c" in names and "app/a" not in names and "app/b" not in names
-
-
-@pytest.mark.asyncio
-async def test_gc_run_once_reclaims_untagged_and_keeps_tagged(one):
-    blobs = blobs_client(one)
-    kept = await blobs.add_bytes(b"keep me " * 100)
-    dropped = await blobs.add_bytes(b"drop me " * 100)
-    await blobs.tag_set("keep", kept)
-    # Remove every tag protecting `dropped` (add_bytes auto-tags it).
-    for tag in await blobs.tag_list():
-        if tag.hash == dropped:
-            await blobs.tag_delete(tag.name)
+    # The prefix delete returns its count; a one-shot GC completes.
+    await blobs.tag_set("typed/other", typed)
+    assert await blobs.tag_delete_prefix("typed/") == 2
     await blobs.gc_run_once()
-    assert await blobs.blob_has(kept) is True
-    assert await blobs.blob_has(dropped) is False
 
 
 @pytest.mark.asyncio
@@ -216,25 +205,6 @@ async def test_peer_view_traffic_and_blob_transfer():
 
 
 @pytest.mark.asyncio
-async def test_download_hash_to_store_from_and_collection_split(pair):
-    a, b = pair
-    src, dst = blobs_client(a), blobs_client(b)
-    data = os.urandom(8_000)
-    h = await src.add_bytes(data)
-    report = await dst.download_hash_to_store_from(h, [a.id], BlobFormat.RAW, FetchStrategy.WHOLE)
-    assert report.served() == [a.id]
-    assert await dst.read_to_bytes(h) == data
-
-    entries = [("one.bin", os.urandom(3_000)), ("two.bin", os.urandom(4_000))]
-    coll = await src.add_collection(entries)
-    files, creport = await dst.download_collection_from(
-        coll, [a.id], FetchStrategy.SPLIT_CHILDREN
-    )
-    assert sorted(files) == sorted(entries)
-    assert creport.served() == [a.id]
-
-
-@pytest.mark.asyncio
 async def test_download_hash_from_argument_errors(one):
     blobs = blobs_client(one)
     h = await blobs.add_bytes(b"x")
@@ -295,28 +265,14 @@ async def test_authority_report_and_fingerprint(one):
     by_id = await docs.authority_report(bytes.fromhex(ns_hex))
     assert by_id.access == LocalAccess.WRITE and by_id.fingerprint == fp
 
-    # Unknown namespace: an error, never "read".
+    # Unknown namespace: an error, never "read"; open() maps a miss to None.
     with pytest.raises(Exception):
         await docs.authority_report(os.urandom(32))
-
-
-@pytest.mark.asyncio
-async def test_open_and_import_namespaces(one):
-    docs = docs_client(one)
     assert await docs.open(os.urandom(32)) is None
-
-    doc = await docs.create()
-    reopened = await docs.open(doc.doc_id())
-    assert reopened is not None and reopened.doc_id() == doc.doc_id()
-
-    # A read import of a foreign namespace reports READ.
-    foreign = os.urandom(32)
-    ro = await docs.open_or_import_read_namespace(foreign)
+    reopened = await docs.open(ns_hex)
+    assert reopened is not None and reopened.doc_id() == ns_hex
+    ro = await docs.open_or_import_read_namespace(os.urandom(32))
     assert (await ro.authority_report()).access == LocalAccess.READ
-
-    # A read import never narrows an existing write capability.
-    again = await docs.open_or_import_read_namespace(doc.doc_id())
-    assert (await again.authority_report()).access == LocalAccess.WRITE
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,13 @@
 /**
- * The streaming consumer relay (`relayHttpStream` / `relayHttpStreaming`),
- * end to end over real (loopback, relay-less) nodes: bodies streamed both
- * ways with bounded reads, every failure path (a throwing upload iterator,
- * an AbortSignal, a cancelled response handle, an aborting response, an
- * unknown service, an early close) failing loudly and never truncating, and
- * a handler proxying the relayed response through a third node.
+ * The streaming consumer relay (`relayHttpStream` / `relayHttpStreaming`)
+ * over real (loopback, relay-less) nodes, binding side: the body shapes and
+ * bounded reads, the JS-side failures (a throwing upload iterator, an
+ * AbortSignal, a cancelled response handle, a failed response read and its
+ * code) failing loudly and never truncating, the upload pump and
+ * `onUploadError`, and a handler proxying a relayed response through a third
+ * node. The relay's duplex semantics (early answers, ping-pong, resets after
+ * the head, unknown services) are tested once in
+ * aster/tests/it/expose_foreign.rs (relay_*) and ffi/tests/expose.rs.
  *
  * The handler's bookkeeping logs outcomes in `finally`/after the retry so a
  * reset landing during a retry is still recorded.
@@ -89,10 +92,6 @@ class Streamer {
         for (let i = 0; i < data.length; i += 7000) yield data.subarray(i, i + 7000);
       }
       return { headers: { 'x-len': String(data.length) }, body: back() };
-    }
-    if (request.uri.startsWith('/early')) {
-      // Answer without reading the body.
-      return { status: 413, body: 'too big' };
     }
     if (request.uri.startsWith('/duplex')) {
       // Head first, then echo each request chunk as it arrives. The outcome
@@ -376,14 +375,6 @@ describe('streaming consumer relay', () => {
         /* already over */
       }
 
-      // An unknown service rejects the call; it never hangs the upload.
-      const unknown = await within(relayHttpStream(p.conn, 'nope', { method: 'PUT', uri: '/', body: BIG })).catch(
-        (e: unknown) => e,
-      );
-      expect(unknown).toBeInstanceOf(Error);
-      expect(unknown).not.toBeInstanceOf(HttpBodyError);
-      expect((unknown as Error).message).not.toMatch(/HANG/);
-
       // A response that fails partway rejects the read, every time (code 7).
       const resp = await within(relayHttpStream(p.conn, 'app', { uri: '/abort' }));
       const failed = await (async () => {
@@ -434,74 +425,10 @@ describe('streaming consumer relay', () => {
     }
   });
 
-  it('is full duplex: early answers, ping-pong, post-head failures and closing mid-upload', async () => {
+  it('after the head: an upload failure surfaces through onUploadError, and closing the body stops the pump', async () => {
     const app = new Streamer();
     const p = await pair({ app: app.handle });
     try {
-      // An early answer arrives while an endless upload is still going; the
-      // upload then stops and its generator is closed.
-      let closed = false;
-      async function* endless() {
-        try {
-          for (;;) yield Buffer.alloc(65536, 117);
-        } finally {
-          closed = true;
-        }
-      }
-      const early = await within(relayHttpStream(p.conn, 'app', { method: 'PUT', uri: '/early', body: endless() }));
-      expect(early.status).toBe(413);
-      expect((await within(early.readBody())).toString()).toBe('too big');
-      await until('upload generator closed', () => closed || undefined);
-
-      // Low-level ping-pong: each echo is read before the next write.
-      {
-        const { upload, response } = relayHttpStreaming(p.conn, 'app', { method: 'POST', uri: '/duplex?pingpong' });
-        const resp = await within(response.wait());
-        expect(resp.status).toBe(200);
-        expect(upload.closed).toBe(false);
-        for (let i = 0; i < 20; i++) {
-          const ping = Buffer.from(`ping ${i}`);
-          await within(upload.write(ping));
-          let echo = Buffer.alloc(0);
-          while (echo.length < ping.length) {
-            const c = await within(resp.body.read());
-            expect(c).not.toBeNull();
-            echo = Buffer.concat([echo, c as Buffer]);
-          }
-          expect(echo.equals(ping)).toBe(true);
-        }
-        upload.finish();
-        expect(await within(resp.body.read())).toBeNull();
-        await until('duplex done', () => app.duplex('/duplex?pingpong').some((e) => e[0] === 'duplex done') || undefined);
-      }
-
-      // The same through relayHttpStream, with a generator driven by the
-      // echoes it gets back.
-      {
-        const replies: Array<() => void> = [];
-        let pending = 0;
-        const gotReply = () =>
-          pending > 0
-            ? (pending--, Promise.resolve())
-            : new Promise<void>((resolve) => {
-                replies.push(() => (pending--, resolve()));
-              });
-        async function* chatty() {
-          for (let i = 0; i < 5; i++) {
-            yield Buffer.from(`msg ${i}`);
-            await within(gotReply());
-          }
-        }
-        const resp = await within(relayHttpStream(p.conn, 'app', { method: 'POST', uri: '/duplex?chatty', body: chatty() }));
-        let got = '';
-        for await (const chunk of resp.body) {
-          got += chunk.toString();
-          pending++;
-          replies.shift()?.();
-        }
-        expect(got).toBe([0, 1, 2, 3, 4].map((i) => `msg ${i}`).join(''));
-      }
-
       // A body iterator failing after the head: the handler sees a failed
       // body, the response read fails `read`, and the error is surfaced
       // through onUploadError (the call had already resolved).
@@ -540,22 +467,8 @@ describe('streaming consumer relay', () => {
         expect(app.duplex(uri).some((e) => e[0] === 'duplex done')).toBe(false);
       }
 
-      // Closing the response mid-upload makes the upload's writes fail
-      // `cancelled`.
-      {
-        const { upload, response } = relayHttpStreaming(p.conn, 'app', { method: 'POST', uri: '/duplex?close' });
-        const resp = await within(response.wait());
-        await upload.write(Buffer.from('x'));
-        expect((await within(resp.body.read()))?.toString()).toBe('x');
-        resp.body.close();
-        await until('upload stopped', () => upload.closed || undefined);
-        const gone = await upload.write(Buffer.from('more')).catch((e: unknown) => e);
-        expect(gone).toBeInstanceOf(HttpBodyError);
-        expect((gone as HttpBodyError).kind).toBe('cancelled');
-      }
-
-      // The same through relayHttpStream: closing the body stops the pump
-      // and closes the source generator.
+      // Closing the body stops the upload pump and closes the source
+      // generator.
       {
         let sourceClosed = false;
         async function* steady() {

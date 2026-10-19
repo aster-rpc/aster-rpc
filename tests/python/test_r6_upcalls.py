@@ -2,15 +2,20 @@
 
 Rust emits a typed event, the ``aster.upcalls`` pump decodes it (in Rust)
 into the usual dataclasses, runs the Python coroutine as a task and answers
-by id. Covered here, each end to end through the Rust adapter:
+by id. This file tests the Python mapping only; the upcall behaviour
+(timeouts, overload, close-fails-pending, cache semantics, failure modes,
+HTTP limits and relay failure codes) is tested once in Rust:
+``aster/tests/it/upcalls.rs``, ``ffi/tests/upcalls.rs``,
+``ffi/tests/expose.rs`` and ``aster/tests/it/upcall_vectors.rs``.
+Covered here, each end to end through the Rust adapter:
 
 - the UCv1 payload codec against ``conformance/vectors/upcalls.json`` (via
   the same PyO3 decode/encode the pump uses);
-- the runtime: policies, timeouts, cancellation, overload, shutdown;
+- the runtime: policies, error mapping, cancellation of the Python task;
 - a Python ``LeaseSerializer`` (acquire / renew / release in Rust, served
   as a designated grantor over RPC), a Python lease authorizer, a Python
   ``FencedResource``;
-- the topology ``admitted`` filter (cache semantics, live three-node view);
+- the topology ``admitted`` filter (sync, async and batch predicates);
 - expose authorize, Python HTTP handlers (inline and streamed bodies,
   failures as 5xx, cancellation) and edge route policies (R9);
 - Gate 0 decisions.
@@ -24,7 +29,6 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
-import os
 import time
 from pathlib import Path
 
@@ -61,7 +65,6 @@ from aster import (
     Node,
     NodeId,
     TopologySnapshot,
-    TopologyTiming,
     TopologyView,
     TransitionOutcome,
     UpcallError,
@@ -423,33 +426,6 @@ class RowSerializer(LeaseSerializer):
         return self._snap(resource, time.monotonic())
 
 
-async def test_python_serializer_acquire_renew_release_in_rust():
-    ser = RowSerializer()
-    outcome = await ser.acquire("tree/42", A, FAST)
-    assert outcome.granted
-    lease = outcome.lease
-    assert lease.fence() == Fence("tree/42", 1, A)
-
-    denied = await ser.acquire("tree/42", B, FAST)
-    assert not denied.granted and denied.reason == "held_by_other"
-    assert denied.snapshot.holder == A and denied.snapshot.held
-
-    # Renewals run in Rust, each one an upcall into `transition`.
-    await asyncio.sleep(1.0)
-    assert lease.status == "held"
-    assert ser.ops.count("renew") >= 3
-
-    await lease.release()
-    assert ser.ops[-1] == "release"
-    snap = await ser.rust_snapshot("tree/42")
-    assert (snap.epoch, snap.held, snap.holder) == (2, False, None)
-    nxt = await ser.acquire("tree/42", B, FAST)
-    assert nxt.granted and nxt.lease.epoch == 3
-    revoked = await ser.revoke("tree/42", A)
-    assert revoked.kind == "revoked"
-    assert await _until("fenced holder", lambda: nxt.lease.status in ("fenced", "lost"))
-
-
 async def test_python_serializer_raw_transition_round_trips_every_outcome():
     ser = RowSerializer()
     granted = await ser.rust_transition("r", LeaseOp.acquire(A, 5.0))
@@ -514,60 +490,6 @@ async def test_missing_handler_method_is_unimplemented(rt):
     assert e.value.kind == "unimplemented"
 
 
-async def test_dropping_the_rust_waiter_cancels_the_python_task(rt):
-    ser = FlakySerializer(rt, "slow")
-    call = asyncio.ensure_future(ser.rust_transition("r", LeaseOp.acquire(A, 1.0)))
-    await _until("upcall pending", lambda: rt.pending == 1)
-    call.cancel()  # drops the Rust future -> Cancel{abandoned}
-    await asyncio.wait_for(ser.cancelled.wait(), WAIT_BUDGET)
-    await _until("nothing pending", lambda: rt.pending == 0)
-
-
-async def test_overloaded_queue_without_pump():
-    """A queue of one, never drained: the second upcall is refused at once."""
-    rt = UpcallRuntime(capacity=1, default_policy=UpcallPolicy(timeout=1.0))
-    native = rt._native
-    channel = native.open_channel()
-    # Bind an object to that channel by hand (no pump started).
-    from aster.lease import _foreign_lease_transition
-
-    class Ser:
-        upcall_runtime = None
-
-        async def transition(self, r, op):  # never runs
-            raise AssertionError
-
-    obj = Ser()
-    rt._handlers[channel] = {}
-    rt._bound[(id(obj), "lease_serializer")] = (obj, channel)
-    rt.start = lambda: None  # keep the pump off
-    obj.upcall_runtime = rt
-    first = asyncio.ensure_future(_foreign_lease_transition(obj, "r", LeaseOp.renew(A, 1)))
-    await asyncio.sleep(0.1)
-    with pytest.raises(UpcallError) as e:
-        await _foreign_lease_transition(obj, "r", LeaseOp.renew(A, 1))
-    assert e.value.kind == "overloaded"
-    with pytest.raises(UpcallError) as e:
-        await first
-    assert e.value.kind == "timeout"
-    native.close()
-
-
-async def test_closing_the_runtime_fails_pending_and_cancels_handlers():
-    rt = UpcallRuntime(default_policy=UpcallPolicy(timeout=10.0))
-    ser = FlakySerializer(rt, "slow")
-    call = asyncio.ensure_future(ser.rust_transition("r", LeaseOp.acquire(A, 1.0)))
-    await _until("upcall pending", lambda: rt.pending == 1)
-    await rt.aclose()
-    with pytest.raises(UpcallError) as e:
-        await call
-    assert e.value.kind == "closed"
-    assert ser.cancelled.is_set()
-    with pytest.raises(UpcallError) as e:
-        await FlakySerializer(rt, "slow").rust_snapshot("r")
-    assert e.value.kind == "closed"
-
-
 async def test_unbind_closes_that_objects_channel(rt):
     ser = RowSerializer(rt)
     assert (await ser.rust_snapshot("r")).epoch == 0
@@ -599,10 +521,7 @@ async def test_lease_authorizer_gates_every_transition():
     refused = await store.acquire("r2", B, FAST)
     assert not refused.granted and refused.reason == "unauthorized"
     assert ("acquire", B) in auth.seen
-    # Renewals of a lease acquired under the authorizer are asked too.
-    await asyncio.sleep(0.5)
-    assert ok.lease.status == "held"
-    assert ("renew", A) in auth.seen
+    # Renewals asking the authorizer: Rust memory_serializer_with_foreign_authorizer.
     await ok.lease.release()
 
     # Plain callables (sync or async) work.
@@ -617,48 +536,6 @@ async def test_lease_authorizer_gates_every_transition():
     assert (await store.revoke("r3", A)).kind == "denied"
     store.set_authorizer(None)
     assert (await store.revoke("r3", A)).kind == "revoked"
-
-
-async def test_lease_authorizer_failure_modes(rt):
-    store = MemorySerializer()
-
-    class Broken(LeaseAuthorizer):
-        upcall_runtime = rt
-
-        async def authorize(self, op):
-            raise RuntimeError("policy service down")
-
-    store.set_authorizer(Broken())
-    # Default fail-closed: no answer is a refusal.
-    out = await store.transition("r", LeaseOp.acquire(A, 1.0))
-    assert out.kind == "denied" and out.deny_reason == "unauthorized"
-
-    rt.set_policy("lease_authorize", UpcallPolicy(timeout=0.2, failure_mode="fail_open"))
-    store.set_authorizer(Broken())
-    assert (await store.transition("r", LeaseOp.acquire(A, 1.0))).kind == "granted"
-
-    class Slow(LeaseAuthorizer):
-        upcall_runtime = rt
-        cancelled = False
-
-        async def authorize(self, op):
-            try:
-                await asyncio.sleep(5)
-            except asyncio.CancelledError:
-                Slow.cancelled = True
-                raise
-
-    rt.set_policy("lease_authorize", UpcallPolicy(timeout=0.2, failure_mode="fail_closed"))
-    store.set_authorizer(Slow())
-    t0 = time.monotonic()
-    out = await store.transition("r2", LeaseOp.acquire(A, 1.0))
-    assert out.deny_reason == "unauthorized"
-    assert time.monotonic() - t0 < 2
-    await _until("authorizer cancelled", lambda: Slow.cancelled)
-
-    # A non-bool answer is no answer.
-    store.set_authorizer(lambda op: "yes")
-    assert (await store.transition("r3", LeaseOp.acquire(A, 1.0))).deny_reason == "unauthorized"
 
 
 # -- grantor over a Python serializer ----------------------------------------------
@@ -680,8 +557,7 @@ async def test_python_serializer_serves_a_designated_grantor():
             assert outcome.lease.holder == a.id
             # The grant is the Python row, bound to the authenticated caller.
             assert ser.rows["db/primary"].holder == str(a.id)
-            await asyncio.sleep(0.5)
-            assert "renew" in ser.ops
+            # Renewal over RPC: Rust rpc_lease.rs lease_handle_renews_over_rpc.
             await outcome.lease.release()
             assert ser.rows["db/primary"].held is False
         finally:
@@ -738,52 +614,11 @@ async def test_fenced_resource_applies_rejects_and_reports_unknown(rt):
     with pytest.raises(FenceOutcomeUnknownError) as e:
         await Crashy().mutate_via_rust(Fence("r", 1, A), A, b"x")
     assert e.value.kind == "foreign" and isinstance(e.value, UpcallError)
-
-    class Hung(FencedResource):
-        upcall_runtime = rt
-
-        async def mutate(self, fence, writer, op):
-            await asyncio.sleep(5)
-
-    with pytest.raises(FenceOutcomeUnknownError) as e:
-        await Hung().mutate_via_rust(Fence("r", 1, A), A, b"x")
-    assert e.value.kind == "timeout"
+    # A hung mutate timing out as unknown: Rust
+    # fenced_mutation_without_an_answer_times_out_as_unknown.
 
 
 # -- topology admitted filter --------------------------------------------------------
-
-
-async def test_admitted_filter_cache_semantics(rt):
-    calls = []
-
-    def pred(node_id):
-        calls.append(node_id)
-        return str(node_id) != B
-
-    flt = AdmittedFilter(pred, ttl=0.5, runtime=rt)
-    # A miss answers the failure mode (fail-closed) and queues a batch.
-    assert flt.is_admitted(A) is False
-    await _until("A resolved", lambda: flt.is_admitted(A))
-    assert flt.is_admitted(B) is False
-    s = flt.stats()
-    assert s.misses >= 2 and s.hits >= 1 and s.upcalls >= 1
-    assert all(isinstance(c, NodeId) for c in calls)
-
-    # Stale-while-revalidate after ttl.
-    await asyncio.sleep(0.6)
-    n = len(calls)
-    assert flt.is_admitted(A) is True
-    assert flt.stats().stale >= 1
-    await _until("refreshed", lambda: len(calls) > n)
-
-    # Pushed answers win until ttl; invalidate forces a re-resolve.
-    flt.set(A, False)
-    assert flt.is_admitted(A) is False
-    flt.invalidate(A)
-    assert flt.is_admitted(A) is False  # miss -> fallback
-    await _until("A re-resolved", lambda: flt.is_admitted(A))
-    flt.clear()
-    assert flt.is_admitted(A) is False
 
 
 async def test_admitted_filter_async_predicate_batch_and_prefetch(rt):
@@ -809,92 +644,6 @@ async def test_admitted_filter_async_predicate_batch_and_prefetch(rt):
     await flt2.prefetch([A, B, "cc" * 32])
     assert b.batches == [(A, B, "cc" * 32)]
     assert flt2.is_admitted("cc" * 32)
-
-
-async def test_admitted_filter_failures_fall_back_and_are_cached(rt):
-    calls = []
-
-    def broken(node_id):
-        calls.append(node_id)
-        raise RuntimeError("directory down")
-
-    flt = AdmittedFilter(broken, failure_retry=0.5, runtime=rt)
-    with pytest.raises(UpcallError) as e:
-        await flt.prefetch([A])
-    assert e.value.kind == "foreign"
-    assert flt.is_admitted(A) is False  # cached fallback, no hammering
-    n = len(calls)
-    await asyncio.sleep(0.2)
-    assert flt.is_admitted(A) is False and len(calls) == n
-
-    rt.set_policy("topology_admitted", UpcallPolicy(timeout=0.3, failure_mode="fail_open"))
-    open_flt = AdmittedFilter(broken, runtime=rt)
-    assert open_flt.is_admitted(B) is True  # miss -> fail-open answer
-    with pytest.raises(UpcallError):
-        await open_flt.prefetch([B])
-    assert open_flt.is_admitted(B) is True
-
-    # A wrong-length answer is a decode failure.
-    class Short:
-        def admitted_batch(self, ids):
-            return [True]
-
-    with pytest.raises(UpcallError) as e:
-        await AdmittedFilter(Short(), runtime=rt).prefetch([A, B])
-    assert e.value.kind == "decode"
-
-
-@pytest_asyncio.fixture
-async def monitored_trio():
-    nodes = [
-        await Node.start(_offline(enable_monitoring=True), alpns=[b"r6/probe"]) for _ in range(3)
-    ]
-    for n in nodes:
-        await _ready(n)
-    for x in nodes:
-        for y in nodes:
-            if x is not y:
-                x.add_node_addr(y)
-    yield nodes
-    for n in nodes:
-        await n.shutdown()
-
-
-@pytest.mark.network
-@pytest.mark.timeout(90)
-async def test_topology_admitted_filter_on_a_live_shared_view(monitored_trio):
-    nodes = monitored_trio
-    ids = [n.id for n in nodes]
-    banned = {str(ids[2])}
-    flt = AdmittedFilter(lambda n: str(n) not in banned, ttl=60)
-    await flt.prefetch(ids)
-    secret = os.urandom(32)
-    timing = TopologyTiming(min_hold=0, liveness_ttl=60)
-    for i, n in enumerate(nodes):
-        await n.topology().enable_shared(
-            secret,
-            bootstrap=[x for x in ids if x != n.id],
-            position_refresh=0.5,
-            timing=timing,
-            admitted=flt if i == 0 else None,
-        )
-
-    async def members(node, k):
-        c = await node.topology().my_cluster()
-        return c if c is not None and len(c.members) == k else None
-
-    # The unfiltered node sees all three; the filtered one never counts the
-    # rejected producer.
-    await _until("unfiltered view of three", lambda: members(nodes[1], 3), timeout=40)
-    pair = await _until("filtered view of two", lambda: members(nodes[0], 2), timeout=40)
-    assert ids[2] not in pair.members
-    snap = await nodes[0].topology().snapshot()
-    assert snap.cluster_of(ids[2]) is None
-
-    # Pushing the change takes effect at the next view.
-    flt.set(ids[2], True)
-    await _until("filtered view of three", lambda: members(nodes[0], 3), timeout=40)
-    assert flt.stats().hits > 0
 
 
 async def test_topology_snapshot_from_view():
@@ -981,14 +730,6 @@ async def test_expose_authorize_by_upcall():
         team = Team()
         expose = host.expose()
         expose.expose_socket("api", f"127.0.0.1:{port}", authorize=team)
-
-        class Down:
-            upcall_runtime = rt
-
-            async def authorize(self, service_id, who, metadata):
-                raise RuntimeError("authz down")
-
-        expose.expose_socket("down", f"127.0.0.1:{port}", authorize=Down())
         expose.expose_socket("open", f"127.0.0.1:{port}")
         serving = asyncio.ensure_future(expose.serve([EXPOSE_ALPN]))
 
@@ -997,16 +738,9 @@ async def test_expose_authorize_by_upcall():
         assert resp.startswith(b"HTTP/1.1 200") and resp.endswith(b"hello from python")
         assert team.seen == [("api", peer.id, b"token")]
         assert (await _get(conn, "open")).startswith(b"HTTP/1.1 200")
-
-        # A refusal (wrong metadata, new connection) and fail-closed on error.
-        conn2 = await asyncio.wait_for(net_client(peer).connect(host.node_id(), EXPOSE_ALPN), 10)
-        assert await _get(conn2, "api", b"wrong") == b""
-        assert await _get(conn2, "down") == b""
-
-        # Fail-open for that kind lets the failing authorizer through.
-        rt.set_policy("expose_authorize", UpcallPolicy(timeout=0.5, failure_mode="fail_open"))
-        conn3 = await asyncio.wait_for(net_client(peer).connect(host.node_id(), EXPOSE_ALPN), 10)
-        assert (await _get(conn3, "down")).startswith(b"HTTP/1.1 200")
+        # Refusals and the failure modes: Rust expose_authorize_upcalls_per_service,
+        # socket_target_with_and_without_a_foreign_authorizer and
+        # authorize_without_an_answer_follows_the_failure_mode (ffi/tests/expose.rs).
         serving.cancel()
         with pytest.raises(ValueError):
             expose.expose_socket("bad", "not-an-addr")
@@ -1027,8 +761,6 @@ class App(HttpHandler):
     def __init__(self, rt):
         self.upcall_runtime = rt
         self.seen = []
-        self.cancelled = []
-        self.started = asyncio.Event()
 
     async def handle(self, request):
         self.seen.append(request)
@@ -1065,13 +797,6 @@ class App(HttpHandler):
                 raise RuntimeError("mid-body failure")
 
             return HttpResponse(200, (), failing())
-        if request.uri == "/slow":
-            self.started.set()
-            try:
-                await asyncio.sleep(30)
-            except asyncio.CancelledError:
-                self.cancelled.append(request.uri)
-                raise
         return HttpResponse(404, (), b"")
 
 
@@ -1147,70 +872,11 @@ async def test_expose_http_handler_by_upcall():
             await _relay(conn, "GET", "/midway")
         assert not isinstance(failed.value, (AssertionError, asyncio.TimeoutError))
 
-        # No answer before the kind's timeout: 504, and the handler task is
-        # cancelled.
-        resp = await _relay(conn, "GET", "/slow")
-        assert resp.status == 504
-        await _until("slow handler cancelled", lambda: app.cancelled == ["/slow"], 10)
-
-        # A declared body over max_request_body: 413 without an upcall.
-        expose.expose_http("capped", app, max_request_body=1000)
-        n = len(app.seen)
-        resp = await asyncio.wait_for(
-            relay_http(
-                conn, "capped", "POST", "/echo", headers={"content-length": "5000"}, body=b"x" * 5000
-            ),
-            15,
-        )
-        assert resp.status == 413 and len(app.seen) == n
-
-        # The consumer giving up before the head cancels the handler task.
-        app.started.clear()
-        pending = asyncio.ensure_future(relay_http(conn, "app", "GET", "/slow"))
-        await asyncio.wait_for(app.started.wait(), 10)
-        pending.cancel()
-        await _until("abandoned handler cancelled", lambda: app.cancelled == ["/slow"] * 2, 10)
-
-        # The authorizer still gates the service (new connection, other peer).
-        stranger = await Node.start(_offline())
-        try:
-            await _ready(stranger)
-            stranger.add_node_addr(host)
-            c2 = await asyncio.wait_for(
-                net_client(stranger).connect(host.node_id(), HTTP_ALPN), 10
-            )
-            with pytest.raises(Exception):
-                await _relay(c2, "GET", "/hello")
-        finally:
-            await stranger.shutdown()
-        serving.cancel()
-        with pytest.raises(ValueError):
-            expose.expose_http("x", None)
-    finally:
-        await rt.aclose()
-        for n in (host, peer):
-            await n.shutdown()
-
-
-@pytest.mark.network
-@pytest.mark.timeout(60)
-async def test_expose_http_unimplemented_handler_is_501():
-    host = await Node.start(_offline(), alpns=[HTTP_ALPN])
-    peer = await Node.start(_offline())
-    rt = UpcallRuntime()
-    try:
-        for n in (host, peer):
-            await _ready(n)
-        peer.add_node_addr(host)
-
-        class NoHandle:  # neither callable nor a handle() method
-            upcall_runtime = rt
-
-        expose = host.expose()
-        expose.expose_http("app", NoHandle())
-        serving = asyncio.ensure_future(expose.serve([HTTP_ALPN]))
-        conn = await asyncio.wait_for(net_client(peer).connect(host.node_id(), HTTP_ALPN), 10)
-        assert (await _relay(conn, "GET", "/")).status == 501
+        # The 504 timeout, the 413 body cap, consumer-cancel and the
+        # authorizer refusing a stranger are Rust behaviour
+        # (ffi/tests/expose.rs: handler_failures_become_5xx_statuses,
+        # request_body_limits, consumer_cancel_before_the_head_cancels_the_upcall,
+        # authorize_deny_refuses_the_request_before_any_http_upcall).
 
         # A plain async function is a handler too.
         async def fn(request):
@@ -1220,6 +886,8 @@ async def test_expose_http_unimplemented_handler_is_501():
         resp = await asyncio.wait_for(relay_http(conn, "fn", "GET", "/x"), 15)
         assert (resp.status, resp.body) == (202, b"/x")
         serving.cancel()
+        with pytest.raises(ValueError):
+            expose.expose_http("x", None)
     finally:
         await rt.aclose()
         for n in (host, peer):
@@ -1264,9 +932,6 @@ class Streamer(HttpHandler):
                     yield data[i : i + 7000]
 
             return HttpResponse(200, [("x-len", str(len(data)))], back())
-        if request.uri == "/early":
-            # Answer without reading the body.
-            return HttpResponse(413, (), b"too big")
         if request.uri == "/duplex":
             # Head first, then echo each request chunk as it arrives.
             log = self.log
@@ -1284,25 +949,6 @@ class Streamer(HttpHandler):
                     log.append(outcome)
 
             return HttpResponse(200, (), echo())
-        if request.uri == "/abort":
-
-            async def failing():
-                yield b"x" * 600
-                await asyncio.sleep(0.05)
-                raise RuntimeError("origin failed mid-body")
-
-            return HttpResponse(200, (), failing())
-        if request.uri == "/forever":
-            log = self.log
-
-            async def endless():
-                try:
-                    while True:
-                        yield b"y" * 16384
-                finally:
-                    log.append(("forever closed",))
-
-            return HttpResponse(200, (), endless())
         return HttpResponse(404, (), b"")
 
 
@@ -1429,41 +1075,11 @@ async def test_relay_http_stream_failures_never_truncate():
             await call
         await _until("cancelled call failed the body", lambda: len(body_failures()) == 3)
 
-        # Low level: cancelling only the response awaitable resets the
-        # request too, even with the upload handle still alive.
-        app.started.clear()
-        upload_h, pending = relay_http_streaming(conn, "app", "PUT", "/echo")
-        await upload_h.write(b"z" * 50_000)
-        await asyncio.wait_for(app.started.wait(), 10)
-        pending.cancel()
-        await _until("cancelled awaitable failed the body", lambda: len(body_failures()) == 4)
-        await _until("upload sees the reset", lambda: upload_h.closed)
-        with pytest.raises(HttpBodyError) as gone:
-            await upload_h.write(b"more")
-        assert gone.value.kind in ("cancelled", "finished")
-
-        # An unknown service fails the call, never hangs the upload.
-        with pytest.raises(Exception) as unknown:
-            await asyncio.wait_for(relay_http_stream(conn, "nope", "PUT", "/", body=BIG), 15)
-        assert not isinstance(unknown.value, (asyncio.TimeoutError, HttpBodyError))
-
-        # A response that fails partway raises from the read, every time.
-        resp = await asyncio.wait_for(relay_http_stream(conn, "app", "GET", "/abort"), 15)
-        with pytest.raises(HttpBodyError) as failed:
-            async for _ in resp.body:
-                pass
-        assert failed.value.kind == "read" and failed.value.code == 7
-        with pytest.raises(HttpBodyError):
-            await resp.body.read()
-
-        # Closing the body early stops the handler's stream.
-        resp = await asyncio.wait_for(relay_http_stream(conn, "app", "GET", "/forever"), 15)
-        async with resp.body as body:
-            assert await body.read(100)
-        with pytest.raises(HttpBodyError) as closed:
-            await resp.body.read()
-        assert closed.value.kind == "cancelled"
-        await _until("handler stream closed", lambda: ("forever closed",) in app.log)
+        # The rest is Rust behaviour (ffi/tests/expose.rs):
+        # relay_stream_failures_have_stable_codes (unknown service, reset
+        # before the head), relay_stream_keeps_the_full_duplex_contract (a
+        # response aborted mid-body fails the read; freeing the response
+        # resets the upload) and consumer_cancel_mid_stream_makes_writes_cancelled.
         # No handler ever took a failed upload for a complete (short) one.
         assert not [e for e in app.log if e[0] == "body"]
     finally:
@@ -1522,41 +1138,11 @@ async def test_relay_http_stream_is_full_duplex():
     app = Streamer(rt)
     host, peer, serving, conn = await _stream_pair(rt, ("app", app))
     try:
-        # An early answer arrives while an endless upload is still going;
-        # the upload then stops (the handler is gone) and its iterator is
-        # closed.
-        closed = asyncio.Event()
-
-        async def endless():
-            try:
-                while True:
-                    yield b"u" * 65536
-            finally:
-                closed.set()
-
-        resp = await asyncio.wait_for(
-            relay_http_stream(conn, "app", "PUT", "/early", body=endless()), 15
-        )
-        assert resp.status == 413 and await resp.read_body() == b"too big"
-        await asyncio.wait_for(closed.wait(), 15)
-
-        # Ping-pong: each echo comes back before the next chunk is written.
-        upload_h, pending = relay_http_streaming(conn, "app", "POST", "/duplex")
-        resp = await asyncio.wait_for(pending, 15)
-        assert resp.status == 200 and not upload_h.closed
-        for i in range(20):
-            ping = f"ping {i}".encode()
-            await upload_h.write(ping)
-            echo = b""
-            while len(echo) < len(ping):
-                echo += await asyncio.wait_for(resp.body.read(), 15)
-            assert echo == ping
-        upload_h.finish()
-        assert await asyncio.wait_for(resp.body.read(), 15) is None
-        await _until("duplex done", lambda: ("duplex done",) in app.log)
-
-        # The same through relay_http_stream with a generator driven by the
-        # echoes it gets back.
+        # The early 413 during an endless upload, chunk-by-chunk ping-pong and
+        # closing the response mid-upload: Rust
+        # relay_stream_keeps_the_full_duplex_contract (ffi/tests/expose.rs).
+        # Here: the Python mapping of a body generator driven by the echoes it
+        # gets back, and of one that fails after the head.
         replies: asyncio.Queue = asyncio.Queue()
 
         async def chatty():
@@ -1616,17 +1202,6 @@ async def test_relay_http_stream_is_full_duplex():
             expose_log.removeHandler(capture)
         last = len(app.log) - 1 - app.log[::-1].index(("start", "/duplex"))
         assert ("duplex done",) not in app.log[last:]
-
-        # Closing the response mid-upload stops the upload.
-        upload_h, pending = relay_http_streaming(conn, "app", "POST", "/duplex")
-        resp = await asyncio.wait_for(pending, 15)
-        await upload_h.write(b"x")
-        assert await asyncio.wait_for(resp.body.read(), 15) == b"x"
-        await resp.body.aclose()
-        await _until("upload stopped", lambda: upload_h.closed)
-        with pytest.raises(HttpBodyError) as gone:
-            await upload_h.write(b"more")
-        assert gone.value.kind == "cancelled"
     finally:
         serving.cancel()
         await rt.aclose()
@@ -1694,8 +1269,6 @@ async def test_edge_route_policy_by_upcall():
                 self.seen.append((peer, metadata, specs))
                 if metadata == b"all":
                     return True
-                if metadata == b"boom":
-                    raise RuntimeError("policy down")
                 return [s for s in specs if s.host.endswith(".example")]
 
         policy = Domains()
@@ -1719,17 +1292,12 @@ async def test_edge_route_policy_by_upcall():
         assert router.lookup("evil.test", 443) is None
         await reg.close()
         assert reg.closed
-        await _until("route evicted", lambda: router.lookup("a.example", 443) is None, 10)
 
         reg2 = await asyncio.wait_for(request_route(conn, specs[1:], b"all"), 10)
         assert reg2.granted == tuple(specs[1:])
-
-        # No usable answer: fail-closed grants nothing; fail-open everything.
-        reg3 = await asyncio.wait_for(request_route(conn, specs[:1], b"boom"), 10)
-        assert reg3.granted == ()
-        rt.set_policy("expose_route_policy", UpcallPolicy(timeout=0.5, failure_mode="fail_open"))
-        reg4 = await asyncio.wait_for(request_route(conn, specs[:1], b"boom"), 10)
-        assert reg4.granted == (specs[0],)
+        # Eviction on close and the failure modes: Rust
+        # cancelled_successful_route_registration_frees_handle_and_evicts_route
+        # and route_policy_grant_and_deny (ffi/tests/expose.rs).
         serving.cancel()
     finally:
         await rt.aclose()
@@ -1777,27 +1345,6 @@ async def test_gate0_decided_by_python_handler_over_upcalls():
         assert [s[0] for s in seen] == [ep.endpoint_id()] * 2
         assert all(s[1] == APP_ALPN and isinstance(s[2], bool) for s in seen)
     finally:
-        await ep.close()
-        await node.shutdown()
-
-
-@pytest.mark.network
-@pytest.mark.timeout(60)
-async def test_gate0_upcall_failure_mode_rejects_with_hook_unavailable():
-    node = await Node.start(AsterConfig(enable_hooks=True), alpns=[APP_ALPN])
-    ep = await _client()
-    rt = UpcallRuntime(policies={"admission_handshake": UpcallPolicy(timeout=0.3)})
-
-    class NoDecision(AdmissionHandler):
-        upcall_runtime = rt  # handshake not overridden -> unimplemented
-
-    try:
-        node.serve_admission(NoDecision())
-        conn = await ep.connect_node_addr(node.node_addr_info(), APP_ALPN)
-        closed = await asyncio.wait_for(conn.closed(), timeout=10)
-        assert closed["code"] == 403 and closed["reason"] == b"hook unavailable"
-    finally:
-        await rt.aclose()
         await ep.close()
         await node.shutdown()
 

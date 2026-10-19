@@ -4,7 +4,10 @@ drain, over real nodes through ``AsterServer`` / ``AsterClient``.
 
 Mirrors ``aster::rpc::CallContext``, ``CallOptions`` and
 ``AsterServer::drain`` (``docs/_internal/bindings/mirror-2026-10.md``, items
-H, C and D).
+H, C and D). Binding wiring only; drain, deadline and context behaviour is
+tested once in ``aster/tests/it/rpc_drain.rs``, ``rpc_deadline.rs`` and
+``rpc_call_context.rs``. The Python client's own deadline enforcement stays
+here (deadline-budget policy is per binding).
 """
 
 from __future__ import annotations
@@ -138,20 +141,6 @@ async def _wait(event: asyncio.Event, what: str, timeout: float = 10.0) -> None:
 
 
 @pytest.mark.timeout(30)
-async def test_principal_peer_provenance_and_effective_deadline(pair):
-    server, client = pair
-    svc = await client.client(MirrorCtx)
-    got = await svc.who(Req(text="a"))
-    me = client._node.node_id()
-    # No authenticator: the principal is the transport peer.
-    assert got.peer == me and got.principal == me
-    assert got.provenance == "iroh_authenticated"
-    # The effective deadline is Rust's: the server handler timeout (300 s)
-    # applies even when the caller sets none.
-    assert 0 < got.remaining_ms <= 300_000
-
-
-@pytest.mark.timeout(30)
 async def test_cancelled_resolves_on_peer_cancel(pair):
     _, client = pair
     svc = await client.client(MirrorCtx)
@@ -192,6 +181,12 @@ async def test_options_on_all_four_patterns(pair):
 
     got = await svc.who(Req(text="u"))
     assert got.meta == "tenant=t1"
+    # The native context reaches the handler: no authenticator, so the
+    # principal is the transport peer (aster/tests/it/rpc_call_context.rs
+    # session_scoped_handlers_see_the_session_and_no_authenticator_means_principal_is_peer).
+    me = client._node.node_id()
+    assert got.peer == me and got.principal == me
+    assert got.provenance == "iroh_authenticated"
     # The header carries whole seconds (rounded up); the client enforces the
     # exact sub-second deadline (see test_options_deadline_*).
     assert 0 < got.remaining_ms <= 1000
@@ -315,35 +310,6 @@ async def _assert_closed_after_drain(server, client, svc) -> None:
     with pytest.raises(Exception) as e:
         await asyncio.wait_for(fresh_call(), 30)
     assert not (isinstance(e.value, RpcError) and e.value.is_draining), e.value
-
-
-@pytest.mark.timeout(60)
-async def test_concurrent_drains_share_one_report_and_close_once(pair):
-    server, client = pair
-    first = asyncio.ensure_future(server.drain(10.0))
-    second = asyncio.ensure_future(server.drain(10.0))
-    a, b = await asyncio.wait_for(asyncio.gather(first, second), 30)
-    assert a.calls_completed == b.calls_completed
-    assert a.calls_refused == b.calls_refused
-
-
-@pytest.mark.timeout(60)
-async def test_drain_deadline_cancels_stuck_handlers(pair):
-    server, client = pair
-    svc = await client.client(MirrorCtx)
-    held = asyncio.ensure_future(svc.hold(Req()))
-    await _wait(GATE.entered, "handler entry")
-    report = await asyncio.wait_for(server.drain(0.2), 20)
-    assert report.deadline_reached is True
-    assert report.calls_cancelled == 1
-    assert report.connections_closed >= 1
-    await _wait(GATE.saw_cancel, "handler cancel at the drain deadline")
-    with pytest.raises((RpcError, Exception)) as e:
-        await asyncio.wait_for(held, 10)
-    if isinstance(e.value, RpcError):
-        assert e.value.is_draining
-    GATE.release.set()
-    await _assert_closed_after_drain(server, client, svc)
 
 
 def test_rpc_error_is_draining():

@@ -3,12 +3,14 @@
 ``[enrollment]`` settings (design: "AsterServer integration", section 15 of
 ``docs/_internal/working_ideas/aster-enrollment.md``).
 
-Port of ``aster/tests/enrollment_aster_server.rs``. The root is played by the
-native module's test-only helpers (``_EnrollmentTestRoot``,
-``_enrollment_test_credential``, ``_enrollment_test_delegation``), standing in
-for ``aster enroll node``, ``aster enroll delegate`` and ``aster enroll revoke
---peer``; everything the application writes is configuration and
-``requires=``.
+Binding wiring only: the behaviour (restriction policy, issuer renewal,
+the fail-closed matrix, open servers) is tested once in
+``aster/tests/enrollment_aster_server.rs``. These tests check that the
+configuration reaches native, that roles reach ``requires=``, and that
+refusals map to the Python exceptions. The root is played by the native
+module's test-only helpers (``_EnrollmentTestRoot``,
+``_enrollment_test_credential``), standing in for ``aster enroll node`` and
+``aster enroll revoke --peer``.
 """
 
 from __future__ import annotations
@@ -36,7 +38,6 @@ from aster import (
 from aster._aster import (
     _EnrollmentTestRoot,
     _enrollment_test_credential,
-    _enrollment_test_delegation,
 )
 from aster.runtime import AdmissionDeniedError
 from aster.status import PermissionDeniedError
@@ -163,6 +164,11 @@ async def call(ops, method: str) -> str:
     return reply.role
 
 
+async def many_items():
+    for _ in range(100):
+        yield Empty("x")
+
+
 @pytest.fixture
 async def root():
     root = await _EnrollmentTestRoot.start(seed(1), FLEET)
@@ -203,6 +209,24 @@ async def test_credential_roles_gate_requires_and_root_revocation_closes_the_con
             await call(ing, "status")
         with pytest.raises(PermissionDeniedError):
             await call(ing, "logs")
+        # A Gate-3 refusal of a client stream sending many items is
+        # PERMISSION_DENIED (the server's status), not the client's failed send.
+        for _ in range(5):
+            with pytest.raises(PermissionDeniedError):
+                await asyncio.wait_for(ing.upload(many_items()), 10)
+
+        # Runtime restriction reaches the native attribute table: it narrows
+        # the credential's roles from the next call, clearing restores them,
+        # and a peer without a session maps to LookupError. The policy is
+        # aster/tests/enrollment_aster_server.rs
+        # runtime_restriction_narrows_credential_roles.
+        srv.restrict_peer_roles(node_id(5), ["ops.status"])
+        with pytest.raises(PermissionDeniedError):
+            await call(op, "logs")
+        assert srv.clear_peer_restriction(node_id(5))
+        assert await call(op, "logs") == "ops.logs,ops.status"
+        with pytest.raises(LookupError):
+            srv.restrict_peer_roles(node_id(9), ["ops.status"])
 
         # No enrollment at all: Gate 0 refuses the connection itself.
         stranger = AsterClient(config=base(8), address=srv.address)
@@ -232,101 +256,6 @@ async def test_credential_roles_gate_requires_and_root_revocation_closes_the_con
         await srv.close()
 
 
-async def test_runtime_restriction_refuses_the_next_call(root, tmp_path):
-    """The credential sets the maximum; runtime settings can only restrict.
-    Restricting a credential's ``ops.status,ops.logs`` to ``ops.status``
-    refuses ``logs`` on the next call; a restriction never grants a role the
-    credential lacks; clearing restores the credential roles; a peer without
-    a session cannot be restricted."""
-    srv = await start_server(server_config(root, tmp_path))
-    client = None
-    try:
-        client, ops = await connect(srv, client_config(root, 5, credential(5, "ops.status,ops.logs")))
-        peer = node_id(5)
-        assert await call(ops, "logs") == "ops.logs,ops.status"
-
-        srv.restrict_peer_roles(peer, ["ops.status"])
-        assert await call(ops, "status") == "ops.status"
-        with pytest.raises(PermissionDeniedError):
-            await call(ops, "logs")
-
-        srv.restrict_peer_roles(peer, ["ops.admin"])
-        with pytest.raises(PermissionDeniedError):
-            await call(ops, "logs")
-
-        assert srv.clear_peer_restriction(peer)
-        assert await call(ops, "logs") == "ops.logs,ops.status"
-        with pytest.raises(LookupError):
-            srv.restrict_peer_roles(node_id(9), ["ops.status"])
-    finally:
-        if client is not None:
-            await client.close()
-        await srv.close()
-
-
-async def test_client_stream_refusal_is_permission_denied(root, tmp_path):
-    """A Gate-3 refusal of a client-stream call sending many items is
-    PERMISSION_DENIED, not UNAVAILABLE: the server stops the request side
-    before the client has sent everything, and the client reports the
-    server's status rather than its own failed send."""
-
-    async def items():
-        for _ in range(100):
-            yield Empty("x")
-
-    srv = await start_server(server_config(root, tmp_path))
-    clients: list[AsterClient] = []
-    try:
-        ingest, ing = await connect(srv, client_config(root, 6, credential(6, "ops.ingest")))
-        clients.append(ingest)
-        for _ in range(5):
-            with pytest.raises(PermissionDeniedError):
-                await asyncio.wait_for(ing.upload(items()), 10)
-        admin, adm = await connect(srv, client_config(root, 5, credential(5, "ops.admin")))
-        clients.append(admin)
-        assert (await asyncio.wait_for(adm.upload(items()), 10)).role == "100"
-    finally:
-        for client in clients:
-            await client.close()
-        await srv.close()
-
-
-async def test_config_driven_issuer_renews_client_credentials(root, tmp_path):
-    """A server configured as a delegated issuer serves renewals; a client
-    whose credential that server signed renews automatically and stays
-    admitted, and its roles keep working, past its first credential's expiry.
-    The server syncs policy from a configured replica (the root)."""
-    delegation = tmp_path / "issuer.chain"
-    delegation.write_text(_enrollment_test_delegation(seed(1), node_id(2), FLEET) + "\n")
-    srv = await start_server(
-        server_config(
-            root,
-            tmp_path,
-            replicas=(root.ticket,),
-            issuer_delegation_file=str(delegation),
-            issuer_lifetime_secs=15,
-        )
-    )
-    client = None
-    try:
-        assert srv.enrollment.has_issuer
-        issued = srv.enrollment.issue_for(node_id(7), attributes={"aster.role": "ops.status"})
-
-        client, ops = await connect(srv, client_config(root, 7, issued))
-        assert client.is_renewing, "the server signed it, so it renews"
-        # Past the first credential's expiry: renewal starts with a third of
-        # the lifetime left (5 s), enough to re-present on a loaded host.
-        deadline = time.time() + 15 + 3
-        while time.time() < deadline:
-            assert await call(ops, "status") == "ops.status"
-            await asyncio.sleep(0.5)
-        assert client.enrollment.credential != issued, "the credential was renewed"
-    finally:
-        if client is not None:
-            await client.close()
-        await srv.close()
-
-
 async def test_misconfiguration_fails_closed_with_a_clear_error(root, tmp_path):
     """Misconfiguration stops the start with an error that names the
     problem; nothing runs open."""
@@ -346,43 +275,17 @@ async def test_misconfiguration_fails_closed_with_a_clear_error(root, tmp_path):
         state_path=str(tmp_path / "server-enrollment.json"),
     )
     chain = credential(2)
+    # One native refusal is enough to prove it maps to ValueError with the
+    # message intact; the full fail-closed matrix is aster/tests/
+    # enrollment_aster_server.rs misconfiguration_fails_closed_with_a_clear_error.
     await refused(
         base(2, enrollment_credential_chain=chain, enrollment={**good, "audience": None}),
         "audience is required",
     )
-    await refused(
-        AsterConfig(
-            relay_mode="disabled",
-            secret_key=seed(2),
-            enrollment_credential_chain=chain,
-            enrollment=good,
-        ),
-        "no trusted root",
-    )
-    await refused(
-        base(2, enrollment_credential_chain=chain, enrollment={**good, "state_path": None}),
-        "keeps denials durably",
-    )
-    # A server with no credential, or one that does not verify for its key,
-    # starts: only a root registration admits it (aster/tests/
-    # enrollment_aster_server.rs registered_server_restarts_without_a_valid_credential).
     # A file path where the inline chain belongs.
     await refused(
         base(2, enrollment_credential_chain="/etc/aster/server.cred", enrollment=good),
         "ASTER_ENROLLMENT_CREDENTIAL)",
-    )
-    await refused(
-        base(2, enrollment_credential_chain=chain, enrollment={**good, "policy": "allow_everyone"}),
-        "policy",
-    )
-    await refused(
-        base(2, enrollment_credential_chain=chain, enrollment={**good, "fleet_namespace": "not-hex"}),
-        "fleet_namespace",
-    )
-    # Enabled with nothing else set: still refused, never open.
-    await refused(
-        base(2, enrollment_credential_chain=chain, enrollment={"enabled": True}),
-        "audience is required",
     )
     # A credential file that does not exist.
     await refused(
@@ -414,31 +317,6 @@ async def test_misconfiguration_fails_closed_with_a_clear_error(root, tmp_path):
         )
         with pytest.raises(ValueError, match="server-only"):
             await AsterClient(config=issuer_client, address=srv.address).connect()
-    finally:
-        await srv.close()
-
-
-async def test_open_server_admits_any_client_and_advertises_services():
-    """Without enrollment the server is open and the client needs no
-    configuration beyond the address."""
-    srv = await start_server(AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0"))
-    try:
-        assert srv.enrollment is None
-        client = AsterClient(
-            config=AsterConfig(relay_mode="disabled", bind_addr="127.0.0.1:0"),
-            address=srv.address,
-        )
-        await client.connect()
-        try:
-            assert client.open_gate
-            assert client.enrollment is None
-            assert [s.name for s in client.services] == ["Ops"]
-            ops = await client.client(Ops)
-            assert await call(ops, "ping") == ""
-            with pytest.raises(PermissionDeniedError):
-                await call(ops, "status")
-        finally:
-            await client.close()
     finally:
         await srv.close()
 

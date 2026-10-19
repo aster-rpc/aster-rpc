@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   Service,
   Rpc,
@@ -81,6 +81,25 @@ function scripted(script: Step[], streamItems: string[] = [], streamError?: RpcE
   return { transport, sent };
 }
 
+// Retry backoff and breaker reset run on `setTimeout` and `Date.now`; vitest's
+// fake timers replace both, so these tests run on a virtual clock with no real
+// sleeps and can assert exact deadlines.
+beforeEach(() => { vi.useFakeTimers({ now: 1_000_000 }); });
+afterEach(() => { vi.useRealTimers(); });
+
+/** Settle `p`, firing pending timers in order on the virtual clock. */
+async function drive<T>(p: Promise<T>): Promise<T> {
+  let done = false;
+  const outcome = p.then(
+    (value) => { done = true; return { ok: true as const, value }; },
+    (error: unknown) => { done = true; return { ok: false as const, error }; },
+  );
+  for (let i = 0; i < 100 && !done; i++) await vi.advanceTimersToNextTimerAsync();
+  const r = await outcome;
+  if (r.ok) return r.value;
+  throw r.error;
+}
+
 const unavailable = () => new RpcError(StatusCode.UNAVAILABLE, 'down');
 const notFound = () => new RpcError(StatusCode.NOT_FOUND, 'missing');
 const fastRetry = (maxAttempts: number) =>
@@ -154,7 +173,7 @@ describe('client interceptors: retry', () => {
     const { transport, sent } = scripted([unavailable(), unavailable(), 'ok']);
     const t = new Tagger('t');
     const client = createClient(FlakyService, transport as any, { interceptors: [t, fastRetry(3)] });
-    expect(await client.idem({ v: 'r' })).toEqual({ v: 'ok+t' });
+    expect(await drive(client.idem({ v: 'r' }))).toEqual({ v: 'ok+t' });
     expect(sent).toHaveLength(3);
     expect(t.log.filter(l => l.startsWith('req'))).toEqual(['req:idem:1', 'req:idem:2', 'req:idem:3']);
   });
@@ -173,7 +192,7 @@ describe('client interceptors: retry', () => {
     const t = new Tagger('t');
     const client = createClient(FlakyService, transport as any, { interceptors: [t, fastRetry(2)] });
     const reqs = { async *[Symbol.asyncIterator]() { yield { v: 'a' }; yield { v: 'b' }; } };
-    expect(await client.ingest(reqs)).toEqual({ v: 'ok+t' });
+    expect(await drive(client.ingest(reqs))).toEqual({ v: 'ok+t' });
     expect(sent.map(s => s.request)).toEqual([
       [{ v: 'a+t' }, { v: 'b+t' }],
       [{ v: 'a+t' }, { v: 'b+t' }],
@@ -185,9 +204,10 @@ describe('client interceptors: retry', () => {
     const slow = new RetryInterceptor({ maxAttempts: 3, backoff: { initialMs: 5_000, multiplier: 1, maxMs: 5_000, jitter: 0 } });
     const client = createClient(FlakyService, transport as any, { interceptors: [slow] });
     const started = Date.now();
-    const err = await client.idem({ v: 'r' }, { deadlineSecs: 0.2 }).catch((e: RpcError) => e);
+    const err = await drive(client.idem({ v: 'r' }, { deadlineSecs: 0.2 })).catch((e: RpcError) => e);
     expect((err as RpcError).code).toBe(StatusCode.DEADLINE_EXCEEDED);
-    expect(Date.now() - started).toBeLessThan(1_000);
+    // The 5 s backoff cannot fit in the 0.2 s deadline, so no time passes at all.
+    expect(Date.now() - started).toBe(0);
     expect(sent).toHaveLength(1);
     expect(sent[0]!.deadlineSecs).toBe(0.2);
   });
@@ -196,10 +216,10 @@ describe('client interceptors: retry', () => {
     const { transport, sent } = scripted([unavailable(), 'ok']);
     const retry = new RetryInterceptor({ maxAttempts: 2, backoff: { initialMs: 50, multiplier: 1, maxMs: 50, jitter: 0 } });
     const client = createClient(FlakyService, transport as any, { interceptors: [retry] });
-    expect(await client.idem({ v: 'r' }, { deadlineSecs: 5 })).toEqual({ v: 'ok' });
+    expect(await drive(client.idem({ v: 'r' }, { deadlineSecs: 5 }))).toEqual({ v: 'ok' });
     expect(sent[0]!.deadlineSecs).toBe(5);
-    expect(sent[1]!.deadlineSecs).toBeGreaterThan(4);
-    expect(sent[1]!.deadlineSecs).toBeLessThan(4.96);
+    // Exactly the 50 ms backoff has passed on the virtual clock.
+    expect(sent[1]!.deadlineSecs).toBeCloseTo(4.95, 6);
   });
 
   it('an abort ends the backoff with CANCELLED', async () => {
@@ -207,10 +227,12 @@ describe('client interceptors: retry', () => {
     const slow = new RetryInterceptor({ maxAttempts: 3, backoff: { initialMs: 5_000, multiplier: 1, maxMs: 5_000, jitter: 0 } });
     const client = createClient(FlakyService, transport as any, { interceptors: [slow] });
     const ac = new AbortController();
-    const call = client.idem({ v: 'r' }, { signal: ac.signal });
-    // short-wait-ok: the abort lands inside the 5 s retry backoff; cancelling it is the behaviour under test
-    setTimeout(() => ac.abort(), 20);
-    await expect(call).rejects.toMatchObject({ code: StatusCode.CANCELLED });
+    const call = client.idem({ v: 'r' }, { signal: ac.signal }).catch((e: RpcError) => e);
+    // 20 ms into the 5 s backoff, the abort ends it.
+    await vi.advanceTimersByTimeAsync(20);
+    ac.abort();
+    expect(await call).toMatchObject({ code: StatusCode.CANCELLED });
+    expect(vi.getTimerCount()).toBe(0);
   });
 });
 
@@ -241,9 +263,12 @@ describe('client interceptors: circuit breaker', () => {
 
   it('half-open: a non-counted error frees the probe slot; a success closes it', async () => {
     const { transport } = scripted([unavailable(), notFound(), 'ok']);
-    const breaker = new CircuitBreakerInterceptor({ failureThreshold: 1, resetTimeoutMs: 0 });
+    const breaker = new CircuitBreakerInterceptor({ failureThreshold: 1, resetTimeoutMs: 30_000 });
     const client = createClient(FlakyService, transport as any, { interceptors: [breaker] });
     await open(client, breaker);
+    vi.advanceTimersByTime(29_999);
+    await expect(client.call({ v: 'early' })).rejects.toThrow('circuit breaker is open');
+    vi.advanceTimersByTime(1);
     await expect(client.call({ v: 'probe' })).rejects.toMatchObject({ code: StatusCode.NOT_FOUND });
     expect(breaker.currentState).toBe('half_open');
     expect(breaker.halfOpenInFlight).toBe(0);
@@ -253,22 +278,24 @@ describe('client interceptors: circuit breaker', () => {
 
   it('half-open: a counted failure reopens it', async () => {
     const { transport } = scripted([unavailable(), unavailable()]);
-    const breaker = new CircuitBreakerInterceptor({ failureThreshold: 3, resetTimeoutMs: 0 });
+    const breaker = new CircuitBreakerInterceptor({ failureThreshold: 3, resetTimeoutMs: 30_000 });
     const client = createClient(FlakyService, transport as any, { interceptors: [breaker] });
     breaker.recordFailure(unavailable());
     breaker.recordFailure(unavailable());
     await open(client, breaker);
+    vi.advanceTimersByTime(30_000);
     await expect(client.call({ v: 'probe' })).rejects.toMatchObject({ code: StatusCode.UNAVAILABLE });
     expect(breaker.currentState).toBe('open');
   });
 
   it('a refusal by a later breaker gives back the earlier breaker\'s probe slot', async () => {
     const { transport } = scripted([unavailable()]);
-    const first = new CircuitBreakerInterceptor({ failureThreshold: 1, resetTimeoutMs: 0 });
+    const first = new CircuitBreakerInterceptor({ failureThreshold: 1, resetTimeoutMs: 30_000 });
     const second = new CircuitBreakerInterceptor({ failureThreshold: 1, resetTimeoutMs: 60_000 });
     const client = createClient(FlakyService, transport as any, { interceptors: [first, second] });
     await open(client, first);
     expect(second.currentState).toBe('open');
+    vi.advanceTimersByTime(30_000);
     await expect(client.call({ v: 'probe' })).rejects.toThrow('circuit breaker is open');
     expect(first.currentState).toBe('half_open');
     expect(first.halfOpenInFlight).toBe(0);
@@ -278,7 +305,7 @@ describe('client interceptors: circuit breaker', () => {
     const { transport, sent } = scripted([unavailable()]);
     const breaker = new CircuitBreakerInterceptor({ failureThreshold: 1, resetTimeoutMs: 60_000 });
     const client = createClient(FlakyService, transport as any, { interceptors: [breaker, fastRetry(3)] });
-    await expect(client.idem({ v: 'r' })).rejects.toThrow('circuit breaker is open');
+    await expect(drive(client.idem({ v: 'r' }))).rejects.toThrow('circuit breaker is open');
     expect(sent).toHaveLength(1);
   });
 });

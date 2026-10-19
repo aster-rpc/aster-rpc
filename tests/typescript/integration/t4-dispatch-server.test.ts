@@ -3,9 +3,10 @@
  * §4.3) — JS handlers answering by call id, Rust routing — for every event
  * delivery variant (TSFN per event, TSFN batched, ring + await, ring + poll).
  *
- * Unary, server-stream (with backpressure), client-stream, deadline cancel
- * and peer cancel (connection closed mid-stream), each ending with an empty
- * call table: whatever happened to a call, Rust must have let go of it.
+ * Unary, server-stream (with backpressure), client-stream and a deadline
+ * cancel reaching the JS handler, each ending with an empty call table. Peer
+ * cancel and the deadline semantics are tested once in Rust
+ * (aster/tests/it/dynamic_dispatch.rs).
  *
  * The client is the TS `IrohTransport` over a real QUIC connection, with an
  * identity codec: payloads are opaque bytes to the server.
@@ -64,10 +65,9 @@ const ECHO_SERVICE: DynamicServiceSpec = {
       response: { hash: h('b2') },
       default_timeout: 0.3,
     },
-    { name: 'hang', pattern: 'server_stream', request: { hash: h('a1') }, response: { hash: h('b2') } },
   ],
 };
-const [ECHO, COUNT, SUM, SLOW, HANG] = [0, 1, 2, 3, 4];
+const [ECHO, COUNT, SUM, SLOW] = [0, 1, 2, 3];
 
 /** Opaque bytes in and out. */
 const BYTES = { encode: (x: unknown) => x as Uint8Array, decode: (x: Uint8Array) => x };
@@ -85,12 +85,9 @@ interface Fixture {
   loop: DispatchLoop;
   cancelled: Map<number, number>; // callId -> reason
   waiters: Map<number, () => void>;
-  hangStarted: Promise<number>;
 }
 
 function handlers(fx: { cancelled: Map<number, number>; waiters: Map<number, () => void> }) {
-  let hangStarted!: (id: number) => void;
-  const started = new Promise<number>((r) => (hangStarted = r));
   const waitCancel = (id: number) =>
     new Promise<void>((r) => (fx.cancelled.has(id) ? r() : fx.waiters.set(id, r)));
 
@@ -136,10 +133,8 @@ function handlers(fx: { cancelled: Map<number, number>; waiters: Map<number, () 
         await respondCall(srv, id, Buffer.from(`${items}:${total}`));
         return;
       }
-      case SLOW:
-      case HANG: {
+      case SLOW: {
         await sendFrame(srv, id, Buffer.from('first'));
-        if (ev.methodIdx === HANG) hangStarted(id);
         await waitCancel(id);
         // The call is over: every further op reports it gone.
         expect(srv.isCancelled(id)).toBe(true);
@@ -148,13 +143,13 @@ function handlers(fx: { cancelled: Map<number, number>; waiters: Map<number, () 
       }
     }
   };
-  return { serve, started };
+  return { serve };
 }
 
 async function startFixture(delivery: (typeof DISPATCH_DELIVERIES)[number]): Promise<Fixture> {
   const cancelled = new Map<number, number>();
   const waiters = new Map<number, () => void>();
-  const { serve, started } = handlers({ cancelled, waiters });
+  const { serve } = handlers({ cancelled, waiters });
   const loop = await DispatchLoop.start({
     config: OFFLINE as any,
     services: [ECHO_SERVICE],
@@ -170,7 +165,7 @@ async function startFixture(delivery: (typeof DISPATCH_DELIVERIES)[number]): Pro
       }
     },
   });
-  return { loop, cancelled, waiters, hangStarted: started };
+  return { loop, cancelled, waiters };
 }
 
 async function connect(address: string) {
@@ -246,18 +241,6 @@ describe.skipIf(!hasDispatch).each(DISPATCH_DELIVERIES)('DispatchServer (%s)', (
     expect((err as RpcError).code).toBe(StatusCode.DEADLINE_EXCEEDED);
     await until(() => [...fx.cancelled.values()].includes(2));
     await until(() => fx.loop.native.liveCalls() === 0);
-  });
-
-  it('peer cancel: connection closed mid-stream cancels the handler', async () => {
-    const other = await connect(fx.loop.address);
-    const it = other.transport.serverStream('test.Echo', 'hang', u32(0))[Symbol.asyncIterator]();
-    const first = await it.next();
-    expect(Buffer.from(first.value as Uint8Array).toString()).toBe('first');
-    const id = await fx.hangStarted;
-    other.conn.close(0, 'bye');
-    await until(() => fx.cancelled.get(id) === 1);
-    await until(() => fx.loop.native.liveCalls() === 0);
-    await other.node.close();
   });
 });
 

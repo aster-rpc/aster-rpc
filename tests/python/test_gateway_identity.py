@@ -3,20 +3,18 @@
 ``[remote_config]`` settings and the credentials (design:
 ``docs/_internal/web_gateway/gateway-identity.md``).
 
-Port of ``bindings/go/identity_test.go`` (itself mirroring
+Binding wiring only: config plumbing, the forwarded identity reaching
+``CallContext``, refusals mapping to Python exceptions, and the NodeConfig
+client. The behaviour is tested once in Rust:
 ``aster/tests/enrollment_gateway_identity.rs``,
-``enrollment_provider_tokens.rs`` and ``node_config.rs``). The root is the
-native module's test-only ``_EnrollmentTestRoot``; ``publish_issuer_keys``
-stands in for a node running ``[identity.publisher]`` writing a fetched key
-set into the fleet namespace.
+``enrollment_provider_tokens.rs`` (provider tokens) and ``node_config.rs``
+(NodeConfig hardening and admin checks). The root is the
+native module's test-only ``_EnrollmentTestRoot``.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import json
-import time
 from dataclasses import dataclass
 
 import pytest
@@ -42,11 +40,10 @@ from aster.identity import (
     AMR_WEBAUTHN,
     CONFIG_ADMIN_ROLE,
     GATEWAY_ROLE,
-    IDENTITY_PUBLISHER_ROLE,
     ISSUABLE_ROLES_ATTRIBUTE,
     IdentityOverride,
 )
-from aster.status import PermissionDeniedError, UnauthenticatedError
+from aster.status import PermissionDeniedError
 
 FLEET = "mission-control"
 
@@ -388,129 +385,6 @@ async def test_edge_minted_token_and_node_config(root, tmp_path, stack):
     with pytest.raises(PermissionDeniedError):
         await call(notes, "read", token)  # accept_on_behalf_of = false refuses the entry
     assert (await admin.ack(1, timeout=1.0)).complete
-    with pytest.raises(PermissionDeniedError):
-        await admin.set(sections={"network": {"bind_port": 1}})  # not overridable
     assert (await admin.clear()).complete
     alice = await call(notes, "read", token)
     assert alice.actor == edge_id and alice.tier == 0
-
-    # A peer without aster.config-admin is refused by Gate 3, and one
-    # without aster.gateway cannot forward.
-    plain, plain_notes = await connect(stack, srv, client_config(root, 6, credential(6, "notes.read")))
-    with pytest.raises(PermissionDeniedError):
-        await (await plain.node_config()).get()
-    with pytest.raises(PermissionDeniedError):
-        await call(plain_notes, "read", token)
-
-
-async def test_accept_off_refuses_the_entry(root, tmp_path, stack):
-    """``AsterServer(accept_on_behalf_of=False)`` overrides the config: the
-    entry is refused with PERMISSION_DENIED rather than ignored."""
-    srv = await start_notes(stack, server_config(root, tmp_path), accept_on_behalf_of=False)
-    edge, notes = await connect(
-        stack,
-        srv,
-        client_config(root, 5, credential(5, f"{GATEWAY_ROLE},notes.read", issuable="notes.read")),
-    )
-    token = edge.mint_user_token("alice", ["notes.read"], [AMR_PASSWORD], ttl=60)
-    me = await call(notes, "read")
-    assert me.actor == ""
-    with pytest.raises(PermissionDeniedError):
-        await call(notes, "read", token)
-
-
-# ── Provider tokens from a trusted issuer ───────────────────────────────────
-
-
-class _TestIdP:
-    """Signs ES256 ID tokens with one P-256 key (kid ``k1``)."""
-
-    def __init__(self, iss: str) -> None:
-        from cryptography.hazmat.primitives.asymmetric import ec
-
-        self.iss = iss
-        self.key = ec.generate_private_key(ec.SECP256R1())
-
-    @staticmethod
-    def _b64(raw: bytes) -> str:
-        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
-
-    def jwk(self) -> dict:
-        numbers = self.key.public_key().public_numbers()
-        return {
-            "kty": "EC", "crv": "P-256", "kid": "k1", "alg": "ES256", "use": "sig",
-            "x": self._b64(numbers.x.to_bytes(32, "big")),
-            "y": self._b64(numbers.y.to_bytes(32, "big")),
-        }
-
-    def token(self, claims: dict) -> str:
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import ec
-        from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
-
-        now = int(time.time())
-        claims = {**claims, "iss": self.iss, "iat": now, "exp": now + 300}
-        header = {"alg": "ES256", "typ": "JWT", "kid": "k1"}
-        signing_input = (
-            self._b64(json.dumps(header).encode()) + "." + self._b64(json.dumps(claims).encode())
-        )
-        der = self.key.sign(signing_input.encode(), ec.ECDSA(hashes.SHA256()))
-        r, s = decode_dss_signature(der)
-        return signing_input + "." + self._b64(r.to_bytes(32, "big") + s.to_bytes(32, "big"))
-
-
-async def test_provider_token_from_trusted_issuer(root, tmp_path, stack):
-    """A provider's ES256 token, forwarded unchanged by an edge, verifies
-    with the issuer keys a node holding ``aster.identity-publisher`` wrote
-    into the fleet namespace; its groups map to roles."""
-    iss = "https://idp.test"
-    srv = await start_notes(
-        stack,
-        server_config(
-            root,
-            tmp_path,
-            identity_trusted_issuers=[
-                TrustedIssuer(
-                    iss=iss, audiences=("notes",), roles_claim="groups",
-                    role_map={"readers": "notes.read"},
-                )
-            ],
-        ),
-    )
-    idp = _TestIdP(iss)
-    publisher_chain = credential(8, IDENTITY_PUBLISHER_ROLE)
-    publisher, _ = await connect(stack, srv, client_config(root, 8, publisher_chain))
-    await root.publish_issuer_keys(
-        publisher._node,
-        publisher_chain,
-        iss,
-        json.dumps({"keys": [idp.jwk()]}),
-        srv.node.node_addr_info(),
-    )
-
-    edge, notes = await connect(stack, srv, client_config(root, 5, credential(5, GATEWAY_ROLE)))
-    token = idp.token({"sub": "alice", "aud": "notes", "groups": ["readers", "other"],
-                       "amr": ["pwd"]})
-    # The key set reaches the server's issuer-key cache once its watcher
-    # reads the synchronized entry: wait for that, bounded.
-    deadline = time.monotonic() + 30
-    while True:
-        try:
-            alice = await call(notes, "read", token)
-            break
-        except UnauthenticatedError:
-            if time.monotonic() > deadline:
-                raise
-            await asyncio.sleep(0.05)
-    assert alice.principal == f"{iss}|alice"
-    assert alice.actor == node_id(5)
-    assert alice.roles == "notes.read"
-    assert alice.issuer == iss
-    assert alice.amr == "pwd"
-
-    # A token for another audience, or signed by another key, is refused.
-    with pytest.raises(UnauthenticatedError):
-        await call(notes, "read", idp.token({"sub": "alice", "aud": "other"}))
-    forged = _TestIdP(iss).token({"sub": "alice", "aud": "notes"})
-    with pytest.raises(UnauthenticatedError):
-        await call(notes, "read", forged)

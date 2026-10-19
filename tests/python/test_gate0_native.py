@@ -4,6 +4,16 @@ Covers ``GatePolicy`` / ``PeerAdmissionStore`` / ``TrustMode`` (pure), a node
 started with ``gate=`` (decisions made in Rust, reject code/reason seen by the
 client), and ``node.admission()`` (decisions made in Python, as an async
 iterator of requests).
+
+Only the Python mapping is tested here. The policy decisions themselves are
+Rust unit tests in ``core/src/trust.rs``
+(``protected_policy_allows_admission_alpns_for_unknown_peer``,
+``protected_policy_denies_unknown_peer_on_normal_alpn``,
+``open_dev_policy_allows_unknown_peer_on_normal_alpn``,
+``admitted_peer_is_allowed_until_revoked``,
+``expired_peer_is_denied_and_pruned``, ``custom_admission_alpn_is_open``),
+and the gate deciding this node's own dials is
+``ffi/tests/node_start.rs::gate_decides_this_nodes_own_dials``.
 """
 
 from __future__ import annotations
@@ -14,7 +24,6 @@ import time
 import pytest
 
 from aster import (
-    ALPN_DELEGATED_ADMISSION,
     ALPN_PRODUCER_ADMISSION,
     AsterConfig,
     ConnectRequest,
@@ -42,41 +51,6 @@ def _loopback(**kw) -> AsterConfig:
 # -- GatePolicy / PeerAdmissionStore (no network) ----------------------------
 
 
-def test_default_policy_is_protected_with_admission_alpns_open():
-    gate = GatePolicy()
-    assert gate.trust_mode == TrustMode.PROTECTED
-    assert {ALPN_PRODUCER_ADMISSION, ALPN_DELEGATED_ADMISSION} <= set(gate.admission_alpns)
-    for alpn in gate.admission_alpns:
-        assert gate.should_allow(PEER, alpn) is True
-    assert gate.should_allow(PEER, b"aster/1") is False
-    assert gate.reject_code == 403
-    assert gate.reject_reason == b"peer not admitted"
-
-
-def test_open_dev_allows_everything_and_mode_is_switchable():
-    gate = GatePolicy.open_dev()
-    assert gate.trust_mode == TrustMode.OPEN_DEV
-    assert gate.should_allow(PEER, b"aster/1") is True
-    gate.trust_mode = TrustMode.PROTECTED
-    assert gate.should_allow(PEER, b"aster/1") is False
-    assert GatePolicy.protected().trust_mode == TrustMode.PROTECTED
-
-
-def test_admit_and_revoke():
-    gate = GatePolicy()
-    assert gate.admit(PEER) is None
-    assert gate.is_admitted(PEER)
-    assert gate.should_allow(PEER, b"aster/1") is True
-    assert gate.should_allow(OTHER, b"aster/1") is False
-    # Typed ids and upper-case hex name the same peer.
-    assert gate.is_admitted(NodeId(PEER.upper()))
-    removed = gate.revoke(PEER)
-    assert removed is not None and removed.peer == PEER
-    assert not gate.is_admitted(PEER)
-    assert gate.should_allow(PEER, b"aster/1") is False
-    assert gate.revoke(PEER) is None
-
-
 def test_admission_record_fields_and_attributes():
     gate = GatePolicy()
     before = time.time()
@@ -100,23 +74,12 @@ def test_admission_record_fields_and_attributes():
     assert rec.expires_at == pytest.approx(rec.admitted_at + 60, abs=1)
     assert gate.attributes(PEER) == {"aster.role": "reader"}
     assert gate.attributes(OTHER) == {}
+    # Typed ids and upper-case hex name the same peer.
+    assert gate.is_admitted(NodeId(PEER.upper()))
     # Re-admitting returns the replaced record.
     prev = gate.admit(PEER, source="my-app")
     assert prev.source == "credential"
     assert gate.store.get(PEER).source == "my-app"
-
-
-def test_expired_admission_is_ignored_and_pruned():
-    store = PeerAdmissionStore()
-    gate = GatePolicy(store=store)
-    gate.admit(PEER, expires_at=time.time() - 1, attributes={"k": "v"})
-    assert not gate.is_admitted(PEER)
-    assert gate.should_allow(PEER, b"aster/1") is False
-    assert gate.attributes(PEER) == {}
-    assert store.get(PEER) is None
-    assert len(store) == 1
-    assert store.prune_expired() == 1
-    assert len(store) == 0
 
 
 def test_store_is_shared_between_gate_and_handles():
@@ -130,19 +93,15 @@ def test_store_is_shared_between_gate_and_handles():
     # Setters keep the store.
     gate.admit(OTHER)
     gate.set_reject(4031, b"nope")
+    gate.trust_mode = TrustMode.OPEN_DEV
+    assert gate.trust_mode == TrustMode.OPEN_DEV
     gate.trust_mode = TrustMode.PROTECTED
-    assert gate.is_admitted(OTHER)
-    assert gate.reject_code == 4031 and gate.reject_reason == b"nope"
-
-
-def test_custom_admission_alpns():
-    gate = GatePolicy(admission_alpns=[b"custom.admit"])
-    assert gate.should_allow(PEER, b"custom.admit") is True
-    assert gate.should_allow(PEER, ALPN_PRODUCER_ADMISSION) is False
     gate.admission_alpns = [ALPN_PRODUCER_ADMISSION]
     assert gate.admission_alpns == [ALPN_PRODUCER_ADMISSION]
-    with pytest.raises(ValueError):
-        gate.admission_alpns = [b""]
+    assert gate.is_admitted(OTHER)
+    assert gate.reject_code == 4031 and gate.reject_reason == b"nope"
+    assert GatePolicy.open_dev().trust_mode == TrustMode.OPEN_DEV
+    assert GatePolicy.protected().trust_mode == TrustMode.PROTECTED
 
 
 def test_bad_arguments_raise_value_error():
@@ -153,6 +112,8 @@ def test_bad_arguments_raise_value_error():
         gate.admit(PEER, ttl=10, expires_at=time.time() + 10)
     with pytest.raises(ValueError):
         gate.admit(PEER, ttl=-1)
+    with pytest.raises(ValueError):
+        gate.admission_alpns = [b""]
 
 
 # -- Node with an attached gate (decided in Rust) ----------------------------
@@ -206,52 +167,6 @@ async def test_gate_denies_then_admits_then_revokes():
             node.admission()
     finally:
         await ep.close()
-        await node.shutdown()
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(30)
-async def test_open_dev_gate_lets_unknown_peer_in():
-    node = await Node.start(_loopback(), alpns=[APP_ALPN], gate=GatePolicy.open_dev())
-    ep = await _client()
-    try:
-        await ep.connect_node_addr(node.node_addr_info(), APP_ALPN)
-        alpn, _ = await _accept_one(node)
-        assert alpn == APP_ALPN
-    finally:
-        await ep.close()
-        await node.shutdown()
-
-
-DOCS_ALPN = b"/iroh-sync/1"
-
-
-@pytest.mark.asyncio
-@pytest.mark.timeout(30)
-async def test_gate_decides_this_nodes_own_dials():
-    """Outbound handshakes bypass admission, so the gate decides this node's
-    own dials at connect time: a peer outside the allowlist is not dialed (as
-    docs sync to a swarm-learned peer would), an admitted one is."""
-    from aster import net_client
-
-    gate = GatePolicy()
-    node = await Node.start(_loopback(), alpns=[APP_ALPN], gate=gate)
-    peer = await Node.start(_loopback())
-    node.add_node_addr(peer)
-    try:
-        with pytest.raises(Exception) as rejected:
-            await asyncio.wait_for(
-                net_client(node).connect(peer.node_id(), DOCS_ALPN), timeout=10
-            )
-        assert not isinstance(rejected.value, asyncio.TimeoutError)
-        gate.admit(peer.id)
-        conn = await asyncio.wait_for(
-            net_client(node).connect(peer.node_id(), DOCS_ALPN), timeout=10
-        )
-        assert conn.remote_id() == peer.id
-        conn.close(0, b"done")
-    finally:
-        await peer.shutdown()
         await node.shutdown()
 
 

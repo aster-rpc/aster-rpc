@@ -16,7 +16,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, rmSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import * as path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -31,7 +31,6 @@ import {
   CoordinationUnresolvedError,
   Node,
   fenceOf,
-  placementPlan,
   type AuditRecord,
   type ResourceKeyInput,
 } from '@aster-rpc/aster';
@@ -142,6 +141,11 @@ describe.skipIf(!FIXTURE)('coordination client against a live three-voter group'
     expect(acl.grants).toEqual([{ subjectNodeId: workerNode.id, rights: CoordinationRights.HOLDER }]);
     const admins = await root.reads().inspectAdmins();
     expect(admins.administrators.length).toBeGreaterThan(0);
+
+    // The recovery export's manifest maps across.
+    const { manifest, body } = await root.reads().recoveryExport();
+    expect(manifest.totalLen).toBe(body.length);
+    expect(manifest.blake3Checksum).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('acquire, renew, compare-and-set, read, release — each resolved and acknowledged', async () => {
@@ -153,6 +157,10 @@ describe.skipIf(!FIXTURE)('coordination client against a live three-voter group'
 
     // The delivery contract: no new sequence until acknowledged.
     await expect(worker.acquire(res('other'), 30_000)).rejects.toBeInstanceOf(CoordinationAwaitingAckError);
+    // One process owns a journal: a second client over it is refused, typed.
+    await expect(
+      CoordinationClient.connect(workerNode, info.groupId, { seedTickets: seeds(), journalDir: journal('worker') }),
+    ).rejects.toBeInstanceOf(CoordinationJournalLockedError);
     await acquired.acknowledge();
     expect(acquired.pending).toBe(false);
     await expect(acquired.acknowledge()).rejects.toMatchObject({ kind: 'closed' });
@@ -301,61 +309,6 @@ describe.skipIf(!FIXTURE)('coordination client against a live three-voter group'
     }
   });
 
-  it('redelivers an unacknowledged result after a restart over the same journal', async () => {
-    const dir = journal('restart-client');
-    const actor = await Node.start({ ...OFFLINE, secretKey: randomBytes(32), rootPubkey: info.authorityKey });
-    try {
-      const acl = await root.reads().inspectAcl(res('restart'));
-      const grant = await root.setGrant(res('restart'), actor.id, CoordinationRights.HOLDER, acl.aclRevision);
-      await grant.acknowledge();
-
-      const first = await CoordinationClient.connect(actor, info.groupId, { seedTickets: seeds(), journalDir: dir });
-      const clientId = await first.clientId();
-      const resolved = await first.acquire(res('restart'), 30_000);
-      expect(resolved.outcome).toBe('granted');
-      const saved = resolved.reply;
-
-      // One process owns the journal.
-      await expect(
-        CoordinationClient.connect(actor, info.groupId, { seedTickets: seeds(), journalDir: dir }),
-      ).rejects.toBeInstanceOf(CoordinationJournalLockedError);
-
-      // "Crash": close without acknowledging. The handle goes inert.
-      first.close();
-      expect(resolved.pending).toBe(false);
-
-      const second = await CoordinationClient.connect(actor, info.groupId, { seedTickets: seeds(), journalDir: dir });
-      expect(await second.clientId()).toBe(clientId);
-      await expect(second.acquire(res('other'), 30_000)).rejects.toBeInstanceOf(CoordinationAwaitingAckError);
-
-      const redelivered = await second.unacknowledged();
-      expect(redelivered).not.toBeNull();
-      expect(redelivered!.reply).toEqual(saved);
-      // resume() redelivers the same awaiting result too.
-      const viaResume = await second.resume();
-      expect(viaResume!.reply).toEqual(saved);
-      await redelivered!.acknowledge();
-      // The other handle names the same, now-acknowledged entry: refused.
-      await expect(viaResume!.acknowledge()).rejects.toThrow();
-
-      expect(await second.unacknowledged()).toBeNull();
-      expect(await second.resume()).toBeNull();
-
-      const released = await second.release(fenceOf(saved.snapshot!));
-      expect(released.outcome).toBe('released');
-      expect(released.sequence).toBe(saved.sequence + 1);
-      expect(released.reply.clientId).toBe(clientId);
-      await released.acknowledge();
-
-      const probe = await second.reads().probeClient(actor.id, clientId);
-      expect(probe.exists).toBe(true);
-      expect(probe.lastSequence).toBe(released.sequence);
-      second.close();
-    } finally {
-      await actor.close();
-    }
-  }, 60_000);
-
   it('streams the audit log in ascending, paged order', async () => {
     const reads = root.reads();
     const all: AuditRecord[] = [];
@@ -385,46 +338,11 @@ describe.skipIf(!FIXTURE)('coordination client against a live three-voter group'
     await expect(reads.auditPage(undefined, 0)).rejects.toMatchObject({ kind: 'invalid' });
   });
 
-  it('exports a verified recovery snapshot', async () => {
-    const { manifest, body } = await root.reads().recoveryExport();
-    expect(manifest.totalLen).toBe(body.length);
-    expect(manifest.blake3Checksum).toMatch(/^[0-9a-f]{64}$/);
-    const file = path.join(tmp, 'export.bin');
-    const toFile = await root.reads().recoveryExportToFile(file);
-    expect(statSync(file).size).toBe(toFile.totalLen);
-    expect(existsSync(`${file}.partial`)).toBe(false);
-  });
-
-  it('plans placement from the live status cut', async () => {
-    const status = await root.reads().groupStatus();
-    const monitor = await Node.start({ ...OFFLINE, enableMonitoring: true });
-    try {
-      await monitor.topology().enableShared(randomBytes(32), { timing: { minHoldMs: 0 } });
-      const snapshot = await monitor.topology().snapshot();
-      const rec = placementPlan(
-        {
-          groupId: status.groupId,
-          genesisHash: status.genesisHash,
-          deploymentProfileCode: status.deploymentProfileCode,
-          ...(status.membershipLogId ? { membershipLogId: status.membershipLogId } : {}),
-          currentVoters: status.voters,
-          currentLearners: status.learners,
-          activeMembershipIntent: status.pendingOperationId != null,
-          policy: {
-            revision: 1,
-            digest: '44'.repeat(32),
-            authorityPublicKey: status.authorityPublicKey,
-            authorityDomain: status.authorityDomain,
-            targetVoters: 3,
-            targetRetainedLearners: 0,
-            eligible: status.voters.map((nodeId) => ({ nodeId })),
-          },
-        },
-        snapshot,
-      );
-      expect(['stable', 'degraded']).toContain(rec.kind);
-    } finally {
-      await monitor.close();
-    }
-  });
+  // Behaviour owned by Rust and not repeated here: restart redelivery over
+  // the same journal (aster/tests/coordination_client.rs
+  // a_resolved_result_survives_a_client_restart_until_acknowledged; ffi
+  // close_after_resolution_makes_the_handle_inert_and_redelivers), the
+  // streamed recovery export (the_recovery_export_streams_into_a_writer_exactly)
+  // and placement over a live topology (ffi placement_reads_a_node_topology;
+  // the placementPlan mapping is in unit/coordination.test.ts).
 });
