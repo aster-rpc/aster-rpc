@@ -272,12 +272,9 @@ async fn docs_and_gossip_under_their_own_protocol() {
     let ticket = doc.share_with_addr(ShareMode::Read).await.unwrap();
     let doc_b = b.docs().join(ticket).await.unwrap();
     timeout(WAIT, async {
-        while doc_b
-            .get_exact(&author, b"k".to_vec())
-            .await
-            .unwrap()
-            .is_none()
-        {
+        // `Err` too: the entry can sync before its content, and until the
+        // content lands `get_exact` fails with "hash not found".
+        while !matches!(doc_b.get_exact(&author, b"k".to_vec()).await, Ok(Some(_))) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
