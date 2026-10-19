@@ -1319,16 +1319,22 @@ impl DispatchServer {
             if let Some(t) = timeout {
                 server = server.handler_timeout(t);
             }
+            let mut node_identity = None;
             if node_info {
-                server = server
-                    .with_builtin_node_info(&node, Default::default(), None)
-                    .0;
+                let (with_info, handle) =
+                    server.with_builtin_node_info(&node, Default::default(), None);
+                server = with_info;
+                node_identity = Some(handle);
             }
             if topology {
                 server = server.with_builtin_topology(&node, topology_requires);
             }
             for svc in services {
                 server = server.dynamic_service(svc).map_err(aster_err)?;
+            }
+            // `aster.services` lists what this server serves, as `AsterServer` does.
+            if let Some(identity) = &node_identity {
+                server.advertise_services(identity);
             }
             let dispatcher = server.dispatcher();
             let table = server.call_table();

@@ -206,6 +206,8 @@ struct Advertised {
 
 struct Active {
     keys: Vec<ServiceKey>,
+    /// What this activation listed under `aster.services`, to take back.
+    listed: Vec<super::baseline::AdvertisedService>,
     #[cfg(all(feature = "docs", feature = "blobs"))]
     advertised: Option<Advertised>,
 }
@@ -231,6 +233,8 @@ pub(crate) struct Host<'a> {
     #[cfg_attr(not(all(feature = "docs", feature = "blobs")), allow(dead_code))]
     pub(crate) node: &'a crate::node::Node,
     pub(crate) dispatcher: &'a super::server::Dispatcher,
+    /// The served NodeInfo identity, when the baseline is on.
+    pub(crate) identity: Option<&'a super::baseline::NodeIdentityHandle>,
     #[cfg(feature = "health")]
     pub(crate) health: Option<&'a crate::ops::HealthServer>,
     /// Services the server reports to `/readyz` before any surface.
@@ -418,8 +422,19 @@ impl SurfaceControl {
         );
         rollback.armed = false;
         drop(rollback);
+        // Discoverable only once callable and committed.
+        let listed: Vec<_> = services
+            .iter()
+            .filter_map(|(svc, session)| {
+                super::baseline::AdvertisedService::from_dispatch(svc.as_ref(), *session)
+            })
+            .collect();
+        if let Some(identity) = host.identity {
+            identity.advertise_services(&listed);
+        }
         state.active = Some(Active {
             keys: keys.clone(),
+            listed,
             #[cfg(all(feature = "docs", feature = "blobs"))]
             advertised,
         });
@@ -458,6 +473,9 @@ impl SurfaceControl {
                     "rpc surface stopped, but its registry entries were not all retracted: {err}"
                 )));
             }
+        }
+        if let Some(identity) = host.identity {
+            identity.withdraw_services(&active.listed);
         }
         self.slot.clear();
         host.dispatcher.session_store().drop_services(&active.keys);

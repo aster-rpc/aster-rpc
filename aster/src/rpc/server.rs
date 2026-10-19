@@ -316,6 +316,39 @@ impl Server {
         Ok(self)
     }
 
+    /// Every service this server serves that has a contract: native shared
+    /// and session services, then binding-implemented ones. Hand-written
+    /// dispatchers have no contract and are left out.
+    pub(crate) fn advertised_services(&self) -> Vec<super::baseline::AdvertisedService> {
+        use super::baseline::AdvertisedService;
+        let mut out: Vec<AdvertisedService> = self
+            .services
+            .values()
+            .filter_map(|svc| AdvertisedService::from_dispatch(svc.as_ref(), false))
+            .chain(
+                self.session_probes
+                    .values()
+                    .filter_map(|svc| AdvertisedService::from_dispatch(svc.as_ref(), true)),
+            )
+            .chain(
+                self.foreign_specs
+                    .iter()
+                    .filter_map(AdvertisedService::from_dynamic),
+            )
+            .collect();
+        out.sort_by(|a, b| (&a.name, a.version).cmp(&(&b.name, b.version)));
+        out
+    }
+
+    /// List the services this server serves in its `aster.ops.NodeInfo`
+    /// identity (`aster.services`), unless the application set that attribute.
+    /// Call after every service is registered. Binding support: what
+    /// [`AsterServerBuilder::start`](super::AsterServerBuilder::start) does.
+    #[doc(hidden)]
+    pub fn advertise_services(&self, identity: &super::baseline::NodeIdentityHandle) {
+        identity.advertise_services(&self.advertised_services());
+    }
+
     /// The table through which the binding answers foreign calls. Every
     /// dispatcher of this server shares it.
     #[cfg(feature = "binding-support")]

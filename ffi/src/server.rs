@@ -892,6 +892,10 @@ pub unsafe extern "C" fn aster_server_start(
             Err(e) => return fail(aster_status_t::ASTER_STATUS_INVALID_ARGUMENT, e),
         };
     }
+    // `aster.services` lists what this server serves, as `AsterServer` does.
+    if let Some(identity) = &node_identity {
+        server.advertise_services(identity);
+    }
     let table = server.call_table();
     let dispatcher = server.dispatcher();
     let handle = server.serve();

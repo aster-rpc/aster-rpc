@@ -1113,3 +1113,26 @@ async def test_publish_contract_full_collection_via_publisher():
 
     await publisher.close()
     await node.shutdown()
+
+
+def test_rust_server_node_info_services_attribute_parses():
+    """A Rust ``AsterServer`` lists its services in the ``aster.services``
+    NodeInfo attribute (O1, ``aster/src/rpc/baseline.rs``). This is the JSON
+    that server writes: ``ServiceSummary.from_json_dict`` takes it, and its
+    keys are exactly ``to_json_dict``'s (the Rust test
+    ``started_server_lists_its_services_in_node_info`` asserts the same set).
+    """
+    from aster.registry.models import ServiceSummary
+
+    rust_json = (
+        '[{"name":"SurfaceEcho","version":1,"contract_id":"ab12",'
+        '"channels":{"rpc":"node-id"},"pattern":"session",'
+        '"serialization_modes":["xlang"]}]'
+    )
+    entries = [ServiceSummary.from_json_dict(d) for d in json.loads(rust_json)]
+    assert [(s.name, s.version, s.contract_id, s.pattern) for s in entries] == [
+        ("SurfaceEcho", 1, "ab12", "session")
+    ]
+    assert entries[0].channels == {"rpc": "node-id"}
+    assert entries[0].serialization_modes == ["xlang"]
+    assert set(json.loads(rust_json)[0]) == set(entries[0].to_json_dict())

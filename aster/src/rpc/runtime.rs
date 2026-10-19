@@ -806,6 +806,11 @@ impl AsterServerBuilder {
         for (alpn, handler) in self.routes {
             server = server.route_alpn_arc(alpn, handler);
         }
+        // List what is served in NodeInfo, whether or not manifests are
+        // published; an `aster.services` the application set stays as is.
+        if let Some(identity) = &identity_handle {
+            server.advertise_services(identity);
+        }
         // Grab the shareable dispatcher before `serve()` consumes the server, so
         // an HTTP transport can drive the same services.
         let dispatcher = server.dispatcher();
@@ -1305,6 +1310,7 @@ impl AsterServer {
         super::surface::Host {
             node: &self.node,
             dispatcher: &self.dispatcher,
+            identity: self.identity_handle.as_ref(),
             #[cfg(feature = "health")]
             health: self.health.as_ref(),
             #[cfg(feature = "health")]

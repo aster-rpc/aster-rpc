@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use aster::rpc::baseline::NodeInfoClient;
+use aster::rpc::baseline::{Attr, NodeIdentity, NodeInfoClient, Value, SERVICES_ATTRIBUTE};
 use aster::rpc::{
     async_trait, fetch_and_verify_contract, AsterServer, Call, ManifestPublication, RpcConnection,
     RpcStatus, RpcSurface, ServiceDispatch, StatusCode, SurfaceState,
@@ -694,4 +694,129 @@ async fn cancelled_activation_leaves_nothing_behind() {
         return;
     }
     panic!("never caught an activation between registry writes");
+}
+
+/// The `aster.services` text a server's NodeInfo serves, parsed. `None` when
+/// the attribute is absent.
+async fn services_attribute(conn: &RpcConnection) -> Option<serde_json::Value> {
+    let identity = within(NodeInfoClient::new(conn.clone()).describe())
+        .await
+        .unwrap();
+    identity
+        .attributes
+        .iter()
+        .find(|a| a.name == SERVICES_ATTRIBUTE)
+        .map(|a| match &a.value {
+            Some(Value::Text(t)) => serde_json::from_str(&t.value).unwrap(),
+            other => panic!("aster.services is not text: {other:?}"),
+        })
+}
+
+/// The keys of the Python `ServiceSummary.to_json_dict`.
+const SUMMARY_KEYS: [&str; 6] = [
+    "channels",
+    "contract_id",
+    "name",
+    "pattern",
+    "serialization_modes",
+    "version",
+];
+
+/// O1: a started server lists what it serves in NodeInfo, in the Python
+/// `ServiceSummary` shape, with no manifest publication involved. A
+/// hand-written dispatcher (no contract) is left out.
+#[tokio::test]
+async fn started_server_lists_its_services_in_node_info() {
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .service(EchoServer::new(EchoImpl::default()))
+        .service(Bare)
+        .start()
+        .await
+        .unwrap();
+    let (client, conn) = client_of(&srv).await;
+
+    let list = services_attribute(&conn).await.expect("aster.services");
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 1, "only the service with a contract: {list:?}");
+    let entry = list[0].as_object().unwrap();
+    let mut keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, SUMMARY_KEYS);
+    let contract = EchoServer::<EchoImpl>::contract();
+    assert_eq!(entry["name"], "SurfaceEcho");
+    assert_eq!(entry["version"], 1);
+    assert_eq!(entry["contract_id"], aster::rpc::contract_id(&contract));
+    assert_eq!(entry["pattern"], "shared");
+    assert_eq!(
+        entry["serialization_modes"],
+        serde_json::json!(contract.serialization_modes)
+    );
+    assert_eq!(
+        entry["channels"],
+        serde_json::json!({ "rpc": srv.id().to_string() })
+    );
+
+    srv.shutdown().await;
+    client.shutdown().await;
+}
+
+/// An `aster.services` the application set is left as it was, and a bare node
+/// lists nothing.
+#[tokio::test]
+async fn explicit_services_attribute_wins_and_bare_node_lists_none() {
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .node_identity(NodeIdentity {
+            attributes: vec![Attr::new(SERVICES_ATTRIBUTE, "[]")],
+            ..Default::default()
+        })
+        .service(EchoServer::new(EchoImpl::default()))
+        .start()
+        .await
+        .unwrap();
+    let (client, conn) = client_of(&srv).await;
+    assert_eq!(
+        services_attribute(&conn).await,
+        Some(serde_json::json!([])),
+        "the application's value stays"
+    );
+    srv.shutdown().await;
+
+    let bare = deferred().await;
+    let (client2, conn2) = client_of(&bare).await;
+    assert_eq!(services_attribute(&conn2).await, None);
+    bare.shutdown().await;
+    client.shutdown().await;
+    client2.shutdown().await;
+}
+
+/// A deferred server lists its services once the surface is active, with
+/// publication disabled, and takes them back on deactivation.
+#[tokio::test]
+async fn deferred_surface_lists_services_while_active() {
+    let srv = deferred().await;
+    let (client, conn) = client_of(&srv).await;
+    assert_eq!(services_attribute(&conn).await, None, "before activation");
+
+    srv.activate(
+        RpcSurface::builder()
+            .service(EchoServer::new(EchoImpl::default()))
+            .manifest_publication(ManifestPublication::Disabled)
+            .build(),
+    )
+    .await
+    .unwrap();
+    let list = services_attribute(&conn).await.expect("while active");
+    assert_eq!(list[0]["name"], "SurfaceEcho");
+    assert_eq!(
+        list[0]["contract_id"],
+        aster::rpc::contract_id(&EchoServer::<EchoImpl>::contract())
+    );
+
+    srv.deactivate().await.unwrap();
+    assert_eq!(services_attribute(&conn).await, None, "after deactivation");
+
+    srv.shutdown().await;
+    client.shutdown().await;
 }

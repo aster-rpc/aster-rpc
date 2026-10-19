@@ -242,6 +242,42 @@ impl NodeIdentityHandle {
         *guard = identity;
     }
 
+    /// List `services` under [`SERVICES_ATTRIBUTE`], unless the application
+    /// already set that attribute (an explicit value always wins). A node with no
+    /// contract-bearing service sets nothing.
+    pub(crate) fn advertise_services(&self, services: &[AdvertisedService]) {
+        // A bare node (no contract-bearing service) lists nothing.
+        if services.is_empty() {
+            return;
+        }
+        self.update(|identity| {
+            if identity
+                .attributes
+                .iter()
+                .any(|a| a.name == SERVICES_ATTRIBUTE)
+            {
+                return;
+            }
+            let json = services_json(services, &identity.node_id);
+            identity
+                .attributes
+                .push(Attr::new(SERVICES_ATTRIBUTE, json));
+        });
+    }
+
+    /// Remove [`SERVICES_ATTRIBUTE`] when its value is the one
+    /// [`advertise_services`](Self::advertise_services) wrote for `services`
+    /// (never an application's own).
+    pub(crate) fn withdraw_services(&self, services: &[AdvertisedService]) {
+        self.update(|identity| {
+            let json = services_json(services, &identity.node_id);
+            identity.attributes.retain(|a| {
+                !(a.name == SERVICES_ATTRIBUTE
+                    && matches!(&a.value, Some(Value::Text(t)) if t.value == json))
+            });
+        });
+    }
+
     /// Mutate the served identity in place. The pinned `node_id` is restored
     /// after the closure runs, so it cannot be changed from here either.
     pub fn update(&self, f: impl FnOnce(&mut NodeIdentity)) {
@@ -250,6 +286,70 @@ impl NodeIdentityHandle {
         f(&mut guard);
         guard.node_id = node_id;
     }
+}
+
+/// The `aster.ops.NodeInfo` attribute that lists the services a node serves:
+/// a JSON list of the Python `ServiceSummary` shape (`name`, `version`,
+/// `contract_id`, `channels`, `pattern`, `serialization_modes`). Clients read it
+/// to find what a peer serves without a registry.
+pub const SERVICES_ATTRIBUTE: &str = "aster.services";
+
+/// One served service, as listed in [`SERVICES_ATTRIBUTE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AdvertisedService {
+    pub(crate) name: String,
+    pub(crate) version: i32,
+    pub(crate) contract_id: String,
+    pub(crate) session: bool,
+    pub(crate) serialization_modes: Vec<String>,
+}
+
+impl AdvertisedService {
+    /// From a native dispatcher's contract. `None` for a hand-written
+    /// dispatcher, which has no contract and so no contract id.
+    pub(crate) fn from_dispatch(svc: &dyn ServiceDispatch, session: bool) -> Option<Self> {
+        let mut contract = svc.contract_artifacts()?.contract;
+        if session {
+            contract.scoped = super::ScopeKind::Session;
+        }
+        Some(Self {
+            name: contract.name.clone(),
+            version: contract.version,
+            contract_id: super::contract::contract_id(&contract),
+            session,
+            serialization_modes: contract.serialization_modes.clone(),
+        })
+    }
+
+    /// From a binding-implemented service. `None` if it has no valid contract.
+    pub(crate) fn from_dynamic(svc: &super::dynamic::DynamicService) -> Option<Self> {
+        Some(Self {
+            name: svc.name.clone(),
+            version: svc.version,
+            contract_id: svc.contract_id().ok()?,
+            session: svc.scope == super::ScopeKind::Session,
+            serialization_modes: svc.contract().serialization_modes,
+        })
+    }
+}
+
+fn services_json(services: &[AdvertisedService], channel: &str) -> String {
+    let list: Vec<serde_json::Value> = services
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "name": s.name,
+                "version": s.version,
+                "contract_id": s.contract_id,
+                // One RPC channel; the client resolves it to the connection
+                // it is already on, so only the name matters.
+                "channels": { "rpc": channel },
+                "pattern": if s.session { "session" } else { "shared" },
+                "serialization_modes": s.serialization_modes,
+            })
+        })
+        .collect();
+    serde_json::Value::Array(list).to_string()
 }
 
 /// The stock implementation served by `AsterServerBuilder`: serves the live
