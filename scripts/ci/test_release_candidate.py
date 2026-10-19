@@ -499,8 +499,12 @@ class CandidateTests(unittest.TestCase):
         job_if = {job: (re.search(r"^    if: (.+)$", block, re.M) or [None, None])[1] for job, block in blocks.items()}
         gate = {"lint", "rust-tests", "test", "typescript", "ffi-go"}
         # Gate jobs run on every event, so a push to main qualifies correctness.
-        for job in gate:
+        # typescript also runs after a rust-tests failure (that edge only
+        # orders the jobs), but needs the addon test produced.
+        for job in gate - {"typescript"}:
             self.assertIsNone(job_if[job], job)
+        self.assertEqual(job_if["typescript"], "${{ !cancelled() && needs.test.result == 'success' }}")
+        for job in gate:
             self.assertIn(job, policy["required_jobs"])
         # Every producer and assurance job is skipped on a push to main.
         for job in set(blocks) - gate - {"candidate"}:

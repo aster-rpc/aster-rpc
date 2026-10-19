@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# ci-watch.sh -- follow the Forgejo Actions jobs for one commit and, the
-# moment a job fails, print the end of its log and the lines that explain it.
+# ci-watch.sh -- follow the Forgejo Actions jobs for one commit; as each job
+# fails, print the end of its log and the lines that explain it, and keep
+# watching until the run finishes, so one run reports every failure.
 #
 #   scripts/ci/ci-watch.sh               HEAD
 #   scripts/ci/ci-watch.sh <sha>         that commit
@@ -8,8 +9,11 @@
 #   scripts/ci/ci-watch.sh <sha> --event workflow_dispatch
 #                                        only that event's runs (the release
 #                                        candidate; a push runs the gate)
+#   scripts/ci/ci-watch.sh <sha> --fail-fast
+#                                        stop at the first failed job
 #
-# Exit 0 when every job that ran succeeded, 1 on the first failure, 2 when no
+# Exit 0 when every job that ran succeeded, 1 when any failed (once the run
+# finishes, or at the first failure with --fail-fast), 2 when no
 # jobs appear for the commit within the wait. Reads the API with the git
 # credential for forge.emrul.dev and job logs over ssh on the Forge host
 # (the API cannot read logs): docs/_internal/dev-loop-runbook.md.
@@ -26,12 +30,14 @@ APPEAR_TIMEOUT="${ASTER_CI_WATCH_APPEAR:-600}"
 cd "$(dirname "$0")/../.."
 rev=HEAD
 once=false
+fail_fast=false
 event=""
 while (( $# )); do
   case "$1" in
     --once) once=true ;;
+    --fail-fast) fail_fast=true ;;
     --event) event="${2:?--event needs a value}"; shift ;;
-    -*) echo "usage: scripts/ci/ci-watch.sh [<sha>] [--once] [--event <name>]" >&2; exit 2 ;;
+    -*) echo "usage: scripts/ci/ci-watch.sh [<sha>] [--once] [--fail-fast] [--event <name>]" >&2; exit 2 ;;
     *) rev="$1" ;;
   esac
   shift
@@ -119,6 +125,8 @@ explain() {
 }
 
 start=$(date +%s)
+# Failed jobs already explained, one "<id> <status> <name>" line each.
+explained=""
 echo "ci-watch: $(git log -1 --format='%h %s' "$sha")"
 while true; do
   if ! out="$(jobs)"; then
@@ -134,16 +142,23 @@ while true; do
     sleep "$POLL"
     continue
   fi
-  failed="$(awk '$2 == "failure" || $2 == "cancelled" {print; exit}' <<<"$out")"
   summary="$(awk '{c[$2]++} END {for (s in c) printf "%s=%d ", s, c[s]}' <<<"$out")"
   printf '%s  %s\n' "$(date +%H:%M:%S)" "$summary"
-  if [[ -n "$failed" ]]; then
-    read -r id _ name <<<"$failed"
-    explain "$id" "$name"
-    exit 1
-  fi
+  while read -r id status name; do
+    [[ -n "$id" ]] || continue
+    grep -qx -- "$id $status $name" <<<"$explained" && continue
+    explain "$id" "$name" </dev/null
+    explained+="$id $status $name"$'\n'
+    $fail_fast && exit 1
+  done < <(awk '$2 == "failure" || $2 == "cancelled"' <<<"$out")
   run_states="$(runs)"
   if [[ -n "$run_states" ]] && ! grep -qE ' (running|waiting|blocked|queued)$' <<<"$run_states"; then
+    if [[ -n "$explained" ]]; then
+      echo
+      echo "ci-watch: run finished; failed jobs:"
+      sed -E '/^$/d; s/^([0-9]+) ([a-z]+) (.*)$/  \3 (\2, task \1)/' <<<"$explained"
+      exit 1
+    fi
     if grep -qE ' (failure|cancelled)$' <<<"$run_states"; then
       echo "ci-watch: run failed without a failed job in the task list:"
       echo "$run_states"
@@ -152,6 +167,9 @@ while true; do
     echo "ci-watch: run finished: $(tr '\n' ' ' <<<"$run_states")"
     exit 0
   fi
-  $once && exit 0
+  if $once; then
+    [[ -z "$explained" ]] || exit 1
+    exit 0
+  fi
   sleep "$POLL"
 done
