@@ -9,6 +9,11 @@ namespace Aster.Tests;
 
 public class StreamingLifecycleTests
 {
+    // How long to wait for something that must happen. The parked producers
+    // never unpark before teardown, so any bound proves a call didn't wait for
+    // one; a loaded runner needed more than 3 s to deliver a deadline's cancel.
+    private static readonly TimeSpan Settle = TimeSpan.FromSeconds(15);
+
     private sealed class ParkedRequests : IAsyncEnumerable<EchoRequest>, IAsyncEnumerator<EchoRequest>
     {
         public readonly TaskCompletionSource<bool> Entered = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -68,28 +73,28 @@ public class StreamingLifecycleTests
         var result = bidi ? ConsumeBidi() : conn.ClientStreamAsync<EchoRequest, EchoReply>("Lifecycle", "upload", requests);
         try
         {
-            await delivered.Task.WaitAsync(TimeSpan.FromSeconds(3));
-            await requests.Entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            await delivered.Task.WaitAsync(Settle);
+            await requests.Entered.Task.WaitAsync(Settle);
             // The actual native dispatch call has sent its terminal response and gone.
-            await Task.Run(async () => { while (server.LiveCalls != 0) await Task.Delay(5); }).WaitAsync(TimeSpan.FromSeconds(3));
+            await Task.Run(async () => { while (server.LiveCalls != 0) await Task.Delay(5); }).WaitAsync(Settle);
             if (reject)
             {
-                var error = await Assert.ThrowsAsync<RpcError>(() => result.WaitAsync(TimeSpan.FromSeconds(2)));
+                var error = await Assert.ThrowsAsync<RpcError>(() => result.WaitAsync(Settle));
                 Assert.Equal(StatusCode.InvalidArgument, error.Code);
             }
-            else Assert.Equal("early answer", (await result.WaitAsync(TimeSpan.FromSeconds(2))).Message);
+            else Assert.Equal("early answer", (await result.WaitAsync(Settle)).Message);
             Assert.Equal(0, requests.Disposals); // no concurrent Dispose/MoveNext
             if (reject) requests.Release.TrySetException(new InvalidOperationException("late source failure"));
             else requests.Release.TrySetResult(true); // late value must never be sent
-            await Task.Run(async () => { while (requests.Disposals == 0) await Task.Delay(5); }).WaitAsync(TimeSpan.FromSeconds(3));
+            await Task.Run(async () => { while (requests.Disposals == 0) await Task.Delay(5); }).WaitAsync(Settle);
             Assert.Equal(1, requests.Disposals);
             Assert.Equal(0UL, server.LiveCalls);
-            Assert.Equal("after", (await conn.UnaryAsync<EchoRequest, EchoReply>("Lifecycle", "echo", new EchoRequest { Message = "after" }).WaitAsync(TimeSpan.FromSeconds(3))).Message);
+            Assert.Equal("after", (await conn.UnaryAsync<EchoRequest, EchoReply>("Lifecycle", "echo", new EchoRequest { Message = "after" }).WaitAsync(Settle)).Message);
         }
         finally
         {
             requests.Release.TrySetResult(false);
-            try { await result.WaitAsync(TimeSpan.FromSeconds(3)); } catch { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
+            try { await result.WaitAsync(Settle); } catch { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
         }
     }
     private sealed class ThrowingRequests(Exception error, string phase) : IAsyncEnumerable<EchoRequest>, IAsyncEnumerator<EchoRequest>
@@ -138,8 +143,8 @@ public class StreamingLifecycleTests
             if (bidi) { await foreach (var _ in conn.BidiStreamAsync<EchoRequest, EchoReply>("LocalFailure", "chat", requests)) { } }
             else await conn.ClientStreamAsync<EchoRequest, EchoReply>("LocalFailure", "upload", requests);
         }
-        Assert.Same(error, await Assert.ThrowsAsync<InvalidOperationException>(() => Consume().WaitAsync(TimeSpan.FromSeconds(3))));
-        await Task.Run(async () => { while (server.LiveCalls != 0) await Task.Delay(5); }).WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Same(error, await Assert.ThrowsAsync<InvalidOperationException>(() => Consume().WaitAsync(Settle)));
+        await Task.Run(async () => { while (server.LiveCalls != 0) await Task.Delay(5); }).WaitAsync(Settle);
     }
 
     [Theory]
@@ -166,13 +171,13 @@ public class StreamingLifecycleTests
             if (bidi) { await foreach (var _ in conn.BidiStreamAsync<EchoRequest, EchoReply>("Empty", "chat", Empty())) { } }
             else await conn.ClientStreamAsync<EchoRequest, EchoReply>("Empty", "upload", Empty());
         }
-        var error = await Assert.ThrowsAsync<RpcError>(() => Consume().WaitAsync(TimeSpan.FromSeconds(3)));
+        var error = await Assert.ThrowsAsync<RpcError>(() => Consume().WaitAsync(Settle));
         // The asynchronous finish/reset race can report native refusal or cancellation.
         // Neither may report OK or dispatch the protected streaming handler.
         Assert.Contains(error.Code, new[] { StatusCode.InvalidArgument, StatusCode.Cancelled });
         Assert.Equal(0, Volatile.Read(ref dispatched));
         Assert.Equal(0UL, server.LiveCalls);
-        Assert.Equal("after", (await conn.UnaryAsync<EchoRequest, EchoReply>("Empty", "echo", new EchoRequest { Message = "after" }).WaitAsync(TimeSpan.FromSeconds(3))).Message);
+        Assert.Equal("after", (await conn.UnaryAsync<EchoRequest, EchoReply>("Empty", "echo", new EchoRequest { Message = "after" }).WaitAsync(Settle)).Message);
     }
 
     [Theory]
@@ -213,24 +218,24 @@ public class StreamingLifecycleTests
         var result = Consume();
         try
         {
-            await delivered.Task.WaitAsync(TimeSpan.FromSeconds(3));
-            await requests.Entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            await delivered.Task.WaitAsync(Settle);
+            await requests.Entered.Task.WaitAsync(Settle);
             if (!deadline) ct.Cancel();
             if (deadline)
             {
-                var error = await Assert.ThrowsAsync<RpcError>(() => result.WaitAsync(TimeSpan.FromSeconds(3)));
+                var error = await Assert.ThrowsAsync<RpcError>(() => result.WaitAsync(Settle));
                 Assert.Equal(StatusCode.DeadlineExceeded, error.Code);
             }
-            else await Assert.ThrowsAnyAsync<OperationCanceledException>(() => result.WaitAsync(TimeSpan.FromSeconds(3)));
-            await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(3));
-            await Task.Run(async () => { while (server.LiveCalls != 0) await Task.Delay(5); }).WaitAsync(TimeSpan.FromSeconds(3));
+            else await Assert.ThrowsAnyAsync<OperationCanceledException>(() => result.WaitAsync(Settle));
+            await cancelled.Task.WaitAsync(Settle);
+            await Task.Run(async () => { while (server.LiveCalls != 0) await Task.Delay(5); }).WaitAsync(Settle);
             Assert.Equal(0, requests.Disposals);
         }
         finally
         {
             requests.Release.TrySetResult(false);
-            try { await result.WaitAsync(TimeSpan.FromSeconds(3)); } catch { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
-            await Task.Run(async () => { while (requests.Disposals == 0) await Task.Delay(5); }).WaitAsync(TimeSpan.FromSeconds(3));
+            try { await result.WaitAsync(Settle); } catch { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
+            await Task.Run(async () => { while (requests.Disposals == 0) await Task.Delay(5); }).WaitAsync(Settle);
         }
         Assert.Equal(1, requests.Disposals);
     }
@@ -258,18 +263,18 @@ public class StreamingLifecycleTests
         var replies = conn.BidiStreamAsync<EchoRequest, EchoReply>("Abandon", "chat", requests).GetAsyncEnumerator();
         try
         {
-            Assert.True(await replies.MoveNextAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(3)));
+            Assert.True(await replies.MoveNextAsync().AsTask().WaitAsync(Settle));
             Assert.Equal("first reply", replies.Current.Message);
-            await replies.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(2));
-            await cancelled.Task.WaitAsync(TimeSpan.FromSeconds(3));
-            await Task.Run(async () => { while (server.LiveCalls != 0) await Task.Delay(5); }).WaitAsync(TimeSpan.FromSeconds(3));
+            await replies.DisposeAsync().AsTask().WaitAsync(Settle);
+            await cancelled.Task.WaitAsync(Settle);
+            await Task.Run(async () => { while (server.LiveCalls != 0) await Task.Delay(5); }).WaitAsync(Settle);
             Assert.Equal(0, requests.Disposals);
         }
         finally
         {
             requests.Release.TrySetResult(false);
             await replies.DisposeAsync();
-            await Task.Run(async () => { while (requests.Disposals == 0) await Task.Delay(5); }).WaitAsync(TimeSpan.FromSeconds(3));
+            await Task.Run(async () => { while (requests.Disposals == 0) await Task.Delay(5); }).WaitAsync(Settle);
         }
         Assert.Equal(1, requests.Disposals);
     }
@@ -315,7 +320,7 @@ public class StreamingLifecycleTests
         var result = conn.ClientStreamAsync<EchoRequest, EchoReply>("Pressure", "upload", Produce(), cancellationToken: cancel.Token);
         try
         {
-            await entered.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            await entered.Task.WaitAsync(Settle);
             int previous = Volatile.Read(ref completed);
             bool stalled = false;
             for (int i = 0; i < 30; i++)
@@ -326,16 +331,16 @@ public class StreamingLifecycleTests
                 previous = now;
             }
             cancel.Cancel();
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => result.WaitAsync(TimeSpan.FromSeconds(3)));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => result.WaitAsync(Settle));
             Assert.True(stalled, "bounded producer never reached backpressure");
             Assert.InRange(Volatile.Read(ref completed), 1, 31);
             Console.WriteLine($"completed payloads before cancellation: {Volatile.Read(ref completed)} (2 MiB each, cap 32)");
-            Assert.Equal("after", (await conn.UnaryAsync<EchoRequest, EchoReply>("Pressure", "echo", new EchoRequest { Message = "after" }).WaitAsync(TimeSpan.FromSeconds(3))).Message);
+            Assert.Equal("after", (await conn.UnaryAsync<EchoRequest, EchoReply>("Pressure", "echo", new EchoRequest { Message = "after" }).WaitAsync(Settle)).Message);
         }
         finally
         {
             cancel.Cancel();
-            try { await result.WaitAsync(TimeSpan.FromSeconds(3)); } catch { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
+            try { await result.WaitAsync(Settle); } catch { /* swallow-ok: draining in teardown; the test asserted what it needs above */ }
         }
     }
 }

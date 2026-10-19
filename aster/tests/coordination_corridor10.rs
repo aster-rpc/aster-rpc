@@ -55,6 +55,7 @@ use aster::coordination::ids::{CoordinationGroupId, CoordinationNodeId};
 use aster::coordination::model::limits::{
     RIGHT_ACQUIRE, RIGHT_MUTATE, RIGHT_READ, RIGHT_RELEASE, RIGHT_RENEW,
 };
+use aster::coordination::store::wire::GroupStatusReplyWireV1;
 use aster::coordination::testing::GroupFixture;
 use aster::rpc::AsterServer;
 use aster::topology::TopologySnapshot;
@@ -113,6 +114,21 @@ async fn within<T, F: std::future::Future<Output = T>>(what: &str, f: F) -> T {
     match tokio::time::timeout(PATIENCE, f).await {
         Ok(value) => value,
         Err(_) => panic!("{what}: no answer within {PATIENCE:?}"),
+    }
+}
+
+/// One `group_status` cut. A read during an election or on a loaded host can
+/// find no member ready to serve it; that is a transient refusal, so retry it.
+async fn status_cut(client: &CoordinationClient) -> GroupStatusReplyWireV1 {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        match within("group_status", client.reads().group_status()).await {
+            Ok(status) => return status,
+            Err(_) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => panic!("the status cut: {error:?}"),
+        }
     }
 }
 
@@ -911,9 +927,7 @@ async fn observed_input(
     policy: PlacementPolicy,
     topology: TopologySnapshot,
 ) -> PlacementInput {
-    let status = within("group_status", client.reads().group_status())
-        .await
-        .expect("the status cut");
+    let status = status_cut(client).await;
     let ids = |nodes: &[aster::coordination::contract::NodeIdV1]| -> BTreeSet<CoordinationNodeId> {
         nodes
             .iter()
@@ -1432,9 +1446,7 @@ async fn two_racing_corridor_managers_commit_one_intent_and_one_transition() {
         report_b.reason
     );
 
-    let status = within("status", observer.reads().group_status())
-        .await
-        .expect("the status cut");
+    let status = status_cut(&observer).await;
     assert_eq!(
         status.pending_operation_id.as_deref(),
         accepted[0]
@@ -1723,9 +1735,7 @@ async fn a_corridor_manager_killed_after_the_journal_fsync_retries_the_same_requ
     let (membership_bytes, membership_hash, membership_sequence, membership_outcome);
     {
         let client = corridor.admin(&membership_journal).await;
-        let status = within("status", client.reads().group_status())
-            .await
-            .expect("the status cut");
+        let status = status_cut(&client).await;
         let mut desired: Vec<aster::coordination::contract::NodeIdV1> = desired_positions
             .iter()
             .map(|p| aster::coordination::contract::NodeIdV1 {
@@ -1812,9 +1822,7 @@ async fn a_corridor_manager_killed_after_the_journal_fsync_retries_the_same_requ
     // the dead manager minted, never one from a fresh plan.
     let deadline = std::time::Instant::now() + PATIENCE;
     let proved: &str = loop {
-        let status = within("status", next_life.reads().group_status())
-            .await
-            .expect("the status cut");
+        let status = status_cut(&next_life).await;
         if let Some(pending) = &status.pending_operation_id {
             assert_eq!(
                 pending.as_slice(),
