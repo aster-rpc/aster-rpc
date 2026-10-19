@@ -65,7 +65,7 @@ public sealed class OtlpReceiver : IDisposable
     public void StopListening()
     {
         _listener.Stop();
-        _loop.Wait(TimeSpan.FromSeconds(2));
+        _loop.Wait(WaitBudget.Value);
     }
 
     public void StartListening()

@@ -319,6 +319,7 @@ public final class InteropEcho {
           throw new RpcError(StatusCode.CANCELLED, "chain: inbound cancelled");
         }
         try {
+          // short-wait-ok: poll tick between cancel/deadline checks; the loop is bounded by cleanupBound
           return future.get(20, TimeUnit.MILLISECONDS);
         } catch (TimeoutException pending) {
           // Poll only while this handler owns the outbound invocation.
@@ -587,6 +588,7 @@ public final class InteropEcho {
       workers.add(Thread.ofVirtual().start(() -> {
         while (System.nanoTime() < deadline) {
           Long sequence;
+          // short-wait-ok: campaign mode: poll tick so the worker re-checks the window deadline
           try { sequence = jobs.poll(20, TimeUnit.MILLISECONDS); }
           catch (InterruptedException interrupted) { Thread.currentThread().interrupt(); return; }
           if (sequence == null || System.nanoTime() >= deadline) continue;
@@ -605,12 +607,14 @@ public final class InteropEcho {
               Thread.sleep(50);
               // An early transport failure must keep its original class, not become cancellation.
               if (!call.isDone()) call.cancel(true);
+              // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg (planned cancel)
               call.get(1, TimeUnit.SECONDS);
               bad = true;
             } else if (kind == 1) {
               CompletableFuture<ServerStreamCall<EchoReply>> opening = client.openServerStream(
                   addr, "InteropEcho", "generate", request, EchoReply.class, options);
               ServerStreamCall<EchoReply> stream;
+              // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg
               try { stream = opening.get(3, TimeUnit.SECONDS); }
               catch (Throwable error) {
                 // The opening future has no native cancellation hook. Reclaim a late result.
@@ -621,6 +625,7 @@ public final class InteropEcho {
                 int count = 0;
                 while (true) {
                   if (System.nanoTime() - callStarted >= 3_000_000_000L) throw new TimeoutException("stream watchdog");
+                  // short-wait-ok: campaign mode: poll tick under the 3 s stream watchdog
                   EchoReply reply = stream.recvWithTimeout(20, TimeUnit.MILLISECONDS);
                   if (reply == null) {
                     if (stream.isComplete()) break;
@@ -635,6 +640,7 @@ public final class InteropEcho {
             } else {
               CompletableFuture<EchoReply> call = client.call(addr, "InteropEcho", "echo", request, EchoReply.class, options);
               owned = call;
+              // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg
               EchoReply reply = call.get(3, TimeUnit.SECONDS);
               bad = reply.count != 42 || !reply.message.equals(request.message) || !Arrays.equals(reply.data, data) || !reply.server_lang.equals("rust");
             }
@@ -683,6 +689,7 @@ public final class InteropEcho {
     }
     long sequence = 0;
     while (System.nanoTime() < deadline) {
+      // short-wait-ok: campaign mode: offer tick so the producer re-checks the window deadline
       if (jobs.offer(sequence, 20, TimeUnit.MILLISECONDS)) {
         sequence++;
         stats.high.accumulateAndGet(jobs.size(), Math::max);
@@ -738,6 +745,7 @@ public final class InteropEcho {
     try (AsterClient client = AsterClient.builder().config(config()).codec(codec)
         .build().get(30, TimeUnit.SECONDS)) {
       NodeAddr addr = NodeAddr.fromTicket(ticket);
+      // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg
       IrohConnection connection = client.connect(addr).get(2, TimeUnit.SECONDS);
       int generation = 0;
       long pid = ProcessHandle.current().pid();
@@ -759,6 +767,7 @@ public final class InteropEcho {
             NodeAddr replacement = NodeAddr.fromTicket(command.path("ticket").asText());
             if (replacement.endpointId().equals(addr.endpointId())) throw new IllegalArgumentException("replace_peer requires fresh peer identity");
             connection.close();
+            // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg
             connection = client.connect(replacement).get(2, TimeUnit.SECONDS);
             addr = replacement; generation = command.path("generation").asInt();
             response = Map.of("phase", "campaign_peer", "generation", generation, "active_calls", 0, "pid", pid, "owner_identity", ownerIdentity);

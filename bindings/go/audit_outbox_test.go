@@ -157,7 +157,7 @@ func TestAuditOutbox_CloneAndCanceledClose(t *testing.T) {
 	if err := outbox.Close(ctx); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(waitBudget())
 	for {
 		reopened, openErr := OpenAuditOutbox(ctx, rt, cfg)
 		if openErr == nil {

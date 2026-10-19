@@ -5,6 +5,7 @@ import {
   IrohTransport,
   mapTransportError,
 } from '../../../bindings/typescript/packages/aster/src/transport/iroh.ts';
+import { WAIT_BUDGET_MS } from '../helpers/wait-budget.ts';
 const native = tryLoadNative() as any;
 if (!native?.RpcConnection) throw new Error('local validation control requires native RPC');
 const offline = { relayMode: 'disabled', bindAddr: '127.0.0.1:0', logLevel: 'warn' };
@@ -25,7 +26,7 @@ async function bounded<T>(p: Promise<T>, label: string): Promise<T> {
     return await Promise.race([
       p,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} still pending after 500ms`)), 500);
+        timer = setTimeout(() => reject(new Error(`${label} still pending after ${WAIT_BUDGET_MS}ms`)), WAIT_BUDGET_MS);
       }),
     ]);
   } finally {

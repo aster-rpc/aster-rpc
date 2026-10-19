@@ -1,6 +1,7 @@
 #![cfg(all(feature = "enrollment", feature = "docs"))]
 //! Issuer revocation over the network (enrollment B8): INV-E6 and INV-E7.
 
+use aster_transport_core::test_support::wait_budget;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -222,7 +223,7 @@ async fn revoked_issuer_closes_chain_sessions_and_keeps_registered_nodes() {
         // An ordinary connection Gate 0 admitted for the chain-only node.
         chained.add_peer(&replica).unwrap();
         let outbound = chained.connect(&replica.id(), NORMAL).await.unwrap();
-        let inbound = tokio::time::timeout(Duration::from_secs(5), replica_connections.recv())
+        let inbound = tokio::time::timeout(wait_budget(), replica_connections.recv())
             .await
             .unwrap()
             .unwrap();
@@ -256,10 +257,10 @@ async fn revoked_issuer_closes_chain_sessions_and_keeps_registered_nodes() {
         .await
         .unwrap();
         assert_eq!(revoked.reason, DenialReason::IssuerRevoked);
-        tokio::time::timeout(Duration::from_secs(5), inbound.closed())
+        tokio::time::timeout(wait_budget(), inbound.closed())
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), outbound.closed())
+        tokio::time::timeout(wait_budget(), outbound.closed())
             .await
             .unwrap();
         assert_eq!(

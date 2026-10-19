@@ -38,6 +38,7 @@ from .workloads import (
     ChaosSession, EchoReq, EchoResp, CounterReq, CounterResp,
     SumItem, SumResp, ALL_TYPES,
 )
+from wait_budget import WAIT_BUDGET
 
 
 def _codec():
@@ -75,7 +76,7 @@ async def _call_unary(c_send, c_recv, codec, method, request):
     await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
     await write_frame(c_send, codec.encode(request), flags=0)
 
-    frame = await asyncio.wait_for(read_frame(c_recv), timeout=5.0)
+    frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
     if frame is None:
         raise ConnectionError("stream ended")
     payload, flags = frame
@@ -148,7 +149,7 @@ async def test_g2_cancel_produces_cancelled_trailer():
         got_cancelled = False
         for _ in range(10):
             try:
-                frame = await asyncio.wait_for(read_frame(c_recv), timeout=5.0)
+                frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
             except asyncio.TimeoutError:
                 break
             if frame is None:
@@ -203,7 +204,7 @@ async def test_g4_client_stream_rejects_non_ok_trailer():
         await write_frame(c_send, codec.encode(ok_status), flags=TRAILER)
 
         # Read response
-        frame = await asyncio.wait_for(read_frame(c_recv), timeout=5.0)
+        frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
         assert frame is not None, "no response from server"
         payload, flags = frame
         assert not (flags & TRAILER), "expected data frame, got trailer"
@@ -236,7 +237,7 @@ async def test_g4_client_stream_non_ok_eoi():
         await write_frame(c_send, codec.encode(bad_status), flags=TRAILER)
 
         # Read response -- should be an error, not a success with total=10
-        frame = await asyncio.wait_for(read_frame(c_recv), timeout=5.0)
+        frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
         assert frame is not None, "no response from server"
         payload, flags = frame
 
@@ -343,6 +344,7 @@ async def test_g6_bidi_reader_error_not_silent_eof():
         responses = []
         for _ in range(5):
             try:
+                # short-wait-ok: a timeout ends the read loop; no frame after the corrupt one is an accepted outcome
                 frame = await asyncio.wait_for(read_frame(c_recv), timeout=3.0)
             except asyncio.TimeoutError:
                 break
@@ -457,6 +459,7 @@ async def test_g1_concurrent_calls_after_recv_fault():
         call1_failed = False
         call1_value = None
         try:
+            # short-wait-ok: the injected recv fault may surface as a timeout; failure is an accepted outcome
             resp1 = await asyncio.wait_for(stub.echo(EchoReq(value=42)), timeout=5.0)
             call1_value = resp1.value if hasattr(resp1, 'value') else None
         except Exception:
@@ -466,6 +469,7 @@ async def test_g1_concurrent_calls_after_recv_fault():
         call2_value = None
         call2_failed = False
         try:
+            # short-wait-ok: call 2 may fail in any way, including a timeout; only a stale value is asserted
             resp2 = await asyncio.wait_for(stub.echo(EchoReq(value=99)), timeout=5.0)
             call2_value = resp2.value if hasattr(resp2, 'value') else None
         except Exception:
@@ -537,7 +541,7 @@ async def test_g5_decompression_bomb_rejected():
         await write_frame(c_send, bomb, flags=COMPRESSED)
 
         # Server should respond with an error (not crash/OOM)
-        frame = await asyncio.wait_for(read_frame(c_recv), timeout=5.0)
+        frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
         assert frame is not None, "server crashed without responding"
         payload, flags = frame
 
@@ -587,7 +591,7 @@ async def test_g8_deadline_enforced_in_session():
         # Read response -- should be an error within ~2s (deadline + skew)
         # If the server ignores the deadline, this will take 10s and the
         # test will time out.
-        frame = await asyncio.wait_for(read_frame(c_recv), timeout=5.0)
+        frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
 
         elapsed = time.monotonic() - start
 
@@ -651,7 +655,7 @@ async def test_g3_oversized_metadata_rejected():
         await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
 
         # Server should reject with RESOURCE_EXHAUSTED before reading request
-        frame = await asyncio.wait_for(read_frame(c_recv), timeout=5.0)
+        frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
         assert frame is not None, "server crashed without responding"
         payload, flags = frame
 
@@ -696,7 +700,7 @@ async def test_g3_too_many_metadata_entries_rejected():
         )
         await write_frame(c_send, codec.encode(call_hdr), flags=CALL)
 
-        frame = await asyncio.wait_for(read_frame(c_recv), timeout=5.0)
+        frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
         assert frame is not None, "server crashed without responding"
         payload, flags = frame
 
@@ -740,7 +744,7 @@ async def test_g12_corrupt_payload_produces_error_trailer():
         await write_frame(c_send, b"\xff\xfe\xfd\xfc\xfb\xfa\x00\x01", flags=0)
 
         # Server should respond with an error trailer
-        frame = await asyncio.wait_for(read_frame(c_recv), timeout=5.0)
+        frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
         assert frame is not None, "server crashed without responding"
         payload, flags = frame
 

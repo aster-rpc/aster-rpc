@@ -11,6 +11,7 @@ from aster import AsterClient, AsterServer, bidi_stream, server_stream, service,
 from aster.config import AsterConfig
 from aster.status import StatusCode
 from aster.transport.iroh import IrohBidiChannel
+from wait_budget import WAIT_BUDGET
 
 
 def channel(native):
@@ -110,22 +111,22 @@ async def test_native_bidi_and_empty_stream_lifecycle(phase):
                     channel = client.echo()
                     sending = asyncio.create_task(channel.send(Item("one")))
                     tasks.append(sending)
-                    await asyncio.wait_for(entered.wait(), 3)
+                    await asyncio.wait_for(entered.wait(), WAIT_BUDGET)
                     receiving = asyncio.create_task(channel.recv())
                     tasks.append(receiving)
                     await asyncio.sleep(0)
                     release.set()
-                    await asyncio.wait_for(sending, 3)
-                    assert (await asyncio.wait_for(receiving, 3)).value == "one"
+                    await asyncio.wait_for(sending, WAIT_BUDGET)
+                    assert (await asyncio.wait_for(receiving, WAIT_BUDGET)).value == "one"
                     await channel.close()
                     await channel.close()
-                    assert (await asyncio.wait_for(channel.wait_for_trailer(), 3))[0] == StatusCode.OK
+                    assert (await asyncio.wait_for(channel.wait_for_trailer(), WAIT_BUDGET))[0] == StatusCode.OK
                     assert len(opens) == 1 and probe.invocations == 1
                 elif phase == "empty_then_recover":
                     channel = client.echo()
                     await channel.close()
                     await channel.close()
-                    trailer = await asyncio.wait_for(channel.wait_for_trailer(), 3)
+                    trailer = await asyncio.wait_for(channel.wait_for_trailer(), WAIT_BUDGET)
                     assert trailer[0] in (StatusCode.INVALID_ARGUMENT, StatusCode.CANCELLED)
                     assert probe.invocations == 0
                 else:
@@ -137,10 +138,10 @@ async def test_native_bidi_and_empty_stream_lifecycle(phase):
                 recovered = client.echo()
                 await recovered.send(Item("healthy"))
                 await recovered.close()
-                assert (await asyncio.wait_for(recovered.recv(), 3)).value == "healthy"
-                assert (await asyncio.wait_for(recovered.wait_for_trailer(), 3))[0] == StatusCode.OK
+                assert (await asyncio.wait_for(recovered.recv(), WAIT_BUDGET)).value == "healthy"
+                assert (await asyncio.wait_for(recovered.wait_for_trailer(), WAIT_BUDGET))[0] == StatusCode.OK
                 dispatcher = server._server._dispatcher
-                async with asyncio.timeout(3):
+                async with asyncio.timeout(WAIT_BUDGET):
                     while dispatcher.in_flight or dispatcher.server.live_calls():
                         await asyncio.sleep(0.01)
             finally:

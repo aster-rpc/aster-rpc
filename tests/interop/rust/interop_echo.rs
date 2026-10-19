@@ -483,6 +483,7 @@ async fn deadline_case(conn: &RpcConnection) -> Verdict {
 /// cancels it): the server must observe a cancellation.
 async fn cancel_case(client: &InteropEchoClient) -> Verdict {
     let before = cancelled_count(client).await?;
+    // short-wait-ok: the client cancels hold by dropping it after 300 ms
     if tokio::time::timeout(Duration::from_millis(300), client.hold(probe()))
         .await
         .is_ok()
@@ -794,6 +795,7 @@ fn campaign_status(error: &aster::Error) -> String {
 async fn campaign_connect(node: &Node, ticket: &str) -> anyhow::Result<RpcConnection> {
     let t = Ticket::from_base58(ticket)?;
     let id = node.add_ticket_addr(&t)?;
+    // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg
     Ok(tokio::time::timeout(Duration::from_secs(2), node.rpc_connect(&id)).await??)
 }
 
@@ -813,6 +815,7 @@ async fn campaign_request(
     if kind == "cancel" {
         // Dropping this public call future sends caller cancellation; the hold
         // connection carries a ten-second RPC budget independently of the drop.
+        // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg
         match tokio::time::timeout(Duration::from_millis(50), client.hold(req)).await {
             Err(_) => return Ok(kind),
             Ok(Ok(_)) => return Err("INTEGRITY".into()),
@@ -832,6 +835,7 @@ async fn campaign_request(
             .map_err(|e| campaign_status(&e))?;
         let mut count = 0;
         loop {
+            // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg
             let next = match tokio::time::timeout(Duration::from_secs(2), stream.recv()).await {
                 Ok(next) => next,
                 Err(_) => {
@@ -978,6 +982,7 @@ async fn campaign_window(
                 } else {
                     &client
                 };
+                // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg
                 let outcome = match tokio::time::timeout(
                     Duration::from_secs(3),
                     campaign_request(caller, sequence, slow),
@@ -1072,6 +1077,7 @@ async fn campaign_window(
     }
     accepting.store(false, Ordering::SeqCst);
     drop(tx);
+    // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg
     let drained = tokio::time::timeout(Duration::from_secs(4), async {
         while let Some(result) = workers.join_next().await {
             if result.is_err() {

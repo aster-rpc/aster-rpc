@@ -22,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import site.aster.config.AsterConfig;
 import site.aster.ffi.IrohException;
 import site.aster.node.IrohNode;
+import site.aster.testing.WaitBudget;
 
 final class DocsContractTest {
   private static byte[] utf8(String value) {
@@ -158,6 +159,7 @@ final class DocsContractTest {
         Doc doc = await(node.docs().createAsync());
         DocEvents events = await(doc.subscribeAsync())) {
       AuthorId author = await(node.docs().createAuthorAsync());
+      // short-wait-ok: no event is pending; the receiver timeout is the behaviour under test
       var timeout = events.nextAsync(Duration.ofMillis(30));
       var timedOut =
           assertThrows(java.util.concurrent.ExecutionException.class, () -> await(timeout));
@@ -168,7 +170,7 @@ final class DocsContractTest {
       assertTrue(canceled.isDone());
       assertTrue(canceled.isCancelled());
       assertThrows(java.util.concurrent.CancellationException.class, () -> await(canceled));
-      var pending = events.nextAsync(Duration.ofSeconds(5));
+      var pending = events.nextAsync(WaitBudget.duration());
       await(doc.setBytesAsync(author, "live/key", utf8("value")));
       DocEvent event = await(pending);
       assertEquals(DocEventType.INSERT_LOCAL, event.type());
@@ -178,7 +180,7 @@ final class DocsContractTest {
       // A second handle can write while the original Doc owner is gone.
       try (Doc writer = await(node.docs().openAsync(doc.docId())).orElseThrow()) {
         doc.close();
-        var next = events.nextAsync(Duration.ofSeconds(5));
+        var next = events.nextAsync(WaitBudget.duration());
         await(writer.setBytesAsync(author, "after/close", utf8("still subscribed")));
         assertEquals("after/close", await(next).entry().key());
       }
@@ -211,7 +213,7 @@ final class DocsContractTest {
         if (canceled) {
           assertTrue(receiving.isDone());
           assertTrue(receiving.isCancelled());
-          event = await(events.nextAsync(Duration.ofSeconds(5)));
+          event = await(events.nextAsync(WaitBudget.duration()));
         } else event = await(receiving);
         assertEquals(key, event.entry().key());
       }
@@ -237,7 +239,7 @@ final class DocsContractTest {
         DocEvent remote = null;
         DocEvent sync = null;
         for (int i = 0; i < 40 && (remote == null || sync == null); i++) {
-          DocEvent event = await(subscription.events().nextAsync(Duration.ofSeconds(5)));
+          DocEvent event = await(subscription.events().nextAsync(WaitBudget.duration()));
           assertNotNull(event);
           if (event.type() == DocEventType.INSERT_REMOTE) remote = event;
           if (event.type() == DocEventType.SYNC_FINISHED && event.sync().succeeded()) sync = event;

@@ -907,7 +907,7 @@ func exerciseApplicationLogOutage(t *testing.T, mode string) {
 		t.Fatalf("closed collector received logs requests: before=%d after=%d", requestsBefore, requests)
 	}
 	if mode == "stall" && stalled == 0 {
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(waitBudget())
 		for stalled == 0 && time.Now().Before(deadline) {
 			time.Sleep(25 * time.Millisecond)
 			obsBodiesMu.Lock()

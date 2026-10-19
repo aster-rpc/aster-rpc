@@ -49,6 +49,7 @@ import site.aster.server.spi.ServiceDescriptor;
 import site.aster.server.spi.ServiceDispatcher;
 import site.aster.server.spi.StreamingKind;
 import site.aster.server.spi.UnaryDispatcher;
+import site.aster.testing.WaitBudget;
 
 /**
  * Client interceptors (deadline, retry, circuit breaker, user interceptors) on every call pattern,
@@ -845,10 +846,11 @@ final class ClientInterceptorsE2ETest {
     var c = client(breaker);
     failure(c.<Msg, Msg>call(addr, SVC, "boom", new Msg("cancel-probe", 0), Msg.class));
     var probe = c.<Msg, Msg>call(addr, SVC, "slow", new Msg("probe", 0), Msg.class);
-    assertTrue(slowEntered.await(5, TimeUnit.SECONDS));
+    assertTrue(slowEntered.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
     assertTrue(probe.cancel(true));
-    assertThrows(CancellationException.class, () -> probe.get(5, TimeUnit.SECONDS));
-    assertTrue(slowCancelled.await(5, TimeUnit.SECONDS));
+    assertThrows(
+        CancellationException.class, () -> probe.get(WaitBudget.SECONDS, TimeUnit.SECONDS));
+    assertTrue(slowCancelled.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
     assertEquals(
         "echo:healthy-probe|",
         get(c.<Msg, Msg>call(addr, SVC, "echo", new Msg("healthy-probe", 0), Msg.class)).text());
@@ -864,7 +866,7 @@ final class ClientInterceptorsE2ETest {
     assertTrue(slowEntered.await(10, TimeUnit.SECONDS), "the handler is running");
     assertTrue(f.cancel(true));
     assertTrue(f.isCancelled());
-    assertThrows(CancellationException.class, () -> f.get(5, TimeUnit.SECONDS));
+    assertThrows(CancellationException.class, () -> f.get(WaitBudget.SECONDS, TimeUnit.SECONDS));
     assertTrue(slowCancelled.await(10, TimeUnit.SECONDS), "the handler saw the cancel");
     assertEquals(1, SLOW_CANCELLED.get());
   }
@@ -1052,12 +1054,13 @@ final class ClientInterceptorsE2ETest {
       assertEquals(0, queue.remainingCapacity());
       assertTrue(queue.retainedBytes() <= ResponseBuffer.MAX_RETAINED_BYTES);
       for (int i = 0; i < 600; i++) {
-        Msg response = call.recvWithTimeout(5, TimeUnit.SECONDS);
+        Msg response = call.recvWithTimeout(WaitBudget.SECONDS, TimeUnit.SECONDS);
         assertNotNull(response);
         assertEquals(i, response.n());
       }
       RpcError error =
-          assertThrows(RpcError.class, () -> call.recvWithTimeout(5, TimeUnit.SECONDS));
+          assertThrows(
+              RpcError.class, () -> call.recvWithTimeout(WaitBudget.SECONDS, TimeUnit.SECONDS));
       assertEquals(StatusCode.NOT_FOUND, error.code());
       assertEquals("after burst", error.rpcMessage());
       assertThrows(RpcError.class, call::recv);
@@ -1081,7 +1084,8 @@ final class ClientInterceptorsE2ETest {
       assertEquals(256, queue.size());
       call.cancel();
       RpcError error =
-          assertThrows(RpcError.class, () -> call.recvWithTimeout(5, TimeUnit.SECONDS));
+          assertThrows(
+              RpcError.class, () -> call.recvWithTimeout(WaitBudget.SECONDS, TimeUnit.SECONDS));
       assertEquals(StatusCode.CANCELLED, error.code());
       var reader = BidiCall.class.getDeclaredField("readerThread");
       reader.setAccessible(true);
@@ -1218,10 +1222,11 @@ final class ClientInterceptorsE2ETest {
                 });
         if (reject) {
           RpcError error =
-              assertInstanceOf(RpcError.class, failure(reading.orTimeout(3, TimeUnit.SECONDS)));
+              assertInstanceOf(
+                  RpcError.class, failure(reading.orTimeout(WaitBudget.SECONDS, TimeUnit.SECONDS)));
           assertEquals(StatusCode.INVALID_ARGUMENT, error.code());
         } else {
-          assertEquals("early answer", reading.get(3, TimeUnit.SECONDS).text());
+          assertEquals("early answer", reading.get(WaitBudget.SECONDS, TimeUnit.SECONDS).text());
           assertNull(call.recv());
         }
         call.complete();

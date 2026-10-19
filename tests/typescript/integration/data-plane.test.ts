@@ -14,6 +14,7 @@ import {
   type GossipTopicEvent,
 } from '@aster-rpc/aster';
 import { waitForInitialSync } from '../../../bindings/typescript/packages/aster/src/runtime.js';
+import { WAIT_BUDGET_MS } from '../helpers/wait-budget.ts';
 
 const OFFLINE = { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } as const;
 const NO_HASH = '00'.repeat(32);
@@ -225,7 +226,7 @@ describe('docs', () => {
         got.push(ev);
         if (ev.kind === 'insert_local') break;
       }
-    })(), 5000, 'insert_local');
+    })(), WAIT_BUDGET_MS, 'insert_local');
     const ins = got.at(-1)!;
     expect(ins.kind).toBe('insert_local');
     expect(Buffer.from(ins.entry!.key).toString()).toBe('ev');
@@ -260,6 +261,7 @@ describe('docs', () => {
     const ticket = await doc.shareWithAddr('read');
     await doc.leave(); // A now refuses B's sync request.
     const joined = await b.docs().joinAndSubscribe(ticket);
+    // short-wait-ok: A refuses every sync, so the wait must run out and report false
     expect(await waitForInitialSync(joined.takeDoc(), joined.takeEvents(), 3000)).toBe(false);
   });
 });

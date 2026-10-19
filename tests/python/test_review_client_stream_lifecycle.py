@@ -7,6 +7,7 @@ import pytest
 from aster import AsterClient, AsterServer, client_stream, service, wire_type
 from aster.config import AsterConfig
 from aster.status import RpcError, StatusCode
+from wait_budget import WAIT_BUDGET
 
 
 @wire_type("test.review.clientstream/Item")
@@ -56,10 +57,10 @@ async def test_native_client_stream_ends_with_a_parked_source(phase):
             client = await owner.client(Probe)
             call = asyncio.ensure_future(client.answer(source(), timeout=0.2 if phase == "deadline" else 5))
             try:
-                await asyncio.wait_for(parked.wait(), 3)
+                await asyncio.wait_for(parked.wait(), WAIT_BUDGET)
                 if phase == "cancel":
                     call.cancel()
-                done, _ = await asyncio.wait({call}, timeout=2 if phase == "deadline" else 1)
+                done, _ = await asyncio.wait({call}, timeout=WAIT_BUDGET)
                 assert done, "RPC waited for a parked producer instead of its terminal result"
                 if phase == "success":
                     assert (await call).value == "success"
@@ -72,20 +73,20 @@ async def test_native_client_stream_ends_with_a_parked_source(phase):
                     assert error.value.code == (StatusCode.PERMISSION_DENIED if phase == "reject" else StatusCode.DEADLINE_EXCEEDED)
                 assert not cleaned.is_set(), "fixture did not retain the independent user wait"
                 dispatcher = server._server._dispatcher
-                async with asyncio.timeout(2):
+                async with asyncio.timeout(WAIT_BUDGET):
                     while dispatcher.in_flight or dispatcher.server.live_calls():
                         await asyncio.sleep(0.01)
             finally:
                 release.set()
                 if not call.done():
                     call.cancel()
-                await asyncio.wait_for(asyncio.gather(call, return_exceptions=True), 3)
-                await asyncio.wait_for(cleaned.wait(), 3)
+                await asyncio.wait_for(asyncio.gather(call, return_exceptions=True), WAIT_BUDGET)
+                await asyncio.wait_for(cleaned.wait(), WAIT_BUDGET)
 
             async def healthy():
                 yield Item("healthy")
 
-            assert (await asyncio.wait_for(client.answer(healthy()), 2)).value == "healthy"
+            assert (await asyncio.wait_for(client.answer(healthy()), WAIT_BUDGET)).value == "healthy"
 
 
 async def test_native_local_frame_validation_ends_client_stream_without_dispatch():
@@ -110,11 +111,11 @@ async def test_native_local_frame_validation_ends_client_stream_without_dispatch
             client._transport._codec = InvalidCodec()
             try:
                 with pytest.raises(RpcError) as error:
-                    await asyncio.wait_for(client.answer(source()), 1)
+                    await asyncio.wait_for(client.answer(source()), WAIT_BUDGET)
                 assert error.value.code == StatusCode.UNKNOWN
                 assert error.value.message == "empty payload only allowed with TRAILER, CANCEL or END_STREAM flags"
                 dispatcher = server._server._dispatcher
-                async with asyncio.timeout(2):
+                async with asyncio.timeout(WAIT_BUDGET):
                     while dispatcher.in_flight or dispatcher.server.live_calls():
                         await asyncio.sleep(0.01)
                 assert Probe.calls == before
@@ -124,4 +125,4 @@ async def test_native_local_frame_validation_ends_client_stream_without_dispatch
             async def healthy():
                 yield Item("healthy")
 
-            assert (await asyncio.wait_for(client.answer(healthy()), 2)).value == "healthy"
+            assert (await asyncio.wait_for(client.answer(healthy()), WAIT_BUDGET)).value == "healthy"

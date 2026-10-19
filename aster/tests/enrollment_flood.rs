@@ -2,6 +2,7 @@
 //! fresh identities that open enrollment connections and never send a probe.
 #![cfg(all(feature = "enrollment", feature = "docs"))]
 
+use aster_transport_core::test_support::wait_budget;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -176,7 +177,7 @@ async fn gate_latency(
     for _ in 0..samples {
         let started = Instant::now();
         let outbound = peer.connect(&replica.id(), NORMAL).await.unwrap();
-        let admitted = tokio::time::timeout(Duration::from_secs(5), inbound.recv())
+        let admitted = tokio::time::timeout(wait_budget(), inbound.recv())
             .await
             .expect("gate check stalled")
             .unwrap();
@@ -289,7 +290,7 @@ async fn flood_above_the_eviction_threshold_evicts_slow_probes() {
         .unwrap();
     // 8 newer connections arrive within ~80 ms; this probe waits 500 ms.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let closed = tokio::time::timeout(Duration::from_secs(2), connection.closed())
+    let closed = tokio::time::timeout(wait_budget(), connection.closed())
         .await
         .expect("slow probe was not evicted");
     assert_eq!(closed.reason.unwrap(), b"enrollment busy");

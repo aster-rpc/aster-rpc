@@ -159,6 +159,7 @@ impl ServiceDispatch for Svc {
                 let mut cancelled = CountOnDrop::new(&self.seen.cancelled);
                 // Read requests until the stream ends or the call is cancelled.
                 loop {
+                    // short-wait-ok: a poll tick; the loop rechecks its stop flag between waits
                     match tokio::time::timeout(Duration::from_millis(5), call.recv_request()).await
                     {
                         Ok(Some(_)) => {}
@@ -175,6 +176,7 @@ impl ServiceDispatch for Svc {
             "chat" => {
                 let mut cancelled = CountOnDrop::new(&self.seen.cancelled);
                 loop {
+                    // short-wait-ok: a poll tick; the loop rechecks its stop flag between waits
                     match tokio::time::timeout(Duration::from_millis(5), call.recv_request()).await
                     {
                         Ok(Some(req)) => {
@@ -469,6 +471,7 @@ async fn a_dropped_unary_future_cancels_and_does_not_poison_the_pool() {
     f.conn.set_shared_pool_size(1);
     let hang = h("hang");
     let fut = f.conn.unary(&hang, vec![1]);
+    // short-wait-ok: dropping the call on expiry is the cancel under test
     assert!(tokio::time::timeout(Duration::from_millis(200), fut)
         .await
         .is_err());
@@ -495,6 +498,7 @@ async fn a_client_cancel_drops_a_unary_handler() {
     f.conn.set_shared_pool_size(1);
     let park = h("park");
     let fut = f.conn.unary(&park, vec![1]);
+    // short-wait-ok: dropping the call on expiry is the cancel under test
     assert!(tokio::time::timeout(Duration::from_millis(200), fut)
         .await
         .is_err());

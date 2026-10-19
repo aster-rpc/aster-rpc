@@ -193,6 +193,7 @@ async fn observed_persistent_node_is_promoted_and_outlives_its_chain() {
         let reviewed = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 let _ = joiner_enroll.connect(replica.addr()).await; // swallow-ok: retried until the review lands; the outcome is asserted after the loop
+                                                                     // short-wait-ok: one sync round per try; the loop retries within its 30 s bound
                 let _ = observations
                     .sync_with_timeout(&[replica.id()], Duration::from_secs(2))
                     .await;

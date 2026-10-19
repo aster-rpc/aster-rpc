@@ -42,6 +42,8 @@ from aster import (
 from aster import _logbridge
 from aster import logging as aster_logging
 
+from wait_budget import WAIT_BUDGET
+
 HEX32 = "0123456789abcdef" * 2
 TRACEPARENT = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 
@@ -449,10 +451,10 @@ async def test_concurrent_trace_carriers_are_isolated_and_restored():
 
     tasks = [asyncio.create_task(worker(i)) for i in range(2)]
     try:
-        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), 2)
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered)), WAIT_BUDGET)
         assert tracing.current_trace_id() is None
         release.set()
-        await asyncio.wait_for(asyncio.gather(*tasks), 2)
+        await asyncio.wait_for(asyncio.gather(*tasks), WAIT_BUDGET)
     finally:
         release.set()
         for task in tasks:

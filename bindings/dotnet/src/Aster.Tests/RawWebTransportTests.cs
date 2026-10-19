@@ -89,6 +89,7 @@ public class RawWebTransportTests
     public async Task CancelAcceptDoesNotConsumeNextSessionAndStopReleasesSockets()
     {
         using var runtime = new Runtime(); await using var listener = await RawWTListener.StartPublicAsync(runtime, Options());
+        // short-wait-ok: no peer connects yet, so the accept must be cancelled by this deadline
         using var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(20));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => listener.AcceptAsync(cancel.Token));
         await using var peer = new Peer($"https://{listener.QuicAddress}/raw", "connect");
@@ -108,6 +109,7 @@ public class RawWebTransportTests
         await using (var denied = new Peer($"https://{listener.QuicAddress}/raw?cap=a&cap=b", "connect", "--token", "Bearer invalid", "--expected-status", "401")) await denied.Pass();
         await using (var wrong = new Peer($"https://{listener.QuicAddress}/raw-extra", "connect", "--token", "Bearer valid", "--expected-status", "404")) await wrong.Pass();
         var rejected = Assert.Single(seen); Assert.Equal("cap=a&cap=b", rejected.Metadata["aster.webtransport.query"]); Assert.Equal("/raw", rejected.Metadata["aster.webtransport.path"]); Assert.Equal("CONNECT", rejected.Method);
+        // short-wait-ok: no peer is connecting, so the accept must be cancelled by this deadline
         using (var cancelled = new CancellationTokenSource(TimeSpan.FromMilliseconds(20))) await Assert.ThrowsAnyAsync<OperationCanceledException>(() => listener.AcceptAsync(cancelled.Token));
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(25));
         await using var peer = new Peer($"https://{listener.QuicAddress}/raw", "echo", "--token", "Bearer valid");
@@ -122,6 +124,7 @@ public class RawWebTransportTests
         await using var peer = new Peer($"https://{listener.QuicAddress}/raw", "lifecycle");
         using var session = await listener.AcceptAsync(ct); using var pending = await session.AcceptBiAsync(ct);
         Assert.Equal("pending"u8.ToArray(), await pending.ReadAsync(1024, ct));
+        // short-wait-ok: the peer holds the tail until the datagram below, so this read must be cancelled
         using (var cancel = new CancellationTokenSource(TimeSpan.FromMilliseconds(20))) await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending.ReadAsync(1024, cancel.Token));
         session.SendDatagram("continue"u8); Assert.Equal("-tail"u8.ToArray(), await ReadAll(pending, ct));
         using var reset = await session.AcceptBiAsync(ct); Assert.Equal("reset-me"u8.ToArray(), await reset.ReadAsync(1024, ct));
@@ -132,7 +135,7 @@ public class RawWebTransportTests
         Assert.Throws<IrohException>(() => session.SendDatagram(new byte[checked((int)session.MaxDatagramSize!.Value + 1)]));
         var blocked = session.AcceptUniAsync(ct);
         session.SendDatagram("done"u8); Assert.Equal("ready-close"u8.ToArray(), await session.ReceiveDatagramAsync(ct)); session.CloseConnection(42, "test complete"u8);
-        await Assert.ThrowsAsync<IrohException>(() => blocked.WaitAsync(TimeSpan.FromSeconds(2)));
+        await Assert.ThrowsAsync<IrohException>(() => blocked.WaitAsync(WaitBudget.Value));
         Assert.Equal(1, (await session.ClosedAsync(ct)).Version); await peer.Pass();
     }
     [Fact]

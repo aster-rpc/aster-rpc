@@ -30,6 +30,7 @@ async fn raw_bytes_bidirectional_unidirectional_datagrams_priority_ack_and_close
             .unwrap();
         let session = listener.accept().await.unwrap();
         assert!(
+            // short-wait-ok: a probe that must still be pending; expiry is the pass
             tokio::time::timeout(Duration::from_millis(20), session.accept_bi())
                 .await
                 .is_err()
@@ -82,6 +83,7 @@ async fn raw_bytes_bidirectional_unidirectional_datagrams_priority_ack_and_close
         let blocked = session.accept_uni();
         tokio::pin!(blocked);
         assert!(
+            // short-wait-ok: a probe that must still be pending; expiry is the pass
             tokio::time::timeout(Duration::from_millis(20), &mut blocked)
                 .await
                 .is_err()
@@ -193,6 +195,7 @@ async fn stop_pending_read_and_reset_blocked_write_preserve_application_codes() 
         assert_eq!(stream.read(1).await.unwrap(), b"x");
         let read = stream.read(1);
         tokio::pin!(read);
+        // short-wait-ok: a probe that must still be pending; expiry is the pass
         assert!(tokio::time::timeout(Duration::from_millis(20), &mut read)
             .await
             .is_err());
@@ -202,6 +205,7 @@ async fn stop_pending_read_and_reset_blocked_write_preserve_application_codes() 
         let data = vec![0; 16 * 1024 * 1024];
         let write = stream.write(&data);
         tokio::pin!(write);
+        // short-wait-ok: a probe that must still be pending; expiry is the pass
         assert!(tokio::time::timeout(Duration::from_millis(20), &mut write)
             .await
             .is_err());
@@ -237,6 +241,7 @@ async fn authentication_precedes_upgrade_and_listener_close_cancels_accept() {
         .await
         .is_err());
     assert!(
+        // short-wait-ok: a probe that must still be pending; expiry is the pass
         tokio::time::timeout(Duration::from_millis(20), listener.accept())
             .await
             .is_err()
@@ -264,12 +269,14 @@ async fn listener_close_cancels_reads_and_peer_stop_unblocks_write() {
         assert_eq!(stream.read(1).await.unwrap(), b"x");
         let read = stream.read(1);
         tokio::pin!(read);
+        // short-wait-ok: a probe that must still be pending; expiry is the pass
         assert!(tokio::time::timeout(Duration::from_millis(20), &mut read)
             .await
             .is_err());
         let bytes = vec![0; 16 * 1024 * 1024];
         let write = stream.write(&bytes);
         tokio::pin!(write);
+        // short-wait-ok: a probe that must still be pending; expiry is the pass
         assert!(tokio::time::timeout(Duration::from_millis(20), &mut write)
             .await
             .is_err());

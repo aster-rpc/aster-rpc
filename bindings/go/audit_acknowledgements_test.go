@@ -58,6 +58,7 @@ func TestAuditOutbox_AcknowledgementLogPagesAndWatches(t *testing.T) {
 	if _, err := outbox.WaitAcknowledgements(ctx, 0, 1, 2*time.Hour); !errors.As(err, &invalid) {
 		t.Fatalf("wait above one hour: %v", err)
 	}
+	// short-wait-ok: an empty log must return an empty page; the bound is the idle wait under test
 	if page, err := outbox.WaitAcknowledgements(ctx, 0, 10, 20*time.Millisecond); err != nil || len(page) != 0 {
 		t.Fatalf("empty wait: %v %v", page, err)
 	}

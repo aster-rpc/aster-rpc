@@ -278,6 +278,7 @@ async def _cancel_case(client) -> str:
     """``hold`` cancelled by the client after 300 ms: the server observes it."""
     before = await _cancelled_count(client)
     try:
+        # short-wait-ok: the client cancels hold after 300 ms; expiry is the case under test
         r = await asyncio.wait_for(client.hold(EchoRequest(message="hold")), 0.3)
     except asyncio.TimeoutError:
         pass
@@ -385,6 +386,7 @@ async def _chain_deadline_case(client) -> str:
     before = await _cancelled_count(client)
     started = time.monotonic()
     try:
+        # short-wait-ok: guard only; the elapsed check below already fails the case at 4 s
         await asyncio.wait_for(client.hold(EchoRequest(message="chain-deadline"), timeout=2), 8)
     except RpcError as exc:
         if exc.code != StatusCode.DEADLINE_EXCEEDED:
@@ -416,6 +418,7 @@ async def _chain_cancel_case(client) -> str:
         else:
             raise AssertionError("Rust leaf did not report the matching hold handler started within 4s")
         call.cancel()
+        # short-wait-ok: promptness bound: caller cancellation must land well before the call's 10 s deadline
         await asyncio.wait_for(call, 2)
     except asyncio.TimeoutError:
         if leaf_started:
@@ -666,6 +669,7 @@ async def campaign_client(ticket_str: str) -> None:
             conn.close(0, b"replace peer")
         t = AsterTicket.from_string(ticket)
         addr = NodeAddr(endpoint_id=t.endpoint_id, relay_url=None, direct_addresses=t.direct_addrs)
+        # short-wait-ok: campaign mode: connect expiry is a classified outcome shared by every language leg
         conn = await asyncio.wait_for(net_client(node).connect_node_addr(addr, RPC_ALPN), 2)
         client = create_client(InteropEcho, connection=conn)
 
@@ -742,6 +746,7 @@ async def campaign_client(ticket_str: str) -> None:
                 status = "ok"
                 success = False
                 try:
+                    # short-wait-ok: campaign mode: expiry is a classified outcome (local_timeout) shared by every language leg
                     kind = await asyncio.wait_for(request(sequence), 3)
                     result[kind] += 1
                     success = True
@@ -785,6 +790,7 @@ async def campaign_client(ticket_str: str) -> None:
                 queue.get_nowait()
                 queue.task_done()
             try:
+                # short-wait-ok: campaign mode: drain expiry is counted as an unexpected error, shared by every language leg
                 await asyncio.wait_for(queue.join(), 4)
             except TimeoutError:
                 result["unexpected_errors"] += 1

@@ -28,6 +28,8 @@ pub mod registry;
 pub mod ring;
 pub mod signing;
 pub mod stream_io;
+#[doc(hidden)]
+pub mod test_support;
 pub mod ticket;
 pub mod topology;
 pub mod trust;

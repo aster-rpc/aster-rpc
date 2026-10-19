@@ -33,6 +33,7 @@ import org.junit.jupiter.api.Test;
 import org.slf4j.event.Level;
 import site.aster.health.HealthServer;
 import site.aster.node.IrohNode;
+import site.aster.testing.WaitBudget;
 
 /**
  * Path B: an application record written through {@link LogEmit} reaches the OTLP logs exporter (a
@@ -79,7 +80,9 @@ final class LogEmitTest {
       executor.shutdown();
       listenerStopped.countDown();
       try {
-        assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "collector handlers drained");
+        assertTrue(
+            executor.awaitTermination(WaitBudget.SECONDS, TimeUnit.SECONDS),
+            "collector handlers drained");
         assertEquals(0, inFlight.get(), "collector has no in-flight handlers");
       } catch (InterruptedException e) {
         Thread.currentThread().interrupt();
@@ -118,7 +121,9 @@ final class LogEmitTest {
             if (logs) {
               bodyRead.countDown();
               try {
-                assertTrue(releaseBody.await(5, TimeUnit.SECONDS), "release pre-close request");
+                assertTrue(
+                    releaseBody.await(WaitBudget.SECONDS, TimeUnit.SECONDS),
+                    "release pre-close request");
               } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new AssertionError("interrupted before recording collector request", e);
@@ -305,27 +310,29 @@ final class LogEmitTest {
                       .POST(HttpRequest.BodyPublishers.ofString("pre-close-control"))
                       .build(),
                   HttpResponse.BodyHandlers.discarding());
-      assertTrue(bodyRead.await(5, TimeUnit.SECONDS), "control request read before close");
+      assertTrue(
+          bodyRead.await(WaitBudget.SECONDS, TimeUnit.SECONDS),
+          "control request read before close");
       assertEquals(1, collector.accepted.get());
       assertEquals(1, collector.inFlight.get());
       assertEquals(oldBaseline, collector.logRequests.get());
       stopped = CompletableFuture.runAsync(collector::stop);
-      assertTrue(collector.listenerStopped.await(5, TimeUnit.SECONDS));
+      assertTrue(collector.listenerStopped.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
       assertEquals(1, collector.inFlight.get(), "pre-close handler still needs draining");
       assertFalse(stopped.isDone(), "stop must wait for the accepted handler");
       releaseBody.countDown();
-      stopped.get(5, TimeUnit.SECONDS);
+      stopped.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
       // Diagnostic control: the old equality assertion fails without any request
       // being sent to a closed listener. The post-drain baseline includes it.
       assertThrows(
           AssertionError.class, () -> assertEquals(oldBaseline, collector.logRequests.get()));
       assertEquals(oldBaseline + 1, collector.logRequests.get());
       assertEquals(0, collector.inFlight.get());
-      request.handle((response, error) -> null).get(5, TimeUnit.SECONDS);
+      request.handle((response, error) -> null).get(WaitBudget.SECONDS, TimeUnit.SECONDS);
     } finally {
       releaseBody.countDown();
       if (stopped == null) collector.stop();
-      else stopped.get(5, TimeUnit.SECONDS);
+      else stopped.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
     }
   }
 

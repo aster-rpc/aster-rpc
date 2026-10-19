@@ -286,6 +286,7 @@ async function deadlineCase(client: any): Promise<string> {
 async function cancelCase(client: any): Promise<string> {
   const before = await cancelledCount(client);
   const ac = new AbortController();
+  // short-wait-ok: hold never answers; this client abort is the case under test, and the server leg must observe it
   setTimeout(() => ac.abort(), 300);
   let r: unknown;
   try {
@@ -377,6 +378,7 @@ async function campaignClient(ticket: string): Promise<void> {
   const replace = async (newTicket: string) => {
     conn?.close(0, 'replace peer');
     const t = native.asterTicketFromString(newTicket);
+    // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg (2 s connect, as in the Rust leg)
     conn = await withTimeout(node.connectNodeAddr(t.endpointId, RPC_ALPN, t.directAddrs, undefined), 2000);
     client = createClient(InteropEcho, new IrohTransport(conn, codec));
   };
@@ -474,6 +476,7 @@ async function campaignClient(ticket: string): Promise<void> {
     }
     accepting = false;
     queue.length = 0;
+    // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg (4 s worker drain, as in the Rust leg)
     try { await withTimeout(Promise.all(workers), 4000); }
     catch { result.unexpected_errors++; throw new Error('campaign workers did not drain within 4s'); }
     result.latency_histogram = { unit: 'us', upper_bounds_powers_of_two: true, counts: result.latency_histogram };

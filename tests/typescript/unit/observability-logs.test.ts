@@ -112,6 +112,7 @@ describe('a full TSFN queue counts drops', () => {
     const N = 600;
     native.emitTestLogs(N, 0, 3, 'flood');
     // Starve the event loop: no TSFN callback can run for 400 ms.
+    // short-wait-ok: a deliberate 400 ms starvation of the JS thread; nothing wakes it
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
     await emitted(N, base);
     await until(() => {
@@ -141,6 +142,7 @@ describe('bursts are coalesced, not dropped', () => {
     const base = native.testEmitted();
     const N = 600;
     native.emitTestLogs(N, 0, 3, 'burst');
+    // short-wait-ok: a deliberate 400 ms starvation of the JS thread; nothing wakes it
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400);
     await emitted(N, base);
     await until(() => c.records.length >= N);

@@ -7,6 +7,7 @@
 //! through it; without it the relay's certificate is rejected
 //! (`UnknownIssuer`) and the node never gets a home relay.
 
+use aster_transport_core::test_support::wait_budget;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -216,5 +217,5 @@ async fn relay_with_private_ca_connects_only_with_the_ca_configured() {
     let reply = recv.read_to_end(64).await.unwrap();
     assert_eq!(reply, b"ping");
     conn.close(0u32.into(), b"done");
-    let _ = tokio::time::timeout(Duration::from_secs(5), echo).await;
+    let _ = tokio::time::timeout(wait_budget(), echo).await;
 }

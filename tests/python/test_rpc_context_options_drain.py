@@ -32,6 +32,8 @@ from aster import (
 )
 from aster.status import RpcError, StatusCode
 
+from wait_budget import WAIT_BUDGET
+
 
 @wire_type("test.mirror/Req")
 @dataclass
@@ -174,7 +176,7 @@ def test_plain_context_principal_defaults_to_peer():
 
 async def test_plain_context_cancelled_resolves_at_deadline():
     ctx = CallContext(service="S", method="m", deadline=time.time() + 0.05)
-    await asyncio.wait_for(ctx.cancelled(), 5)
+    await asyncio.wait_for(ctx.cancelled(), WAIT_BUDGET)
     assert ctx.is_cancelled()
 
 

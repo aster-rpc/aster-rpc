@@ -14,7 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 
 LINT_CHECKS=(
-  cli-compat guard-tests test-swallow fmt clippy-workspace coordination-deps otel-deps
+  cli-compat guard-tests test-swallow test-waits fmt clippy-workspace coordination-deps otel-deps
   deny clippy-coordination clippy-binding-support clippy-ffi-fixture
   clippy-napi clippy-enrollment clippy-exec clippy-expose publish-manifests
 )
@@ -29,6 +29,10 @@ check() {
     # `swallow-ok: <reason>` (resilience-test-plan.md §4).
     test-swallow)
       python3 scripts/ci/lint_test_swallow.py ;;
+    # Short literal waits in test code without the wait budget or a
+    # `short-wait-ok: <reason>` (dev-loop-runbook.md, "No short literal waits").
+    test-waits)
+      python3 scripts/ci/lint_test_waits.py ;;
     fmt)
       cargo fmt --all -- --check ;;
     clippy-workspace)

@@ -7,6 +7,7 @@ import { resolve } from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { AuditOutbox, AuditOutboxError, type AuditAcknowledgement, type AuditOutboxConfig } from '@aster-rpc/aster';
+import { WAIT_BUDGET_MS } from './helpers/wait-budget.ts';
 
 const repo = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const receiverScript = resolve(repo, 'tests/audit_outbox/receiver.py');
@@ -131,6 +132,7 @@ describe('shared native durable audit outbox', () => {
     try {
       expect(await outbox.acknowledgements()).toEqual([]);
       // Nothing to wait for: an empty page once the wait ends.
+      // short-wait-ok: nothing is submitted, so the 20 ms wait must expire with an empty page
       expect(await outbox.waitAcknowledgements(0n, 10, 20)).toEqual([]);
 
       const controller = new AbortController();
@@ -153,7 +155,7 @@ describe('shared native durable audit outbox', () => {
       expect(await outbox.acknowledgements(page[0].cursor, 10)).toEqual([]);
 
       // A waiter after the last cursor wakes on the next acknowledgement.
-      const waiting = outbox.waitAcknowledgements(page[0].cursor, 10, 10_000);
+      const waiting = outbox.waitAcknowledgements(page[0].cursor, 10, WAIT_BUDGET_MS);
       const second = await outbox.submit({ timestampMs: 2n, kind: 'intent', payload: { n: 2 } });
       const next = await waiting;
       expect(next.map((a) => a.eventId)).toEqual([second]);

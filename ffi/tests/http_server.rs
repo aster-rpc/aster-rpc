@@ -1,5 +1,6 @@
 //! Authenticated listener ownership and foreign dispatch through the C ABI.
 
+use aster_transport_core::test_support::wait_budget;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc};
@@ -335,10 +336,7 @@ impl Drop for Fixture {
             if self.rt != 0 {
                 let _ = aster_server_destroy(self.rt, self.server);
                 let _ = aster_upcalls_free(self.rt, self.upcalls);
-                assert_eq!(
-                    aster_runtime_close_and_wait(self.rt, Duration::from_secs(5)),
-                    0
-                );
+                assert_eq!(aster_runtime_close_and_wait(self.rt, wait_budget()), 0);
             }
         }
     }
@@ -438,7 +436,7 @@ fn foreign_auth_and_dispatch_work_over_ready_https_and_webtransport() {
             .await
             .unwrap();
         let mut reply = Vec::new();
-        tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(&mut reply))
+        tokio::time::timeout(wait_budget(), recv.read_to_end(&mut reply))
             .await
             .unwrap()
             .unwrap();
@@ -561,16 +559,10 @@ fn server_destroy_cancels_pending_auth_and_joins_child_ports() {
                 .await
         })
     });
-    let id = fixture
-        .auth_started
-        .recv_timeout(Duration::from_secs(3))
-        .unwrap();
+    let id = fixture.auth_started.recv_timeout(wait_budget()).unwrap();
     assert_eq!(aster_server_destroy(fixture.rt, fixture.server), 0);
     assert_eq!(
-        fixture
-            .auth_cancelled
-            .recv_timeout(Duration::from_secs(3))
-            .unwrap(),
+        fixture.auth_cancelled.recv_timeout(wait_budget()).unwrap(),
         id
     );
     if let Ok(bytes) = client.join().unwrap() {
@@ -613,7 +605,7 @@ fn runtime_close_joins_live_listener_and_start_race_does_not_publish_late_owner(
         }
     });
     barrier.wait();
-    assert_eq!(aster_runtime_close_and_wait(rt, Duration::from_secs(5)), 0);
+    assert_eq!(aster_runtime_close_and_wait(rt, wait_budget()), 0);
     fixture.rt = 0;
     start.join().unwrap();
     released(&live_addr, true);

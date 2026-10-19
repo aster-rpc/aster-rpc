@@ -12,6 +12,8 @@ import pytest_asyncio
 
 from aster import create_endpoint, IrohError
 
+from wait_budget import WAIT_BUDGET
+
 
 ALPN = b"test/binding/conninfo/1"
 
@@ -34,7 +36,7 @@ async def live_connection():
         _state["server_conn"] = conn
 
     task = asyncio.create_task(listener())
-    await asyncio.wait_for(ready.wait(), timeout=5)
+    await asyncio.wait_for(ready.wait(), timeout=WAIT_BUDGET)
 
     ep_conn = await create_endpoint_with_config(cfg)
     conn = await ep_conn.connect_node_addr(listen_addr, ALPN)

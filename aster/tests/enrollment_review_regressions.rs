@@ -1,6 +1,7 @@
 #![cfg(all(feature = "enrollment", feature = "docs"))]
 //! Regressions from the 2026-10-12 enrollment review.
 
+use aster_transport_core::test_support::wait_budget;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -106,12 +107,10 @@ async fn admitted_peer_capacity_preserves_existing_member() {
     replica_enroll.check_peer(&public(3)).await.unwrap();
     member.add_peer(&replica).unwrap();
     let _connection = member.connect(&replica.id(), NORMAL).await.unwrap();
-    assert!(
-        tokio::time::timeout(Duration::from_secs(3), received.recv())
-            .await
-            .unwrap()
-            .is_some()
-    );
+    assert!(tokio::time::timeout(wait_budget(), received.recv())
+        .await
+        .unwrap()
+        .is_some());
     extra.shutdown().await;
     member.shutdown().await;
     replica.shutdown().await;
@@ -158,7 +157,7 @@ async fn stalled_unauthenticated_handshakes_cannot_starve_admitted_peers() {
 
     client.add_peer(&replica).unwrap();
     let _connection = client.connect(&replica.id(), NORMAL).await;
-    let accepted = tokio::time::timeout(Duration::from_secs(3), received.recv()).await;
+    let accepted = tokio::time::timeout(wait_budget(), received.recv()).await;
     assert!(
         matches!(accepted, Ok(Some(_))),
         "admitted peer's ordinary connection was rejected while an unauthenticated handshake held the permit"

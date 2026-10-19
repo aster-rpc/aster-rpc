@@ -2,6 +2,7 @@
 //! Authentication upcalls remain bounded after polling and never turn missing
 //! or malformed answers into authenticated calls, regardless of failure policy.
 
+use aster_transport_core::test_support::wait_budget;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,7 +45,7 @@ fn start(auth: ForeignAuthenticator) -> tokio::task::JoinHandle<Result<AuthOutco
 }
 
 async fn next(queue: &UpcallQueue) -> UpcallEvent {
-    tokio::time::timeout(Duration::from_secs(1), queue.ready())
+    tokio::time::timeout(wait_budget(), queue.ready())
         .await
         .unwrap();
     let mut event = None;
@@ -90,7 +91,7 @@ async fn draining_queue_does_not_release_pending_capacity_and_clones_share_limit
     let event = next(&queue).await;
     assert_eq!(queue.len(), 0);
     assert_eq!(upcalls.pending_count(), 1);
-    let refusal = tokio::time::timeout(Duration::from_millis(100), auth.authenticate(&context()))
+    let refusal = tokio::time::timeout(wait_budget(), auth.authenticate(&context()))
         .await
         .unwrap()
         .err()

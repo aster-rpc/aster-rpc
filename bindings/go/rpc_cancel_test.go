@@ -190,7 +190,7 @@ func TestRPC_CancellableUnaryAndBoundedRecv(t *testing.T) {
 		t.Fatalf("bidi recv took %v to observe the cancel", d)
 	}
 
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(waitBudget())
 	for f.srv.LiveCalls() != 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}

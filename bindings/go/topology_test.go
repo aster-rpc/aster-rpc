@@ -35,6 +35,7 @@ func topologyEventually(t *testing.T, ctx context.Context, check func() bool) {
 		select {
 		case <-ctx.Done():
 			t.Fatal("topology did not converge: ", ctx.Err())
+		// short-wait-ok: poll tick; ctx bounds the overall wait
 		case <-time.After(50 * time.Millisecond):
 		}
 	}

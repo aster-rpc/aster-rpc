@@ -127,6 +127,7 @@ func TestCallOptions_DeadlineEndsTheCall(t *testing.T) {
 	if !errors.Is(err, ErrRpcDeadlineExceeded) {
 		t.Fatalf("unary: %v", err)
 	}
+	// short-wait-ok: the bidi deadline's DEADLINE_EXCEEDED is the behaviour under test
 	b, err := OpenBidiStream[testEchoRequest, testEchoReply](ctx, f.conn, "Options", "slowBidi", WithDeadline(time.Now().Add(300*time.Millisecond)))
 	if err != nil {
 		t.Fatal(err)
@@ -152,6 +153,7 @@ func TestCallOptions_EarliestDeadlineWins(t *testing.T) {
 		t.Fatalf("timeout deadline %v", d)
 	}
 	// A ctx deadline earlier than the option's stays.
+	// short-wait-ok: the parent's short deadline must survive callContext; it is the value under test
 	parent, cancelParent := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancelParent()
 	ctx3, cancel3 := buildOptions([]CallOption{WithTimeout(time.Hour)}).callContext(parent)

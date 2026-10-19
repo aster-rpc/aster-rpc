@@ -163,6 +163,20 @@ func config() aster.AsterConfig {
 	return cfg
 }
 
+// waitBudget is how long a check waits for something that must happen;
+// mirrors bindings/go/wait_budget_test.go (15 s x ASTER_TEST_TIME_SCALE, default 1).
+func waitBudget() time.Duration {
+	scale := 1.0
+	if raw := strings.TrimSpace(os.Getenv("ASTER_TEST_TIME_SCALE")); raw != "" {
+		v, err := strconv.ParseFloat(raw, 64)
+		if err != nil || v <= 0 || math.IsInf(v, 0) || math.IsNaN(v) {
+			panic(fmt.Sprintf("ASTER_TEST_TIME_SCALE must be a positive number, got %q", raw))
+		}
+		scale = v
+	}
+	return time.Duration(float64(15*time.Second) * scale)
+}
+
 func main() {
 	svc := service()
 	sess := sessionService()
@@ -419,6 +433,7 @@ produce:
 	go func() { workers.Wait(); close(drained) }()
 	select {
 	case <-drained:
+	// short-wait-ok: campaign mode: the 4 s drain bound is a classified outcome shared by every language leg
 	case <-time.After(4 * time.Second):
 		return nil, fmt.Errorf("campaign workers did not drain within 4 s")
 	}
@@ -480,6 +495,7 @@ func campaignClient(svc *aster.Service, ticket string) error {
 		return err
 	}
 	connect := func(ticket string) (*aster.RpcConnection, error) {
+		// short-wait-ok: campaign mode: the 2 s connect bound is a classified outcome shared by every language leg
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		return cl.ConnectTicket(ctx, ticket)
@@ -599,7 +615,7 @@ func checkChainReceipt(receipt, request string, budget time.Duration) error {
 }
 
 func chainCancelled(ctx context.Context, conn *aster.RpcConnection) (*EchoReply, error) {
-	pctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	pctx, cancel := context.WithTimeout(ctx, waitBudget())
 	defer cancel()
 	return aster.Call[EchoRequest, EchoReply](pctx, conn, "InteropEcho", "cancelled", &EchoRequest{Message: "probe"})
 }
@@ -693,7 +709,7 @@ func chainClient(svc *aster.Service, ticket string) bool {
 		}()
 		// Confirm this exact traced hold reached the leaf before explicitly cancelling it.
 		var receipt *EchoReply
-		for until := time.Now().Add(2 * time.Second); time.Now().Before(until); {
+		for until := time.Now().Add(waitBudget()); time.Now().Before(until); {
 			receipt, err = chainCancelled(ctx, conn)
 			if err != nil {
 				return "", err
@@ -723,11 +739,12 @@ func chainClient(svc *aster.Service, ticket string) bool {
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, aster.ErrCancelled) {
 				return "", fmt.Errorf("chain explicit cancel wanted CANCELLED, got %v", err)
 			}
-		case <-time.After(time.Second):
+		case <-time.After(waitBudget()):
 			return "", fmt.Errorf("chain explicit cancel did not return promptly")
 		}
-		// This bound finishes well before the 8 s deadline: only explicit cancel can pass.
-		for until := time.Now().Add(2 * time.Second); time.Now().Before(until); {
+		// The elapsed check below, not this bound, proves the cancel landed well before
+		// the 8 s deadline: only explicit cancel can pass.
+		for until := time.Now().Add(waitBudget()); time.Now().Before(until); {
 			after, err := chainCancelled(ctx, conn)
 			if err != nil {
 				return "", err
@@ -1002,6 +1019,7 @@ func client(svc, sess *aster.Service, ticket string) bool {
 		if err != nil {
 			return "", err
 		}
+		// short-wait-ok: DEADLINE_EXCEEDED from this deadline is the behaviour under test
 		dctx, dcancel := context.WithTimeout(ctx, time.Second)
 		defer dcancel()
 		r, err := aster.Call[EchoRequest, EchoReply](dctx, conn, "InteropEcho", "hold", &EchoRequest{Message: "hold"})

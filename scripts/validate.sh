@@ -78,6 +78,14 @@ else
     fail "Swallowed failures in test code: handle them or add swallow-ok: <reason>"
 fi
 
+# ── 0b'. No short literal waits in test code ──────────────────────
+step "lint_test_waits.py"
+if python3 scripts/ci/lint_test_waits.py; then
+    pass "No unexplained short literal waits in test code"
+else
+    fail "Short literal waits in test code: use the wait budget or add short-wait-ok: <reason>"
+fi
+
 # ── 0c. Fork compatibility (only when iroh-fork-manifest.toml changed) ─
 step "fork_compat.sh"
 if scripts/ci/fork_compat.sh; then

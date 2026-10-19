@@ -225,6 +225,7 @@ async fn no_cap_and_no_header_deadline_means_no_deadline() {
         req_rx,
         Arc::new(AtomicBool::new(false)),
     );
+    // short-wait-ok: the handler must still be running; expiry is the pass
     let outcome = tokio::time::timeout(Duration::from_millis(500), d.dispatch_parts(parts)).await;
     assert!(outcome.is_err(), "the handler should still be running");
     node.shutdown().await;

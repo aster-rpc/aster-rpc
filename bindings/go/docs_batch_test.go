@@ -175,7 +175,7 @@ func TestDocBatch_InvalidCancellationAndRetry(t *testing.T) {
 	if count == 0 {
 		t.Fatal("never exercised cancellation")
 	}
-	deadline := time.Now().Add(3 * time.Second)
+	deadline := time.Now().Add(waitBudget())
 	for {
 		n.runtime.mu.Lock()
 		pending := len(n.runtime.ops) + len(n.runtime.pending) + len(n.runtime.abandoned)

@@ -285,6 +285,7 @@ async fn a_call_waiting_on_a_full_queue_ends_when_the_server_shuts_down() {
     // released. Shutdown must neither wait on that call nor let it publish.
     gate.resume();
     assert!(
+        // short-wait-ok: the call must still be waiting for a queue slot; expiry is the pass
         tokio::time::timeout(Duration::from_millis(300), gate.settled())
             .await
             .is_err(),

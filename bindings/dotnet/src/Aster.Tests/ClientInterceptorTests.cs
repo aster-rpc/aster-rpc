@@ -297,6 +297,7 @@ public class ClientInterceptorTests : IAsyncLifetime
         _flakyFailUntil = int.MaxValue;
         var breaker = new CircuitBreakerInterceptor(failureThreshold: 10);
         var conn = _conn.WithInterceptors([breaker, new RetryInterceptor(5, initialMs: 5000, maxMs: 5000, jitter: 0.0)]);
+        // short-wait-ok: the cancel lands inside the 5 s retry backoff; the cancellation is the behaviour under test
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(400));
         var sw = Stopwatch.StartNew();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => conn.UnaryAsync<EchoRequest, EchoReply>("Flaky", "flaky", Req(), Idem, cts.Token));

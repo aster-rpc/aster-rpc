@@ -2,6 +2,7 @@
 //! (`AsterConfig::reuse_last_port`), so peers' cached direct addresses and a
 //! NAT mapping stay valid across a restart.
 
+use aster_transport_core::test_support::wait_budget;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::Path;
 use std::time::Duration;
@@ -267,7 +268,7 @@ async fn second_node_on_the_same_data_dir_does_not_fight() {
     let first = start(&config).await;
     let port = v4_port(&first);
     let before = std::fs::read_to_string(data.join(RECORD)).unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(5), Node::start(config.clone())).await;
+    let second = tokio::time::timeout(wait_budget(), Node::start(config.clone())).await;
     if let Ok(Ok(second)) = second {
         assert_ne!(v4_port(&second), port, "the second node falls back");
         second.shutdown().await;

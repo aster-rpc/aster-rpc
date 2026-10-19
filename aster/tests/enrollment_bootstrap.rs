@@ -1,5 +1,6 @@
 #![cfg(all(feature = "enrollment", feature = "docs"))]
 
+use aster_transport_core::test_support::wait_budget;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -154,7 +155,7 @@ async fn raw_presentation(node: &Node, replica: &Node, chain: &str) -> bool {
         .await
         .unwrap();
     send.write_all(presentation).await.unwrap();
-    let denied = tokio::time::timeout(Duration::from_secs(5), recv.read_exact(4))
+    let denied = tokio::time::timeout(wait_budget(), recv.read_exact(4))
         .await
         .unwrap()
         .is_err();
@@ -367,13 +368,13 @@ async fn reciprocal_validation_rejects_rogue_replica_and_failopen_install() {
             .unwrap();
         send.write_all(payload).await.unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_secs(5), recv.read_exact(4))
+            tokio::time::timeout(wait_budget(), recv.read_exact(4))
                 .await
                 .unwrap()
                 .is_err(),
             "client disclosed presentation to unverified replica"
         );
-        tokio::time::timeout(Duration::from_secs(5), connection.closed())
+        tokio::time::timeout(wait_budget(), connection.closed())
             .await
             .unwrap();
     });
@@ -479,7 +480,7 @@ async fn strict_operation_freshness_and_new_connection_source_are_checked() {
     let (ready, ticket) = client_enroll.connect(loopback_addr.clone()).await.unwrap();
     client.add_node_addr(loopback_addr).unwrap();
     let connection = client.connect(&replica.id(), NORMAL).await.unwrap();
-    let accepted = tokio::time::timeout(Duration::from_secs(5), received.recv())
+    let accepted = tokio::time::timeout(wait_budget(), received.recv())
         .await
         .unwrap()
         .unwrap();
@@ -510,7 +511,7 @@ async fn strict_operation_freshness_and_new_connection_source_are_checked() {
         .await
         .is_err());
     connection.close(0, b"restart".to_vec()).unwrap();
-    tokio::time::timeout(Duration::from_secs(5), accepted.closed())
+    tokio::time::timeout(wait_budget(), accepted.closed())
         .await
         .unwrap();
     client.shutdown().await;
@@ -530,11 +531,12 @@ async fn strict_operation_freshness_and_new_connection_source_are_checked() {
     moved_target.direct_addresses = vec![non_loopback.to_string()];
     moved.add_node_addr(moved_target).unwrap();
     if let Ok(connection) = moved.connect(&replica.id(), NORMAL).await {
-        tokio::time::timeout(Duration::from_secs(5), connection.closed())
+        tokio::time::timeout(wait_budget(), connection.closed())
             .await
             .unwrap();
     }
     assert!(
+        // short-wait-ok: asserts no connection is accepted
         tokio::time::timeout(Duration::from_millis(100), received.recv())
             .await
             .is_err()
@@ -590,7 +592,7 @@ async fn oversized_partial_handshakes_and_dropped_hook_owner_fail_closed() {
         .await
         .unwrap();
         assert!(handler.await.unwrap().is_err());
-        tokio::time::timeout(Duration::from_secs(2), outbound.closed())
+        tokio::time::timeout(wait_budget(), outbound.closed())
             .await
             .unwrap();
     }
@@ -599,7 +601,7 @@ async fn oversized_partial_handshakes_and_dropped_hook_owner_fail_closed() {
     // ordinary handshake must reject even when no consumer answers hooks.
     tokio::time::sleep(Duration::from_millis(150)).await;
     if let Ok(connection) = attacker.connect(&replica.id(), NORMAL).await {
-        tokio::time::timeout(Duration::from_secs(3), connection.closed())
+        tokio::time::timeout(wait_budget(), connection.closed())
             .await
             .unwrap();
     }
@@ -713,7 +715,7 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
         ));
         live.add_peer(&replica).unwrap();
         let outbound = live.connect(&replica.id(), NORMAL).await.unwrap();
-        let tracked = tokio::time::timeout(Duration::from_secs(5), replica_connections.recv())
+        let tracked = tokio::time::timeout(wait_budget(), replica_connections.recv())
             .await
             .unwrap()
             .unwrap();
@@ -742,10 +744,10 @@ async fn offline_root_reciprocal_bootstrap_registration_and_live_revocation() {
         .await
         .unwrap();
         assert!(revoke_started.elapsed() < Duration::from_secs(15));
-        tokio::time::timeout(Duration::from_secs(5), tracked.closed())
+        tokio::time::timeout(wait_budget(), tracked.closed())
             .await
             .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), outbound.closed())
+        tokio::time::timeout(wait_budget(), outbound.closed())
             .await
             .unwrap();
         assert!(replica_enroll.check_peer(&public(5)).await.is_err());
@@ -1114,6 +1116,7 @@ async fn definite_denial_closes_every_gate_admitted_connection() {
         tokio::time::sleep(interval * 4).await;
         for connection in &held {
             assert!(
+                // short-wait-ok: asserts the connection stays open
                 tokio::time::timeout(Duration::from_millis(1), connection.closed())
                     .await
                     .is_err(),
@@ -1145,7 +1148,7 @@ async fn definite_denial_closes_every_gate_admitted_connection() {
         assert!(denied.elapsed() <= interval + Duration::from_secs(1));
         assert!(
             peer.connect(&replica.id(), NORMAL).await.is_err()
-                || tokio::time::timeout(Duration::from_secs(3), async {
+                || tokio::time::timeout(wait_budget(), async {
                     peer.connect(&replica.id(), NORMAL)
                         .await
                         .unwrap()

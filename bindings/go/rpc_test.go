@@ -254,6 +254,7 @@ func TestRPC_ErrorsAndTrailers(t *testing.T) {
 
 	// The deadline travels in the header (whole seconds); the server ends the
 	// call with DEADLINE_EXCEEDED.
+	// short-wait-ok: the slow call must fail on this deadline; its expiry is under test
 	dctx, dcancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	_, err = Call[testEchoRequest, testEchoReply](dctx, f.conn, "Errs", "slow", req, WithMetadata("trace", "abc"))
 	dcancel()
@@ -265,6 +266,7 @@ func TestRPC_ErrorsAndTrailers(t *testing.T) {
 	}
 	// Server-side deadline (2 s on the wire) with a client that keeps waiting.
 	start := time.Now()
+	// short-wait-ok: the slow call must fail on this deadline; its expiry is under test
 	sctx, scancel := context.WithTimeout(ctx, 1900*time.Millisecond)
 	defer scancel()
 	errCh := make(chan error, 1)
@@ -312,6 +314,7 @@ func TestRPC_DeadlineExceededTrailer(t *testing.T) {
 		t.Fatalf("handler ctx: %v", err)
 	}
 	// A client deadline is enforced natively and matches both sentinels.
+	// short-wait-ok: the client deadline's DEADLINE_EXCEEDED is the behaviour under test
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
 	_, err = Call[testEchoRequest, testEchoReply](ctx, f.conn, "D", "wait", &testEchoRequest{Data: []byte{}})
@@ -526,7 +529,7 @@ func TestRPC_CancelAndBidiPingPong(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("server handler not cancelled")
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(waitBudget())
 	for f.srv.LiveCalls() != 0 && time.Now().Before(deadline) {
 		time.Sleep(20 * time.Millisecond)
 	}

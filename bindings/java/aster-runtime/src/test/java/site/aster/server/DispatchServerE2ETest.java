@@ -40,6 +40,7 @@ import site.aster.server.spi.ServiceDescriptor;
 import site.aster.server.spi.ServiceDispatcher;
 import site.aster.server.spi.StreamingKind;
 import site.aster.server.spi.UnaryDispatcher;
+import site.aster.testing.WaitBudget;
 
 /**
  * Java ↔ Java over dynamic dispatch (C ABI 3.5): every pattern, error mapping, session-scoped
@@ -423,7 +424,7 @@ final class DispatchServerE2ETest {
       assertTrue(HOLD_ENTERED.await(10, TimeUnit.SECONDS), "handler reached its second receive");
       Thread.sleep(300); // let it sit in more than one recv slice
       call.cancel();
-      String outcome = HOLD_OUTCOME.get(5, TimeUnit.SECONDS);
+      String outcome = HOLD_OUTCOME.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
       assertTrue(outcome.equals("cancelled") || outcome.equals("end"), outcome);
       RpcError e =
           assertInstanceOf(
@@ -442,6 +443,7 @@ final class DispatchServerE2ETest {
         get(
             client.<Msg, Msg>openServerStream(
                 addr, "test.Dispatch", "silent", new Msg("", 0), Msg.class));
+    // short-wait-ok: the silent handler sends nothing; the wait must expire
     assertNull(call.recvWithTimeout(300, TimeUnit.MILLISECONDS), "nothing arrives");
     long t0 = System.nanoTime();
     call.close();
@@ -493,7 +495,7 @@ final class DispatchServerE2ETest {
         } else {
           stop.set(true);
         }
-        var r = result.get(5, TimeUnit.SECONDS);
+        var r = result.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
         var trailer = assertInstanceOf(site.aster.ffi.Rpc.Recv.Trailer.class, r);
         assertEquals(
             site.aster.server.wire.RpcStatus.CANCELLED,

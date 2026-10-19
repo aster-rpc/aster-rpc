@@ -5,6 +5,7 @@ import pytest
 from aster.http import generate_webtransport_certificate, RPCAuthResponse
 from aster.webtransport import WebTransportListener, WebTransportOptions
 from raw_wt_peer import peer, scenario
+from wait_budget import WAIT_BUDGET
 
 pytestmark = [pytest.mark.network, pytest.mark.timeout(30)]
 
@@ -67,19 +68,21 @@ async def test_cancelled_accept_preserves_next_session_and_close_wakes_pending(o
     listener = await WebTransportListener.start_public(options)
     try:
         with pytest.raises(asyncio.TimeoutError):
+            # short-wait-ok: asserts accept() has no session to return yet
             await asyncio.wait_for(listener.accept(), 0.03)
         async with peer(f"https://{listener.quic_addr}/wt") as client:
             assert await client.session(f"https://{listener.quic_addr}/wt") == 200
-            session = await asyncio.wait_for(listener.accept(), 3)
+            session = await asyncio.wait_for(listener.accept(), WAIT_BUDGET)
             with pytest.raises(asyncio.TimeoutError):
+                # short-wait-ok: asserts no datagram is queued yet
                 await asyncio.wait_for(session.receive_datagram(), 0.03)
             client.send_datagram(b"next")
             assert await session.receive_datagram() == b"next"
             pending = asyncio.create_task(session.accept_uni())
             await asyncio.sleep(0)
             session.close(42, b"done")
-            with pytest.raises(RuntimeError): await asyncio.wait_for(pending, 1)
-            await asyncio.wait_for(session.closed(), 1)
+            with pytest.raises(RuntimeError): await asyncio.wait_for(pending, WAIT_BUDGET)
+            await asyncio.wait_for(session.closed(), WAIT_BUDGET)
     finally: await listener.stop()
     released(listener.tcp_addr)
 
@@ -93,6 +96,7 @@ async def test_preupgrade_auth_raw_query_and_wrong_route(options):
     try:
         url = f"https://{listener.quic_addr}/wt"
         assert (await scenario(url, expected_status=401, mode="connect"))["result"] == "PASS"
+        # short-wait-ok: asserts the rejected session never reaches accept()
         with pytest.raises(asyncio.TimeoutError): await asyncio.wait_for(listener.accept(), 0.03)
         assert (await scenario(url+"-wrong", expected_status=404, mode="connect"))["result"] == "PASS"
         async with peer(url) as client:
@@ -110,7 +114,7 @@ async def test_limits_and_listener_stop_cancel_pending(options):
     pending = asyncio.create_task(listener.accept())
     await asyncio.sleep(0)
     await listener.stop()
-    with pytest.raises(RuntimeError): await asyncio.wait_for(pending, 1)
+    with pytest.raises(RuntimeError): await asyncio.wait_for(pending, WAIT_BUDGET)
     with pytest.raises(ValueError):
         await WebTransportListener.start_public(WebTransportOptions(options.certificate_pem, options.private_key_pem, max_sessions=0))
     with pytest.raises(RuntimeError):
@@ -126,12 +130,13 @@ async def test_reset_cancelled_read_position_server_bidi_and_empty_datagram(opti
         reset = await session.accept_bi()
         assert await pending.read() == b"pending"
         assert await reset.read() == b"reset-me"
+        # short-wait-ok: asserts the stream has no more data until the peer sends its tail
         with pytest.raises(asyncio.TimeoutError): await asyncio.wait_for(pending.read(), 0.03)
         blocked_read = asyncio.create_task(reset.read())
         await asyncio.sleep(0.01)
         await reset.reset(7)
         await reset.stop(9)
-        with pytest.raises(RuntimeError): await asyncio.wait_for(blocked_read, 1)
+        with pytest.raises(RuntimeError): await asyncio.wait_for(blocked_read, WAIT_BUDGET)
         assert not await reset.transport_acked()
         assert await session.receive_datagram() == b""
         assert await session.receive_datagram() == b"lifecycle"
@@ -147,7 +152,7 @@ async def test_reset_cancelled_read_position_server_bidi_and_empty_datagram(opti
         blocked = asyncio.create_task(session.accept_uni())
         await asyncio.sleep(0)
         session.close(19, b"done")
-        with pytest.raises(RuntimeError): await asyncio.wait_for(blocked, 1)
+        with pytest.raises(RuntimeError): await asyncio.wait_for(blocked, WAIT_BUDGET)
         assert (await remote)["result"] == "PASS"
     finally:
         if session: session.close()

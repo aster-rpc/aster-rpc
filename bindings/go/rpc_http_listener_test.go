@@ -591,7 +591,7 @@ func TestHTTPListener_StopCancelsPendingAuthentication(t *testing.T) {
 	}()
 	select {
 	case <-entered:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("authentication never started")
 	}
 	if _, status, err := httpListenerCall(client, l.TCPAddr(), "Bearer overflow", []byte{1}); err != nil || status.Code != StatusResourceExhausted {
@@ -602,12 +602,12 @@ func TestHTTPListener_StopCancelsPendingAuthentication(t *testing.T) {
 	}
 	select {
 	case <-canceled:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("stop did not cancel authentication")
 	}
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("stopped request did not finish")
 	}
 	assertHTTPPortsReleased(t, l.TCPAddr(), false)
@@ -667,7 +667,7 @@ func TestHTTPListener_GraceThenCancelsGoHandler(t *testing.T) {
 	go func() { defer close(done); _, _, _ = httpListenerCall(client, l.TCPAddr(), "Bearer valid", payload) }()
 	select {
 	case <-entered:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("Go handler never started")
 	}
 	begin := time.Now()
@@ -679,12 +679,12 @@ func TestHTTPListener_GraceThenCancelsGoHandler(t *testing.T) {
 	}
 	select {
 	case <-canceled:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("listener stop did not cancel Go handler context")
 	}
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("stopped handler request did not finish")
 	}
 	if calls := srv.LiveCalls(); calls != 0 {

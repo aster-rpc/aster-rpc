@@ -325,7 +325,7 @@ public class ExposeRelayTests
         var resp = await ExposeClient.RelayStreamAsync(rig.Conn, ExposeRig.Svc, "PUT", "/early", null, src).WaitAsync(T);
         Assert.Equal("too big", Encoding.UTF8.GetString(await ReadAll(resp.Body)));
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        await resp.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        await resp.DisposeAsync().AsTask().WaitAsync(WaitBudget.Value);
         resp.Dispose(); // sync dispose does not block either
         Assert.True(sw.Elapsed < TimeSpan.FromSeconds(3), $"dispose took {sw.Elapsed}");
         Assert.False(resp.Upload.IsCompleted); // the pump keeps running in the background
@@ -344,7 +344,7 @@ public class ExposeRelayTests
         var src = new StallingStream(never.Task, honourCancellation: true);
         var resp = await ExposeClient.RelayStreamAsync(rig.Conn, ExposeRig.Svc, "POST", "/duplex", null, src).WaitAsync(T);
         await Eventually(() => src.Reads >= 2, "source parked");
-        await resp.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); // before the end: abandon
+        await resp.DisposeAsync().AsTask().WaitAsync(WaitBudget.Value); // before the end: abandon
         Assert.True(src.Cancelled, "the pump's token reached the stream read");
         Assert.False(await resp.Upload.WaitAsync(T));
         await Eventually(() => h.Has(l => l == "read err"), "handler saw the reset");

@@ -5,6 +5,7 @@
 
 import { describe, expect, it } from 'vitest';
 import { waitForInitialSync } from '../../../bindings/typescript/packages/aster/src/runtime.js';
+import { WAIT_BUDGET_MS } from '../helpers/wait-budget.ts';
 
 type Ev = { kind: string; syncOk?: boolean; syncOrigin?: string; syncError?: string };
 
@@ -23,16 +24,17 @@ const completed: Ev = { kind: 'sync_finished', syncOk: true, syncOrigin: 'accept
 describe('waitForInitialSync', () => {
   it('waits to the deadline after a failed round', async () => {
     const start = Date.now();
+    // short-wait-ok: the deadline is the behaviour under test; the wait must run to it
     expect(await waitForInitialSync(emptyDoc, receiver([failed]), 500)).toBe(false);
     expect(Date.now() - start).toBeGreaterThanOrEqual(490);
   });
 
   it('stops at a completed round after a failed one', async () => {
-    expect(await waitForInitialSync(emptyDoc, receiver([failed, completed]), 5000)).toBe(true);
+    expect(await waitForInitialSync(emptyDoc, receiver([failed, completed]), WAIT_BUDGET_MS)).toBe(true);
   });
 
   it('stops when an entry shows up while events are quiet', async () => {
     const doc = { queryKeyPrefix: async () => [{}] };
-    expect(await waitForInitialSync(doc, receiver([failed]), 5000)).toBe(true);
+    expect(await waitForInitialSync(doc, receiver([failed]), WAIT_BUDGET_MS)).toBe(true);
   });
 });

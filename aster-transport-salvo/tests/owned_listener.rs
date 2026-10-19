@@ -1,5 +1,6 @@
 //! Real owned PEM listeners: readiness, authentication, and bounded shutdown.
 
+use aster_transport_core::test_support::wait_budget;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -148,7 +149,7 @@ fn assert_reply(bytes: &[u8], wanted: &[u8]) {
 }
 
 async fn next(rx: &mut mpsc::UnboundedReceiver<()>) {
-    tokio::time::timeout(Duration::from_secs(2), rx.recv())
+    tokio::time::timeout(wait_budget(), rx.recv())
         .await
         .unwrap()
         .unwrap();
@@ -212,7 +213,7 @@ async fn authenticated_tcp_and_webtransport_are_ready_on_one_ephemeral_port() {
     .unwrap();
     // No readiness retries: construction already bound both sockets.
     let conn = tokio::time::timeout(
-        Duration::from_secs(3),
+        wait_budget(),
         endpoint.connect(format!("https://{addr}/aster/wt")),
     )
     .await
@@ -228,7 +229,7 @@ async fn authenticated_tcp_and_webtransport_are_ready_on_one_ephemeral_port() {
         .await
         .unwrap();
     let mut denied = Vec::new();
-    tokio::time::timeout(Duration::from_secs(3), denied_recv.read_to_end(&mut denied))
+    tokio::time::timeout(wait_budget(), denied_recv.read_to_end(&mut denied))
         .await
         .unwrap()
         .unwrap();
@@ -246,7 +247,7 @@ async fn authenticated_tcp_and_webtransport_are_ready_on_one_ephemeral_port() {
         .await
         .unwrap();
     let mut reply = Vec::new();
-    tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(&mut reply))
+    tokio::time::timeout(wait_budget(), recv.read_to_end(&mut reply))
         .await
         .unwrap()
         .unwrap();
@@ -307,13 +308,10 @@ async fn shutdown_drains_until_grace_then_cancels_pending_http_handler() {
         .unwrap();
     next(&mut started).await;
     let begin = Instant::now();
-    tokio::time::timeout(
-        Duration::from_secs(2),
-        listener.stop(Duration::from_millis(50)),
-    )
-    .await
-    .unwrap()
-    .unwrap();
+    tokio::time::timeout(wait_budget(), listener.stop(Duration::from_millis(50)))
+        .await
+        .unwrap()
+        .unwrap();
     assert!(begin.elapsed() >= Duration::from_millis(40));
     next(&mut dropped).await;
     drop(response);
@@ -382,13 +380,14 @@ async fn cancelling_stop_keeps_ownership_for_a_later_join() {
         .await
         .unwrap();
     next(&mut started).await;
+    // short-wait-ok: a probe that must still be pending; expiry is the pass
     assert!(tokio::time::timeout(
         Duration::from_millis(10),
         listener.stop(Duration::from_millis(100))
     )
     .await
     .is_err());
-    tokio::time::timeout(Duration::from_secs(2), listener.stop(Duration::ZERO))
+    tokio::time::timeout(wait_budget(), listener.stop(Duration::ZERO))
         .await
         .unwrap()
         .unwrap();
@@ -430,12 +429,13 @@ async fn stopping_listener_cancels_live_webtransport_and_retry_joins_quic_drain(
     // Application work is forced immediately; the QUIC socket still has its
     // close/drain to finish. Cancelling this wait must retain that ownership.
     assert!(
+        // short-wait-ok: a probe that must still be pending; expiry is the pass
         tokio::time::timeout(Duration::from_millis(1), listener.stop(Duration::ZERO))
             .await
             .is_err()
     );
     next(&mut dropped).await;
-    tokio::time::timeout(Duration::from_secs(3), listener.stop(Duration::ZERO))
+    tokio::time::timeout(wait_budget(), listener.stop(Duration::ZERO))
         .await
         .unwrap()
         .unwrap();

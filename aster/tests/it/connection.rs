@@ -253,6 +253,7 @@ async fn bootstrap_alpn_admission_gates_normal_alpn() {
     server.add_peer(&client).unwrap();
 
     // Phase 1: before admission, the RPC ALPN must NOT complete an echo.
+    // short-wait-ok: an unadmitted peer must not complete an echo; expiry is a pass
     let pre = timeout(Duration::from_secs(5), async {
         let conn = client.connect(&server.id(), RPC_ALPN).await?;
         let (send, recv) = conn.open_bi().await?;
@@ -428,6 +429,7 @@ async fn datagram_round_trip() {
     let mut got = None;
     for _ in 0..20 {
         conn.send_datagram(b"timing-ping".to_vec()).unwrap();
+        // short-wait-ok: datagrams are unreliable; each try waits briefly, then resends
         if let Ok(Ok(dg)) = timeout(Duration::from_millis(300), conn.read_datagram()).await {
             got = Some(dg);
             break;

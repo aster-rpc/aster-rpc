@@ -17,6 +17,7 @@ from aster.interceptors import CircuitBreakerInterceptor, DeadlineInterceptor, R
 from aster.rpc_types import RetryPolicy
 from aster.status import RpcError, StatusCode
 from aster.transport.iroh import IrohTransport
+from wait_budget import WAIT_BUDGET
 
 
 @wire_type("test.review.retrydeadline/Request")
@@ -76,33 +77,33 @@ async def test_native_healthy_peer_progresses_beside_stalled_and_disconnected_pe
                     neighbor = IrohTransport(connection, codec=client._transport._codec)
                     transports.append(neighbor)
                     task = asyncio.ensure_future(client.call(Request("hold"), timeout=10))
-                    await asyncio.wait_for(stalled.hold_entered.wait(), 3)
+                    await asyncio.wait_for(stalled.hold_entered.wait(), WAIT_BUDGET)
                     for phase in ("stalled", "disconnected"):
                         for index in range(3):
                             tag = f"{phase}-{index}"
                             response = await asyncio.wait_for(neighbor.unary(
-                                "ReviewRetryDeadline", "call", Request(tag), deadline_secs=1), 2)
+                                "ReviewRetryDeadline", "call", Request(tag), deadline_secs=1), WAIT_BUDGET)
                             assert response.tag == tag
                         if phase == "stalled":
                             assert not task.done() and stalled.active_holds == 1
                             await client._transport.close()
                             with pytest.raises(RpcError) as failed:
-                                await asyncio.wait_for(task, 3)
+                                await asyncio.wait_for(task, WAIT_BUDGET)
                             # Abrupt local close has no remote trailer. The existing
                             # interceptor normalizes ConnectionLostError to UNKNOWN.
                             assert failed.value.code in (StatusCode.CANCELLED, StatusCode.UNAVAILABLE, StatusCode.UNKNOWN)
-                    async with asyncio.timeout(3):
+                    async with asyncio.timeout(WAIT_BUDGET):
                         while stalled.active_holds:
                             await asyncio.sleep(0.01)
                     recovery_connection = await owner._ep.connect_node_addr(bad.node.node_addr_info(), b"aster/1")
                     recovered = IrohTransport(recovery_connection, codec=client._transport._codec)
                     transports.append(recovered)
                     assert (await asyncio.wait_for(recovered.unary(
-                        "ReviewRetryDeadline", "call", Request("recovered"), deadline_secs=1), 2)).tag == "recovered"
+                        "ReviewRetryDeadline", "call", Request("recovered"), deadline_secs=1), WAIT_BUDGET)).tag == "recovered"
                     assert healthy.received_tags == [f"{phase}-{index}" for phase in ("stalled", "disconnected") for index in range(3)]
                     for server in (bad, good):
                         dispatcher = server._server._dispatcher
-                        async with asyncio.timeout(3):
+                        async with asyncio.timeout(WAIT_BUDGET):
                             while dispatcher.in_flight or dispatcher.server.live_calls():
                                 await asyncio.sleep(0.01)
                 finally:
@@ -160,11 +161,11 @@ async def test_native_pool_retry_deadline_and_recovery(phase, monkeypatch):
                 if phase != "pool":
                     hold = asyncio.ensure_future(blocker.call(Request("hold"), timeout=5))
                     tasks.append(hold)
-                    await asyncio.wait_for(probe.hold_entered.wait(), timeout=3)
+                    await asyncio.wait_for(probe.hold_entered.wait(), timeout=WAIT_BUDGET)
                     started = loop.time()
                     target = asyncio.ensure_future(client.call(Request("transient"), timeout=1))
                     tasks.append(target)
-                    await asyncio.wait_for(attempt_entered.wait(), timeout=2)
+                    await asyncio.wait_for(attempt_entered.wait(), timeout=WAIT_BUDGET)
                     # A real handler owns the only pooled stream. The target's
                     # first native attempt cannot reach its handler yet.
                     await asyncio.sleep(0.35)
@@ -175,11 +176,11 @@ async def test_native_pool_retry_deadline_and_recovery(phase, monkeypatch):
                     started = loop.time()
                     target = asyncio.ensure_future(client.call(Request("transient"), timeout=1))
                     tasks.append(target)
-                    await asyncio.wait_for(backoff_entered.wait(), timeout=2)
+                    await asyncio.wait_for(backoff_entered.wait(), timeout=WAIT_BUDGET)
                     assert probe.transient_calls == 1
                     hold = asyncio.ensure_future(blocker.call(Request("hold"), timeout=5))
                     tasks.append(hold)
-                    await asyncio.wait_for(probe.hold_entered.wait(), timeout=3)
+                    await asyncio.wait_for(probe.hold_entered.wait(), timeout=WAIT_BUDGET)
 
                 if phase == "without_interceptor":
                     assert (await target).tag == "retried"
@@ -254,10 +255,10 @@ async def test_native_saturated_pool_cancellation_and_recovery(monkeypatch):
             try:
                 hold = asyncio.ensure_future(client.call(Request("hold"), timeout=5))
                 tasks.append(hold)
-                await asyncio.wait_for(probe.hold_entered.wait(), timeout=3)
+                await asyncio.wait_for(probe.hold_entered.wait(), timeout=WAIT_BUDGET)
                 queued = [asyncio.ensure_future(client.call(Request(f"queued-{i}"), timeout=3)) for i in range(16)]
                 tasks.extend(queued)
-                await asyncio.wait_for(entered.wait(), timeout=3)
+                await asyncio.wait_for(entered.wait(), timeout=WAIT_BUDGET)
                 # Each observed transport invocation delegates directly to the
                 # native client; the entered blocker owns its only pool slot.
                 await asyncio.sleep(0.05)
@@ -322,7 +323,7 @@ async def test_native_breaker_probe_recovery(aftermath):
                     second.opened_at -= second.recovery_timeout
                 else:
                     pending = asyncio.ensure_future(client.call(Request("hold"), timeout=3))
-                    await asyncio.wait_for(probe.hold_entered.wait(), timeout=2)
+                    await asyncio.wait_for(probe.hold_entered.wait(), timeout=WAIT_BUDGET)
                     assert first.half_open_calls == 1
                     pending.cancel()
                     with pytest.raises(asyncio.CancelledError):

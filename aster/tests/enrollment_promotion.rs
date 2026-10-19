@@ -156,6 +156,7 @@ async fn check_before_reconciliation_moves_a_promoted_node_onto_its_record() {
         // with the root has refreshed the replica's store.
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
+                // short-wait-ok: one sync round per try; the loop retries within its 30 s bound
                 let _ = fleet
                     .sync_with_timeout(&[replica.id()], Duration::from_secs(2))
                     .await;

@@ -910,6 +910,7 @@ mod foreign {
         assert_eq!(s.status, Status::Ok);
 
         // Peer cancel: the client gives up and its pooled stream is cancelled.
+        // short-wait-ok: dropping the call on expiry is the cancel under test
         let gave_up = tokio::time::timeout(
             Duration::from_millis(150),
             conn.unary(&header("test.Foreign", "hang"), vec![1]),

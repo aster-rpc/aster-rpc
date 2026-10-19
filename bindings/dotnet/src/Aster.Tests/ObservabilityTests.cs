@@ -846,7 +846,7 @@ public class ObservabilityTests : IAsyncLifetime
             using (Tracing.WithTraceContext($"00-{trace}-00f067aa0ba902b7-01", new Dictionary<string, string> { ["tenant"] = trace }))
             {
                 entered[index].SetResult(true);
-                await release.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                await release.Task.WaitAsync(WaitBudget.Value);
                 await Task.Yield();
                 Assert.Equal(trace, Tracing.CurrentTraceId);
                 Assert.Equal(trace, Tracing.CurrentBaggage["tenant"]);
@@ -856,10 +856,10 @@ public class ObservabilityTests : IAsyncLifetime
         var tasks = new[] { Worker(0), Worker(1) };
         try
         {
-            await Task.WhenAll(entered[0].Task, entered[1].Task).WaitAsync(TimeSpan.FromSeconds(5));
+            await Task.WhenAll(entered[0].Task, entered[1].Task).WaitAsync(WaitBudget.Value);
             Assert.Equal(original, Tracing.CurrentTraceId);
             release.SetResult(true);
-            await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(5));
+            await Task.WhenAll(tasks).WaitAsync(WaitBudget.Value);
             Assert.Equal(original, Tracing.CurrentTraceId);
         }
         finally { release.TrySetResult(true); await Task.WhenAll(tasks); }

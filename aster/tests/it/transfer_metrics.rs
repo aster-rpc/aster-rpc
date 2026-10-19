@@ -255,6 +255,7 @@ async fn docs_and_gossip_under_their_own_protocol() {
         loop {
             ta.broadcast(b"hello".to_vec()).await.unwrap();
             if let Ok(Ok(aster::GossipEvent::Received { .. })) =
+                // short-wait-ok: one broadcast per try; the loop retries within WAIT
                 timeout(Duration::from_millis(500), tb.recv()).await
             {
                 return;

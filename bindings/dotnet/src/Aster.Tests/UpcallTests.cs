@@ -554,6 +554,7 @@ public class UpcallTests
         var calls = Enumerable.Range(0, 300).Select(i => res.MutateAsync(new Fence("r", 1, "a"), "a", BitConverter.GetBytes(i))).ToList();
         // The pool must stay responsive while hundreds of upcalls are parked.
         var probe = Task.Run(() => 1);
+        // short-wait-ok: promptness bound; a starved pool still runs the probe once thread injection catches up, so the budget would prove nothing
         Assert.Equal(1, await probe.WaitAsync(TimeSpan.FromSeconds(2)));
         var all = await Task.WhenAll(calls).WaitAsync(T);
         for (int i = 0; i < all.Length; i++)

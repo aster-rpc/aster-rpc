@@ -8,6 +8,7 @@ use aster::{AsterConfig, Node, RelayMode};
 use aster_transport_core::framing::{
     decode_frame, encode_frame, FLAG_END_STREAM, FLAG_HEADER, FLAG_TRAILER,
 };
+use aster_transport_core::test_support::wait_budget;
 use aster_transport_salvo::{generate_webtransport_cert, HttpConfig, TlsMaterial};
 use salvo::prelude::Service;
 use salvo::test::{ResponseExt, TestClient};
@@ -187,7 +188,7 @@ async fn public_http_and_wt_preserve_gates_and_reject_spoofed_sessions_before_fa
             .await
             .unwrap();
         let mut bytes = Vec::new();
-        tokio::time::timeout(Duration::from_secs(3), recv.read_to_end(&mut bytes))
+        tokio::time::timeout(wait_budget(), recv.read_to_end(&mut bytes))
             .await
             .unwrap()
             .unwrap();

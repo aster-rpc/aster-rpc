@@ -318,6 +318,7 @@ describe.skipIf(!available)('T4: RpcServer on dynamic dispatch + RpcConnection c
   it('AbortSignal cancels a unary call', async () => {
     const ac = new AbortController();
     const p = t.unary('t4.Echo', 'slow', {}, { signal: ac.signal });
+    // short-wait-ok: the slow handler never answers; the abort is the behaviour under test
     setTimeout(() => ac.abort(), 30);
     await expectCode(p, StatusCode.CANCELLED);
     const pre = new AbortController();

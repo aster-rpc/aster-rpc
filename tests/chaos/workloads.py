@@ -28,6 +28,7 @@ from aster.status import RpcError, StatusCode
 
 from .harness import History
 from .nemeses import NemesisBase, NemesisRecvStream
+from wait_budget import WAIT_BUDGET
 
 
 # -- Wire types ---------------------------------------------------------------
@@ -220,6 +221,7 @@ async def unary_workload(nemesis: NemesisBase, history: History) -> None:
                 request={"value": i},
             )
             try:
+                # short-wait-ok: a timeout is a recorded, accepted outcome; the SlowHandler nemesis (5 s) is meant to outlast it
                 resp = await asyncio.wait_for(
                     stub.echo(EchoReq(value=i)), timeout=3.0
                 )
@@ -254,6 +256,7 @@ async def session_sequential_workload(nemesis: NemesisBase, history: History) ->
                 request={"seq": i},
             )
             try:
+                # short-wait-ok: a timeout is a recorded, accepted outcome; the SlowHandler nemesis (5 s) is meant to outlast it
                 resp = await asyncio.wait_for(
                     stub.increment(CounterReq()), timeout=3.0
                 )
@@ -294,6 +297,7 @@ async def client_stream_workload(nemesis: NemesisBase, history: History) -> None
             for v in values:
                 yield SumItem(value=v)
 
+        # short-wait-ok: a timeout is a recorded, accepted outcome; the SlowHandler nemesis (5 s) is meant to outlast it
         resp = await asyncio.wait_for(stub.sum_stream(items()), timeout=5.0)
         total = resp.total if hasattr(resp, "total") else resp.get("total")
         history.complete(
@@ -342,11 +346,11 @@ async def cancel_workload(nemesis: NemesisBase, history: History) -> None:
 
         # Read frames until we get a CANCELLED trailer (or timeout)
         got_cancelled = False
-        deadline = asyncio.get_event_loop().time() + 5.0
+        deadline = asyncio.get_event_loop().time() + WAIT_BUDGET
 
         while asyncio.get_event_loop().time() < deadline:
             try:
-                frame = await asyncio.wait_for(read_frame(c_recv), timeout=3.0)
+                frame = await asyncio.wait_for(read_frame(c_recv), timeout=WAIT_BUDGET)
             except (asyncio.TimeoutError, Exception):
                 break
             if frame is None:

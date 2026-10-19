@@ -112,7 +112,7 @@ public class CqStateMachineTests
         cq.Complete(op, FakeEvent.Completed(42));
 
         // Should receive exactly one event
-        var ev = await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(100));
+        var ev = await tcs.Task.WaitAsync(WaitBudget.Value);
         Assert.Equal(42ul, ev.Handle);
         Assert.Equal(24u, ev.Kind); // StreamFinished
 
@@ -229,7 +229,7 @@ public class CqStateMachineTests
         // First complete
         cq.Complete(op, FakeEvent.Completed(1));
 
-        var first = await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(100));
+        var first = await tcs.Task.WaitAsync(WaitBudget.Value);
         Assert.True(tcs.Task.IsCompleted);
 
         // Second complete should be no-op
@@ -265,7 +265,7 @@ public class CqStateMachineTests
         var ev = new FakeEvent { Kind = 22 /* FrameReceived */, Handle = 99, ErrorCode = 0 };
         cq.Complete(op, ev);
 
-        var result = await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(100));
+        var result = await tcs.Task.WaitAsync(WaitBudget.Value);
         Assert.Equal(99ul, result.Handle);
         Assert.Equal(22u, result.Kind);
         Assert.Equal(0, result.ErrorCode);
@@ -292,7 +292,7 @@ public class CqStateMachineTests
 
                 try
                 {
-                    var result = await tcs.Task.WaitAsync(TimeSpan.FromSeconds(2));
+                    var result = await tcs.Task.WaitAsync(WaitBudget.Value);
                     results.Add((idx, result.Handle));
                 }
                 catch (TimeoutException)
@@ -349,6 +349,7 @@ public class CqStateMachineTests
 
                 try
                 {
+                    // short-wait-ok: every op is unregistered, so it never completes; a timeout counts as the cancelled terminal
                     await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(200));
                     statuses[idx] = 2;
                 }

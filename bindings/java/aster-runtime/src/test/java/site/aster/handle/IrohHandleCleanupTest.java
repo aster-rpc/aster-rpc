@@ -6,6 +6,7 @@ import java.lang.ref.Cleaner;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
+import site.aster.testing.WaitBudget;
 
 class IrohHandleCleanupTest {
   static class Handle extends IrohHandle {
@@ -56,7 +57,7 @@ class IrohHandleCleanupTest {
                 }));
       }
       start.countDown();
-      for (Future<?> job : jobs) job.get(2, TimeUnit.SECONDS);
+      for (Future<?> job : jobs) job.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
       assertEquals(1, released.get());
       assertTrue(handle.isClosed());
       cleanup.clean();
@@ -65,7 +66,7 @@ class IrohHandleCleanupTest {
     } finally {
       start.countDown();
       pool.shutdownNow();
-      assertTrue(pool.awaitTermination(2, TimeUnit.SECONDS));
+      assertTrue(pool.awaitTermination(WaitBudget.SECONDS, TimeUnit.SECONDS));
       handle.close();
     }
   }

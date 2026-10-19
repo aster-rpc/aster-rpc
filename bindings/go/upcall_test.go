@@ -29,7 +29,7 @@ func leakCheck(t *testing.T) {
 	before := runtime.NumGoroutine()
 	t.Cleanup(func() {
 		t.Helper()
-		deadline := time.Now().Add(5 * time.Second)
+		deadline := time.Now().Add(waitBudget())
 		for {
 			n := runtime.NumGoroutine()
 			if n <= before {
@@ -471,6 +471,7 @@ func TestUpcalls_AcquireGivenUpByContextNeverLeaksALease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ser.Close()
+	// short-wait-ok: the acquire must end with DeadlineExceeded while the serializer holds it
 	short, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel()
 	if _, err := ser.Acquire(short, "r", "a", LeaseOptions{TTL: time.Minute}); !errors.Is(err, context.DeadlineExceeded) {
@@ -491,6 +492,7 @@ func TestUpcalls_AcquireGivenUpByContextNeverLeaksALease(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ser2.Close()
+	// short-wait-ok: the acquire must end with DeadlineExceeded before the delayed grant
 	c, cancel2 := context.WithTimeout(ctx, 100*time.Millisecond)
 	defer cancel2()
 	if _, err := ser2.Acquire(c, "late", "a", LeaseOptions{TTL: time.Minute}); !errors.Is(err, context.DeadlineExceeded) {

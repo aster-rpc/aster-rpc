@@ -16,6 +16,7 @@ import site.aster.ffi.IrohLibrary;
 import site.aster.ffi.IrohStatus;
 import site.aster.health.HealthServer;
 import site.aster.node.IrohNode;
+import site.aster.testing.WaitBudget;
 
 /**
  * Pipeline lifecycle and the pure parts of the trace API (no server needed): init / shutdown /
@@ -186,7 +187,7 @@ final class ObservabilityLifecycleTest {
             String[] seen = new String[1];
             Tracing.propagating(pool).execute(() -> seen[0] = Tracing.currentTraceId());
             pool.shutdown();
-            assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+            assertTrue(pool.awaitTermination(WaitBudget.SECONDS, TimeUnit.SECONDS));
             assertEquals("4bf92f3577b34da6a3ce929d0e0e4736", seen[0]);
           } catch (Exception e) {
             throw new AssertionError(e);
@@ -270,7 +271,7 @@ final class ObservabilityLifecycleTest {
                       () -> {
                         entered.countDown();
                         try {
-                          assertTrue(release.await(5, TimeUnit.SECONDS));
+                          assertTrue(release.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
                         } catch (InterruptedException e) {
                           Thread.currentThread().interrupt();
                           throw new AssertionError(e);
@@ -281,15 +282,15 @@ final class ObservabilityLifecycleTest {
                       Tracing.propagating(pool)));
             });
       }
-      assertTrue(entered.await(5, TimeUnit.SECONDS));
+      assertTrue(entered.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
       assertNull(Tracing.currentTraceId());
       release.countDown();
-      for (var task : tasks) task.get(5, TimeUnit.SECONDS);
-      assertNull(pool.submit(Tracing::currentTraceId).get(5, TimeUnit.SECONDS));
+      for (var task : tasks) task.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
+      assertNull(pool.submit(Tracing::currentTraceId).get(WaitBudget.SECONDS, TimeUnit.SECONDS));
     } finally {
       release.countDown();
       pool.shutdownNow();
-      assertTrue(pool.awaitTermination(5, TimeUnit.SECONDS));
+      assertTrue(pool.awaitTermination(WaitBudget.SECONDS, TimeUnit.SECONDS));
     }
   }
 }

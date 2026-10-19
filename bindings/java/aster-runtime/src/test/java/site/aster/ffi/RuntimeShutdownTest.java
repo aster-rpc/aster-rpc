@@ -23,10 +23,13 @@ import site.aster.docs.Doc;
 import site.aster.docs.DocEvents;
 import site.aster.event.IrohEvent;
 import site.aster.node.IrohNode;
+import site.aster.testing.WaitBudget;
 
 final class RuntimeShutdownTest {
   private static Throwable failure(CompletableFuture<?> future) {
-    return assertThrows(ExecutionException.class, () -> future.get(2, TimeUnit.SECONDS)).getCause();
+    return assertThrows(
+            ExecutionException.class, () -> future.get(WaitBudget.SECONDS, TimeUnit.SECONDS))
+        .getCause();
   }
 
   private static IrohEvent event(long operation, long buffer) {
@@ -161,7 +164,7 @@ final class RuntimeShutdownTest {
         } else first.thenAccept(stop);
         try {
           poller.start();
-          stopped.get(2, TimeUnit.SECONDS);
+          stopped.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
           poller.stop(); // Wait for the worker to leave the batch before inspecting outcomes.
           assertFalse(second.isDone(), "the rest of a stopped batch must not be accessed");
           assertEquals(0, laterHandlers.get(), "a stopped handler chain must not reuse the event");
@@ -200,7 +203,7 @@ final class RuntimeShutdownTest {
                   });
       // This write's completion can share a poll batch with the receive that closes the runtime.
       doc.setBytesAsync(author, "self/close", new byte[] {1});
-      closed.get(2, TimeUnit.SECONDS);
+      closed.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
       IrohException error = assertInstanceOf(IrohException.class, failure(idleReceive));
       assertEquals(IrohStatus.ALREADY_CLOSED, error.status());
       assertEquals(0, node.runtime().registry().size());

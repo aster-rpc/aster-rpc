@@ -224,6 +224,7 @@ func TestRawWT_CancelAcceptDoesNotConsumeNextSessionAndStopReleasesPorts(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	// short-wait-ok: no peer connects, so the accept must end with DeadlineExceeded
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	if s, err := l.Accept(ctx); s != nil || !errors.Is(err, context.DeadlineExceeded) {
@@ -296,7 +297,7 @@ func TestRawWT_AuthBeforeUpgradeAndExactRoute(t *testing.T) {
 		if req.Metadata["aster.webtransport.path"] != "/raw" || req.Metadata["aster.webtransport.query"] != "cap=a&cap=b" || req.Service != "webtransport" || req.Method != "CONNECT" {
 			t.Fatalf("auth metadata %#v", req)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("no auth")
 	}
 	select {
@@ -304,6 +305,7 @@ func TestRawWT_AuthBeforeUpgradeAndExactRoute(t *testing.T) {
 		t.Fatalf("wrong route authenticated: %#v", req)
 	default:
 	}
+	// short-wait-ok: denied requests must create no session; the accept is expected to expire
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	if s, err := l.Accept(ctx); s != nil || !errors.Is(err, context.DeadlineExceeded) {
@@ -385,6 +387,7 @@ func TestRawWT_ReadCancellationResetServerBiAndCloseWake(t *testing.T) {
 	if err != nil || string(data) != "pending" {
 		t.Fatalf("initial read %q %v", data, err)
 	}
+	// short-wait-ok: nothing is sent yet, so the read must end with DeadlineExceeded
 	timeout, stop := context.WithTimeout(ctx, 20*time.Millisecond)
 	defer stop()
 	if data, err = pending.Read(timeout, 1024); len(data) != 0 || !errors.Is(err, context.DeadlineExceeded) {
@@ -475,7 +478,7 @@ func TestRawWT_ReadCancellationResetServerBiAndCloseWake(t *testing.T) {
 		if err == nil {
 			t.Fatal("closed session accept succeeded")
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("close did not wake pending accept")
 	}
 	if _, err = session.Closed(ctx); err != nil {

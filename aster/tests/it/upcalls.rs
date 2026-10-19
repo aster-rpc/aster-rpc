@@ -4,6 +4,7 @@
 //! way a C ABI poll thread would, plus the mechanism's timeout, failure
 //! mode, cancellation, ordering and unknown-id rules.
 
+use aster_transport_core::test_support::wait_budget;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -52,6 +53,7 @@ impl Foreign {
         let (s, v) = (stop.clone(), seen.clone());
         let thread = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
+                // short-wait-ok: a poll tick; the loop rechecks its stop flag between waits
                 if !queue.wait_blocking(Duration::from_millis(10)) {
                     continue;
                 }
@@ -486,6 +488,7 @@ async fn dropping_the_waiter_cancels_the_upcall() {
             UpcallKind::LeaseSnapshot,
             codec::encode_lease_snapshot_request("r"),
         );
+        // short-wait-ok: dropping the call on expiry is the cancel under test
         let _ = tokio::time::timeout(Duration::from_millis(20), fut).await;
     }
     assert!(queue.is_empty());
@@ -1163,5 +1166,5 @@ async fn gate0_admission_answered_by_upcall() {
 
     client.shutdown().await;
     server.shutdown().await;
-    let _ = tokio::time::timeout(Duration::from_secs(5), bridge).await;
+    let _ = tokio::time::timeout(wait_budget(), bridge).await;
 }

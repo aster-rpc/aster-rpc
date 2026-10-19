@@ -41,6 +41,7 @@ import site.aster.interceptors.CallContext;
 import site.aster.interceptors.Interceptor;
 import site.aster.server.DispatchServerE2ETest.Msg;
 import site.aster.server.wire.RpcStatus;
+import site.aster.testing.WaitBudget;
 import site.aster.upcall.FailureMode;
 import site.aster.upcall.Ucv1;
 import site.aster.upcall.UpcallKind;
@@ -323,7 +324,11 @@ final class HttpListenerE2ETest {
     var failure =
         assertThrows(
             java.util.concurrent.ExecutionException.class,
-            () -> AsterServer.builder().builtinTopology(true).build().get(5, TimeUnit.SECONDS));
+            () ->
+                AsterServer.builder()
+                    .builtinTopology(true)
+                    .build()
+                    .get(WaitBudget.SECONDS, TimeUnit.SECONDS));
     assertTrue(failure.getCause().getMessage().contains("monitoring"));
     var node = site.aster.topology.TopologyTest.node(false);
     try (var rt = node.runtime();
@@ -571,10 +576,11 @@ final class HttpListenerE2ETest {
             client.sendAsync(
                 request(listener.tcpAddress(), "echo", "alice", f.body(new Msg("", 0))),
                 HttpResponse.BodyHandlers.ofByteArray());
-        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        assertTrue(entered.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
         listener.stop(Duration.ZERO);
         assertTrue(
-            cancelled.await(5, TimeUnit.SECONDS), "native cancellation interrupts auth worker");
+            cancelled.await(WaitBudget.SECONDS, TimeUnit.SECONDS),
+            "native cancellation interrupts auth worker");
         assertTrue(invocation.get().isCancelled());
         assertFalse(
             invocation
@@ -582,7 +588,7 @@ final class HttpListenerE2ETest {
                 .respond(
                     Upcalls.STATUS_OK,
                     Ucv1.encodeRpcAuthResponse(new Ucv1.RpcAuthResponse(true, "late", Map.of()))));
-        pending.handle((response, error) -> null).get(5, TimeUnit.SECONDS);
+        pending.handle((response, error) -> null).get(WaitBudget.SECONDS, TimeUnit.SECONDS);
         assertTrue(f.calls.isEmpty());
         released(listener.tcpAddress(), true);
       }
@@ -609,7 +615,7 @@ final class HttpListenerE2ETest {
       try (HttpListener listener = f.server.startHttp(f.upcalls, config(false))) {
         Reply reply = call(client, listener.tcpAddress(), "echo", "alice", f.body(new Msg("", 0)));
         assertEquals(RpcStatus.UNAVAILABLE, reply.status().code());
-        assertTrue(interrupted.await(5, TimeUnit.SECONDS));
+        assertTrue(interrupted.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
         assertTrue(f.calls.isEmpty());
       }
     }
@@ -654,12 +660,12 @@ final class HttpListenerE2ETest {
             client.sendAsync(
                 request(listener.tcpAddress(), "echo", "alice", f.body(new Msg("", 0))),
                 HttpResponse.BodyHandlers.ofByteArray());
-        assertTrue(entered.await(5, TimeUnit.SECONDS));
+        assertTrue(entered.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
         f.server.node().runtime().close();
-        assertTrue(cancelled.await(5, TimeUnit.SECONDS));
+        assertTrue(cancelled.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
         assertEquals(Upcalls.CANCEL_SHUTDOWN, invocation.get().cancelReason());
         assertFalse(f.upcalls.hasRpcAuthenticator());
-        pending.handle((response, error) -> null).get(5, TimeUnit.SECONDS);
+        pending.handle((response, error) -> null).get(WaitBudget.SECONDS, TimeUnit.SECONDS);
         long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
         while (true) {
           try {
@@ -702,15 +708,15 @@ final class HttpListenerE2ETest {
                       result.completeExceptionally(e);
                     }
                   });
-      assertTrue(ready.await(5, TimeUnit.SECONDS));
+      assertTrue(ready.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
       f.server.close();
       try {
-        HttpListener listener = result.get(5, TimeUnit.SECONDS);
+        HttpListener listener = result.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
         listener.close();
       } catch (java.util.concurrent.ExecutionException e) {
         assertInstanceOf(IrohException.class, e.getCause());
       }
-      starter.join(Duration.ofSeconds(5));
+      starter.join(WaitBudget.duration());
       assertFalse(starter.isAlive());
       released(address, true);
     }

@@ -321,6 +321,7 @@ async fn datagram_demux_round_trip() -> Result<()> {
     let mut got = None;
     for _ in 0..10 {
         client_router.send(42, b"datagram payload")?;
+        // short-wait-ok: datagrams are unreliable; each try waits briefly, then resends
         if let Ok(Some(p)) = timeout(Duration::from_millis(300), flow.recv()).await {
             got = Some(p);
             break;

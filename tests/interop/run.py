@@ -250,6 +250,7 @@ class Server:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
+                # short-wait-ok: poll tick; the address() deadline bounds the overall wait
                 line = self.lines.get(timeout=0.5)
             except queue.Empty:
                 if self.proc.poll() is not None:

@@ -21,6 +21,7 @@ import {
   type Lease,
   type LeaseStatus,
 } from '@aster-rpc/aster';
+import { WAIT_BUDGET_MS } from '../helpers/wait-budget.ts';
 
 const OFFLINE = { relayMode: 'disabled', bindAddr: '127.0.0.1:0' } as const;
 // Fast renewals; a TTL that survives a stall on a loaded host.
@@ -118,7 +119,7 @@ describe('lease: in-memory serializer', () => {
       for await (const s of lease.statusChanges()) seen.push(s);
     })();
     expect((await ser.revoke('r', 'operator')).kind).toBe('revoked');
-    await within(watching, 3000, 'fenced status');
+    await within(watching, WAIT_BUDGET_MS, 'fenced status');
     expect(seen).toEqual(['fenced']);
     expect(lease.status).toBe('fenced');
     expect(lease.fence()).toBeNull();

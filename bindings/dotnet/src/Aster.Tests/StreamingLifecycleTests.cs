@@ -10,9 +10,8 @@ namespace Aster.Tests;
 public class StreamingLifecycleTests
 {
     // How long to wait for something that must happen. The parked producers
-    // never unpark before teardown, so any bound proves a call didn't wait for
-    // one; a loaded runner needed more than 3 s to deliver a deadline's cancel.
-    private static readonly TimeSpan Settle = TimeSpan.FromSeconds(15);
+    // never unpark before teardown, so any bound proves a call didn't wait for one.
+    private static TimeSpan Settle => WaitBudget.Value;
 
     private sealed class ParkedRequests : IAsyncEnumerable<EchoRequest>, IAsyncEnumerator<EchoRequest>
     {

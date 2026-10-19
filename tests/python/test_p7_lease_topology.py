@@ -42,6 +42,8 @@ from aster import (
     seal_namespace_grant,
 )
 
+from wait_budget import WAIT_BUDGET
+
 pytestmark = pytest.mark.network
 
 FAST = LeaseOptions(ttl=0.6, renew_interval=0.15, holder_margin=0.1)
@@ -153,7 +155,7 @@ async def test_revoke_fences_holder_and_status_changes_ends():
     watching = asyncio.ensure_future(watch())
     await asyncio.sleep(0)
     assert (await ser.revoke("r", "operator")).kind == "revoked"
-    await asyncio.wait_for(watching, 3)
+    await asyncio.wait_for(watching, WAIT_BUDGET)
     assert seen == ["fenced"]
     assert lease.status == "fenced"
     assert lease.fence() is None

@@ -71,21 +71,21 @@ func TestRPC_ClientStreamEarlyResponseWithParkedProducer(t *testing.T) {
 				unpark()
 				select {
 				case <-produced:
-				case <-time.After(3 * time.Second):
+				case <-time.After(waitBudget()):
 					t.Error("source teardown hung")
 				}
 			}()
 			select {
 			case <-delivered:
-			case <-time.After(3 * time.Second):
+			case <-time.After(waitBudget()):
 				t.Fatal("server did not receive first request")
 			}
 			select {
 			case <-parked:
-			case <-time.After(3 * time.Second):
+			case <-time.After(waitBudget()):
 				t.Fatal("producer did not park")
 			}
-			deadline := time.Now().Add(3 * time.Second)
+			deadline := time.Now().Add(waitBudget())
 			for f.srv.LiveCalls() != 0 && time.Now().Before(deadline) {
 				time.Sleep(5 * time.Millisecond)
 			}
@@ -102,13 +102,13 @@ func TestRPC_ClientStreamEarlyResponseWithParkedProducer(t *testing.T) {
 				} else if got.err != nil || got.reply.Message != "early answer" {
 					t.Fatalf("early answer: %+v %v", got.reply, got.err)
 				}
-			case <-time.After(2 * time.Second):
+			case <-time.After(waitBudget()):
 				t.Fatal("public client-stream call stayed pending after native server terminal while producer parked")
 			}
 			unpark()
 			select {
 			case <-produced:
-			case <-time.After(3 * time.Second):
+			case <-time.After(waitBudget()):
 				t.Fatal("producer did not leave after release")
 			}
 			if !reject {
@@ -135,7 +135,7 @@ func TestRPC_ClientStreamLocalFailures(t *testing.T) {
 	for _, phase := range []string{"panic", "encode", "nil-encode"} {
 		t.Run(phase, func(t *testing.T) {
 			f := newRPCFixture(t, ServerOptions{Services: []*Service{interopService()}})
-			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), waitBudget())
 			defer cancel()
 			original := f.conn.codec
 			failure := errors.New("local encoding failure")
@@ -201,7 +201,7 @@ func TestRPC_ClientStreamEmptyValidationAndRecovery(t *testing.T) {
 		return &testEchoReply{Count: count, Data: []byte{}}, nil
 	}))
 	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc}})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), waitBudget())
 	defer cancel()
 	empty := func(func(*testEchoRequest) bool) {}
 	if reply, err := CallClientStream[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "emptyguard", empty); reply != nil || !errors.Is(err, ErrRpcInvalidArgument) {
@@ -227,6 +227,7 @@ func TestRPC_ClientStreamEmptyContextPriority(t *testing.T) {
 			var ctx context.Context
 			var cancel context.CancelFunc
 			if deadline {
+				// short-wait-ok: the deadline's DEADLINE_EXCEEDED is the behaviour under test
 				ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
 			} else {
 				ctx, cancel = context.WithCancel(context.Background())
@@ -266,7 +267,7 @@ func TestRPC_BidiEmptyAndRepeatedFinish(t *testing.T) {
 		return nil
 	}))
 	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc}})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), waitBudget())
 	defer cancel()
 	empty, err := OpenBidiStream[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "chat")
 	if err != nil {
@@ -334,6 +335,7 @@ func TestRPC_ClientStreamCancellationWithParkedProducer(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			if deadline {
 				cancel()
+				// short-wait-ok: the deadline variant asserts DEADLINE_EXCEEDED from this deadline
 				ctx, cancel = context.WithTimeout(context.Background(), 500*time.Millisecond)
 			}
 			defer cancel()
@@ -354,18 +356,18 @@ func TestRPC_ClientStreamCancellationWithParkedProducer(t *testing.T) {
 				close(release)
 				select {
 				case <-produced:
-				case <-time.After(3 * time.Second):
+				case <-time.After(waitBudget()):
 					t.Error("source did not exit")
 				}
 			}()
 			select {
 			case <-delivered:
-			case <-time.After(3 * time.Second):
+			case <-time.After(waitBudget()):
 				t.Fatal("first request not delivered")
 			}
 			select {
 			case <-parked:
-			case <-time.After(3 * time.Second):
+			case <-time.After(waitBudget()):
 				t.Fatal("source not parked")
 			}
 			if !deadline {
@@ -380,15 +382,15 @@ func TestRPC_ClientStreamCancellationWithParkedProducer(t *testing.T) {
 				} else if !errors.Is(err, context.Canceled) || !errors.Is(err, ErrRpcCancelled) {
 					t.Fatalf("cancel: %v", err)
 				}
-			case <-time.After(3 * time.Second):
+			case <-time.After(waitBudget()):
 				t.Fatal("parked producer blocked cancellation")
 			}
 			select {
 			case <-cancelled:
-			case <-time.After(3 * time.Second):
+			case <-time.After(waitBudget()):
 				t.Fatal("handler did not cancel")
 			}
-			until := time.Now().Add(3 * time.Second)
+			until := time.Now().Add(waitBudget())
 			for f.srv.LiveCalls() != 0 && time.Now().Before(until) {
 				time.Sleep(5 * time.Millisecond)
 			}
@@ -418,7 +420,7 @@ func TestRPC_BidiAbandonmentWithParkedProducer(t *testing.T) {
 		return nil
 	}))
 	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc}})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), waitBudget())
 	defer cancel()
 	reqs := func(yield func(*testEchoRequest) bool) {
 		defer close(produced)
@@ -440,10 +442,10 @@ func TestRPC_BidiAbandonmentWithParkedProducer(t *testing.T) {
 	}
 	select {
 	case <-cancelled:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("handler not cancelled after response abandonment")
 	}
-	until := time.Now().Add(3 * time.Second)
+	until := time.Now().Add(waitBudget())
 	for f.srv.LiveCalls() != 0 && time.Now().Before(until) {
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -453,7 +455,7 @@ func TestRPC_BidiAbandonmentWithParkedProducer(t *testing.T) {
 	unpark()
 	select {
 	case <-produced:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("released producer did not exit")
 	}
 	if !refused.Load() {
@@ -465,7 +467,7 @@ func TestRPC_BidiAbandonmentWithParkedProducer(t *testing.T) {
 // Clearing rc makes an accidental native operation deterministic rather than racing a handle.
 func TestRPC_ReleasedCallRefusesLateProducerOperations(t *testing.T) {
 	f := newRPCFixture(t, ServerOptions{Services: []*Service{interopService()}})
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), waitBudget())
 	defer cancel()
 	c, err := openCall(ctx, f.conn, PatternClientStream, "InteropEcho", "ingest", &callOptions{})
 	if err != nil {
@@ -532,7 +534,7 @@ func TestRPC_FlowControlledSendCancellationDrainsBeforeRelease(t *testing.T) {
 	go func() { _, err := c.readSingle("client-stream"); read <- err }()
 	select {
 	case <-entered:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		cancel()
 		t.Fatal("handler not entered")
 	}
@@ -555,12 +557,12 @@ func TestRPC_FlowControlledSendCancellationDrainsBeforeRelease(t *testing.T) {
 		if err == nil {
 			t.Error("bounded producer finished before backpressure")
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("cancel could not wake send")
 	}
 	select {
 	case <-read:
-	case <-time.After(3 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("reader did not drain")
 	}
 	c.release()
@@ -568,7 +570,7 @@ func TestRPC_FlowControlledSendCancellationDrainsBeforeRelease(t *testing.T) {
 		t.Fatal("backpressure not established")
 	}
 	t.Logf("completed payloads before cancellation: %d (2 MiB each, cap 32)", completed.Load())
-	followCtx, followCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	followCtx, followCancel := context.WithTimeout(context.Background(), waitBudget())
 	defer followCancel()
 	if _, err := Call[testEchoRequest, testEchoReply](followCtx, f.conn, "InteropEcho", "echo", &testEchoRequest{Data: []byte{}}); err != nil {
 		t.Fatalf("followup: %v", err)
@@ -589,7 +591,7 @@ func TestRPC_BidiCloseDrainsPendingRecv(t *testing.T) {
 		return nil
 	}))
 	f := newRPCFixture(t, ServerOptions{Services: []*Service{svc, interopService()}})
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), waitBudget())
 	defer cancel()
 	b, err := OpenBidiStream[testEchoRequest, testEchoReply](ctx, f.conn, "CloseRecv", "chat")
 	if err != nil {
@@ -601,7 +603,7 @@ func TestRPC_BidiCloseDrainsPendingRecv(t *testing.T) {
 	}
 	select {
 	case <-entered:
-	case <-time.After(time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("handler not entered")
 	}
 	received := make(chan error, 1)
@@ -609,13 +611,14 @@ func TestRPC_BidiCloseDrainsPendingRecv(t *testing.T) {
 	select {
 	case err := <-received:
 		t.Fatalf("recv unexpectedly ended: %v", err)
+	// short-wait-ok: the pending recv must not end before Close; the bound is the assertion
 	case <-time.After(20 * time.Millisecond):
 	}
 	closed := make(chan struct{})
 	go func() { b.Close(); close(closed) }()
 	select {
 	case <-closed:
-	case <-time.After(time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("Close did not drain recv")
 	}
 	select {
@@ -623,7 +626,7 @@ func TestRPC_BidiCloseDrainsPendingRecv(t *testing.T) {
 		if err == nil {
 			t.Fatal("closed recv succeeded")
 		}
-	case <-time.After(time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("recv not joined")
 	}
 	if _, err := Call[testEchoRequest, testEchoReply](ctx, f.conn, "InteropEcho", "echo", &testEchoRequest{Data: []byte{}}); err != nil {

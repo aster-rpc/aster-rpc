@@ -208,6 +208,7 @@ fn event_loop(
     let mut routes: HashMap<u64, mpsc::Sender<DispatchEvent>> = HashMap::new();
     let mut method_of: HashMap<u64, u32> = HashMap::new();
     while !stop.load(Ordering::SeqCst) {
+        // short-wait-ok: a poll tick; the loop rechecks its stop flag between waits
         consumer.wait_blocking(Duration::from_millis(20));
         consumer.drain(64, |ev| match ev {
             DispatchEvent::Call(call) => {

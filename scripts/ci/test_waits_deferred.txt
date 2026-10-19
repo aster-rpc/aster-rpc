@@ -1,0 +1,20 @@
+# Short literal waits not yet converted (scripts/ci/lint_test_waits.py), in
+# suites the standard-profile release candidate does not run: the Mission
+# Control examples and guide, assurance probes and repros, the audit-outbox
+# receiver, and the Python files whose tests are all `network` or
+# `iroh_primitives` (python-extended, full profile only).
+#
+# `<count> <path>`: the lint fails when a file holds more hits than its count,
+# and when it holds fewer (lower the count). Convert a file and delete its line.
+1 bindings/java/aster-examples-mission-control/src/test/java/site/aster/examples/missioncontrol/CrossSessionIsolationTest.java
+1 bindings/java/aster-examples-mission-control/src/test/java/site/aster/examples/missioncontrol/MissionControlE2ETest.java
+6 tests/assurance/native/JavaArenaProbe.java
+1 tests/assurance/repros/parked-client-stream.test.ts
+7 tests/assurance/test_campaign_collector.py
+1 tests/audit_outbox/receiver.py
+1 tests/audit_outbox/test_receiver.py
+2 tests/integration/mission_control/test_guide.py
+2 tests/integration/mission_control/test_guide.ts
+3 tests/python/test_docs.py
+2 tests/python/test_dumbpipe.py
+14 tests/python/test_http_listener.py

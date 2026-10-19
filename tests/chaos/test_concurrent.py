@@ -47,6 +47,7 @@ from .harness import (
     check_request_response_pairing,
     check_no_silent_corruption,
 )
+from wait_budget import WAIT_BUDGET
 
 
 def _codec():
@@ -128,7 +129,7 @@ async def test_no_crosstalk_between_sessions():
             )
             try:
                 resp = await asyncio.wait_for(
-                    stub.echo(EchoReq(value=unique_val)), timeout=5.0
+                    stub.echo(EchoReq(value=unique_val)), timeout=WAIT_BUDGET
                 )
                 val = resp.value if hasattr(resp, "value") else resp.get("value")
                 history.complete(
@@ -193,7 +194,7 @@ async def test_session_state_isolation():
         for _ in range(n_increments):
             try:
                 resp = await asyncio.wait_for(
-                    stub.increment(CounterReq()), timeout=5.0
+                    stub.increment(CounterReq()), timeout=WAIT_BUDGET
                 )
                 val = resp.counter if hasattr(resp, "counter") else resp.get("counter")
                 counters.append(val)
@@ -251,7 +252,7 @@ async def test_monotonicity_under_contention():
         for _ in range(n_increments):
             try:
                 resp = await asyncio.wait_for(
-                    counter_stub.increment(CounterReq()), timeout=5.0
+                    counter_stub.increment(CounterReq()), timeout=WAIT_BUDGET
                 )
                 val = resp.counter if hasattr(resp, "counter") else resp.get("counter")
                 counters.append(val)
@@ -263,7 +264,7 @@ async def test_monotonicity_under_contention():
         for i in range(n_noise_calls):
             try:
                 await asyncio.wait_for(
-                    stub.echo(EchoReq(value=i)), timeout=5.0
+                    stub.echo(EchoReq(value=i)), timeout=WAIT_BUDGET
                 )
             except Exception:
                 break
@@ -312,7 +313,7 @@ async def test_session_churn_no_leak():
         try:
             for j in range(calls_per_session):
                 resp = await asyncio.wait_for(
-                    stub.echo(EchoReq(value=i * 100 + j)), timeout=3.0
+                    stub.echo(EchoReq(value=i * 100 + j)), timeout=WAIT_BUDGET
                 )
                 val = resp.value if hasattr(resp, "value") else resp.get("value")
                 assert val == i * 100 + j, (
@@ -325,7 +326,7 @@ async def test_session_churn_no_leak():
     stub, task = _create_session_pair()
     try:
         resp = await asyncio.wait_for(
-            stub.echo(EchoReq(value=9999)), timeout=3.0
+            stub.echo(EchoReq(value=9999)), timeout=WAIT_BUDGET
         )
         val = resp.value if hasattr(resp, "value") else resp.get("value")
         assert val == 9999, f"final session: expected 9999, got {val}"
@@ -368,7 +369,7 @@ async def test_mixed_patterns_concurrent():
             val = client_id * 1000 + i
             try:
                 resp = await asyncio.wait_for(
-                    stub.echo(EchoReq(value=val)), timeout=5.0
+                    stub.echo(EchoReq(value=val)), timeout=WAIT_BUDGET
                 )
                 got = resp.value if hasattr(resp, "value") else resp.get("value")
                 if got != val:
@@ -383,7 +384,7 @@ async def test_mixed_patterns_concurrent():
                 for v in stream_items:
                     yield SumItem(value=v)
 
-            resp = await asyncio.wait_for(stub.sum_stream(items()), timeout=5.0)
+            resp = await asyncio.wait_for(stub.sum_stream(items()), timeout=WAIT_BUDGET)
             total = resp.total if hasattr(resp, "total") else resp.get("total")
             if total != expected_sum:
                 errors.append(

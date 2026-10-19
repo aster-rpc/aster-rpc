@@ -28,6 +28,7 @@ func TestDocSubscriptionLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sub.Close()
+	// short-wait-ok: an idle receive must end with DeadlineExceeded; the deadline is under test
 	timed, stop := context.WithTimeout(ctx, 30*time.Millisecond)
 	defer stop()
 	if _, err := sub.Recv(timed); !errors.Is(err, context.DeadlineExceeded) {
@@ -50,7 +51,7 @@ func TestDocSubscriptionLifecycle(t *testing.T) {
 		if !errors.Is(err, io.EOF) {
 			t.Fatalf("pending recv close: %v", err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("close stranded receive")
 	}
 	if err := sub.Close(); err != nil {
@@ -156,6 +157,7 @@ func TestDocSubscriptionRuntimeShutdown(t *testing.T) {
 		select {
 		case <-ctx.Done():
 			t.Fatal("receive did not register")
+		// short-wait-ok: poll tick; ctx bounds the overall wait
 		case <-time.After(time.Millisecond):
 		}
 	}
@@ -167,7 +169,7 @@ func TestDocSubscriptionRuntimeShutdown(t *testing.T) {
 		if !errors.Is(err, ErrAlreadyClosed) {
 			t.Fatalf("shutdown receive: %v", err)
 		}
-	case <-time.After(time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("runtime shutdown stranded receive")
 	}
 }

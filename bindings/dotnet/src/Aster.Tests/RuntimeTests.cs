@@ -29,7 +29,7 @@ public class RuntimeTests
         var pending = runtime.WaitForAsync(receive);
         Assert.False(pending.IsCompleted);
         runtime.Dispose();
-        await Assert.ThrowsAsync<ObjectDisposedException>(() => pending.WaitAsync(TimeSpan.FromSeconds(3)));
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => pending.WaitAsync(WaitBudget.Value));
         Assert.Equal(0, runtime.PendingOperationCount);
         await Assert.ThrowsAsync<ObjectDisposedException>(async () => await runtime.WaitForAsync(ulong.MaxValue));
         Assert.Throws<ObjectDisposedException>(() => runtime.Retain());
@@ -47,7 +47,7 @@ public class RuntimeTests
         })).ToArray();
         var close = Task.Run(() => { start.Wait(); runtime.Dispose(); });
         start.Set();
-        await Task.WhenAll(waiters.Append(close)).WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.WhenAll(waiters.Append(close)).WaitAsync(WaitBudget.Value);
         Assert.Equal(0, runtime.PendingOperationCount);
     }
 
@@ -61,7 +61,7 @@ public class RuntimeTests
         var pending = events.ReceiveAsync();
         node.Dispose();
         events.Dispose();
-        Assert.Null(await pending.WaitAsync(TimeSpan.FromSeconds(3)));
+        Assert.Null(await pending.WaitAsync(WaitBudget.Value));
         await Assert.ThrowsAsync<ObjectDisposedException>(async () => await runtime.WaitForAsync(ulong.MaxValue));
     }
 

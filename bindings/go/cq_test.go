@@ -34,7 +34,7 @@ func TestFakeCQ_SubmitComplete(t *testing.T) {
 		if got.Kind != ASTER_EVENT_STREAM_FINISHED {
 			t.Errorf("expected STREAM_FINISHED, got %d", got.Kind)
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(waitBudget()):
 		t.Error("timeout waiting for event")
 	}
 
@@ -66,6 +66,7 @@ func TestFakeCQ_SubmitCancel(t *testing.T) {
 	select {
 	case ev := <-ch:
 		t.Errorf("unexpected event %v after cancel", ev)
+	// short-wait-ok: a cancelled op must deliver nothing; the bound is the assertion
 	case <-time.After(50 * time.Millisecond):
 		// Expected: no event received
 	}
@@ -92,7 +93,7 @@ func TestFakeCQ_ExactlyOnceTerminal(t *testing.T) {
 	cq.Complete(op1, &Event{Kind: ASTER_EVENT_STREAM_FINISHED, Handle: 1})
 	select {
 	case <-ch1:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(waitBudget()):
 		t.Error("timeout waiting for op1 event")
 	}
 
@@ -100,7 +101,7 @@ func TestFakeCQ_ExactlyOnceTerminal(t *testing.T) {
 	cq.Complete(op2, &Event{Kind: ASTER_EVENT_STREAM_FINISHED, Handle: 2})
 	select {
 	case <-ch2:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(waitBudget()):
 		t.Error("timeout waiting for op2 event")
 	}
 
@@ -108,7 +109,7 @@ func TestFakeCQ_ExactlyOnceTerminal(t *testing.T) {
 	cq.Complete(op3, &Event{Kind: ASTER_EVENT_ERROR, Handle: 3, ErrorCode: -1})
 	select {
 	case <-ch3:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(waitBudget()):
 		t.Error("timeout waiting for op3 event")
 	}
 
@@ -144,7 +145,7 @@ func TestFakeCQ_CloseDrainsAll(t *testing.T) {
 		if ok {
 			t.Error("ch1 should be closed, not have a value")
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(waitBudget()):
 		t.Error("timeout waiting for ch1 close")
 	}
 }
@@ -168,7 +169,7 @@ func TestFakeCQ_NoDoubleComplete(t *testing.T) {
 		if got.Handle != 1 {
 			t.Errorf("first complete: expected handle 1, got %d", got.Handle)
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(waitBudget()):
 		t.Error("timeout waiting for first event")
 	}
 
@@ -178,6 +179,7 @@ func TestFakeCQ_NoDoubleComplete(t *testing.T) {
 	select {
 	case got := <-ch:
 		t.Errorf("unexpected second event handle=%d", got.Handle)
+	// short-wait-ok: a second completion must deliver nothing; the bound is the assertion
 	case <-time.After(50 * time.Millisecond):
 		// Expected: no second event
 	}
@@ -226,7 +228,7 @@ func TestFakeCQ_EventDataPreserved(t *testing.T) {
 		if got.Buffer != 7 {
 			t.Errorf("expected buffer 7, got %d", got.Buffer)
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(waitBudget()):
 		t.Error("timeout waiting for event")
 	}
 }
@@ -257,7 +259,7 @@ func TestFakeCQ_ConcurrentSubmitComplete(t *testing.T) {
 				if got.Handle != uint64(idx) {
 					t.Errorf("goroutine %d: expected handle %d, got %d", idx, idx, got.Handle)
 				}
-			case <-time.After(500 * time.Millisecond):
+			case <-time.After(waitBudget()):
 				t.Errorf("goroutine %d: timeout waiting for event", idx)
 			}
 		}(i)

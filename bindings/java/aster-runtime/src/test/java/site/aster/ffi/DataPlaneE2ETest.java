@@ -32,6 +32,7 @@ import site.aster.handle.IrohStream;
 import site.aster.handle.PathInfo;
 import site.aster.node.IrohNode;
 import site.aster.node.NodeAddr;
+import site.aster.testing.WaitBudget;
 
 /**
  * C ABI 3.3 data plane through the Java wrappers: ordered multi-provider fetch with a report,
@@ -185,7 +186,8 @@ final class DataPlaneE2ETest {
               .downloadHashFromAsync(
                   h, List.of(pid), BlobFormat.RAW, FetchStrategy.SPLIT_CHILDREN, false);
       ExecutionException e =
-          assertThrows(ExecutionException.class, () -> bad.get(5, TimeUnit.SECONDS));
+          assertThrows(
+              ExecutionException.class, () -> bad.get(WaitBudget.SECONDS, TimeUnit.SECONDS));
       assertTrue(e.getCause() instanceof IrohException, e.toString());
 
       for (String name : List.of("f3/a", "f3/b", "keep")) {

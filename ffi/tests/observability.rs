@@ -8,6 +8,7 @@
 //! The pipeline is process-global, so the cases take one lock and each ends
 //! with no pipeline running.
 
+use aster_transport_core::test_support::wait_budget;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -225,7 +226,7 @@ fn c_abi_exporter_fault(fault: Fault, fault_name: &str) {
         if matches!(fault, Fault::Refused) {
             collector.assert_refused();
         } else {
-            let observed_by = Instant::now() + Duration::from_secs(2);
+            let observed_by = Instant::now() + wait_budget();
             while collector.failed_requests() == 0 && Instant::now() < observed_by {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -253,7 +254,7 @@ fn c_abi_exporter_fault(fault: Fault, fault_name: &str) {
         );
         assert_eq!(aster_observability_flush(5_000), OK, "{}", last_error());
         let body = collector
-            .wait_for(recovered_marker.as_bytes(), Duration::from_secs(5))
+            .wait_for(recovered_marker.as_bytes(), wait_budget())
             .expect("recovered C ABI log was not exported");
         assert!(body.windows(logger.len()).any(|w| w == logger));
         assert!(body.windows(b"recovered".len()).any(|w| w == b"recovered"));
@@ -304,7 +305,7 @@ fn c_abi_exporter_fault(fault: Fault, fault_name: &str) {
         assert_eq!(aster_log_close(), OK);
 
         collector.recover();
-        let closed_by = Instant::now() + Duration::from_secs(3);
+        let closed_by = Instant::now() + wait_budget();
         while aster_otel::state().is_some() && Instant::now() < closed_by {
             std::thread::sleep(Duration::from_millis(10));
         }

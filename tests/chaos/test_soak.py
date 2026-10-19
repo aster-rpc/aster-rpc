@@ -40,6 +40,7 @@ from .workloads import (
     SumItem, SumResp, ALL_TYPES,
 )
 from .harness import History, check_request_response_pairing, check_no_silent_corruption
+from wait_budget import WAIT_BUDGET
 
 
 def _codec():
@@ -116,7 +117,7 @@ async def test_soak_sustained_unary():
             t0 = time.monotonic()
             try:
                 resp = await asyncio.wait_for(
-                    stub.echo(EchoReq(value=i)), timeout=5.0
+                    stub.echo(EchoReq(value=i)), timeout=WAIT_BUDGET
                 )
                 elapsed = time.monotonic() - t0
                 latencies.append(elapsed)
@@ -170,7 +171,7 @@ async def test_soak_counter_consistency():
     try:
         for _ in range(n_calls):
             resp = await asyncio.wait_for(
-                stub.increment(CounterReq()), timeout=5.0
+                stub.increment(CounterReq()), timeout=WAIT_BUDGET
             )
             val = resp.counter if hasattr(resp, "counter") else resp.get("counter")
             counters.append(val)
@@ -205,7 +206,7 @@ async def test_soak_session_churn():
         try:
             for j in range(calls_per):
                 resp = await asyncio.wait_for(
-                    stub.echo(EchoReq(value=i * 100 + j)), timeout=3.0
+                    stub.echo(EchoReq(value=i * 100 + j)), timeout=WAIT_BUDGET
                 )
                 val = resp.value if hasattr(resp, "value") else resp.get("value")
                 assert val == i * 100 + j
@@ -216,7 +217,7 @@ async def test_soak_session_churn():
     stub, task = _create_session()
     try:
         resp = await asyncio.wait_for(
-            stub.echo(EchoReq(value=99999)), timeout=3.0
+            stub.echo(EchoReq(value=99999)), timeout=WAIT_BUDGET
         )
         val = resp.value if hasattr(resp, "value") else resp.get("value")
         assert val == 99999
@@ -258,7 +259,7 @@ async def test_soak_mixed_concurrent():
             val = client_id * 100000 + i
             try:
                 resp = await asyncio.wait_for(
-                    stub.echo(EchoReq(value=val)), timeout=5.0
+                    stub.echo(EchoReq(value=val)), timeout=WAIT_BUDGET
                 )
                 got = resp.value if hasattr(resp, "value") else resp.get("value")
                 if got != val:
@@ -275,7 +276,7 @@ async def test_soak_mixed_concurrent():
         while time.monotonic() < end_time:
             try:
                 resp = await asyncio.wait_for(
-                    stub.increment(CounterReq()), timeout=5.0
+                    stub.increment(CounterReq()), timeout=WAIT_BUDGET
                 )
                 val = resp.counter if hasattr(resp, "counter") else resp.get("counter")
                 vals.append(val)
@@ -293,7 +294,7 @@ async def test_soak_mixed_concurrent():
                     for v in items:
                         yield SumItem(value=v)
                 resp = await asyncio.wait_for(
-                    stub.sum_stream(gen()), timeout=5.0
+                    stub.sum_stream(gen()), timeout=WAIT_BUDGET
                 )
                 total = resp.total if hasattr(resp, "total") else resp.get("total")
                 if total != expected:
@@ -373,7 +374,7 @@ async def test_soak_concurrent_with_faults():
             val = client_id * 10000 + i
             try:
                 resp = await asyncio.wait_for(
-                    stub.echo(EchoReq(value=val)), timeout=5.0
+                    stub.echo(EchoReq(value=val)), timeout=WAIT_BUDGET
                 )
                 got = resp.value if hasattr(resp, "value") else resp.get("value")
                 if got != val:
@@ -389,7 +390,7 @@ async def test_soak_concurrent_with_faults():
         try:
             for i in range(3):
                 await asyncio.wait_for(
-                    stub.echo(EchoReq(value=i)), timeout=3.0
+                    stub.echo(EchoReq(value=i)), timeout=WAIT_BUDGET
                 )
             # Kill the server side mid-session
             task.cancel()
@@ -399,6 +400,7 @@ async def test_soak_concurrent_with_faults():
                 pass  # swallow-ok: reaping a task this test cancelled; its outcome is not what is under test
             # Try another call -- should fail
             try:
+                # short-wait-ok: the server task was killed; this call is expected to fail, possibly by timing out
                 await asyncio.wait_for(
                     stub.echo(EchoReq(value=999)), timeout=3.0
                 )

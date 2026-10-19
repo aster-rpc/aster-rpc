@@ -78,6 +78,7 @@ from aster import (
     relay_http_streaming,
     request_route,
 )
+
 from aster import upcalls as up
 from aster.coordination import (
     LogId,
@@ -87,7 +88,9 @@ from aster.coordination import (
     ProvisionRequest,
 )
 
-REPO = Path(__file__).resolve().parents[2]
+from wait_budget import WAIT_BUDGET
+
+REPO =Path(__file__).resolve().parents[2]
 VECTORS = json.loads((REPO / "conformance/vectors/upcalls.json").read_text())
 
 FAST = LeaseOptions(ttl=0.6, renew_interval=0.15, holder_margin=0.1)
@@ -493,7 +496,7 @@ async def test_serializer_faults_raise_upcall_errors_never_guessed_outcomes(rt):
         await slow.acquire("r", A, FAST)
     assert e.value.kind == "timeout"
     # Rust stopped waiting: the handler task is cancelled.
-    await asyncio.wait_for(slow.cancelled.wait(), 2)
+    await asyncio.wait_for(slow.cancelled.wait(), WAIT_BUDGET)
     assert rt.pending == 0
 
 
@@ -516,7 +519,7 @@ async def test_dropping_the_rust_waiter_cancels_the_python_task(rt):
     call = asyncio.ensure_future(ser.rust_transition("r", LeaseOp.acquire(A, 1.0)))
     await _until("upcall pending", lambda: rt.pending == 1)
     call.cancel()  # drops the Rust future -> Cancel{abandoned}
-    await asyncio.wait_for(ser.cancelled.wait(), 2)
+    await asyncio.wait_for(ser.cancelled.wait(), WAIT_BUDGET)
     await _until("nothing pending", lambda: rt.pending == 0)
 
 
@@ -1954,8 +1957,8 @@ async def test_runtime_close_cancels_streamed_responses():
         await asyncio.sleep(0.2)  # the head is out and the pump is writing
         assert not finished.is_set()
         rt.close()
-        await asyncio.wait_for(finished.wait(), 3)  # the generator's finally ran
-        await asyncio.wait_for(rt.aclose(), 3)
+        await asyncio.wait_for(finished.wait(), WAIT_BUDGET)  # the generator's finally ran
+        await asyncio.wait_for(rt.aclose(), WAIT_BUDGET)
         consumer.cancel()
 
         # An iterator that ignores cancellation: aclose() is bounded.
@@ -1966,12 +1969,12 @@ async def test_runtime_close_cancels_streamed_responses():
             await asyncio.wait_for(started.wait(), 10)
             await asyncio.sleep(0.2)
             t0 = time.monotonic()
-            await asyncio.wait_for(rt2.aclose(), 3)
+            await asyncio.wait_for(rt2.aclose(), WAIT_BUDGET)
             assert time.monotonic() - t0 < 2.5
             assert stubborn.is_set() and not finished.is_set()
         finally:
             stop = True
-            await asyncio.wait_for(finished.wait(), 5)
+            await asyncio.wait_for(finished.wait(), WAIT_BUDGET)
             consumer.cancel()
         serving.cancel()
     finally:

@@ -3,9 +3,21 @@ import pytest
 import pytest_asyncio
 
 from aster import Node, create_endpoint
+from wait_budget import TIME_SCALE
 
 
 ALPN = b"test/echo/1"
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    """Scale pytest-timeout's per-test limit (``--timeout``) with the wait
+    budget (wait_budget.py), so a test whose waits stretch under
+    ``ASTER_TEST_TIME_SCALE`` is not cut off by the unscaled limit.
+    ``pytest.mark.timeout(N)`` on a test is not scaled."""
+    timeout = getattr(config.option, "timeout", None)
+    if timeout and TIME_SCALE != 1.0:
+        config.option.timeout = float(timeout) * TIME_SCALE
 
 # Network fixtures used below.  Any test that requests one of these is
 # automatically marked ``@pytest.mark.network`` so the CI fast-path

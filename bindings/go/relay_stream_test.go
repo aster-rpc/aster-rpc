@@ -189,7 +189,7 @@ func waitRelayDone(t *testing.T, description string, done <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatalf("%s did not finish", description)
 	}
 }
@@ -289,8 +289,8 @@ func TestRelayStream_CloseBeforeTheEndResetsTheUpload(t *testing.T) {
 			for _, failure := range failures {
 				t.Errorf("relay fixture cleanup: %s", failure)
 			}
-		case <-time.After(5 * time.Second):
-			t.Error("relay fixture and its exact runtimes did not stop within 5 s")
+		case <-time.After(waitBudget()):
+			t.Error("relay fixture and its exact runtimes did not stop within the wait budget")
 		}
 	})
 	handlerErr := make(chan error, 1)

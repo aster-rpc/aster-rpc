@@ -676,6 +676,7 @@ func TestExpose_SocketTargetWithAndWithoutAnAuthorizer(t *testing.T) {
 	select {
 	case <-accepted:
 		t.Fatal("the target saw a connection while denied")
+	// short-wait-ok: a denied peer must not reach the target; the bound is the assertion
 	case <-time.After(200 * time.Millisecond):
 	}
 
@@ -924,7 +925,7 @@ func TestExpose_ValidationAndLifecycle(t *testing.T) {
 	}
 	select {
 	case <-rig.ex.Done():
-	case <-time.After(time.Second):
+	case <-time.After(waitBudget()):
 		t.Fatal("Done never closed after Close")
 	}
 	if err := rig.ex.Serve(exposeALPN); !errors.Is(err, ErrAlreadyClosed) {

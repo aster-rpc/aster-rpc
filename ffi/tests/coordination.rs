@@ -9,6 +9,7 @@
 //! All tests share one single-voter group (started once per binary); each
 //! uses its own actor identities, journal directories and resource keys.
 
+use aster_transport_core::test_support::wait_budget;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ptr;
 use std::slice;
@@ -1568,7 +1569,7 @@ fn placement_manager_over_foreign_providers() {
                 );
             }
             if kind_answer == 3 {
-                let deadline = Instant::now() + Duration::from_secs(5);
+                let deadline = Instant::now() + wait_budget();
                 while !foreign
                     .seen
                     .lock()

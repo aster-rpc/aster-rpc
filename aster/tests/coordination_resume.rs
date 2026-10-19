@@ -43,6 +43,7 @@
 
 #![cfg(feature = "coordination-testing")]
 
+use aster_transport_core::test_support::wait_budget;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
@@ -587,6 +588,7 @@ async fn openraft_refuses_a_repeat_change_while_one_is_uncommitted() {
     // come. Abandoning the wait is the point: the entry is on this node's log,
     // so effective is now ahead of committed.
     assert!(
+        // short-wait-ok: the commit cannot come; abandoning the wait is the point
         tokio::time::timeout(
             Duration::from_secs(5),
             raft.change_membership(ChangeMembers::ReplaceAllVoters(shrink.clone()), false),
@@ -599,7 +601,7 @@ async fn openraft_refuses_a_repeat_change_while_one_is_uncommitted() {
     // The repeat the corridor would make. It must be refused as in progress,
     // not accepted as a second entry.
     let repeat = tokio::time::timeout(
-        Duration::from_secs(5),
+        wait_budget(),
         raft.change_membership(ChangeMembers::ReplaceAllVoters(shrink), false),
     )
     .await

@@ -33,6 +33,8 @@ from aster import (
     wire_type,
 )
 
+from wait_budget import WAIT_BUDGET
+
 
 # ── Test wire types ─────────────────────────────────────────────────────────
 
@@ -125,7 +127,7 @@ async def test_streaming_substreams_bypass_the_pool():
             # and then raise.
             resp = await asyncio.wait_for(
                 svc.ping(PingRequest(payload="fresh")),
-                timeout=2.0,
+                timeout=WAIT_BUDGET,
             )
             assert isinstance(resp, PingResponse)
             assert resp.reply == "pong:fresh"

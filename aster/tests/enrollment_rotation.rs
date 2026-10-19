@@ -6,6 +6,7 @@
 //! during the rotation and learns it in the handshake, and a restart that
 //! keeps the new root.
 
+use aster_transport_core::test_support::wait_budget;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -293,7 +294,7 @@ async fn fleet_survives_a_compromise_rotation_and_restart() {
             0
         );
         // INV-A17: every session rested on R0 and is closed.
-        let revoked = tokio::time::timeout(Duration::from_secs(5), async {
+        let revoked = tokio::time::timeout(wait_budget(), async {
             loop {
                 let event = revocations.recv().await.unwrap();
                 if event.peer == public(MEMBER) {

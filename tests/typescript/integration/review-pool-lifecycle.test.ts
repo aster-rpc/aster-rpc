@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { tryLoadNative } from '../../../bindings/typescript/packages/aster/src/native.ts';
 import { IrohTransport } from '../../../bindings/typescript/packages/aster/src/transport/iroh.ts';
 import { StatusCode } from '../../../bindings/typescript/packages/aster/src/status.ts';
+import { WAIT_BUDGET_MS } from '../helpers/wait-budget.ts';
 
 const native = tryLoadNative() as any;
 if (!native?.RpcConnection) throw new Error('Pool lifecycle tests require the native RPC addon');
@@ -24,7 +25,7 @@ async function bounded<T>(promise: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error('RPC lifecycle watchdog expired')), 5000);
+      timer = setTimeout(() => reject(new Error('RPC lifecycle watchdog expired')), WAIT_BUDGET_MS);
     })]);
   } finally { clearTimeout(timer); }
 }

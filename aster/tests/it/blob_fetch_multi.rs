@@ -7,6 +7,7 @@
 //! reports truthfully what each provider did.
 
 use aster::{AsterConfig, BlobFormat, Error, FetchStrategy, Node, NodeId, RelayMode};
+use aster_transport_core::test_support::wait_budget;
 use std::time::Duration;
 use tokio::time::timeout;
 
@@ -580,8 +581,8 @@ async fn interrupted_download_resumes_verified_partial_content() -> anyhow::Resu
     // Return errors instead of asserting/panicking inside the controlled gate,
     // so every failure releases the provider and tears down owned tasks.
     let result: anyhow::Result<()> = async {
-        timeout(Duration::from_secs(3), entered_rx).await.context("provider never reached throttle")??;
-        let partial = timeout(Duration::from_secs(3), async {
+        timeout(wait_budget(), entered_rx).await.context("provider never reached throttle")??;
+        let partial = timeout(wait_budget(), async {
             loop {
                 let local = blobs.native_store().remote().local(HashAndFormat::new(native_hash, NativeFormat::Raw)).await?;
                 if local.local_bytes() > 0 { return Ok::<_, anyhow::Error>(local); }
@@ -595,11 +596,11 @@ async fn interrupted_download_resumes_verified_partial_content() -> anyhow::Resu
         initial_task.abort();
         // Abort is observed by the downloader via its closed progress channel.
         // The provider remains gated while the public result is canceled.
-        let cancelled = timeout(Duration::from_secs(2), initial_task).await.context("cancelled task failed to settle")?;
+        let cancelled = timeout(wait_budget(), initial_task).await.context("cancelled task failed to settle")?;
         ensure!(matches!(cancelled, Err(error) if error.is_cancelled()), "initial download did not cancel");
         ensure!(matches!(blobs.status(&hash).await?, aster::BlobStatus::Partial { .. }), "interrupted blob not Partial");
         release.notify_one();
-        let (bytes, report) = timeout(Duration::from_secs(5), blobs.download_hash_from(
+        let (bytes, report) = timeout(wait_budget(), blobs.download_hash_from(
             &hash, &[provider_id], BlobFormat::Raw, FetchStrategy::Whole
         )).await.context("resume timed out")??;
         ensure!(bytes == payload, "resumed bytes differ");
@@ -613,10 +614,10 @@ async fn interrupted_download_resumes_verified_partial_content() -> anyhow::Resu
     release.notify_one();
     if let Some(task) = initial {
         task.abort();
-        let _ = timeout(Duration::from_secs(2), task).await;
+        let _ = timeout(wait_budget(), task).await;
     }
-    let consumer_closed = timeout(Duration::from_secs(3), consumer.shutdown()).await;
-    let provider_closed = timeout(Duration::from_secs(3), router.shutdown()).await;
+    let consumer_closed = timeout(wait_budget(), consumer.shutdown()).await;
+    let provider_closed = timeout(wait_budget(), router.shutdown()).await;
     event_worker.abort();
     let _ = event_worker.await;
     result?;
@@ -775,6 +776,7 @@ async fn tracker_reports_the_provider_a_cancelled_fetch_was_waiting_on() -> anyh
         &tracker,
     );
     assert!(
+        // short-wait-ok: the fetch must still be waiting on the stalled provider
         timeout(Duration::from_secs(2), fetch).await.is_err(),
         "the fetch should still be waiting on the stalled provider"
     );

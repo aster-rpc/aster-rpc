@@ -20,7 +20,7 @@ public class DocEventTests
             using var canceled = new CancellationTokenSource();
             var pending = events.ReceiveAsync(canceled.Token);
             canceled.Cancel();
-            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending.WaitAsync(TimeSpan.FromSeconds(3), ct));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() => pending.WaitAsync(WaitBudget.Value, ct));
             string key = $"local/{i}";
             await doc.SetBytesAsync(author, key, [(byte)i], ct);
             var ev = await ReadUntil(events, e => e.Kind == DocEventKind.InsertLocal, ct);
@@ -37,7 +37,7 @@ public class DocEventTests
         doc.Dispose();
         var blocked = events.ReceiveAsync(ct);
         events.Dispose();
-        Assert.Null(await blocked.WaitAsync(TimeSpan.FromSeconds(3), ct));
+        Assert.Null(await blocked.WaitAsync(WaitBudget.Value, ct));
         Assert.Null(await events.ReceiveAsync(ct));
         events.Dispose();
     }
@@ -52,7 +52,7 @@ public class DocEventTests
         using var events = await doc.SubscribeAsync(ct);
         var pending = Enumerable.Range(0, 8).Select(_ => events.ReceiveAsync(ct)).ToArray();
         await events.DisposeAsync();
-        foreach (var terminal in await Task.WhenAll(pending).WaitAsync(TimeSpan.FromSeconds(3), ct))
+        foreach (var terminal in await Task.WhenAll(pending).WaitAsync(WaitBudget.Value, ct))
             Assert.Null(terminal);
     }
 

@@ -5,6 +5,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import java.util.concurrent.*;
 import org.junit.jupiter.api.Test;
 import site.aster.ffi.AsterEnvelope;
+import site.aster.testing.WaitBudget;
 
 class ResponseBufferTest {
   @Test
@@ -33,9 +34,9 @@ class ResponseBufferTest {
                   }
                 });
     try {
-      assertTrue(started.await(1, TimeUnit.SECONDS));
+      assertTrue(started.await(WaitBudget.SECONDS, TimeUnit.SECONDS));
       buffer.cancel();
-      assertTrue(stopped.get(2, TimeUnit.SECONDS));
+      assertTrue(stopped.get(WaitBudget.SECONDS, TimeUnit.SECONDS));
     } finally {
       buffer.cancel();
       worker.interrupt();
@@ -75,7 +76,7 @@ class ResponseBufferTest {
       assertTrue(buffer.retainedBytes() <= ResponseBuffer.MAX_RETAINED_BYTES);
       assertFalse(published.isDone(), "capacity is acquired before decode/publication");
       assertEquals("small", buffer.take());
-      published.get(2, TimeUnit.SECONDS);
+      published.get(WaitBudget.SECONDS, TimeUnit.SECONDS);
       assertEquals(large, buffer.retainedBytes());
       assertEquals("large", buffer.take());
       assertEquals(0, buffer.retainedBytes());

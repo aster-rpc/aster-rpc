@@ -119,7 +119,7 @@ func TestHostile_AcceptSubmitThenClose(t *testing.T) {
 
 	// Drain events.
 	terminalCount := 0
-	timeout := time.After(2 * time.Second)
+	timeout := time.After(waitBudget())
 	for terminalCount == 0 {
 		select {
 		case ev := <-ch:
@@ -207,6 +207,7 @@ func TestHostile_CancelOpAndCompletionRacing(t *testing.T) {
 				if ev.Kind == ASTER_EVENT_OPERATION_CANCELLED || ev.Kind == ASTER_EVENT_ERROR {
 					terminals[idx].Store(1)
 				}
+			// short-wait-ok: a cancelled accept with no peer may deliver nothing; outcomes are only logged
 			case <-time.After(500 * time.Millisecond):
 				// Timeout is expected if cancelled
 			}
@@ -273,7 +274,7 @@ func TestHostile_HandleCloseAfterSubmit(t *testing.T) {
 		if ok {
 			t.Error("expected channel closed after runtime.Close(), got event")
 		}
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(waitBudget()):
 		t.Error("timeout waiting for channel close")
 	}
 }
@@ -335,6 +336,7 @@ func TestHostile_ManyOutstandingOnCQ(t *testing.T) {
 		select {
 		case <-chs[i]:
 			eventCount++
+		// short-wait-ok: best-effort drain; cancelled ops may deliver nothing and counts are only logged
 		case <-time.After(100 * time.Millisecond):
 			// May timeout for cancelled ops
 		}
@@ -413,6 +415,7 @@ func TestHostile_ManyConnectionsShareCQ(t *testing.T) {
 		select {
 		case <-chs[i]:
 			eventCount++
+		// short-wait-ok: best-effort drain; cancelled ops may deliver nothing and counts are only logged
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

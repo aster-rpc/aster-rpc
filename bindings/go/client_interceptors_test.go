@@ -163,7 +163,7 @@ func (f *flaky) service(idempotent bool) *Service {
 			f.calls.Add(1)
 			select {
 			case <-ctx.Done():
-			case <-time.After(3 * time.Second):
+			case <-time.After(waitBudget()):
 			}
 			return &testEchoReply{Message: "slow", Data: []byte{}}, nil
 		}),
@@ -379,6 +379,7 @@ func TestClientInterceptors_RetryBackoffBoundedByContext(t *testing.T) {
 	r.Policy = RetryPolicy{MaxAttempts: 5, Backoff: ExponentialBackoff{InitialMs: 10_000, MaxMs: 10_000, Multiplier: 1}}
 	f := newClientFixture(t, true, WithClientInterceptors(r))
 	f.f.failFirst.Store(100)
+	// short-wait-ok: the deadline must cut the 10 s retry backoff short; its expiry is under test
 	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
 	defer cancel()
 	start := time.Now()
@@ -503,6 +504,7 @@ func TestClientInterceptors_Deadline(t *testing.T) {
 		}
 	})
 	t.Run("propagated into the native call, not retried", func(t *testing.T) {
+		// short-wait-ok: DEADLINE_EXCEEDED from this deadline is the behaviour under test
 		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 		defer cancel()
 		start := time.Now()
@@ -914,7 +916,7 @@ func TestClientInterceptors_NativeBreakerAftermath(t *testing.T) {
 			}
 			f := newClientFixture(t, false, WithClientInterceptors(breakers...))
 			f.f.failFirst.Store(1)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), waitBudget())
 			defer cancel()
 			if _, err := echo(ctx, f, "seed"); !errors.Is(err, ErrRpcUnavailable) {
 				t.Fatalf("seed: %v", err)
@@ -935,7 +937,7 @@ func TestClientInterceptors_NativeBreakerAftermath(t *testing.T) {
 					_, err := Call[testEchoRequest, testEchoReply](probeCtx, f.conn, "Flaky", "slow", &testEchoRequest{Data: []byte{}})
 					done <- err
 				}()
-				until := time.Now().Add(2 * time.Second)
+				until := time.Now().Add(waitBudget())
 				for f.f.calls.Load() != 2 {
 					if time.Now().After(until) {
 						t.Fatal("probe never reached peer")

@@ -76,6 +76,7 @@ final class AuditAcknowledgementsTest {
         assertEquals(
             AuditOutboxException.Kind.INVALID_EVENT,
             failure(outbox.waitAcknowledgements(0, 1, Duration.ofHours(2))).kind());
+        // short-wait-ok: nothing is acknowledged yet; the wait must expire empty
         assertEquals(List.of(), get(outbox.waitAcknowledgements(0, 10, Duration.ofMillis(20))));
 
         LinkedBlockingQueue<AuditOutbox.Acknowledgement> watched = new LinkedBlockingQueue<>();

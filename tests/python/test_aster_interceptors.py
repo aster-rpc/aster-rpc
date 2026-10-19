@@ -23,6 +23,7 @@ from aster.interceptors import (
 from aster.status import RpcError, StatusCode
 from aster.transport.local import LocalTransport
 from aster.rpc_types import RetryPolicy, SerializationMode
+from wait_budget import WAIT_BUDGET
 
 
 @wire_type("test.interceptors/EchoRequest")
@@ -236,7 +237,7 @@ class TestPhase7Interceptors:
         client = self._scripted_client(script, [DeadlineInterceptor(), RetryInterceptor(policy)])
         call = asyncio.ensure_future(client.echo(EchoRequest("retry"), timeout=20))
         try:
-            await asyncio.wait_for(sleeping.wait(), timeout=2)
+            await asyncio.wait_for(sleeping.wait(), timeout=WAIT_BUDGET)
             call.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await call

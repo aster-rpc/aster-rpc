@@ -440,6 +440,7 @@ public class Abi7Tests
         await using var rig = await Rig.Start();
         var slow = rig.Conn.UnaryAsync<EchoRequest, EchoReply>("Abi7", "slow", new EchoRequest { Count = 20_000 });
         await rig.SlowEntered.Task.WaitAsync(Budget);
+        // short-wait-ok: the token ends the drain grace early; its cancellation is what the test drives
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
         var report = await rig.Server.DrainAsync(TimeSpan.FromSeconds(20), cts.Token).WaitAsync(Budget);
         Assert.True(report.DeadlineReached);

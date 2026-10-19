@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { tryLoadNative } from '../../../bindings/typescript/packages/aster/src/native.ts';
 import { IrohTransport, mapTransportError } from '../../../bindings/typescript/packages/aster/src/transport/iroh.ts';
 import { StatusCode } from '../../../bindings/typescript/packages/aster/src/status.ts';
+import { WAIT_BUDGET_MS } from '../helpers/wait-budget.ts';
 
 const native = tryLoadNative() as any;
 if (!native?.RpcConnection) throw new Error('Parked client-stream diagnostic requires a native addon exposing RpcConnection');
@@ -18,7 +19,7 @@ async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error(`${label} hung after 5000ms`)), 5000);
+      timer = setTimeout(() => reject(new Error(`${label} hung after ${WAIT_BUDGET_MS}ms`)), WAIT_BUDGET_MS);
     })]);
   } finally { clearTimeout(timer); }
 }

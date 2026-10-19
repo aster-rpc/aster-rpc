@@ -25,6 +25,8 @@ import pytest
 from aster import Tcp, create_endpoint
 from aster.tunnel import HttpProxy, TunnelHandle, Udp
 
+from wait_budget import WAIT_BUDGET
+
 
 ALPN = b"test/tunnel/py"
 
@@ -39,8 +41,8 @@ async def test_tunnel_authorize_validates_ticket_size():
     ep_a = await create_endpoint(ALPN)
     ep_b = await create_endpoint(ALPN)
     accept_task = asyncio.ensure_future(ep_a.accept())
-    conn = await asyncio.wait_for(ep_b.connect(ep_a.endpoint_id(), ALPN), timeout=5.0)
-    _ = await asyncio.wait_for(accept_task, timeout=5.0)
+    conn = await asyncio.wait_for(ep_b.connect(ep_a.endpoint_id(), ALPN), timeout=WAIT_BUDGET)
+    _ = await asyncio.wait_for(accept_task, timeout=WAIT_BUDGET)
 
     with pytest.raises(ValueError):
         await conn.open_tunnel(b"too short")
@@ -54,9 +56,9 @@ async def test_tunnel_authorize_rejects_excessive_ttl():
     ep_client = await create_endpoint(ALPN)
     accept_task = asyncio.ensure_future(ep_server.accept())
     _ = await asyncio.wait_for(
-        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=5.0
+        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=WAIT_BUDGET
     )
-    server_conn = await asyncio.wait_for(accept_task, timeout=5.0)
+    server_conn = await asyncio.wait_for(accept_task, timeout=WAIT_BUDGET)
 
     with pytest.raises(ValueError):
         # 1 hour > 120s hard cap
@@ -71,9 +73,9 @@ async def test_authorize_tunnel_returns_single_ticket_for_multi_target():
     ep_client = await create_endpoint(ALPN)
     accept_task = asyncio.ensure_future(ep_server.accept())
     _ = await asyncio.wait_for(
-        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=5.0
+        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=WAIT_BUDGET
     )
-    server_conn = await asyncio.wait_for(accept_task, timeout=5.0)
+    server_conn = await asyncio.wait_for(accept_task, timeout=WAIT_BUDGET)
 
     targets = [
         ("tcp", "127.0.0.1", 5900),
@@ -93,9 +95,9 @@ async def test_authorize_tunnel_rejects_unknown_kind():
     ep_client = await create_endpoint(ALPN)
     accept_task = asyncio.ensure_future(ep_server.accept())
     _ = await asyncio.wait_for(
-        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=5.0
+        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=WAIT_BUDGET
     )
-    server_conn = await asyncio.wait_for(accept_task, timeout=5.0)
+    server_conn = await asyncio.wait_for(accept_task, timeout=WAIT_BUDGET)
 
     with pytest.raises(NotImplementedError):
         server_conn.authorize_tunnel([("udp", "127.0.0.1", 53)], 30)
@@ -109,9 +111,9 @@ async def test_authorize_tunnel_rejects_empty_targets():
     ep_client = await create_endpoint(ALPN)
     accept_task = asyncio.ensure_future(ep_server.accept())
     _ = await asyncio.wait_for(
-        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=5.0
+        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=WAIT_BUDGET
     )
-    server_conn = await asyncio.wait_for(accept_task, timeout=5.0)
+    server_conn = await asyncio.wait_for(accept_task, timeout=WAIT_BUDGET)
 
     with pytest.raises(ValueError):
         server_conn.authorize_tunnel([], 30)
@@ -128,9 +130,9 @@ async def test_tunnel_handle_authorize_tcp_returns_bytes():
     ep_client = await create_endpoint(ALPN)
     accept_task = asyncio.ensure_future(ep_server.accept())
     _ = await asyncio.wait_for(
-        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=5.0
+        ep_client.connect(ep_server.endpoint_id(), ALPN), timeout=WAIT_BUDGET
     )
-    server_conn = await asyncio.wait_for(accept_task, timeout=5.0)
+    server_conn = await asyncio.wait_for(accept_task, timeout=WAIT_BUDGET)
 
     handle = TunnelHandle(server_conn)
 

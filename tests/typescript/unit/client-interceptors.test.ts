@@ -208,6 +208,7 @@ describe('client interceptors: retry', () => {
     const client = createClient(FlakyService, transport as any, { interceptors: [slow] });
     const ac = new AbortController();
     const call = client.idem({ v: 'r' }, { signal: ac.signal });
+    // short-wait-ok: the abort lands inside the 5 s retry backoff; cancelling it is the behaviour under test
     setTimeout(() => ac.abort(), 20);
     await expect(call).rejects.toMatchObject({ code: StatusCode.CANCELLED });
   });

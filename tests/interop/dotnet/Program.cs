@@ -145,7 +145,7 @@ internal static class InteropEcho
                 {
                     if (kind == 3)
                     {
-                        call.CancelAfter(50);
+                        call.CancelAfter(50); // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg (the planned 50 ms cancel)
                         await conn.UnaryAsync<EchoRequest, EchoReply>("InteropEcho", "hold", request, options, call.Token);
                         bad = true;
                     }
@@ -221,6 +221,7 @@ internal static class InteropEcho
             }
         }
         catch (OperationCanceledException) { }
+        // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg (4 s worker drain, as in the Rust leg)
         await Task.WhenAll(workers).WaitAsync(TimeSpan.FromSeconds(4));
         int discarded = jobs.Reader.Count;
         while (jobs.Reader.TryRead(out _)) { }
@@ -269,7 +270,8 @@ internal static class InteropEcho
             AsterTicket peer = AsterTicket.Parse(ticket);
             async Task<RpcConnection> Connect(AsterTicket target)
             {
-                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                // short-wait-ok: campaign mode: expiry is a classified outcome shared by every language leg (2 s connect, as in the Rust leg)
+                using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(2)); // short-wait-ok: same 2 s campaign connect bound
                 return await client.ConnectAsync(target, deadline.Token).WaitAsync(TimeSpan.FromSeconds(2));
             }
             RpcConnection conn = await Connect(peer);
@@ -599,6 +601,7 @@ internal static class InteropEcho
     private static async Task<string> CancelCase(RpcConnection conn)
     {
         int before = await CancelledCount(conn);
+        // short-wait-ok: hold never answers; this client cancel is the case under test, and the server leg must observe it
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
         try
         {

@@ -93,6 +93,7 @@ impl Foreign {
         let (s, v) = (stop.clone(), seen.clone());
         let thread = std::thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
+                // short-wait-ok: a poll tick; the loop rechecks its stop flag between waits
                 if !queue.wait_blocking(Duration::from_millis(10)) {
                     continue;
                 }
@@ -598,6 +599,7 @@ async fn peer_abort_cancels_the_upcall_and_closes_the_body() {
     .await;
 
     // The consumer gives up: its request future (and stream) is dropped.
+    // short-wait-ok: the handler never answers; the consumer gives up on expiry
     let abandoned = tokio::time::timeout(
         Duration::from_millis(500),
         relay_request(&n.conn, SVC, get("/slow")),
@@ -935,6 +937,7 @@ async fn route_policy_grants_the_answered_subset() {
     let sn = seen.clone();
     let thread = std::thread::spawn(move || {
         while !s.load(Ordering::Relaxed) {
+            // short-wait-ok: a poll tick; the loop rechecks its stop flag between waits
             if queue.wait_blocking(Duration::from_millis(10)) {
                 queue.drain(8, |ev| {
                     if ev.kind == UpcallKind::ExposeRoutePolicy {
@@ -2145,6 +2148,7 @@ async fn relay_blocking_timeouts_consume_nothing() {
     let (up, resp) = (upload.clone(), response.clone());
     let (written, timeouts) = on_thread(move || {
         assert_eq!(
+            // short-wait-ok: asserts the wait times out
             resp.wait_blocking(Duration::from_millis(50)).unwrap_err(),
             ResponseError::Timeout
         );
@@ -2223,6 +2227,7 @@ async fn relay_try_calls_and_readiness_drive_an_exchange() {
         }
         // Full right now; the upload task may still drain into QUIC, so
         // wait for readiness briefly, else every buffer is full.
+        // short-wait-ok: a brief readiness probe; expiry means every buffer is full
         match tokio::time::timeout(Duration::from_millis(200), upload.ready()).await {
             Ok(r) => r.unwrap(),
             Err(_) => break,

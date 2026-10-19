@@ -179,7 +179,7 @@ func soakNodeConfig() AsterConfig {
 // abandoned completions (cancelled accepts complete within a short bound).
 func assertSoakBacklogDrains(t *testing.T, runtime *Runtime) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(waitBudget())
 	for {
 		pending, abandoned := soakRuntimeBacklog(runtime)
 		if pending == 0 && abandoned == 0 {

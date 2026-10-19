@@ -439,6 +439,7 @@ public class RpcTests : IAsyncLifetime
     [Fact]
     public async Task Client_Cancellation_Stops_Waiting()
     {
+        // short-wait-ok: the slow handler never answers; the client-side cancel is the behaviour under test
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(300));
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
             _conn.UnaryAsync<EchoRequest, EchoReply>("Extra", "slow", new EchoRequest(), cancellationToken: cts.Token));

@@ -9,6 +9,7 @@ from aster.client import ServiceClient
 from aster.status import RpcError, StatusCode
 from aster.transport.base import ConnectionLostError, TransportError
 from aster.transport.iroh import IrohTransport
+from wait_budget import WAIT_BUDGET
 
 
 class Codec:
@@ -83,9 +84,9 @@ async def test_local_failure_does_not_wait_for_parked_native_response(phase):
         yield "first"
 
     with pytest.raises(type(error)) as caught:
-        await asyncio.wait_for(value.client_stream("service", "method", source()), 1)
+        await asyncio.wait_for(value.client_stream("service", "method", source()), WAIT_BUDGET)
     assert caught.value is error
-    await asyncio.wait_for(sink.cancelled.wait(), 1)
+    await asyncio.wait_for(sink.cancelled.wait(), WAIT_BUDGET)
     await asyncio.sleep(0)
     assert response.cancelled()
     assert sink.finishes == 0
@@ -99,8 +100,8 @@ async def test_empty_source_refuses_without_finishing_or_waiting_for_native():
             yield None
 
     with pytest.raises(TransportError, match="at least one request frame"):
-        await asyncio.wait_for(value.client_stream("service", "method", source()), 1)
-    await asyncio.wait_for(sink.cancelled.wait(), 1)
+        await asyncio.wait_for(value.client_stream("service", "method", source()), WAIT_BUDGET)
+    await asyncio.wait_for(sink.cancelled.wait(), WAIT_BUDGET)
     assert sink.sends == sink.finishes == 0
     assert response.cancelled()
 
@@ -141,10 +142,10 @@ async def test_cleared_error_traceback_cannot_break_owned_deferred_cleanup(throu
         operation = value.client_stream("service", "method", source())
     call = asyncio.create_task(operation)
     try:
-        await asyncio.wait_for(parked.wait(), 1)
+        await asyncio.wait_for(parked.wait(), WAIT_BUDGET)
         response.set_exception(RpcError(StatusCode.PERMISSION_DENIED, "rejected"))
         try:
-            await asyncio.wait_for(call, 1)
+            await asyncio.wait_for(call, WAIT_BUDGET)
         except RpcError as error:
             traceback.clear_frames(error.__traceback__)
         else:
@@ -152,9 +153,9 @@ async def test_cleared_error_traceback_cannot_break_owned_deferred_cleanup(throu
         assert not cleaned.is_set()
     finally:
         release.set()
-        await asyncio.wait_for(cleaned.wait(), 1)
-    await asyncio.wait_for(sink.cancelled.wait(), 1)
-    async with asyncio.timeout(1):
+        await asyncio.wait_for(cleaned.wait(), WAIT_BUDGET)
+    await asyncio.wait_for(sink.cancelled.wait(), WAIT_BUDGET)
+    async with asyncio.timeout(WAIT_BUDGET):
         while value._stream_tasks:
             await asyncio.sleep(0)
     assert sink.sends == 1
@@ -187,7 +188,7 @@ async def test_finite_source_finishes_once_without_extra_aclose():
 
     sink.finish = finish
     source = FiniteSource()
-    assert await asyncio.wait_for(value.client_stream("service", "method", source), 1) == b"response"
+    assert await asyncio.wait_for(value.client_stream("service", "method", source), WAIT_BUDGET) == b"response"
     assert sink.sends == 2
     assert sink.finishes == 1
     assert source.closes == 0

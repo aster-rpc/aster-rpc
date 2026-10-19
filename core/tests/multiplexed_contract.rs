@@ -34,6 +34,7 @@
 //! Python / TS / Java would surface the symptom but not the root
 //! cause; this file pins the cause at the core layer.
 
+use aster_transport_core::test_support::wait_budget;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -729,7 +730,7 @@ proptest! {
         // is hung and the whole property fails.
         let live_result: Result<Result<(), anyhow::Error>, tokio::time::error::Elapsed> =
             rt.block_on(async {
-                timeout(Duration::from_secs(5), async {
+                timeout(wait_budget(), async {
                     let handle = h.conn.acquire_stream(None).await?;
                     drive_unary_call(handle.get(), b"live", b"check").await
                 })
@@ -1017,6 +1018,7 @@ async fn slow_handler_backpressures_the_request_queue() -> Result<()> {
     // Now push many more frames than any queue depth. With bounded queues the
     // writes stall in QUIC flow control; the test's point is that the process
     // does not accumulate them all, and that it stays responsive.
+    // short-wait-ok: stalled writes are a pass; only absorbing every frame fails
     let pushed = tokio::time::timeout(Duration::from_millis(500), async {
         for i in 0..10_000u32 {
             let last = i == 9_999;

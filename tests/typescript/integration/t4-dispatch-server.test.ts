@@ -33,6 +33,7 @@ import { ClientChain } from '../../../bindings/typescript/packages/aster/src/cli
 import { CircuitBreakerInterceptor } from '../../../bindings/typescript/packages/aster/src/interceptors/circuit-breaker.ts';
 import { RpcPattern } from '../../../bindings/typescript/packages/aster/src/types.ts';
 import { RpcError, StatusCode } from '../../../bindings/typescript/packages/aster/src/status.ts';
+import { WAIT_BUDGET_MS } from '../helpers/wait-budget.ts';
 
 const native = tryLoadNative() as any;
 const hasDispatch = !!native?.DispatchServer;
@@ -277,7 +278,7 @@ describe.skipIf(!hasDispatch)('DispatchServer ring delivery close', () => {
       const closed = server.close();
       const result = await Promise.race([
         Promise.all([batch, closed]).then(([events]) => events),
-        new Promise((resolve) => { timeout = setTimeout(() => resolve('hung'), 5000); }),
+        new Promise((resolve) => { timeout = setTimeout(() => resolve('hung'), WAIT_BUDGET_MS); }),
       ]);
       expect(result).toEqual([]);
       expect(server.debugState().slice(0, 3)).toEqual([0, 0, 1]);
@@ -320,10 +321,9 @@ describe.skipIf(!hasDispatch)('DispatchServer ring delivery close', () => {
       await until(() => server.liveCalls() === 2);
       await server.close();
       // The node stays up (attached), so only close can end these calls.
-      // Keep the original post-close five-second outcome budget.
       const bounded = (p: Promise<unknown>) => Promise.race([
         p,
-        new Promise((r) => setTimeout(() => r('hung'), 5000)),
+        new Promise((r) => setTimeout(() => r('hung'), WAIT_BUDGET_MS)),
       ]);
       expect(await bounded(taken)).toBe(StatusCode.INTERNAL);
       expect(await bounded(unread)).toBe(StatusCode.INTERNAL);
@@ -417,7 +417,7 @@ describe.skipIf(!hasDispatch)('DispatchLoop JS wrapper attach window', () => {
       loop = await serving;
       const result = await Promise.race([
         reply,
-        new Promise((resolve) => { timeout = setTimeout(() => resolve('hung'), 5000); }),
+        new Promise((resolve) => { timeout = setTimeout(() => resolve('hung'), WAIT_BUDGET_MS); }),
       ]);
       expect(result).toBe('echo:js-early');
       expect(onCall).toHaveBeenCalledTimes(1);
@@ -470,7 +470,7 @@ describe.skipIf(typeof native?.DispatchServer?.debugArmAttach !== 'function')(
         loop = await serving;
         const got = await Promise.race([
           reply.then((b: any) => Buffer.from(b).toString()),
-          new Promise((r) => setTimeout(() => r('hung'), 5000)),
+          new Promise((r) => setTimeout(() => r('hung'), WAIT_BUDGET_MS)),
         ]);
         expect(got).toBe('echo:early');
       } finally {
@@ -551,6 +551,7 @@ describe.skipIf(!hasDispatch)('DispatchServer bounded TSFN delivery', () => {
         batchSizes.push(events.length);
         if (!stalled) {
           stalled = true;
+          // short-wait-ok: a deliberate 250 ms stall of the delivery callback; nothing wakes it
           Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
         }
         for (const ev of events) {
@@ -569,7 +570,7 @@ describe.skipIf(!hasDispatch)('DispatchServer bounded TSFN delivery', () => {
             return await Promise.race([
               client.transport.unary('test.Echo', 'echo', Buffer.from('bounded-' + i)),
               new Promise<never>((_, reject) => {
-                timeout = setTimeout(() => reject(new Error('dispatch timed out')), 5000);
+                timeout = setTimeout(() => reject(new Error('dispatch timed out')), WAIT_BUDGET_MS);
               }),
             ]);
           } finally {
