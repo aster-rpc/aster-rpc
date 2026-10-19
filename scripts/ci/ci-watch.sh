@@ -152,7 +152,10 @@ while true; do
     $fail_fast && exit 1
   done < <(awk '$2 == "failure" || $2 == "cancelled"' <<<"$out")
   run_states="$(runs)"
-  if [[ -n "$run_states" ]] && ! grep -qE ' (running|waiting|blocked|queued)$' <<<"$run_states"; then
+  # A run reports failure at its first failed job while others still run, so
+  # it has finished only when no job is still running or waiting either.
+  if [[ -n "$run_states" ]] && ! grep -qE ' (running|waiting|blocked|queued)$' <<<"$run_states" \
+      && ! awk '$2 ~ /^(running|waiting|blocked|queued)$/ {f=1} END {exit !f}' <<<"$out"; then
     if [[ -n "$explained" ]]; then
       echo
       echo "ci-watch: run finished; failed jobs:"
