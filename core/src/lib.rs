@@ -322,6 +322,25 @@ pub struct CoreClosedInfo {
     pub kind: String,
     pub code: Option<u64>,
     pub reason: Option<Vec<u8>>,
+    /// Why the connection ended, from the transport's own close error.
+    pub cause: CloseCause,
+}
+
+/// The transport's classification of a connection close (from the real
+/// `ConnectionError`, not from its text).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseCause {
+    /// No data for the negotiated idle timeout.
+    TimedOut,
+    /// This side closed it (`CoreConnection::close`, endpoint shutdown). The
+    /// close code is not reported back, so the caller must know why it closed.
+    LocallyClosed,
+    /// The peer closed it with an application close (`code` and `reason`
+    /// carry what it sent).
+    PeerClosed,
+    /// Anything else: transport error, QUIC-level close, reset, version
+    /// mismatch.
+    Other,
 }
 
 fn closed_info(closed: &ConnectionError) -> CoreClosedInfo {
@@ -331,10 +350,17 @@ fn closed_info(closed: &ConnectionError) -> CoreClosedInfo {
         }
         _ => (None, Some(closed.to_string().into_bytes())),
     };
+    let cause = match closed {
+        ConnectionError::TimedOut => CloseCause::TimedOut,
+        ConnectionError::LocallyClosed => CloseCause::LocallyClosed,
+        ConnectionError::ApplicationClosed(_) => CloseCause::PeerClosed,
+        _ => CloseCause::Other,
+    };
     CoreClosedInfo {
         kind: format!("{closed:?}"),
         code,
         reason,
+        cause,
     }
 }
 

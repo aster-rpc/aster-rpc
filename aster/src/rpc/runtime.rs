@@ -1336,6 +1336,26 @@ impl AsterServer {
             .map(crate::coordination::Coordination::of)
     }
 
+    /// The peers connected now, and a receiver of every connect and
+    /// disconnect from that point on.
+    ///
+    /// The snapshot and the subscription are taken under one lock, so a peer
+    /// connecting while this runs is in the snapshot or in the stream, never
+    /// both and never neither. Events are per peer and fire only after
+    /// admission: [`PeerEvent::Connected`] on a peer's first admitted
+    /// `aster/1` connection, [`PeerEvent::Disconnected`] (with a
+    /// [`DisconnectReason`]) when its last one ends. A peer the gate refuses
+    /// produces none. Whether the peer serves what you need is answered by
+    /// reading its `aster.services` NodeInfo attribute on `Connected`.
+    ///
+    /// The receiver is a bounded [`tokio::sync::broadcast`] receiver
+    /// ([`PEER_EVENT_CAPACITY`](super::PEER_EVENT_CAPACITY) events). One that
+    /// falls behind gets `RecvError::Lagged(n)`; connections never wait for
+    /// it. After `Lagged`, call this again and rebuild from the new snapshot.
+    pub fn peer_events(&self) -> (Vec<super::PeerSnapshot>, super::PeerEventReceiver) {
+        self.handle.peer_events()
+    }
+
     /// Drain, then [`shutdown`](Self::shutdown): the graceful way to take a
     /// replica out of rotation (a rolling restart, a scale-in).
     ///

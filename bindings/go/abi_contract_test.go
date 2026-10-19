@@ -194,7 +194,7 @@ func TestABI_UpcallAndExposeLayouts(t *testing.T) {
 		t.Error("topology snapshot event drifted from header")
 	}
 	// ABI 7.0 swapped the hook failure mode values; 7.1 added the audit acknowledgement log.
-	if major, minor, _ := Version(); major != 7 || ABIVersionMajor != 7 || minor < ABIMinorRequired || ABIMinorRequired != 7 {
+	if major, minor, _ := Version(); major != 7 || ABIVersionMajor != 7 || minor < ABIMinorRequired || ABIMinorRequired != 8 {
 		t.Errorf("library ABI %d.%d, binding needs 7.%d+ (major %d)", major, minor, ABIMinorRequired, ABIVersionMajor)
 	}
 	if ASTER_EVENT_ENROLLMENT_RESULT != 127 || AdmissionErrorNotAdmitted != 1 || AdmissionErrorDenied != 2 ||

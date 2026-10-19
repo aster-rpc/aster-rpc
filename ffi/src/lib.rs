@@ -52,6 +52,7 @@ pub mod raw_webtransport;
 pub mod rpc;
 pub mod server;
 pub mod server_drain;
+pub mod server_peers;
 pub mod tls;
 pub mod topology;
 pub mod upcall;
@@ -244,8 +245,13 @@ pub mod upcall;
 //   `aster_enrollment_mint_user_token` and the issuer-key publisher accessors
 //   (`aster_enrollment_publisher_*`). No existing layout changes. See
 //   `ffi/RENAME_MAP.md` "7.7".
+// - 7.8.0 (additive): peer events (`server_peers.rs`):
+//   `aster_server_peer_events` (the peers connected now plus a receiver, taken
+//   together), `aster_peer_events_poll` (connected / disconnected / lagged as
+//   JSON) and `aster_peer_events_release`. Events are per peer and only after
+//   admission. See `ffi/RENAME_MAP.md` "7.8".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 7;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 8;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

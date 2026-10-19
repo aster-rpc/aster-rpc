@@ -431,6 +431,101 @@ async fn credential_roles_gate_requires_and_root_revocation_closes_the_connectio
     .unwrap();
 }
 
+/// Peer events on an enrolled server: a peer the gate refuses produces none,
+/// an admitted one is `Connected` with the roles of its credential, and the
+/// root's revocation ends it as `Revoked`.
+#[tokio::test]
+async fn peer_events_follow_admission_and_report_revocation() {
+    use aster::rpc::{DisconnectReason, PeerEvent};
+    use aster_transport_core::test_support::wait_budget;
+
+    async fn event(events: &mut aster::rpc::PeerEventReceiver) -> PeerEvent {
+        tokio::time::timeout(wait_budget(), events.recv())
+            .await
+            .expect("a peer event")
+            .unwrap()
+    }
+
+    tokio::time::timeout(wait_budget() * 8, async {
+        let root = Root::start().await;
+        let files = tempfile::tempdir().unwrap();
+        let server = start_server(
+            server_base()
+                .enrollment(server_enrollment(&root, files.path()))
+                .build(),
+        )
+        .await
+        .unwrap();
+        let (snapshot, mut events) = server.peer_events();
+        assert!(snapshot.is_empty());
+
+        // No enrollment: Gate 0 refuses it, so it never connects. The next
+        // event is the operator's, not the stranger's.
+        let stranger = AsterClient::builder()
+            .config(base(8).build())
+            .address(server.address().unwrap())
+            .connect()
+            .await;
+        if let Ok(stranger) = stranger {
+            let _ = call(&stranger.rpc(), "ping").await;
+            stranger.close().await;
+        }
+
+        let operator = connect(
+            &server,
+            client_config(&root, 5, credential(5, Some("ops.status, ops.logs"))),
+        )
+        .await
+        .unwrap();
+        let operator_id = hex::encode(public(5));
+        match event(&mut events).await {
+            PeerEvent::Connected {
+                peer,
+                alpn,
+                identity,
+            } => {
+                assert_eq!(peer, operator_id);
+                assert_eq!(alpn, b"aster/1");
+                assert_eq!(identity.endpoint_id, operator_id);
+                assert_eq!(identity.principal.as_deref(), Some(operator_id.as_str()));
+                assert_eq!(identity.roles, vec!["ops.logs", "ops.status"]);
+            }
+            other => panic!("expected the operator to connect, got {other:?}"),
+        }
+        assert_eq!(server.peer_events().0.len(), 1);
+
+        let mut revoked = server.enrollment().unwrap().revocations();
+        root.enrollment.connect(server.node().addr()).await.unwrap();
+        root.revoke(public(5)).await;
+        root.fleet
+            .sync_with_timeout(&[server.id()], wait_budget())
+            .await
+            .unwrap();
+        tokio::time::timeout(wait_budget(), async {
+            loop {
+                if revoked.recv().await.unwrap().peer == public(5) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the server revokes the operator");
+        assert_eq!(
+            event(&mut events).await,
+            PeerEvent::Disconnected {
+                peer: operator_id,
+                reason: DisconnectReason::Revoked
+            }
+        );
+
+        operator.close().await;
+        server.shutdown().await;
+        root.node.shutdown().await;
+    })
+    .await
+    .unwrap();
+}
+
 /// A credential admits a persistent node only until the root registers it
 /// (design §4), so a registered server restarts with its credential expired,
 /// or with none, and its replica admits it by the registration. While it ran

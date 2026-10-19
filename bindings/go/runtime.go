@@ -598,9 +598,9 @@ func Version() (major, minor, patch uint32) {
 // identity on the config path (AsterConfig.Identity / RemoteConfig via
 // aster_config_set_identity, CallInfo.Actor / AuthMethods / OnBehalfOf,
 // NodeProperties, WithOnBehalfOf, Enrollment.MintUserToken, the publisher
-// notices, NodeConfigClient). This binding needs native ABI 7.7 or a later
-// 7.x.
-const ABIMinorRequired = uint32(7)
+// notices, NodeConfigClient); 7.8 peer events (AsterServer.PeerEvents). This
+// binding needs native ABI 7.8 or a later 7.x.
+const ABIMinorRequired = uint32(8)
 
 var (
 	abiOnce sync.Once

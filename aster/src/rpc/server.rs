@@ -606,12 +606,10 @@ impl Server {
         let dispatcher = self.dispatcher();
         let resolver = dispatcher.frame_limit_resolver();
         let foreign = dispatcher.foreign.clone();
-        let handle = reactor::start_reactor_with_control(
-            self.core,
-            256,
-            Some(resolver),
-            self.drain.reactor(),
-        );
+        let peers = super::peers::PeerLedger::new(self.attributes.clone());
+        let control = self.drain.reactor();
+        control.set_observer(peers.clone());
+        let handle = reactor::start_reactor_with_control(self.core, 256, Some(resolver), control);
         let drain = self.drain.clone();
         let sessions = dispatcher.sessions.clone();
         let (mut event_rx, mut non_rpc_rx) = handle.into_parts();
@@ -749,6 +747,7 @@ impl Server {
             route_join,
             drain,
             sessions,
+            peers,
         }
     }
 }
@@ -1695,9 +1694,17 @@ pub struct ServerHandle {
     route_join: tokio::task::JoinHandle<()>,
     drain: Arc<DrainShared>,
     sessions: Arc<SessionStore>,
+    peers: Arc<super::peers::PeerLedger>,
 }
 
 impl ServerHandle {
+    /// The peers connected now, and a receiver of every connect and
+    /// disconnect after them (see [`peers`](super::peers)): the snapshot and
+    /// the subscription are taken together, so no peer falls between them.
+    pub fn peer_events(&self) -> (Vec<super::PeerSnapshot>, super::PeerEventReceiver) {
+        self.peers.subscribe()
+    }
+
     /// Stop both the RPC dispatch and ALPN fan-out loops.
     pub fn abort(&self) {
         self.rpc_join.abort();

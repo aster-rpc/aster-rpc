@@ -212,6 +212,11 @@ impl AttributeStore {
         source.and_then(|source| source.issuable_roles(peer))
     }
 
+    /// Whether an [`AttributeSource`] (enrollment) is installed.
+    pub(crate) fn has_source(&self) -> bool {
+        self.source.read().unwrap().is_some()
+    }
+
     fn sourced(&self, peer: &str) -> Option<SourcedAttributes> {
         let source = self.source.read().unwrap().clone();
         source.and_then(|source| source.attributes(peer))

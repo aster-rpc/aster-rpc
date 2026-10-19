@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 7
 
-#define ASTER_ABI_VERSION_MINOR 7
+#define ASTER_ABI_VERSION_MINOR 8
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -8100,6 +8100,58 @@ int32_t aster_server_drain(aster_runtime_t runtime,
                            aster_server_t server,
                            uint32_t grace_ms,
                            struct aster_drain_report_t *out_report);
+
+/**
+ * ABI 7.8: the peers connected to `server` now, and a receiver of every
+ * connect and disconnect after them, taken together so no peer falls
+ * between the two. `*out_receiver` is the receiver handle (release it with
+ * `aster_peer_events_release`); `*out_snapshot_json` is owned JSON
+ * (`aster_string_release`): an array of `{"peer", "alpn", "connections",
+ * "identity": {"endpoint_id", "principal" (string or null), "roles": []}}`.
+ *
+ * Events are per peer, not per connection, and only after the node's
+ * admission gates: a peer enrollment (or a drain) refuses never appears. A
+ * peer is connected from its first admitted `aster/1` connection until its
+ * last one ends. `NOT_FOUND` for an unknown server; `ALREADY_CLOSED` for one
+ * that is stopping.
+ *
+ * # Safety
+ * `out_receiver` and `out_snapshot_json` must be writable.
+ */
+int32_t aster_server_peer_events(aster_server_t server,
+                                 uint64_t *out_receiver,
+                                 struct aster_bytes_t *out_snapshot_json);
+
+/**
+ * ABI 7.8: wait up to `timeout_ms` (0: don't wait) for the next peer event
+ * and write it as owned JSON (`aster_string_release`):
+ * `{"type": "connected", "peer", "alpn", "identity": {...}}`,
+ * `{"type": "disconnected", "peer", "reason": "closed" | "timed_out" |
+ * "revoked" | "drained" | "error"}` or `{"type": "lagged", "missed": n}`.
+ *
+ * `lagged` means the receiver fell behind a bounded queue (1024 events) and
+ * `missed` events were dropped; its state is stale, so call
+ * `aster_server_peer_events` again, release this receiver and rebuild from
+ * the new snapshot. `TIMEOUT`: no event yet (`*out_json` stays empty).
+ * `NOT_FOUND`: the receiver was released. `ALREADY_CLOSED`: the server
+ * ended, so no event will come. Polls on one receiver are serialised; a
+ * release wakes a pending poll with `NOT_FOUND`. `UNSUPPORTED` on a tokio
+ * runtime thread.
+ *
+ * # Safety
+ * `out_json` must be writable.
+ */
+int32_t aster_peer_events_poll(aster_runtime_t runtime,
+                               uint64_t receiver,
+                               uint32_t timeout_ms,
+                               struct aster_bytes_t *out_json);
+
+/**
+ * ABI 7.8: release a peer event receiver. A pending
+ * `aster_peer_events_poll` on it returns `NOT_FOUND`. `NOT_FOUND` for an
+ * unknown or already released receiver.
+ */
+int32_t aster_peer_events_release(uint64_t receiver);
 
 /**
  * Generate a self-signed ECDSA certificate. Empty SANs default to localhost.

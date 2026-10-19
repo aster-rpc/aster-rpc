@@ -42,6 +42,7 @@ pub mod jwks_publisher;
 pub mod lease;
 pub mod node_config;
 pub(crate) mod observe;
+pub mod peers;
 pub mod projection;
 pub mod proxy;
 pub mod runtime;
@@ -94,6 +95,9 @@ pub use node_config::{AttrValue, NodeProperties, CONFIG_ADMIN_ROLE};
 pub use node_config::{NodeConfigClient, NodeConfigHandle};
 #[cfg(feature = "otel")]
 pub use observe::otel::{current_trace_context, with_trace_context, ExtractContext};
+pub use peers::{
+    DisconnectReason, PeerEvent, PeerEventReceiver, PeerIdentity, PeerSnapshot, PEER_EVENT_CAPACITY,
+};
 pub use projection::{Projection, ProjectionRegistry};
 pub use proxy::{DynContract, DynResponseStream, DynValue, DynamicClient};
 #[cfg(all(feature = "docs", feature = "blobs"))]

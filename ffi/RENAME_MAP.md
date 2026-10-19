@@ -1,4 +1,24 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.7)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.8)
+
+## New in 7.8 (peer events; additive)
+
+Rust `AsterServer::peer_events` / `ServerHandle::peer_events` (semantics in
+`aster::rpc::peers`): which peers are connected to a dispatch server, and when
+that changes. A peer is connected from its first admitted `aster/1`
+connection (past Gate 0 / enrollment, not refused by a drain) until its last
+one ends, so several connections from one peer are one connect and one
+disconnect, and a refused peer never appears. No existing layout changes.
+
+| Item | Role |
+|---|---|
+| `aster_server_peer_events(server, *out_receiver, *out_snapshot_json)` | The peers connected now (JSON array of `{peer, alpn, connections, identity: {endpoint_id, principal, roles}}`; `principal` is the endpoint id of a peer with a live enrollment session, else `null`) and a receiver handle, taken under one lock so no peer falls between them. |
+| `aster_peer_events_poll(rt, receiver, timeout_ms, *out_json)` | Blocks up to `timeout_ms` for one event as JSON: `connected` (`peer`, `alpn`, `identity`), `disconnected` (`peer`, `reason`: `closed`, `timed_out`, `revoked`, `drained`, `error`) or `lagged` (`missed`). `TIMEOUT` when none; `NOT_FOUND` once released; `ALREADY_CLOSED` when the server ended. `UNSUPPORTED` on a tokio runtime thread. |
+| `aster_peer_events_release(receiver)` | Releases the receiver and wakes a pending poll. |
+
+The queue holds 1024 events. A receiver that falls behind gets one `lagged`
+event with the number missed; its state is stale, so the consumer calls
+`aster_server_peer_events` again and rebuilds from the new snapshot. Go
+requires 7.8 (`ABIMinorRequired = 8`).
 
 ## New in 7.7 (gateway identity on the config-driven path; additive)
 

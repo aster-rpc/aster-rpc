@@ -548,6 +548,18 @@ pub struct ReactorControl {
     connections: Mutex<HashMap<u64, LiveConnection>>,
     refused: AtomicU64,
     changed: Notify,
+    observer: std::sync::RwLock<Option<Arc<dyn ConnectionObserver>>>,
+}
+
+/// Told when an `aster/1` connection is taken into the reactor (past the
+/// node's admission gates, and not refused by a drain) and when it ends.
+/// Both run on the connection's own task and must not block.
+pub trait ConnectionObserver: Send + Sync + 'static {
+    /// `connection_id` is open, before its first stream is accepted.
+    fn opened(&self, connection_id: u64, peer: &str, alpn: &[u8]);
+    /// `connection_id` is over. `drained` is true when the reactor closed it
+    /// with [`DRAIN_CLOSE_CODE`] (a local close reports no code of its own).
+    fn closed(&self, connection_id: u64, peer: &str, info: &CoreClosedInfo, drained: bool);
 }
 
 struct LiveConnection {
@@ -594,6 +606,19 @@ impl ReactorControl {
 
     pub fn is_draining(&self) -> bool {
         self.draining.load(Ordering::Acquire)
+    }
+
+    /// Install the connection observer (replacing any earlier one). Set it
+    /// before the reactor starts so no connection is missed.
+    pub fn set_observer(&self, observer: Arc<dyn ConnectionObserver>) {
+        *self.observer.write().unwrap_or_else(|e| e.into_inner()) = Some(observer);
+    }
+
+    fn observer(&self) -> Option<Arc<dyn ConnectionObserver>> {
+        self.observer
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Connections refused at accept since draining started.
@@ -669,9 +694,16 @@ impl ReactorControl {
         );
     }
 
-    fn unregister(&self, connection_id: u64) {
-        self.connections.lock().unwrap().remove(&connection_id);
+    /// Forget `connection_id`; whether the drain had closed it.
+    fn unregister(&self, connection_id: u64) -> bool {
+        let drained = self
+            .connections
+            .lock()
+            .unwrap()
+            .remove(&connection_id)
+            .is_some_and(|c| c.drained);
         self.changed.notify_waiters();
+        drained
     }
 
     fn call_ended(&self) {
@@ -747,8 +779,13 @@ pub struct ReactorFeeder {
 impl ReactorFeeder {
     pub fn feed(&self, conn: CoreConnection) {
         let tx = self.event_tx.clone();
-        self.rt_handle
-            .spawn(connection_loop(conn, tx, self.resolve.clone(), None));
+        self.rt_handle.spawn(connection_loop(
+            conn,
+            RPC_ALPN.to_vec(),
+            tx,
+            self.resolve.clone(),
+            None,
+        ));
     }
 
     /// Install the per-method body-frame cap resolver. Without one every
@@ -846,6 +883,7 @@ async fn accept_loop(
                     let tx = event_tx.clone();
                     tokio::spawn(connection_loop(
                         conn,
+                        alpn,
                         tx,
                         resolve.clone(),
                         Some(control.clone()),
@@ -928,6 +966,7 @@ impl ConnectionGone {
 
 async fn connection_loop(
     conn: CoreConnection,
+    alpn: Vec<u8>,
     event_tx: mpsc::Sender<ReactorEvent>,
     resolve: Option<FrameLimitResolver>,
     control: Option<Arc<ReactorControl>>,
@@ -938,8 +977,12 @@ async fn connection_loop(
         control: control.clone(),
         ..ConnectionGone::default()
     });
+    let observer = control.as_ref().and_then(|control| control.observer());
     if let Some(control) = &control {
         control.register(connection_id, conn.clone(), gone.clone());
+    }
+    if let Some(observer) = &observer {
+        observer.opened(connection_id, &peer_id, &alpn);
     }
 
     // `accept_aster_bi` transparently dispatches `FLAG_TUNNEL` streams
@@ -962,9 +1005,9 @@ async fn connection_loop(
     }
 
     gone.set();
-    if let Some(control) = &control {
-        control.unregister(connection_id);
-    }
+    let drained = control
+        .as_ref()
+        .is_some_and(|control| control.unregister(connection_id));
 
     // Connection closed or accept_bi returned an error — emit a
     // ConnectionClosed event so the binding can reap per-connection
@@ -974,6 +1017,9 @@ async fn connection_loop(
     // future resolves immediately; otherwise it resolves on the next
     // close frame.
     let info = conn.closed().await;
+    if let Some(observer) = &observer {
+        observer.closed(connection_id, &peer_id, &info, drained);
+    }
     #[cfg(feature = "test-hooks")]
     test_hooks::connection_close_sending(connection_id);
     let closed_enqueued = event_tx
