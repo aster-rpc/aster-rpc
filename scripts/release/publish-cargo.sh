@@ -17,8 +17,8 @@ case "$mode" in
 esac
 
 packages=(
-  aster_transport_core
   aster-otel
+  aster_transport_core
   aster-macros
   aster-expose
   aster
