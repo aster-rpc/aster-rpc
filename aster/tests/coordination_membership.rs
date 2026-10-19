@@ -34,7 +34,7 @@ use aster::coordination::contract::{
     ActionV1, ChangeMembershipActionV1, ClientCommandV1, CommandV1, MemberSeedV1, NodeIdV1,
 };
 use aster::coordination::ids::CoordinationNodeId;
-use aster::coordination::testing::{GroupFixture, ProposeError};
+use aster::coordination::testing::{Committed, GroupFixture};
 use aster::rpc::AsterServer;
 
 const DOMAIN: &str = "membership.test";
@@ -100,6 +100,32 @@ async fn await_leader(voters: &[Voter], what: &str) -> usize {
             "{what}: no leader within {PATIENCE:?}"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Commit `command` at whichever voter leads, retrying a refusal (no leader, a
+/// forward) and a timeout until `PATIENCE` runs out: leadership can move or
+/// stall on a loaded host, even in a fresh group (candidate 20 timed out the
+/// first plan here). Resending is safe because it is the same command each
+/// time: its client id and sequence replay the cached reply, and a plan whose
+/// operation id and request are unchanged returns the existing intent
+/// (`model/membership.rs`), so a copy that already committed is not a second
+/// change.
+async fn commit_at_leader(voters: &[Voter], command: CommandV1, what: &str) -> Committed {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        let at = voters[await_leader(voters, what).await].coordination();
+        match at
+            .propose_for_testing_within(command.clone(), Duration::from_secs(20))
+            .await
+        {
+            Ok(committed) => return committed,
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                eprintln!("{what}: {error:?}; retrying at the current leader");
+            }
+            Err(error) => panic!("{what}: {error:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -260,20 +286,15 @@ async fn departing_voters_are_retained_as_learners_and_can_return() {
     let staying: Vec<usize> = (0..SIZE).filter(|i| !departing.contains(i)).collect();
 
     let coordination = voters[leader].coordination();
-    let accepted = coordination
-        .propose_for_testing_within(
-            plan(
-                &fixture,
-                voters[leader].index,
-                b"shrink",
-                coordination.membership_log_id_for_testing(),
-                &staying,
-                &departing,
-            ),
-            Duration::from_secs(20),
-        )
-        .await
-        .expect("the plan commits");
+    let shrink = plan(
+        &fixture,
+        voters[leader].index,
+        b"shrink",
+        coordination.membership_log_id_for_testing(),
+        &staying,
+        &departing,
+    );
+    let accepted = commit_at_leader(&voters, shrink, "the shrink").await;
     assert_eq!(
         outcome_of(&accepted).0,
         MEMBERSHIP_ACCEPTED,
@@ -298,35 +319,17 @@ async fn departing_voters_are_retained_as_learners_and_can_return() {
     let before = coordination
         .last_applied_for_testing()
         .expect("an applied index");
-    // Leadership may move once the group has shrunk, so propose at whichever
-    // voter leads now. Only a refusal is retried: it never committed, whereas
-    // a timed-out plan may have, and a second copy would be refused.
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    let accepted = loop {
-        let proposer = &voters[await_leader(&voters, "for the grow").await];
-        let at = proposer.coordination();
-        match at
-            .propose_for_testing_within(
-                plan(
-                    &fixture,
-                    proposer.index,
-                    b"grow",
-                    at.membership_log_id_for_testing(),
-                    &all,
-                    &[],
-                ),
-                Duration::from_secs(20),
-            )
-            .await
-        {
-            Ok(committed) => break committed,
-            Err(ProposeError::Rejected(rejection)) if tokio::time::Instant::now() < deadline => {
-                eprintln!("the grow was refused, retrying at the current leader: {rejection:?}")
-            }
-            Err(error) => panic!("the restoring plan commits: {error:?}"),
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // Leadership may move once the group has shrunk; the helper proposes at
+    // whichever voter leads.
+    let grow = plan(
+        &fixture,
+        voters[leader].index,
+        b"grow",
+        coordination.membership_log_id_for_testing(),
+        &all,
+        &[],
+    );
+    let accepted = commit_at_leader(&voters, grow, "the grow").await;
     assert_eq!(
         outcome_of(&accepted).0,
         MEMBERSHIP_ACCEPTED,
@@ -371,20 +374,19 @@ async fn a_second_plan_is_refused_without_disturbing_the_first() {
     let staying: Vec<usize> = (0..SIZE).filter(|i| !departing.contains(i)).collect();
     let at = coordination.membership_log_id_for_testing();
 
-    let first = coordination
-        .propose_for_testing_within(
-            plan(
-                &fixture,
-                voters[leader].index,
-                b"first",
-                at.clone(),
-                &staying,
-                &departing,
-            ),
-            Duration::from_secs(20),
-        )
-        .await
-        .expect("the first plan commits");
+    let first = commit_at_leader(
+        &voters,
+        plan(
+            &fixture,
+            voters[leader].index,
+            b"first",
+            at.clone(),
+            &staying,
+            &departing,
+        ),
+        "the first plan",
+    )
+    .await;
     assert_eq!(
         outcome_of(&first).0,
         MEMBERSHIP_ACCEPTED,
@@ -396,13 +398,13 @@ async fn a_second_plan_is_refused_without_disturbing_the_first() {
     // A second, different operation planned from the same starting point. It
     // must be refused — but as a *decision*, not a fault: the command commits
     // and the reply says no. Apply is total, so a rejection is an applied entry.
-    let second = coordination
-        .propose_for_testing_within(
-            plan(&fixture, voters[leader].index, b"second", at, &all, &[]),
-            Duration::from_secs(20),
-        )
-        .await
-        .expect("a refused plan is still a committed command, not an error");
+    // A refused plan is still a committed command, not an error.
+    let second = commit_at_leader(
+        &voters,
+        plan(&fixture, voters[leader].index, b"second", at, &all, &[]),
+        "the second plan",
+    )
+    .await;
     assert_ne!(
         outcome_of(&second).0,
         MEMBERSHIP_ACCEPTED,
@@ -453,20 +455,15 @@ async fn a_genesis_replay_survives_a_membership_change() {
     let staying: Vec<usize> = (0..SIZE).filter(|i| !departing.contains(i)).collect();
 
     let coordination = voters[leader].coordination();
-    let accepted = coordination
-        .propose_for_testing_within(
-            plan(
-                &fixture,
-                voters[leader].index,
-                b"shrink-before-replay",
-                coordination.membership_log_id_for_testing(),
-                &staying,
-                &departing,
-            ),
-            Duration::from_secs(20),
-        )
-        .await
-        .expect("the plan commits");
+    let shrink = plan(
+        &fixture,
+        voters[leader].index,
+        b"shrink-before-replay",
+        coordination.membership_log_id_for_testing(),
+        &staying,
+        &departing,
+    );
+    let accepted = commit_at_leader(&voters, shrink, "the shrink").await;
     assert_eq!(outcome_of(&accepted).0, MEMBERSHIP_ACCEPTED);
     await_shape(
         &voters[leader],
@@ -482,29 +479,15 @@ async fn a_genesis_replay_survives_a_membership_change() {
     // fatal.
     //
     // Leadership may move once the group has shrunk (it did on a loaded
-    // runner), so propose at whichever voter leads now, retrying a forward:
-    // the replay is idempotent.
-    let deadline = tokio::time::Instant::now() + PATIENCE;
-    let replay = loop {
-        let leader = await_leader(&voters, "for the replay").await;
-        match voters[leader]
-            .coordination()
-            .propose_for_testing_within(
-                CommandV1::Genesis(GenesisCommandV1 {
-                    signed_genesis: fixture.signed_genesis(),
-                }),
-                Duration::from_secs(20),
-            )
-            .await
-        {
-            Ok(committed) => break committed,
-            Err(error) => assert!(
-                tokio::time::Instant::now() < deadline,
-                "an exact replay commits after the membership changed: {error:?}"
-            ),
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    };
+    // runner); the replay is idempotent, so the helper may resend it.
+    let replay = commit_at_leader(
+        &voters,
+        CommandV1::Genesis(GenesisCommandV1 {
+            signed_genesis: fixture.signed_genesis(),
+        }),
+        "the genesis replay",
+    )
+    .await;
     match &replay.reply {
         aster::coordination::contract::CommandReplyV1::System(reply) => assert_eq!(
             reply.system_result_code, 8,
