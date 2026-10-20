@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aster_transport_core::enrollment::issuer as core_issuer;
+use aster_transport_core::enrollment::issuer::{self as core_issuer, renewal_lead};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -342,8 +342,8 @@ impl Drop for RenewalHandle {
 const RENEWAL_CHECK: Duration = Duration::from_secs(5);
 
 impl Enrollment {
-    /// Renew this node's credential from `config.issuer` whenever a third of
-    /// its lifetime remains, retrying with backoff until it expires. The new
+    /// Renew this node's credential from `config.issuer` whenever
+    /// [`renewal_lead`] remains (`max(lifetime / 3, min(10 min, lifetime / 2))`), retrying with backoff until it expires. The new
     /// credential is presented to every admitted peer. Renewal stops when the
     /// root registers this node: the record replaces the credential.
     pub fn start_renewal(&self, config: RenewalConfig) -> RenewalHandle {
@@ -377,7 +377,8 @@ impl Enrollment {
                 return RenewalOutcome::Expired;
             }
             let lifetime = expires_at.saturating_sub(evidence.issued_at());
-            let due = expires_at.saturating_sub(lifetime / 3);
+            let due =
+                expires_at.saturating_sub(renewal_lead(Duration::from_secs(lifetime)).as_secs());
             if now < due {
                 let wait = Duration::from_secs(due - now).min(RENEWAL_CHECK);
                 tokio::time::sleep(wait.max(Duration::from_millis(200))).await;

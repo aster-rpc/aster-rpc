@@ -373,6 +373,15 @@ let echo = EchoClient::new(client.rpc());
   issuer: `srv.issuer().unwrap().issue_for(..)` enrolls new nodes and the
   server serves their renewals. A client renews automatically from the server
   that signed its credential, or from `[enrollment] renew_from`.
+  A client renews when `max(lifetime / 3, min(10 min, lifetime / 2))` of the
+  credential remains, and retries with backoff until it expires. An hour-long
+  credential renews with 20 minutes left, a 20-to-30-minute one with the
+  10-minute floor, and anything shorter at half its lifetime. The floor keeps
+  a stalled renewal from costing live connections: a server whose session
+  still rests on the old chain at expiry revokes it and closes the peer's
+  connections. Credentials under 30 minutes are discouraged (the issuer logs
+  a warning once at configuration): their renewals run almost back to back,
+  and the margin shrinks to seconds. Prefer an hour or more.
 - **Fail closed.** Setting a credential, audience, fleet namespace or issuer
   turns enrollment on; anything missing or malformed stops `start()` /
   `connect()` with an error that names the setting. Nothing falls back to an

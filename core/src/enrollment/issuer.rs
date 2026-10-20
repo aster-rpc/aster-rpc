@@ -14,6 +14,7 @@ use super::{
     Registration, SubjectStanding,
 };
 use crate::delegation::{delegation_limits, Chain, ChainError};
+use std::time::Duration;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssuanceError {
@@ -47,6 +48,23 @@ impl From<EnrollmentError> for IssuanceError {
     }
 }
 
+/// Smallest renewal lead a credential gets when its lifetime allows it: a
+/// client renews with at least this much time left, so a stall of a few
+/// minutes cannot cost it live connections.
+pub const RENEWAL_LEAD_FLOOR: Duration = Duration::from_secs(10 * 60);
+
+/// Credential lifetimes below this draw a warning when an issuer is
+/// configured: the floor leaves them little time between renewals.
+pub const SHORT_LIFETIME_WARNING: Duration = Duration::from_secs(30 * 60);
+
+/// How long before expiry a client renews a credential of `lifetime`:
+/// `max(lifetime / 3, min(RENEWAL_LEAD_FLOOR, lifetime / 2))`. An hour gets
+/// 20 minutes, 20 to 30 minutes get the 10-minute floor, and anything
+/// shorter renews at half its lifetime.
+pub fn renewal_lead(lifetime: Duration) -> Duration {
+    (lifetime / 3).max(RENEWAL_LEAD_FLOOR.min(lifetime / 2))
+}
+
 /// Signs leaves under this node's delegation chain from the root.
 pub struct DelegatedIssuer {
     signer: JwtEnrollmentIssuer,
@@ -71,6 +89,17 @@ impl DelegatedIssuer {
         let limits = delegation_limits(&delegation).ok_or(EnrollmentError::InvalidClaims)?;
         if limits.subject != signer.public_key() || lifetime == 0 {
             return Err(EnrollmentError::InvalidConfiguration);
+        }
+        let effective = Duration::from_secs(lifetime.min(limits.max_child_lifetime));
+        if effective < SHORT_LIFETIME_WARNING {
+            // Once per issuer configuration, not per credential.
+            tracing::warn!(
+                lifetime_secs = effective.as_secs(),
+                renewal_floor_secs = RENEWAL_LEAD_FLOOR.as_secs(),
+                "enrollment: issued credential lifetime is under 30 minutes; clients renew \
+                 with at least a 10-minute lead (half the lifetime when shorter), so \
+                 short lifetimes mean constant renewal"
+            );
         }
         Ok(Self {
             signer,
@@ -172,4 +201,23 @@ fn issue(
         service.observe_issuance(subject, issued.chain(), renewal);
     }
     Ok(issued)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lead(secs: u64) -> Duration {
+        renewal_lead(Duration::from_secs(secs))
+    }
+
+    #[test]
+    fn renewal_lead_follows_the_floor_rule() {
+        assert_eq!(lead(3600), Duration::from_secs(20 * 60));
+        assert_eq!(lead(30 * 60), Duration::from_secs(10 * 60));
+        assert_eq!(lead(20 * 60), Duration::from_secs(10 * 60));
+        assert_eq!(lead(12 * 60), Duration::from_secs(6 * 60));
+        assert_eq!(lead(6), Duration::from_secs(3));
+        assert_eq!(lead(24 * 3600), Duration::from_secs(8 * 3600));
+    }
 }
