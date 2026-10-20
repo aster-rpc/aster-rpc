@@ -880,6 +880,12 @@ the whole call from opening the stream. Unary interceptors see the deadline
 and metadata in `ClientCallContext`. For a session-scoped service, start from
 `session.options()` (`conn.open_session()?`) to stamp the session id.
 
+The client enforces a deadline exactly, to the millisecond. The copy sent to
+the server is whole seconds, rounded up, so a server's `deadline()` can be up
+to a second later than the caller's. The server never cuts a call short. It
+may, though, keep working on a call the caller has already abandoned for up
+to a second longer.
+
 ### 4.6 Per-call authorization (Gate 3)
 
 `#[rpc(requires = …)]` is checked **before** the handler runs, against the
