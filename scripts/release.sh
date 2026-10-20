@@ -9,6 +9,11 @@
 #   3. Follow it with scripts/ci/ci-watch.sh; tag only when it succeeded.
 #   4. Push v<version>; release.yml promotes the sealed candidate's bytes.
 #
+# A candidate job may be rerun (an infrastructure failure, for example). The
+# rerun is recorded, and promotion refuses it unless the tag accepts it:
+# --accept-reruns=<job>[,<job>] writes an "Accept-Reruns:" line into the
+# annotated tag, which release.yml reads. Name only jobs that were rerun.
+#
 # Reads and dispatches with the git credential for forge.emrul.dev, like
 # ci-watch.sh. See docs/_internal/dev-loop-runbook.md, "Cutting a release".
 set -euo pipefail
@@ -22,13 +27,18 @@ allow_dirty=false
 created_tag=false
 push=true
 candidate_only=false
+accept_reruns=""
 for arg in "$@"; do
   case "$arg" in
     --allow-dirty) allow_dirty=true ;;
     --no-push) push=false ;;
     # Qualify HEAD (every producer, sealed candidate) without tagging it.
     --candidate-only) candidate_only=true ;;
-    *) echo "usage: scripts/release.sh [--allow-dirty] [--no-push] [--candidate-only]" >&2; exit 2 ;;
+    --accept-reruns=*)
+      accept_reruns="${arg#--accept-reruns=}"
+      [[ "$accept_reruns" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]] || {
+        echo "error: --accept-reruns takes job ids separated by commas" >&2; exit 2; } ;;
+    *) echo "usage: scripts/release.sh [--allow-dirty] [--no-push] [--candidate-only] [--accept-reruns=<job>[,<job>]]" >&2; exit 2 ;;
   esac
 done
 
@@ -79,8 +89,10 @@ branch="$(git -C "$repo" branch --show-current)"
   echo "error: releases must be tagged from main (currently '$branch')" >&2
   exit 1
 }
-if [[ "$allow_dirty" != true && -n "$(git -C "$repo" status --porcelain)" ]]; then
-  echo "error: worktree is dirty; commit/stash it or pass --allow-dirty" >&2
+# Tracked changes only: the release builds and tags pushed commits, so an
+# untracked scratch file cannot leak into it.
+if [[ "$allow_dirty" != true && -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]]; then
+  echo "error: tracked files have uncommitted changes; commit/stash them or pass --allow-dirty" >&2
   exit 1
 fi
 head="$(git -C "$repo" rev-parse HEAD)"
@@ -154,7 +166,12 @@ for r in json.load(sys.stdin).get("workflow_runs", []):
 
   # Tag the commit that was qualified, not whatever HEAD is by now: the
   # candidate can run for over an hour while the checkout moves on.
-  git -C "$repo" tag -a "$tag" -m "Aster $version" "$head"
+  if [[ -n "$accept_reruns" ]]; then
+    echo "accepting reruns of: ${accept_reruns//,/, } (recorded in the tag)"
+    git -C "$repo" tag -a "$tag" -m "Aster $version" -m "Accept-Reruns: ${accept_reruns//,/, }" "$head"
+  else
+    git -C "$repo" tag -a "$tag" -m "Aster $version" "$head"
+  fi
   created_tag=true
   echo "created $tag at $(git -C "$repo" rev-parse --short "$head")"
 fi

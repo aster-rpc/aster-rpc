@@ -96,6 +96,16 @@ def identity() -> dict:
             "run_number": int(os.environ["FORGEJO_RUN_NUMBER"])}
 
 
+def attempt() -> int:
+    """This job's attempt number (FORGEJO_RUN_ATTEMPT). A rerun candidate
+    job is allowed but recorded: promotion needs it named in the release
+    tag's Accept-Reruns line (see accepted_reruns)."""
+    value = os.environ.get("FORGEJO_RUN_ATTEMPT", "")
+    if not value.isdigit() or int(value) < 1:
+        fail(f"invalid FORGEJO_RUN_ATTEMPT {value!r}")
+    return int(value)
+
+
 def safe_name(name: str) -> None:
     if not re.fullmatch(r"[a-zA-Z0-9_.-]+", name) or name in (".", ".."):
         fail(f"invalid artifact name: {name}")
@@ -114,8 +124,7 @@ def file_map(root: Path) -> dict[str, str]:
 
 
 def record(artifact: str, path_pattern: str, output: Path, job: str, matrix: str, recipe: dict | None = None) -> None:
-    if os.environ.get("FORGEJO_RUN_ATTEMPT") != "1":
-        fail("candidate provenance must come from the first job attempt")
+    run_attempt = attempt()
     safe_name(artifact)
     pattern = ROOT / path_pattern
     paths = [Path(p) for p in glob.glob(str(pattern))]
@@ -143,7 +152,7 @@ def record(artifact: str, path_pattern: str, output: Path, job: str, matrix: str
         if shutil.which(command[0]):
             result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
             tools[command[0]] = result.stdout.strip()
-    evidence = {**identity(), "artifact": artifact, "job": job, "matrix": json.loads(matrix) or {}, "attempt": 1,
+    evidence = {**identity(), "artifact": artifact, "job": job, "matrix": json.loads(matrix) or {}, "attempt": run_attempt,
                 "tools": tools, "files": files,
                 "build_environment": {k: os.environ.get(k, "") for k in ("RUSTUP_TOOLCHAIN", "RUSTFLAGS", "CARGO_PROFILE_DEV_DEBUG", "CARGO_PROFILE_RELEASE_DEBUG")}}
     if recipe is not None:
@@ -251,8 +260,7 @@ def build_recipe(kind: str, package: str, profile: str, features: str,
 
 def verify_input(root: Path, evidence: dict, artifact: str, job: str, recipe: dict) -> None:
     """Reject a mismatched intra-run handoff before a consumer installs/loads it."""
-    if os.environ.get("FORGEJO_RUN_ATTEMPT") != "1":
-        fail("native reuse requires a first-attempt consumer")
+    attempt()
     safe_name(artifact)
     expected = identity()
     validate_recipe(recipe)
@@ -261,7 +269,7 @@ def verify_input(root: Path, evidence: dict, artifact: str, job: str, recipe: di
             fail(f"reused input has mismatched {key}")
     if evidence.get("artifact") != artifact or evidence.get("job") != job:
         fail("reused input has wrong artifact or producer")
-    if evidence.get("attempt") != 1 or evidence.get("matrix") != {}:
+    if not isinstance(evidence.get("attempt"), int) or evidence["attempt"] < 1 or evidence.get("matrix") != {}:
         fail("reused host input has wrong attempt or matrix")
     if evidence.get("build_recipe") != recipe or recipe.get("lock_sha256") != expected["source_hashes"]["Cargo.lock"]:
         fail("reused input has mismatched native build recipe")
@@ -316,7 +324,8 @@ def verify_python_install(wheel: Path, interpreter: str) -> None:
             fail("imported native module is outside installed package")
 
 
-def _verify_artifacts(root: Path, manifest: dict, expected: dict, policy: dict) -> None:
+def _verify_artifacts(root: Path, manifest: dict, expected: dict, policy: dict,
+                      accepted: set[str] | None = None) -> None:
     """Authoritative identity/inventory/hash checks, independent of container layout."""
     for key in ("schema", "repository", "sha", "version", "workflow", "source_hashes", "run_id", "run_number", "assurance_profile"):
         if manifest.get(key) != expected[key]:
@@ -342,8 +351,12 @@ def _verify_artifacts(root: Path, manifest: dict, expected: dict, policy: dict) 
         rule = rules[name.removesuffix(suffix)]
         if evidence.get("job") != rule["job"] or evidence.get("matrix") != rule["matrix"]:
             fail(f"artifact {name} has wrong job or build matrix")
-        if evidence.get("attempt") != 1:
-            fail(f"artifact {name} lacks first-attempt evidence")
+        run_attempt = evidence.get("attempt")
+        if not isinstance(run_attempt, int) or run_attempt < 1:
+            fail(f"artifact {name} has no attempt evidence")
+        if accepted is not None and run_attempt != 1 and rule["job"] not in accepted:
+            fail(f"artifact {name} comes from attempt {run_attempt} of {rule['job']}; "
+                 "name the job in the release tag's Accept-Reruns line to promote it")
         if not evidence.get("tools"):
             fail(f"artifact {name} has no runtime/toolchain evidence")
         directory = root / name
@@ -358,8 +371,11 @@ def _verify_artifacts(root: Path, manifest: dict, expected: dict, policy: dict) 
                 fail(f"unsafe artifact path: {path}")
 
 
-def verify_payload(root: Path, manifest: dict, expected: dict, policy: dict) -> None:
-    _verify_artifacts(root, manifest, expected, policy)
+def verify_payload(root: Path, manifest: dict, expected: dict, policy: dict,
+                   accepted: set[str] | None = None) -> None:
+    # `accepted` is None while sealing (the decision is the release tag's) and
+    # the tag's Accept-Reruns set at promotion.
+    _verify_artifacts(root, manifest, expected, policy, accepted)
     required = {name + f'-{expected["run_number"]}' for name in artifact_policy(policy)}
     # No unrecorded payload directories, including from a partial prior run.
     if {p.name for p in root.iterdir()} != required:
@@ -417,8 +433,7 @@ def handoff_manifest(handoff: Path, needs: dict, expected: dict, policy: dict, *
 
 
 def seal(handoff: Path, output: Path, needs: dict) -> None:
-    if os.environ.get("FORGEJO_RUN_ATTEMPT") != "1":
-        fail("candidate sealing requires first-attempt evidence")
+    attempt()
     policy = read_json(POLICY_PATH)
     # Preserve the fail-before-identity gate for unqualified dependencies.
     _qualified_gates(needs, policy)
@@ -509,25 +524,63 @@ def select_run(runs: list[dict], sha: str) -> dict:
     return candidates[0]
 
 
-def validate_tasks(tasks: list[dict], run: dict) -> None:
-    # The run status and current task statuses must agree. The workflow's
-    # FORGEJO_RUN_ATTEMPT gate and per-artifact attempt records prevent reruns
-    # from replacing failed qualification with green evidence.
+def job_of(task_name: str) -> str:
+    """The workflow job id of a task: a matrix task is named "job (a, b)"."""
+    return task_name.split(" (", 1)[0]
+
+
+def validate_tasks(tasks: list[dict], run: dict, accepted: set[str] = frozenset()) -> None:
+    # The run status and current task statuses must agree. A job may have been
+    # rerun: its latest attempt must be green, and every rerun job must be
+    # named in `accepted` (the release tag's Accept-Reruns line), so a retry
+    # is a recorded decision, never a silent retry-to-green.
     selected = [task for task in tasks if task.get("run_number") == run["index_in_repo"]
                 and task.get("workflow_id") == WORKFLOW and task.get("head_sha") == run["commit_sha"]]
     if not selected:
         fail("candidate has no task-attempt evidence")
+    attempts: dict[str, list[dict]] = {}
     for task in selected:
         if task.get("event") != CANDIDATE_EVENT or task.get("head_branch") not in ("main", "refs/heads/main"):
             fail("candidate task has untrusted event/ref evidence")
-        if task.get("status") not in ("success", "skipped"):
-            fail(f'candidate includes a {task.get("status")} task attempt; no retry-to-green promotion')
+        attempts.setdefault(task.get("name", ""), []).append(task)
+    rerun_jobs = set()
+    for name, history in attempts.items():
+        history.sort(key=lambda task: task.get("id", 0))  # stable: API order breaks ties
+        latest = history[-1]
+        if latest.get("status") not in ("success", "skipped"):
+            fail(f'candidate includes a {latest.get("status")} task attempt ({name})')
+        if len(history) > 1:
+            rerun_jobs.add(job_of(name))
+            if job_of(name) not in accepted:
+                fail(f"candidate job {name} was rerun ({len(history)} attempts); name {job_of(name)} "
+                     "in the release tag's Accept-Reruns line to promote it")
+    unused = set(accepted) - rerun_jobs
+    if unused:
+        fail(f"Accept-Reruns names jobs that were not rerun: {', '.join(sorted(unused))}")
     # Aggregate matrix success alone does not establish complete per-target evidence.
     # The workflow gives each archive consumer a stable explicit task name.
     for name in sorted(FFI_ARCHIVE_CONSUMER_TASKS):
-        matches = [task for task in selected if task.get("name") == name]
-        if len(matches) != 1 or matches[0].get("status") != "success":
+        history = attempts.get(name, [])
+        if not history or history[-1].get("status") != "success":
             fail(f"candidate requires one successful archive consumer task: {name}")
+
+
+def accepted_reruns(tag: str) -> set[str]:
+    """Jobs the release tag accepts as rerun: an `Accept-Reruns: a, b` line in
+    the annotated tag's message (scripts/release.sh --accept-reruns)."""
+    # No readable annotated tag accepts nothing, the strict outcome.
+    result = subprocess.run(["git", "-C", str(ROOT), "cat-file", "-t", f"refs/tags/{tag}"],
+                            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if result.returncode != 0 or result.stdout.strip() != "tag":
+        return set()
+    accepted = set()
+    for line in git("cat-file", "tag", f"refs/tags/{tag}").splitlines():
+        if line.startswith("Accept-Reruns:"):
+            accepted |= {job.strip() for job in line.split(":", 1)[1].split(",") if job.strip()}
+    for job in accepted:
+        if not re.fullmatch(r"[\w-]+", job):
+            fail(f"invalid job in Accept-Reruns: {job!r}")
+    return accepted
 
 
 def safe_extract(archive: Path, output: Path) -> None:
@@ -558,6 +611,9 @@ def fetch(output: Path, api: Forgejo | None = None) -> dict:
             break
         page += 1
     run = select_run(runs, expected["sha"])
+    accepted = accepted_reruns(f'v{expected["version"]}')
+    if accepted:
+        print(f"release tag accepts reruns of: {', '.join(sorted(accepted))}")
     tasks = []
     page = 1
     while True:
@@ -567,7 +623,7 @@ def fetch(output: Path, api: Forgejo | None = None) -> dict:
         if len(batch) < 50:
             break
         page += 1
-    validate_tasks(tasks, run)
+    validate_tasks(tasks, run, accepted)
     expected.update(run_id=run["id"], run_number=run["index_in_repo"])
     key = f'{expected["sha"]}-{expected["run_id"]}'
     base = f"/api/packages/Aster/generic/{PACKAGE}/{key}"
@@ -591,7 +647,7 @@ def fetch(output: Path, api: Forgejo | None = None) -> dict:
     payload = output / "payload"
     payload.mkdir()
     safe_extract(output / "candidate.tar.gz", payload)
-    verify_payload(payload, manifest, expected, read_json(POLICY_PATH))
+    verify_payload(payload, manifest, expected, read_json(POLICY_PATH), accepted)
     # Re-read after download to detect cancellation/deletion/changed provenance.
     current = api.json(f'/api/v1/repos/{REPOSITORY}/actions/runs/{run["id"]}')
     validate_run(current, expected["sha"])
@@ -629,7 +685,8 @@ def materialize(candidate: Path) -> None:
     manifest = read_json(candidate / "candidate.json")
     expected = identity()
     expected.update(run_id=manifest["run_id"], run_number=manifest["run_number"])
-    verify_payload(candidate / "payload", manifest, expected, read_json(POLICY_PATH))
+    verify_payload(candidate / "payload", manifest, expected, read_json(POLICY_PATH),
+                   accepted_reruns(f'v{expected["version"]}'))
     number = manifest["run_number"]
     if (ROOT / "mobile").exists():
         shutil.rmtree(ROOT / "mobile")

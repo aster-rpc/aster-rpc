@@ -48,7 +48,7 @@ class NapiReuse(unittest.TestCase):
         self.verify()
 
     def test_source_toolchain_target_flags_and_generator_mismatch_rejected(self):
-        for key, wrong in (("sha", "e" * 40), ("version", "0.3.899"), ("run_id", 43), ("run_number", 28), ("attempt", 2)):
+        for key, wrong in (("sha", "e" * 40), ("version", "0.3.899"), ("run_id", 43), ("run_number", 28), ("attempt", 0)):
             before = deepcopy(self.evidence)
             self.evidence[key] = wrong
             with self.subTest(identity=key), self.assertRaises(ValueError):

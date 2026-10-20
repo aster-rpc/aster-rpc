@@ -165,8 +165,7 @@ def extract(archive: Path, target: Path) -> None:
 
 
 def retrieve(handoff: Path = Path("handoff")) -> None:
-    if os.environ.get("FORGEJO_RUN_ATTEMPT") != "1":
-        C.fail("candidate retrieval requires first-attempt evidence")
+    C.attempt()
     policy = C.read_json(C.POLICY_PATH)
     gates = C.expected_gates(policy)
     needs = json.loads(os.environ["CANDIDATE_NEEDS"])

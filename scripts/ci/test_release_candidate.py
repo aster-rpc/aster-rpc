@@ -105,7 +105,7 @@ class NativeReuseTests(unittest.TestCase):
     def test_old_commit_version_lock_run_or_producer_rejected_before_use(self):
         for key, wrong in (("sha", "c" * 40), ("version", "0.3.775"), ("run_id", 43), ("run_number", 28),
                            ("source_hashes", {"Cargo.lock": "bad"}), ("workflow", "old.yml"),
-                           ("artifact", "other-27"), ("job", "ffi-java"), ("attempt", 2), ("matrix", {"target": "arm64"})):
+                           ("artifact", "other-27"), ("job", "ffi-java"), ("attempt", 0), ("attempt", "1"), ("matrix", {"target": "arm64"})):
             before = deepcopy(self.evidence)
             self.evidence[key] = wrong
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -140,9 +140,12 @@ class NativeReuseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.verify()
 
-    def test_consumer_retry_and_untyped_recipe_rejected(self):
-        with patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": "2"}), self.assertRaises(ValueError):
-            C.verify_input(self.payload, self.evidence, "native-linux-27", "ffi-release-linux", self.recipe)
+    def test_consumer_rerun_is_allowed_and_untyped_recipe_rejected(self):
+        # A rerun consumer may reuse its producer's input; promotion decides
+        # whether the rerun is accepted (validate_tasks / Accept-Reruns).
+        for value in ("0", "x", ""):
+            with self.subTest(attempt=value), patch.dict(os.environ, {"FORGEJO_RUN_ATTEMPT": value}), self.assertRaises(ValueError):
+                C.verify_input(self.payload, self.evidence, "native-linux-27", "ffi-release-linux", self.recipe)
         for mutation in ({}, {**self.recipe, "extra": True}, {**self.recipe, "profile": "dev"},
                          {**self.recipe, "features": ["coordination-fixture"]}, {**self.recipe, "lock_sha256": "bad"}):
             with self.subTest(recipe=mutation), self.assertRaises(ValueError):
@@ -278,13 +281,49 @@ class CandidateTests(unittest.TestCase):
                 C.select_run(runs, SHA)
 
     def test_failed_task_attempt_cannot_be_replaced_by_green_retry(self):
-        task = {"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA,
+        task = {"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA, "name": "ffi-go",
                 "event": "workflow_dispatch", "head_branch": "main", "status": "success"}
         for status in ("failure", "cancelled", "running", "unknown"):
+            # The latest attempt failing is never promotable, accepted or not.
             with self.subTest(status=status), self.assertRaises(ValueError):
-                C.validate_tasks([task, {**task, "status": status}], run_fixture())
+                C.validate_tasks([{**task, "id": 1}, {**task, "id": 2, "status": status}], run_fixture(), {"ffi-go"})
+            # A green rerun of a failed attempt needs the tag to accept the job.
+            rerun = [{**task, "id": 1, "status": status}, {**task, "id": 2}]
+            with self.subTest(status=status, accepted=False), self.assertRaisesRegex(ValueError, "Accept-Reruns"):
+                C.validate_tasks(rerun, run_fixture())
+            C.validate_tasks(archive_consumer_tasks() + rerun, run_fixture(), {"ffi-go"})
         with self.assertRaises(ValueError):
             C.validate_tasks([], run_fixture())
+
+    def test_accepted_reruns_come_from_the_annotated_release_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.invalid",
+                   "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+            run = lambda *a: subprocess.run(["git", "-C", tmp, "-c", "commit.gpgsign=false", "-c", "tag.gpgsign=false", *a],
+                                            check=True, env=env, capture_output=True)
+            run("init", "-q")
+            run("commit", "-q", "--allow-empty", "-m", "c")
+            run("tag", "-a", "v1", "-m", "Aster 1", "-m", "Accept-Reruns: ffi-release-linux, npm-native-cross")
+            run("tag", "-a", "v2", "-m", "Aster 2")
+            run("tag", "v3")
+            run("tag", "-a", "v4", "-m", "Aster 4", "-m", "Accept-Reruns: bad job!")
+            with patch.object(C, "ROOT", repo):
+                self.assertEqual(C.accepted_reruns("v1"), {"ffi-release-linux", "npm-native-cross"})
+                self.assertEqual(C.accepted_reruns("v2"), set())
+                self.assertEqual(C.accepted_reruns("v3"), set())  # lightweight: accepts nothing
+                self.assertEqual(C.accepted_reruns("v9"), set())  # missing: accepts nothing
+                with self.assertRaises(ValueError):
+                    C.accepted_reruns("v4")
+
+    def test_accept_reruns_matrix_jobs_by_id_and_refuses_unused_names(self):
+        task = {"run_number": 27, "workflow_id": "linux.yml", "head_sha": SHA,
+                "name": "npm-native-cross (, linux-arm64-gnu, aarch64-unknown-linux-gnu)",
+                "event": "workflow_dispatch", "head_branch": "main"}
+        rerun = [{**task, "id": 1, "status": "failure"}, {**task, "id": 2, "status": "success"}]
+        C.validate_tasks(archive_consumer_tasks() + rerun, run_fixture(), {"npm-native-cross"})
+        with self.assertRaisesRegex(ValueError, "not rerun"):
+            C.validate_tasks(archive_consumer_tasks() + rerun, run_fixture(), {"npm-native-cross", "ffi-go"})
 
     def test_archive_consumer_matrix_requires_unique_success_for_every_target(self):
         tasks = archive_consumer_tasks()
@@ -299,7 +338,7 @@ class CandidateTests(unittest.TestCase):
                     C.validate_tasks(invalid, run_fixture())
             for invalid in (tasks[:index] + tasks[index + 1:], tasks + [tasks[index]],
                             tasks[:index] + [{**tasks[index], "head_sha": "c" * 40}] + tasks[index + 1:]):
-                with self.subTest(index=index, tasks=invalid), self.assertRaisesRegex(ValueError, "archive consumer"):
+                with self.subTest(index=index, tasks=invalid), self.assertRaisesRegex(ValueError, "archive consumer|Accept-Reruns"):
                     C.validate_tasks(invalid, run_fixture())
 
     def test_failed_run_rejected_before_artifact_download(self):
@@ -344,11 +383,22 @@ class CandidateTests(unittest.TestCase):
                     C.verify_payload(self.payload, changed, IDENTITY, POLICY)
 
     def test_platform_and_runtime_recipe_must_match(self):
-        for key, wrong in (("job", "windows"), ("matrix", {"target": "aarch64-unknown-linux-gnu"}), ("attempt", 2), ("tools", {})):
+        for key, wrong in (("job", "windows"), ("matrix", {"target": "aarch64-unknown-linux-gnu"}), ("attempt", 0), ("tools", {})):
             changed = deepcopy(self.manifest)
             changed["artifacts"]["native-linux-27"][key] = wrong
             with self.subTest(key=key), self.assertRaises(ValueError):
                 C.verify_payload(self.payload, changed, IDENTITY, POLICY)
+
+    def test_rerun_artifact_needs_the_tag_to_accept_its_job(self):
+        changed = deepcopy(self.manifest)
+        changed["artifacts"]["native-linux-27"]["attempt"] = 2
+        # Sealing records it; promotion refuses it unless the tag names the job.
+        C.verify_payload(self.payload, changed, IDENTITY, POLICY)
+        with self.assertRaisesRegex(ValueError, "Accept-Reruns"):
+            C.verify_payload(self.payload, changed, IDENTITY, POLICY, set())
+        with self.assertRaisesRegex(ValueError, "Accept-Reruns"):
+            C.verify_payload(self.payload, changed, IDENTITY, POLICY, {"macos"})
+        C.verify_payload(self.payload, changed, IDENTITY, POLICY, {"linux"})
 
     def test_failed_missing_or_skipped_gate_cannot_seal(self):
         for needs in ({"linux": {"result": "success"}}, {"linux": {"result": "success"}, "macos": {"result": "failure"}},
@@ -479,7 +529,7 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(jobs, set(policy["required_jobs"]) | set(policy["optional_assurance_jobs"]) | {"python-windows", "candidate"})
         for required in ("lint", "rust-tests", "test", "coordination-fault-macos", "coordination-fault-windows", "nightly-sanitize", "nightly-miri", "ffi-go", "ffi-dotnet", "ffi-java", "ffi-macos", "typescript", "typescript-macos", "python-extended", "python-macos"):
             self.assertIn(required, policy["required_jobs"] + policy["optional_assurance_jobs"])
-        self.assertEqual(workflow.count("name: Refuse retry-to-green candidate builds"), len(jobs))
+        self.assertEqual(workflow.count("name: Flag candidate job reruns"), len(jobs))
         self.assertNotIn('tags: ["v*"]', workflow)
         self.assertIn('ASTER_REQUIRE_FAULT_MATRIX: "1"', workflow)
         self.assertIn("forgejo.event_name != 'pull_request' || steps.iroh.outputs.changed == 'true'", workflow)
@@ -513,7 +563,7 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(job_if["candidate"], "always() && forgejo.event_name == 'workflow_dispatch' && forgejo.ref == 'refs/heads/main'")
         candidate_needs = set(re.findall(r"[\w-]+", re.search(r"^    needs: (.+)$", blocks["candidate"], re.M)[1]))
         self.assertEqual(candidate_needs, set(policy["required_jobs"]) | set(policy["optional_assurance_jobs"]))
-        # First-attempt rule binds the candidate dispatch, in every job.
+        # Every job flags a rerun of the candidate dispatch (accepted only by the tag).
         guard = 'if [[ "$FORGEJO_EVENT_NAME" == workflow_dispatch && "$FORGEJO_REF" == refs/heads/main ]]; then'
         self.assertEqual(workflow.count(guard), len(blocks))
         # The old push-based first-attempt guard is gone ...
