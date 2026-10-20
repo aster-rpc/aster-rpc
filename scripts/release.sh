@@ -19,6 +19,7 @@ WORKFLOW=linux.yml
 
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 allow_dirty=false
+created_tag=false
 push=true
 candidate_only=false
 for arg in "$@"; do
@@ -30,6 +31,46 @@ for arg in "$@"; do
     *) echo "usage: scripts/release.sh [--allow-dirty] [--no-push] [--candidate-only]" >&2; exit 2 ;;
   esac
 done
+
+# Backlog L1: stamp the binding CHANGELOGs after the tag is out, in a follow-up
+# commit on main. The tagged tree is untouched (the sealed candidate stays
+# valid). Best effort: returns non-zero with a warning, never fails the release.
+stamp_changelogs() {
+  local manual="git pull --ff-only origin main && python3 scripts/ci/stamp_changelogs.py $version, then commit the changed files as 'docs: stamp binding CHANGELOGs for $tag' and push main"
+  if [[ -n "$(git -C "$repo" status --porcelain --untracked-files=no)" ]]; then
+    echo "warning: worktree has tracked changes; not stamping CHANGELOGs. Run manually: $manual" >&2
+    return 1
+  fi
+  # main may have moved since the tagged commit; stamp its current tip.
+  git -C "$repo" pull -q --ff-only origin main || {
+    echo "warning: cannot fast-forward main; not stamping CHANGELOGs. Run manually: $manual" >&2
+    return 1
+  }
+  local changed
+  changed="$(python3 "$repo/scripts/ci/stamp_changelogs.py" "$version" --root "$repo")" || {
+    echo "warning: stamp_changelogs.py failed. Run manually: $manual" >&2
+    return 1
+  }
+  if [[ -z "$changed" ]]; then
+    echo "no CHANGELOG has an Unreleased section with entries; nothing to stamp"
+    return 0
+  fi
+  local -a paths=()
+  local line
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && paths+=("$line")
+  done <<<"$changed"
+  git -C "$repo" add -- "${paths[@]}" &&
+    git -C "$repo" commit -q -m "docs: stamp binding CHANGELOGs for $tag" -- "${paths[@]}" || {
+    echo "warning: could not commit the stamped CHANGELOGs (${paths[*]}); they are modified in the worktree. Commit and push them manually." >&2
+    return 1
+  }
+  git -C "$repo" push origin main || {
+    echo "warning: stamp commit is local only; push it manually: git push origin main" >&2
+    return 1
+  }
+  echo "stamped binding CHANGELOGs for $tag and pushed main"
+}
 
 version="$("$repo/scripts/release/version.sh")"
 tag="v$version"
@@ -114,12 +155,17 @@ for r in json.load(sys.stdin).get("workflow_runs", []):
   # Tag the commit that was qualified, not whatever HEAD is by now: the
   # candidate can run for over an hour while the checkout moves on.
   git -C "$repo" tag -a "$tag" -m "Aster $version" "$head"
+  created_tag=true
   echo "created $tag at $(git -C "$repo" rev-parse --short "$head")"
 fi
 
 if [[ "$push" == true ]]; then
   git -C "$repo" push origin "refs/tags/$tag"
   echo "pushed $tag; release.yml promotes the sealed candidate for this commit"
+  # Only when this run created and pushed the tag. Failure never fails the release.
+  if [[ "$created_tag" == true && "$candidate_only" != true ]]; then
+    stamp_changelogs || true
+  fi
 else
   echo "tag not pushed (--no-push)"
 fi
