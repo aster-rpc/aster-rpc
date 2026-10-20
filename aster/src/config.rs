@@ -4451,8 +4451,13 @@ discovery_dns_origin = "dns.example.internal"
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aster.toml");
         fs::write(&path, "[network]\nonline_timeout_ms = 1500\n").unwrap();
+        // An explicit, empty environment: other tests in this process set
+        // ASTER_* variables concurrently.
+        let no_env: [(&str, &str); 0] = [];
         assert_eq!(
-            AsterConfig::from_file(&path).unwrap().online_timeout_ms,
+            AsterConfig::from_file_with_env_vars(&path, no_env)
+                .unwrap()
+                .online_timeout_ms,
             1500
         );
 

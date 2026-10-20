@@ -467,7 +467,10 @@ async fn peer_events_follow_admission_and_report_revocation() {
             .connect()
             .await;
         if let Ok(stranger) = stranger {
-            let _ = call(&stranger.rpc(), "ping").await;
+            assert!(
+                call(&stranger.rpc(), "ping").await.is_err(),
+                "Gate 0 refuses an unenrolled peer"
+            );
             stranger.close().await;
         }
 
