@@ -99,6 +99,10 @@ pub struct AsterServerBuilder {
     enrollment_overrides: crate::enrollment::runtime::Overrides,
     // Late activation: application services arrive later as an `RpcSurface`.
     deferred_surface: bool,
+    // Contract manifest publication at start (default `BestEffort`).
+    manifest_publication: super::ManifestPublication,
+    // Probes of the session-scoped services, for contract publication.
+    session_probes: Vec<Arc<dyn ServiceDispatch>>,
     // Durable audit of `aster.ops.NodeConfig` changes.
     #[cfg(feature = "docs")]
     audit: Option<Arc<dyn super::node_config::AuditSink>>,
@@ -227,8 +231,10 @@ impl AsterServerBuilder {
         S: ServiceDispatch,
         F: Fn() -> S + Send + Sync + 'static,
     {
+        let factory = Arc::new(factory);
+        self.session_probes.push(Arc::new(factory()));
         self.session_appliers
-            .push(Box::new(move |s| s.register_session(factory)));
+            .push(Box::new(move |s| s.register_session(move || factory())));
         self
     }
 
@@ -419,6 +425,22 @@ impl AsterServerBuilder {
     /// start with no service at all.
     pub fn deferred_surface(mut self) -> Self {
         self.deferred_surface = true;
+        self
+    }
+
+    /// Whether [`start`](Self::start) publishes the contract manifests of the
+    /// services added with [`service`](Self::service) and
+    /// [`register_session`](Self::register_session) into a registry doc, as
+    /// every other binding does. The default is
+    /// [`BestEffort`](super::ManifestPublication::BestEffort): start never
+    /// fails because of publication, and a node that cannot publish (built
+    /// without `docs`/`blobs`, or a service with no contract) logs and
+    /// serves without manifests. [`Disabled`](super::ManifestPublication::Disabled)
+    /// publishes nothing. [`Strict`](super::ManifestPublication::Strict) fails
+    /// the start unless every service's manifest is published (a service with
+    /// no contract, or a node that cannot publish, counts as a failure).
+    pub fn manifest_publication(mut self, policy: super::ManifestPublication) -> Self {
+        self.manifest_publication = policy;
         self
     }
 
@@ -649,6 +671,12 @@ impl AsterServerBuilder {
         if let Some(max) = self.handler_timeout {
             server = server.handler_timeout(max);
         }
+        let to_publish: Vec<(Arc<dyn ServiceDispatch>, bool)> = self
+            .services
+            .iter()
+            .map(|svc| (svc.clone(), false))
+            .chain(self.session_probes.iter().map(|p| (p.clone(), true)))
+            .collect();
         for svc in self.services {
             server = server.register_arc(svc);
         }
@@ -937,6 +965,38 @@ impl AsterServerBuilder {
             }
         };
 
+        // Contract manifests, now that every service is callable. Only
+        // `Strict` fails the start: see `manifest_publication`.
+        let publication = if self.manifest_publication == super::ManifestPublication::Disabled
+            || to_publish.is_empty()
+        {
+            super::surface::StartPublication::default()
+        } else {
+            super::surface::publish_at_start(&node, &to_publish).await
+        };
+        if self.manifest_publication == super::ManifestPublication::Strict
+            && publication.published.len() < to_publish.len()
+        {
+            handle.abort();
+            node.shutdown().await;
+            return Err(Error::InvalidArgument(format!(
+                "ManifestPublication::Strict: published {} of {} services' manifests ({})",
+                publication.published.len(),
+                to_publish.len(),
+                if publication.failures.is_empty() {
+                    "a service has no contract, or the node cannot publish".to_string()
+                } else {
+                    publication.failures.join("; ")
+                }
+            )));
+        }
+        #[cfg(feature = "health")]
+        if let Some(health) = &health {
+            health
+                .state()
+                .set_registry(!publication.published.is_empty());
+        }
+
         // A deferred server is ready only once its surface is active.
         #[cfg(feature = "health")]
         if let Some(health) = &health {
@@ -968,6 +1028,7 @@ impl AsterServerBuilder {
             #[cfg(all(feature = "enrollment", feature = "docs"))]
             enrollment,
             surface: late_slot.map(super::surface::SurfaceControl::new),
+            publication,
             #[cfg(feature = "health")]
             host_services: service_count,
         })
@@ -1096,6 +1157,8 @@ pub struct AsterServer {
     enrollment: Option<ServerEnrollment>,
     /// The late-activation state machine (`deferred_surface()` only).
     surface: Option<super::surface::SurfaceControl>,
+    /// What `start` published (empty when disabled or impossible).
+    publication: super::surface::StartPublication,
     /// Services reported to `/readyz` without a surface.
     #[cfg(feature = "health")]
     host_services: u32,
@@ -1258,6 +1321,26 @@ impl AsterServer {
     /// RPC service — this is the in-process view.
     pub fn topology(&self) -> crate::topology::Topology {
         self.node.topology()
+    }
+
+    /// The contracts [`start`](AsterServerBuilder::start) published, as
+    /// `(service, version, contract id)`. Empty when publication was
+    /// [`Disabled`](super::ManifestPublication::Disabled), failed or was
+    /// impossible on this node (see [`manifest_failures`](Self::manifest_failures)).
+    pub fn published_manifests(&self) -> &[super::PublishedService] {
+        &self.publication.published
+    }
+
+    /// Why start-time publication did not publish everything.
+    pub fn manifest_failures(&self) -> &[String] {
+        &self.publication.failures
+    }
+
+    /// The registry doc start-time publication wrote into; share it
+    /// read-only to let consumers discover this server's services.
+    #[cfg(all(feature = "docs", feature = "blobs"))]
+    pub fn manifest_registry(&self) -> Option<&crate::docs::Doc> {
+        self.publication.registry.as_ref()
     }
 
     /// Activate `surface`: install its services, publish its contracts per

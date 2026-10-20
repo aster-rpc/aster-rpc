@@ -1443,6 +1443,33 @@ assert!(fetched.verified);
 # }
 ```
 
+#### Publication by default
+
+`AsterServer::builder()...start()` publishes the contract of every service
+added with `service` / `register_session` into a registry doc it creates, as
+the Python, TypeScript, Java and .NET servers do. Read the result from
+`srv.published_manifests()` and `srv.manifest_registry()` (share that doc
+read-only so consumers can discover the services).
+
+Publication never fails `start`. A node that cannot publish (built without
+`docs` and `blobs`, or a service with no contract such as a hand-written
+`ServiceDispatch`) logs at info level, serves normally and lists the reasons
+in `srv.manifest_failures()`. To publish nothing, opt out:
+
+```rust
+# use aster::rpc::{AsterServer, ManifestPublication};
+# async fn run() -> aster::Result<()> {
+let srv = AsterServer::builder()
+    .manifest_publication(ManifestPublication::Disabled)
+    .start()
+    .await?;
+# Ok(())
+# }
+```
+
+A server built with `deferred_surface()` chooses the policy per `RpcSurface`
+(`BestEffort` by default; `Strict` fails the activation instead).
+
 ### 4.10 Draining a server, and sizing a router
 
 `AsterServer::drain(grace)` takes a replica out of rotation for a rolling

@@ -820,3 +820,116 @@ async fn deferred_surface_lists_services_while_active() {
     srv.shutdown().await;
     client.shutdown().await;
 }
+
+/// O8: a one-step server with default settings publishes its contract
+/// manifest, and the contract verifies from the registry it names.
+#[tokio::test]
+async fn default_one_step_server_publishes_its_manifest() {
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .service(EchoServer::new(EchoImpl::default()))
+        .start()
+        .await
+        .unwrap();
+    assert!(
+        srv.manifest_failures().is_empty(),
+        "{:?}",
+        srv.manifest_failures()
+    );
+    let published = srv.published_manifests();
+    assert_eq!(published.len(), 1, "{published:?}");
+    assert_eq!(published[0].name, "SurfaceEcho");
+    assert_eq!(
+        published[0].contract_id,
+        aster::rpc::contract_id(&EchoServer::<EchoImpl>::contract())
+    );
+    let registry = srv.manifest_registry().expect("a registry doc");
+    assert!(advertised(registry).await);
+    let fetched = within(fetch_and_verify_contract(
+        registry,
+        &srv.node().blobs(),
+        &srv.id(),
+        "SurfaceEcho",
+        1,
+    ))
+    .await
+    .unwrap();
+    assert_eq!(fetched.contract_id, published[0].contract_id);
+    srv.shutdown().await;
+}
+
+/// O8: `Disabled` is the explicit opt-out.
+#[tokio::test]
+async fn one_step_server_can_opt_out_of_publication() {
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .service(EchoServer::new(EchoImpl::default()))
+        .manifest_publication(ManifestPublication::Disabled)
+        .start()
+        .await
+        .unwrap();
+    assert!(srv.published_manifests().is_empty());
+    assert!(srv.manifest_registry().is_none());
+    srv.shutdown().await;
+}
+
+/// O8: a server that cannot publish (a hand-written dispatcher has no
+/// contract) still starts and serves; the skip is reported, not fatal.
+#[tokio::test]
+async fn server_that_cannot_publish_still_starts() {
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .service(Bare)
+        .service(EchoServer::new(EchoImpl::default()))
+        .start()
+        .await
+        .expect("publication problems never fail start");
+    assert_eq!(srv.published_manifests().len(), 1);
+    assert_eq!(
+        srv.manifest_failures().len(),
+        1,
+        "{:?}",
+        srv.manifest_failures()
+    );
+    assert!(srv.manifest_failures()[0].contains("Bare"));
+    let (client, conn) = client_of(&srv).await;
+    assert_eq!(echo_code(&conn).await, Ok("echo: hi".to_string()));
+    client.shutdown().await;
+    srv.shutdown().await;
+
+    let only_bare = AsterServer::builder()
+        .config(cfg())
+        .service(Bare)
+        .start()
+        .await
+        .expect("a server of only unpublishable services starts");
+    assert!(only_bare.published_manifests().is_empty());
+    assert!(only_bare.manifest_registry().is_none());
+    only_bare.shutdown().await;
+}
+
+/// `Strict` on the one-step builder fails the start when any service's
+/// manifest is not published, rather than serving without it.
+#[tokio::test]
+async fn strict_one_step_server_fails_when_a_manifest_is_not_published() {
+    let err = AsterServer::builder()
+        .config(cfg())
+        .service(Bare)
+        .service(EchoServer::new(EchoImpl::default()))
+        .manifest_publication(ManifestPublication::Strict)
+        .start()
+        .await
+        .err()
+        .expect("Strict must not start without every manifest");
+    assert!(err.to_string().contains("published 1 of 2"), "{err}");
+
+    let srv = AsterServer::builder()
+        .config(cfg())
+        .service(EchoServer::new(EchoImpl::default()))
+        .manifest_publication(ManifestPublication::Strict)
+        .start()
+        .await
+        .expect("Strict starts when every manifest is published");
+    assert_eq!(srv.published_manifests().len(), 1);
+    srv.shutdown().await;
+}

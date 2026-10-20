@@ -42,13 +42,15 @@ use crate::error::{Error, Result};
 /// What an activation does about contract manifests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ManifestPublication {
-    /// Publish nothing (the default, and what the one-step
-    /// [`AsterServer`](super::AsterServer) does today).
-    #[default]
+    /// Publish nothing: services are served but not discoverable through a
+    /// registry doc. The explicit opt-out.
     Disabled,
-    /// Publish every service's contract; activation still succeeds when
-    /// publication fails, and the [`SurfaceActivation`] reports what was not
-    /// published.
+    /// Publish every service's contract (the default, as every other
+    /// binding does). Start-up or activation still succeeds when publication
+    /// fails or is impossible (no `docs`/`blobs` support, no writable
+    /// registry); the failure is logged and the [`SurfaceActivation`]
+    /// reports what was not published.
+    #[default]
     BestEffort,
     /// Publish every service's contract or fail the activation. On failure
     /// nothing stays advertised, nothing stays callable, and the server is
@@ -107,7 +109,7 @@ impl RpcSurfaceBuilder {
     }
 
     /// How this surface's contracts are published (default
-    /// [`Disabled`](ManifestPublication::Disabled)).
+    /// [`BestEffort`](ManifestPublication::BestEffort)).
     pub fn manifest_publication(mut self, policy: ManifestPublication) -> Self {
         self.publication = policy;
         self
@@ -548,6 +550,95 @@ type AdvertiseOutcome = Result<(Advertised, Vec<PublishedService>)>;
 struct Staged {
     author: crate::id::AuthorId,
     contracts: Vec<super::publish::StagedContract>,
+}
+
+/// What a one-step [`AsterServer`](super::AsterServer) published at start.
+#[derive(Clone, Default)]
+pub(crate) struct StartPublication {
+    pub published: Vec<PublishedService>,
+    pub failures: Vec<String>,
+    #[cfg(all(feature = "docs", feature = "blobs"))]
+    pub registry: Option<crate::docs::Doc>,
+}
+
+/// Best-effort publication for a server started in one step. Never fails:
+/// a node that cannot publish (feature missing, docs or blobs unavailable)
+/// logs and serves without manifests.
+#[cfg(all(feature = "docs", feature = "blobs"))]
+pub(crate) async fn publish_at_start(
+    node: &crate::node::Node,
+    services: &[(Arc<dyn ServiceDispatch>, bool)],
+) -> StartPublication {
+    let mut failures = Vec::new();
+    let staged = match stage_all(
+        node,
+        services,
+        ManifestPublication::BestEffort,
+        &mut failures,
+    )
+    .await
+    {
+        Ok(staged) => staged,
+        Err(err) => {
+            failures.push(format!("staging: {err}"));
+            return start_publication_skipped(failures);
+        }
+    };
+    if staged.contracts.is_empty() {
+        return start_publication_skipped(failures);
+    }
+    let registry = match node.docs().create().await {
+        Ok(doc) => doc,
+        Err(err) => {
+            failures.push(format!("registry: {err}"));
+            return start_publication_skipped(failures);
+        }
+    };
+    match advertise_all(registry, staged).await {
+        Ok((advertised, published)) => {
+            if !failures.is_empty() {
+                tracing::warn!(
+                    target: crate::log_targets::SERVER,
+                    failures = ?failures,
+                    "some contracts were not published"
+                );
+            }
+            StartPublication {
+                published,
+                failures,
+                registry: Some(advertised.registry),
+            }
+        }
+        Err(err) => {
+            failures.push(format!("registry: {err}"));
+            start_publication_skipped(failures)
+        }
+    }
+}
+
+#[cfg(not(all(feature = "docs", feature = "blobs")))]
+pub(crate) async fn publish_at_start(
+    _node: &crate::node::Node,
+    _services: &[(Arc<dyn ServiceDispatch>, bool)],
+) -> StartPublication {
+    tracing::info!(
+        target: crate::log_targets::SERVER,
+        "manifest publication skipped: built without the `docs` and `blobs` features"
+    );
+    StartPublication::default()
+}
+
+#[cfg(all(feature = "docs", feature = "blobs"))]
+fn start_publication_skipped(failures: Vec<String>) -> StartPublication {
+    tracing::info!(
+        target: crate::log_targets::SERVER,
+        failures = ?failures,
+        "manifest publication skipped; serving without published contracts"
+    );
+    StartPublication {
+        failures,
+        ..StartPublication::default()
+    }
 }
 
 /// Collect and upload every service's contract. Under Strict any failure is
