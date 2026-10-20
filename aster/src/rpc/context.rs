@@ -204,6 +204,19 @@ impl CallContext {
         self.inner.forwarded.as_deref()
     }
 
+    /// Every claim of the verified on-behalf-of token, read-only (a provider
+    /// token's custom claims such as `tenant` included), for a forwarded
+    /// call; `None` for a call without one. Only a token that passed
+    /// verification (issuer, signature, audience, lifetime) yields claims:
+    /// never read identity from unverified metadata. Shared across the call,
+    /// not copied.
+    pub fn token_claims(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        self.inner
+            .forwarded
+            .as_deref()
+            .map(ForwardedIdentity::claims)
+    }
+
     /// How the transport learned [`peer`](Self::peer).
     pub fn provenance(&self) -> PeerProvenance {
         self.inner.provenance

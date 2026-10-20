@@ -87,6 +87,7 @@ final class GatewayIdentityE2ETest {
     public String issuer = "";
     public long tier;
     public String name = "";
+    public String claimsSub = "none";
 
     public Who() {}
   }
@@ -181,6 +182,7 @@ final class GatewayIdentityE2ETest {
     NodeAttribute tier = ctx.nodeAttribute("tier");
     w.tier = tier == null ? 0 : tier.asInt().orElse(0L);
     w.name = ctx.nodeProperties().name();
+    w.claimsSub = ctx.tokenClaims() == null ? "none" : String.valueOf(ctx.tokenClaims().get("sub"));
     return w;
   }
 
@@ -329,6 +331,7 @@ final class GatewayIdentityE2ETest {
 
     Who me = call(edge, addr, "whoami");
     assertEquals(edgeId, me.principal);
+    assertEquals("none", me.claimsSub); // no verified forwarded token, no claims
     assertEquals("", me.actor);
     assertEquals("", me.amr);
     wantCode(
@@ -349,6 +352,7 @@ final class GatewayIdentityE2ETest {
     assertEquals(GatewayIdentity.AMR_WEBAUTHN, alice.amr);
     assertEquals("notes.read", alice.roles);
     assertEquals(edgeId, alice.issuer);
+    assertEquals("alice", alice.claimsSub); // the verified token's claims
 
     String pwd =
         edge.mintUserToken(

@@ -14,7 +14,7 @@
 
 #define ASTER_ABI_VERSION_MAJOR 7
 
-#define ASTER_ABI_VERSION_MINOR 8
+#define ASTER_ABI_VERSION_MINOR 9
 
 #define ASTER_ABI_VERSION_PATCH 0
 
@@ -7984,7 +7984,9 @@ int32_t aster_dispatch_identity(aster_runtime_t runtime,
  * an edge-minted token), `sub`, `jti` (empty when the token has none),
  * `exp` (Unix seconds, decimal), then one `amr` entry per sign-in method
  * (Rust `CallContext::auth_methods`, e.g. `webauthn`; none for a provider
- * token without `amr`). The user's roles are the call's attributes
+ * token without `amr`), then, ABI 7.9, one `claims` entry last: the verified
+ * token's whole claim set as a JSON object (Rust
+ * `CallContext::token_claims`). A reader ignores keys it does not know. The user's roles are the call's attributes
  * (`aster_dispatch_attributes`); the principal is `iss|sub` and the actor the
  * transport peer (`aster_dispatch_identity`). A call that was not forwarded
  * yields an empty list (`*out_buffer` 0). `NOT_FOUND` once the call is over.

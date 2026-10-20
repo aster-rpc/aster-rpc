@@ -123,6 +123,10 @@ pub struct JsForwardedIdentity {
     pub jti: String,
     /// The token's expiry, Unix seconds.
     pub expires_at: f64,
+    /// Every claim of the verified token, as signed, as one JSON object
+    /// string (Rust `ForwardedIdentity::claims`). `CallContext.tokenClaims`
+    /// is the parsed, read-only view.
+    pub claims_json: String,
 }
 
 impl From<&aster::rpc::identity::ForwardedIdentity> for JsForwardedIdentity {
@@ -136,6 +140,7 @@ impl From<&aster::rpc::identity::ForwardedIdentity> for JsForwardedIdentity {
             auth_methods: f.auth_methods().to_vec(),
             jti: f.jti().to_string(),
             expires_at: f.expires_at() as f64,
+            claims_json: serde_json::to_string(f.claims()).unwrap_or_else(|_| "{}".into()),
         }
     }
 }

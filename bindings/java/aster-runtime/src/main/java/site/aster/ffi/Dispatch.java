@@ -723,6 +723,7 @@ public final class Dispatch implements AutoCloseable {
       String jti = "";
       java.time.Instant exp = null;
       java.util.List<String> amr = new java.util.ArrayList<>();
+      java.util.Map<String, Object> claims = java.util.Map.of();
       for (int i = 0; i < count; i++) {
         byte[] k = new byte[b.getInt()];
         b.get(k);
@@ -741,12 +742,24 @@ public final class Dispatch implements AutoCloseable {
             }
           }
           case "amr" -> amr.add(value);
+          case "claims" -> {
+            try {
+              claims =
+                  new com.fasterxml.jackson.databind.ObjectMapper()
+                      .readValue(
+                          value,
+                          new com.fasterxml.jackson.core.type.TypeReference<
+                              java.util.Map<String, Object>>() {});
+            } catch (java.io.IOException ignored) {
+              // left empty
+            }
+          }
           default -> {
             // a later minor may add keys
           }
         }
       }
-      return new site.aster.identity.ForwardedIdentity(iss, sub, jti, exp, amr);
+      return new site.aster.identity.ForwardedIdentity(iss, sub, jti, exp, amr, claims);
     } catch (Throwable t) {
       throw rethrow(t);
     }

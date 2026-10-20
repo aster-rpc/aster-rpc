@@ -148,6 +148,27 @@ class ServerCallContext(CallContext):
         self.__dict__["_amr"] = tuple(value)
 
     @property  # type: ignore[override]
+    def token_claims(self) -> Any:
+        """Every claim of the verified forwarded token, as signed (a provider
+        token's custom claims such as ``tenant`` included), as a read-only
+        mapping; ``None`` for a call without a verified forwarded token (Rust
+        ``CallContext::token_claims``). Never take identity from unverified
+        metadata."""
+        def make() -> Any:
+            obo = self.on_behalf_of
+            if obo is None:
+                return None
+            import json
+            from types import MappingProxyType
+
+            return MappingProxyType(json.loads(obo.claims_json))
+        return self._lazy("_token_claims", make)
+
+    @token_claims.setter
+    def token_claims(self, value: Any) -> None:
+        self.__dict__["_token_claims"] = value
+
+    @property  # type: ignore[override]
     def node_properties(self) -> Any:
         """This node's ``aster.ops.NodeConfig`` properties
         (``aster.identity.NodeProperties``); empty when never set or off."""

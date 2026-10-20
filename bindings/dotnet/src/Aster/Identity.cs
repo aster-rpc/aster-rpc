@@ -164,6 +164,14 @@ public sealed record ForwardedIdentity
     public DateTimeOffset ExpiresAt { get; init; }
     /// <summary>The token's <c>amr</c> (how the user signed in).</summary>
     public IReadOnlyList<string> AuthMethods { get; init; } = Array.Empty<string>();
+    /// <summary>
+    /// Every claim of the verified token, as signed (C ABI 7.9; Rust <c>ForwardedIdentity::claims</c>), read-only.
+    /// Empty when the native library predates 7.9.
+    /// </summary>
+    public IReadOnlyDictionary<string, JsonElement> Claims { get; init; } = EmptyClaims;
+
+    private static readonly IReadOnlyDictionary<string, JsonElement> EmptyClaims =
+        new System.Collections.ObjectModel.ReadOnlyDictionary<string, JsonElement>(new Dictionary<string, JsonElement>());
 
     /// <summary>Parses the <c>aster_dispatch_on_behalf_of</c> k/v list; null when empty.</summary>
     internal static ForwardedIdentity? FromKv(IReadOnlyList<KeyValuePair<string, string>> kv)
@@ -172,6 +180,7 @@ public sealed record ForwardedIdentity
         string iss = "", sub = "", jti = "";
         DateTimeOffset exp = default;
         var amr = new List<string>();
+        IReadOnlyDictionary<string, JsonElement> claims = EmptyClaims;
         foreach (var (k, v) in kv)
         {
             switch (k)
@@ -184,9 +193,13 @@ public sealed record ForwardedIdentity
                         exp = DateTimeOffset.FromUnixTimeSeconds(s);
                     break;
                 case "amr": amr.Add(v); break;
+                case "claims":
+                    var parsed = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(v);
+                    if (parsed is not null) claims = new System.Collections.ObjectModel.ReadOnlyDictionary<string, JsonElement>(parsed);
+                    break;
             }
         }
-        return new ForwardedIdentity { Issuer = iss, Subject = sub, Jti = jti, ExpiresAt = exp, AuthMethods = amr };
+        return new ForwardedIdentity { Issuer = iss, Subject = sub, Jti = jti, ExpiresAt = exp, AuthMethods = amr, Claims = claims };
     }
 }
 

@@ -2025,7 +2025,9 @@ pub unsafe extern "C" fn aster_dispatch_identity(
 /// an edge-minted token), `sub`, `jti` (empty when the token has none),
 /// `exp` (Unix seconds, decimal), then one `amr` entry per sign-in method
 /// (Rust `CallContext::auth_methods`, e.g. `webauthn`; none for a provider
-/// token without `amr`). The user's roles are the call's attributes
+/// token without `amr`), then, ABI 7.9, one `claims` entry last: the verified
+/// token's whole claim set as a JSON object (Rust
+/// `CallContext::token_claims`). A reader ignores keys it does not know. The user's roles are the call's attributes
 /// (`aster_dispatch_attributes`); the principal is `iss|sub` and the actor the
 /// transport peer (`aster_dispatch_identity`). A call that was not forwarded
 /// yields an empty list (`*out_buffer` 0). `NOT_FOUND` once the call is over.
@@ -2047,6 +2049,8 @@ pub unsafe extern "C" fn aster_dispatch_on_behalf_of(
                 return Vec::new();
             };
             let exp = f.expires_at().to_string();
+            // The verified token's whole claim set, one JSON object.
+            let claims = serde_json::to_string(f.claims()).unwrap_or_else(|_| "{}".into());
             let fixed = [
                 ("iss", f.issuer()),
                 ("sub", f.subject()),
@@ -2056,7 +2060,8 @@ pub unsafe extern "C" fn aster_dispatch_on_behalf_of(
             encode_kv(
                 fixed
                     .into_iter()
-                    .chain(f.auth_methods().iter().map(|m| ("amr", m.as_str()))),
+                    .chain(f.auth_methods().iter().map(|m| ("amr", m.as_str())))
+                    .chain(std::iter::once(("claims", claims.as_str()))),
             )
         })
     }

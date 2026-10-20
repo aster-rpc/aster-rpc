@@ -80,6 +80,13 @@ impl ForwardedIdentity {
     fn expires_at(&self) -> u64 {
         self.0.expires_at()
     }
+    /// Every claim of the verified token, as one JSON object string (Rust
+    /// `ForwardedIdentity::claims`). `CallContext.token_claims` is the
+    /// read-only mapping over it.
+    #[getter]
+    fn claims_json(&self) -> String {
+        serde_json::to_string(self.0.claims()).unwrap_or_else(|_| "{}".into())
+    }
 
     fn __repr__(&self) -> String {
         format!(

@@ -32,6 +32,7 @@ public sealed class WhoReply
     [WireName("issuer")] public string Issuer { get; set; } = "";
     [WireName("tier")] public long Tier { get; set; }
     [WireName("name")] public string Name { get; set; } = "";
+    [WireName("claims_sub")] public string ClaimsSub { get; set; } = "none";
 }
 
 /// <summary>
@@ -102,6 +103,7 @@ public class GatewayIdentityTests
             Issuer = ctx.OnBehalfOf?.Issuer ?? "",
             Tier = ctx.NodeAttribute("tier")?.AsInt() ?? 0,
             Name = ctx.NodeProperties.Name,
+            ClaimsSub = ctx.TokenClaims is { } c ? c["sub"].GetString() ?? "" : "none",
         };
     }
 
@@ -265,6 +267,7 @@ public class GatewayIdentityTests
 
         var me = await Call(rc, "whoami");
         Assert.Equal((edgeId, "", ""), (me.Principal, me.Actor, me.Amr));
+        Assert.Equal("none", me.ClaimsSub); // no verified forwarded token, no claims
         await WantCode(StatusCode.PermissionDenied, () => Call(rc, "read")); // the edge itself lacks notes.read
 
         string token = edge.MintUserToken("alice", ["notes.read"], [GatewayIdentity.AmrWebAuthn], TimeSpan.FromMinutes(1));
@@ -275,6 +278,7 @@ public class GatewayIdentityTests
         Assert.Equal(GatewayIdentity.AmrWebAuthn, alice.Amr);
         Assert.Equal("notes.read", alice.Roles);
         Assert.Equal(edgeId, alice.Issuer);
+        Assert.Equal("alice", alice.ClaimsSub); // the verified token's claims
 
         string pwd = edge.Enrollment!.MintUserToken("bob", ["notes.read"], [GatewayIdentity.AmrPassword], TimeSpan.FromMinutes(1));
         await WantCode(StatusCode.PermissionDenied, () => Call(rc, "publish", pwd)); // publish needs a passkey

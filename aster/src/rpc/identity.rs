@@ -135,9 +135,17 @@ pub struct ForwardedIdentity {
     auth_methods: Vec<String>,
     jti: String,
     expires_at: u64,
+    claims: Arc<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl ForwardedIdentity {
+    /// Every claim of the verified token, as signed (a provider token's
+    /// custom claims such as `tenant` included). Shared, not copied per
+    /// call; read-only.
+    pub fn claims(&self) -> &serde_json::Map<String, serde_json::Value> {
+        &self.claims
+    }
+
     /// `iss|sub`: the user's stable identity.
     pub fn principal(&self) -> &str {
         &self.principal
@@ -681,6 +689,7 @@ fn verify_provider(
         auth_methods: verified.amr,
         jti: verified.jti.unwrap_or_default(),
         expires_at: verified.expires_at,
+        claims: verified.claims,
     };
     tracing::debug!(
         target: IDENTITY,
@@ -746,6 +755,7 @@ fn verify_edge(
         auth_methods: verified.amr,
         jti: verified.jti,
         expires_at: verified.expires_at,
+        claims: verified.claims,
     };
     tracing::debug!(
         target: IDENTITY,

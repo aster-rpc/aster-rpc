@@ -23,12 +23,12 @@ It refuses anything else three ways:
   `CGO_CFLAGS` is not major 7;
 - at run time, `CheckABI` (called by `NewRuntime` and before any config is
   filled) returns an error wrapping `ErrABIMismatch` when the loaded library's major is not
-  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (7; 7.1 added the audit
+  `ABIVersionMajor` (7) or its minor is below `ABIMinorRequired` (9; 7.1 added the audit
   outbox acknowledgement log, 7.2 `aster_server_drain`, 7.3 the cluster
   network settings `aster_config_set_network`, 7.4 the transfer metrics and
   `aster_config_set_metrics`, 7.5 the handler call identity
   `aster_dispatch_identity`, 7.6 the on-behalf-of actor, 7.7 gateway identity
-  on the config path);
+  on the config path, 7.8 peer events, 7.9 token claims);
 - the library itself refuses `aster_runtime_new` from another major and, since
   6.0, will not fill an `aster_config_t` until `aster_abi_accept` has
   succeeded for its major, so a 5.x-built caller cannot have its 280-byte

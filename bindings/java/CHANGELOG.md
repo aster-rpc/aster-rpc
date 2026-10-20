@@ -5,6 +5,10 @@ and the annotation / codegen modules) are recorded here.
 
 ## Unreleased
 
+### Added: `CallContext.tokenClaims()` (C ABI 7.9)
+
+Every claim of the verified forwarded token, as signed (a provider token's custom claims such as `tenant` included), as an unmodifiable map (`ForwardedIdentity.claims()`); `null` for a call without a verified forwarded token. Against an older native library the map is empty.
+
 ### Added: server peer events (C ABI 7.8 required)
 
 `IrohLibrary.REQUIRED_ABI_MINOR` is now 8; a 7.0 - 7.7 library is refused.

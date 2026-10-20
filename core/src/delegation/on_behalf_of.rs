@@ -171,6 +171,9 @@ pub struct VerifiedEdgeToken {
     pub not_before: Option<u64>,
     pub expires_at: u64,
     pub jti: String,
+    /// Every claim of the token (`iss`, `sub`, `roles`, `amr`, `iat`, `nbf`
+    /// when set, `exp`, `jti`), as signed.
+    pub claims: std::sync::Arc<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// Whether `role` is one of the framework's (`aster.` prefix, ASCII case
@@ -286,7 +289,12 @@ pub fn verify_edge_token(
     {
         return Err(EdgeTokenError::RoleNotIssuable);
     }
+    let claims = match serde_json::to_value(&payload) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => return Err(EdgeTokenError::Malformed),
+    };
     Ok(VerifiedEdgeToken {
+        claims: std::sync::Arc::new(claims),
         issuer,
         subject: payload.sub,
         roles: payload.roles.into_iter().collect(),

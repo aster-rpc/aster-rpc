@@ -250,8 +250,12 @@ pub mod upcall;
 //   together), `aster_peer_events_poll` (connected / disconnected / lagged as
 //   JSON) and `aster_peer_events_release`. Events are per peer and only after
 //   admission. See `ffi/RENAME_MAP.md` "7.8".
+// - 7.9.0 (additive): token claims. `aster_dispatch_on_behalf_of` appends a
+//   last `claims` entry: the verified forwarded token's whole claim set as a
+//   JSON object (Rust `CallContext::token_claims`). No new symbol or layout.
+//   See `ffi/RENAME_MAP.md` "7.9".
 pub const ASTER_ABI_VERSION_MAJOR: u32 = 7;
-pub const ASTER_ABI_VERSION_MINOR: u32 = 8;
+pub const ASTER_ABI_VERSION_MINOR: u32 = 9;
 pub const ASTER_ABI_VERSION_PATCH: u32 = 0;
 /// Packed ABI version: `(major << 16) | (minor << 8) | patch`.
 /// This is the value `aster_abi_version()` returns.

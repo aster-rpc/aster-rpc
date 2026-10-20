@@ -1,4 +1,15 @@
-# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.8)
+# C ABI rename map (ABI 2.x -> 3.0) and 3.x / 4.x / 5.x / 6.x / 7.x changelog (current: 7.9)
+
+## New in 7.9 (token claims; additive)
+
+`aster_dispatch_on_behalf_of` appends one last k/v entry, `claims`: the
+verified forwarded token's whole claim set as a JSON object (Rust
+`CallContext::token_claims`; a provider token's custom claims such as
+`tenant` included, as signed; an edge-minted token's `iss`, `sub`, `roles`,
+`amr`, `iat`, `nbf`, `exp`, `jti`). It exists only for a call whose token
+passed verification, and is absent for any other call (the list is empty).
+Readers already skip keys they do not know. No new symbol, no layout change.
+Go requires 7.9 (`ABIMinorRequired = 9`).
 
 ## New in 7.8 (peer events; additive)
 

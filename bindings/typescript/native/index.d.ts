@@ -3112,6 +3112,12 @@ export interface ForwardedIdentity {
   jti: string
   /** The token's expiry, Unix seconds. */
   expiresAt: number
+  /**
+   * Every claim of the verified token, as signed, as one JSON object
+   * string (Rust `ForwardedIdentity::claims`). `CallContext.tokenClaims`
+   * is the parsed, read-only view.
+   */
+  claimsJson: string
 }
 
 /** The Gate-0 decision for a `(peer, alpn)` pair. */

@@ -525,6 +525,9 @@ pub struct VerifiedProviderToken {
     pub issued_at: u64,
     pub not_before: Option<u64>,
     pub expires_at: u64,
+    /// Every claim of the token, as signed. Present only on a token that
+    /// passed every check above, so it is verified data.
+    pub claims: std::sync::Arc<Map<String, Value>>,
 }
 
 fn integer(claims: &Map<String, Value>, name: &str) -> Result<Option<u64>, ProviderTokenError> {
@@ -666,9 +669,12 @@ pub fn verify_provider_token(
         EdgeTokenError::NotYetValid => E::NotYetValid,
         _ => E::Lifetime,
     })?;
+    let issuer = iss.to_string();
+    let subject = subject.to_string();
     Ok(VerifiedProviderToken {
-        issuer: iss.to_string(),
-        subject: subject.to_string(),
+        issuer,
+        subject,
+        claims: std::sync::Arc::new(unverified.claims),
         roles,
         amr,
         jti,
@@ -888,6 +894,41 @@ mod tests {
             assert_eq!(verified.jti.as_deref(), Some("j-1"));
             assert_eq!(verified.alg.as_str(), key.alg());
         }
+    }
+
+    #[test]
+    fn a_verified_token_carries_every_claim_and_a_refused_one_none() {
+        let key = TestKey::ec();
+        let fixture = Fixture::new(&[(&key, "k1")]);
+        let signed = with(|c| c["tenant"] = "acme-synthetic".into());
+        let verified = fixture
+            .verify(&key.sign(&header("ES256", "k1"), &signed))
+            .unwrap();
+        // Everything as signed, including the raw (unmapped) group values.
+        assert_eq!(Value::Object((*verified.claims).clone()), signed);
+        // A forged signature, a wrong audience and an expired token are
+        // errors: the result type holds no claims on any refusal.
+        let forged = key.sign(&header("ES256", "k1"), &signed);
+        let mut parts: Vec<&str> = forged.split('.').collect();
+        let other = TestKey::ec().sign(&header("ES256", "k1"), &signed);
+        parts[2] = other.rsplit('.').next().unwrap();
+        assert_eq!(
+            fixture.verify(&parts.join(".")).unwrap_err(),
+            ProviderTokenError::Signature
+        );
+        let wrong_aud = with(|c| c["aud"] = "nobody".into());
+        assert_eq!(
+            fixture
+                .verify(&key.sign(&header("ES256", "k1"), &wrong_aud))
+                .unwrap_err(),
+            ProviderTokenError::Audience
+        );
+        assert_eq!(
+            fixture
+                .verify_at(&key.sign(&header("ES256", "k1"), &signed), NOW + 10_000)
+                .unwrap_err(),
+            ProviderTokenError::Expired
+        );
     }
 
     #[test]

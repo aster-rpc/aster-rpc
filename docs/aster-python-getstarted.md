@@ -306,7 +306,11 @@ Bearer` header for forwarding a provider's token unchanged. In the handler,
 `ctx.principal` is `iss|sub`, `ctx.actor` the edge (also `ctx.peer`),
 `ctx.auth_methods` the token's `amr`, `ctx.attributes["aster.role"]` the
 token's roles, and `ctx.on_behalf_of` the whole verified identity
-(`ForwardedIdentity`: `issuer`, `subject`, `jti`, `expires_at`). For methods
+(`ForwardedIdentity`: `issuer`, `subject`, `jti`, `expires_at`).
+`ctx.token_claims` is every claim of that verified token, as signed (a
+provider token's custom claims such as `tenant` included), as a read-only
+mapping, or `None` for a call without a verified forwarded token. Never take
+identity from unverified headers or metadata. For methods
 that need a stronger sign-in, call `ctx.require_auth_method(AMR_WEBAUTHN)`
 (raises `PermissionDeniedError`).
 

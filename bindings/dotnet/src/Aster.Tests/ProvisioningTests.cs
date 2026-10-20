@@ -86,6 +86,6 @@ public class ProvisioningTests
         Assert.Equal(32, Marshal.SizeOf<ProvisioningResultNative>());
         Assert.Equal(0, Marshal.OffsetOf<ProvisioningResultNative>("data").ToInt32());
         Assert.Equal(16, Marshal.OffsetOf<ProvisioningResultNative>("error").ToInt32());
-        Assert.Equal(8u, Native.RequiredAbiMinor);
+        Assert.Equal(9u, Native.RequiredAbiMinor);
     }
 }

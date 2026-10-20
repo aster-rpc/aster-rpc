@@ -176,6 +176,16 @@ public final class CallContext {
   }
 
   /**
+   * Every claim of the verified forwarded token, as signed (a provider token's custom claims such
+   * as {@code tenant} included), as an unmodifiable map; {@code null} for a call without a verified
+   * forwarded token (Rust {@code CallContext::token_claims}). Never take identity from unverified
+   * metadata.
+   */
+  public java.util.Map<String, Object> tokenClaims() {
+    return onBehalfOf == null ? null : onBehalfOf.claims();
+  }
+
+  /**
    * How the user signed in (the token's {@code amr}, e.g. {@link
    * site.aster.identity.GatewayIdentity#AMR_WEBAUTHN}); empty for a call the peer made as itself
    * (Rust {@code CallContext::auth_methods}).

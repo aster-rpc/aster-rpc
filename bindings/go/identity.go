@@ -263,6 +263,9 @@ type ForwardedIdentity struct {
 	ExpiresAt time.Time
 	// AuthMethods are the token's amr (how the user signed in).
 	AuthMethods []string
+	// Claims is every claim of the verified token, as signed (ABI 7.9; Rust
+	// CallContext::token_claims). Read-only: do not modify it.
+	Claims map[string]any
 }
 
 // RequireAuthMethod returns PERMISSION_DENIED unless the call was made on
@@ -427,6 +430,11 @@ func (d *dispatchServer) onBehalfOf(callID uint64) *ForwardedIdentity {
 			}
 		case "amr":
 			f.AuthMethods = append(f.AuthMethods, e.Value)
+		case "claims":
+			var claims map[string]any
+			if json.Unmarshal([]byte(e.Value), &claims) == nil {
+				f.Claims = claims
+			}
 		}
 	}
 	return f

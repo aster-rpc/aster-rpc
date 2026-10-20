@@ -84,6 +84,7 @@ class WhoReply:
     issuer: str = ""
     tier: int = 0
     name: str = ""
+    claims_sub: str = "none"
 
 
 def who(ctx: CallContext) -> WhoReply:
@@ -97,6 +98,9 @@ def who(ctx: CallContext) -> WhoReply:
         issuer=obo.issuer if obo is not None else "",
         tier=ctx.node_attribute("tier") or 0,
         name=ctx.node_properties.name,
+        claims_sub=(
+            "none" if ctx.token_claims is None else str(ctx.token_claims.get("sub"))
+        ),
     )
 
 
@@ -343,6 +347,7 @@ async def test_edge_minted_token_and_node_config(root, tmp_path, stack):
 
     me = await call(notes, "whoami")
     assert (me.principal, me.actor, me.amr) == (edge_id, "", "")
+    assert me.claims_sub == "none"  # no verified forwarded token, no claims
     with pytest.raises(PermissionDeniedError):
         await call(notes, "read")  # the edge itself lacks notes.read
 
@@ -354,6 +359,7 @@ async def test_edge_minted_token_and_node_config(root, tmp_path, stack):
     assert alice.amr == AMR_WEBAUTHN
     assert alice.roles == "notes.read"
     assert alice.issuer == edge_id
+    assert alice.claims_sub == "alice"  # the verified token's claims
 
     pwd = edge.mint_user_token("bob", ["notes.read"], [AMR_PASSWORD], ttl=60)
     with pytest.raises(PermissionDeniedError, match="webauthn"):

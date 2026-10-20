@@ -625,7 +625,7 @@ func (s *AsterServer) serve(in inbound) {
 		// The gateway is the transport peer; the user is the principal.
 		info.Actor = in.peer
 		if f := s.ds.onBehalfOf(in.callID); f != nil {
-			info.OnBehalfOf, info.AuthMethods = f, f.AuthMethods
+			info.OnBehalfOf, info.AuthMethods, info.TokenClaims = f, f.AuthMethods, f.Claims
 		}
 	}
 	if in.flags&dispatchFlagHasMetadata != 0 {

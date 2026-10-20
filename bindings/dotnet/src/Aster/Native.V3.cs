@@ -9,7 +9,7 @@ namespace Aster;
 internal static unsafe partial class Native
 {
     /// <summary>Minimum ABI minor (of <see cref="AbiVersionMajor"/>) for everything this binding declares.</summary>
-    public const uint RequiredAbiMinor = 8; // 7.8: server peer events (aster_server_peer_events); 7.7: gateway identity on the config path (7.6: on-behalf-of option, actor); 7.5: dispatch identity; 7.1-7.4 audit acknowledgements, drain, network / metrics settings, transfer metrics. 7.0 swapped aster_hook_failure_mode_t (0 = FAIL_CLOSED).
+    public const uint RequiredAbiMinor = 9; // 7.9: forwarded token claims (aster_dispatch_on_behalf_of); 7.8: server peer events (aster_server_peer_events); 7.7: gateway identity on the config path (7.6: on-behalf-of option, actor); 7.5: dispatch identity; 7.1-7.4 audit acknowledgements, drain, network / metrics settings, transfer metrics. 7.0 swapped aster_hook_failure_mode_t (0 = FAIL_CLOSED).
 
     // ─── 3.1: AEv1 envelope + zstd ──────────────────────────────────────────
 

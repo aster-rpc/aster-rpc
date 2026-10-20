@@ -154,6 +154,13 @@ public sealed class ServerCallContext
     /// <summary>The verified forwarded identity (issuer, subject, token id, expiry, sign-in methods); null for a call the peer made as itself.</summary>
     public ForwardedIdentity? OnBehalfOf { get; }
 
+    /// <summary>
+    /// Every claim of the verified forwarded token, as signed (a provider token's custom claims such as
+    /// <c>tenant</c> included), read-only; null for a call without a verified forwarded token (Rust
+    /// <c>CallContext::token_claims</c>). Never take identity from unverified metadata.
+    /// </summary>
+    public IReadOnlyDictionary<string, System.Text.Json.JsonElement>? TokenClaims => OnBehalfOf?.Claims;
+
     /// <summary>How the forwarded user signed in (the token's <c>amr</c>, e.g. <see cref="GatewayIdentity.AmrWebAuthn"/>); empty otherwise (Rust <c>CallContext::auth_methods</c>).</summary>
     public IReadOnlyList<string> AuthMethods => OnBehalfOf?.AuthMethods ?? Array.Empty<string>();
 

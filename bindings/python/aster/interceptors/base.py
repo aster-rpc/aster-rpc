@@ -77,6 +77,9 @@ class CallContext:
     actor: str | None = None
     auth_methods: tuple[str, ...] = ()
     on_behalf_of: Any = None  # aster.identity.ForwardedIdentity | None
+    # Every claim of the verified forwarded token (a read-only mapping), or
+    # None when the call has none (Rust ``CallContext::token_claims``).
+    token_claims: Any = None
     node_properties: Any = None  # aster.identity.NodeProperties | None
     _cancel: Any = field(default=None, init=False, repr=False, compare=False)
 

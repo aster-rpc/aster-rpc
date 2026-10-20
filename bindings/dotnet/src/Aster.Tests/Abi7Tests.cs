@@ -16,7 +16,7 @@ public class Abi7Tests
     [Fact]
     public void Layouts_Constants_And_Exports_Match_The_Header()
     {
-        Assert.Equal(8u, Native.RequiredAbiMinor);
+        Assert.Equal(9u, Native.RequiredAbiMinor);
         Assert.Equal(64, Marshal.SizeOf<DrainReportNative>());
         Assert.Equal(96, Marshal.SizeOf<NetworkConfigNative>());
         Assert.Equal(16, Marshal.SizeOf<MetricsConfigNative>());

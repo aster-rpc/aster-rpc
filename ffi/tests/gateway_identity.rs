@@ -576,6 +576,11 @@ fn forwarded_identity_and_node_config_through_the_c_abi() {
         assert_eq!(entry(forwarded, "amr"), ["webauthn"]);
         assert_eq!(entry(forwarded, "jti").len(), 1);
         assert!(entry(forwarded, "exp")[0].parse::<u64>().unwrap() > now());
+        // ABI 7.9: the verified token's whole claim set, as one JSON object.
+        let claims: Value = serde_json::from_str(entry(forwarded, "claims")[0]).unwrap();
+        assert_eq!(claims["sub"], "alice");
+        assert_eq!(claims["iss"], id(5));
+        assert_eq!(claims["amr"], json!(["webauthn"]));
         assert_eq!(
             entry(alice["attributes"].as_array().unwrap(), "aster.role"),
             ["notes.read"]

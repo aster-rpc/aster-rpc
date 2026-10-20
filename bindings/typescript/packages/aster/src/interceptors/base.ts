@@ -47,6 +47,11 @@ export interface ForwardedIdentity {
   readonly jti: string;
   /** The token's expiry, Unix seconds. */
   readonly expiresAt: number;
+  /**
+   * Every claim of the verified token as one JSON object string; read it
+   * through {@link CallContext.tokenClaims}.
+   */
+  readonly claimsJson?: string;
 }
 
 /**
@@ -118,6 +123,7 @@ export class CallContext {
   /** Server side: reads this node's NodeConfig properties on first access. */
   protected _nodePropertiesLoader?: () => NodeProperties | undefined;
   private _nodeProperties: NodeProperties | undefined;
+  private _tokenClaims: Readonly<Record<string, unknown>> | undefined;
   metadata: Record<string, string>;
   private _attributes: Record<string, string>;
   /** Server side: resolves `attributes` on first access when the call carried none. */
@@ -203,6 +209,30 @@ export class CallContext {
    */
   get actor(): string | undefined {
     return this.onBehalfOf?.actor;
+  }
+
+  /**
+   * Every claim of the verified forwarded token, as signed (a provider
+   * token's custom claims such as `tenant` included), deeply frozen;
+   * `undefined` for a call without a verified forwarded token (Rust
+   * `CallContext::token_claims`). Never take identity from unverified
+   * metadata.
+   */
+  get tokenClaims(): Readonly<Record<string, unknown>> | undefined {
+    const json = this.onBehalfOf?.claimsJson;
+    if (json === undefined) return undefined;
+    if (this._tokenClaims === undefined) {
+      const parsed = JSON.parse(json) as Record<string, unknown>;
+      const freeze = (value: unknown): void => {
+        if (value !== null && typeof value === "object" && !Object.isFrozen(value)) {
+          Object.freeze(value);
+          for (const inner of Object.values(value)) freeze(inner);
+        }
+      };
+      freeze(parsed);
+      this._tokenClaims = parsed;
+    }
+    return this._tokenClaims;
   }
 
   /**

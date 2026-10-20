@@ -32,6 +32,10 @@ type whoReply struct {
 	Issuer    string
 	Tier      int64
 	Name      string
+	// ClaimsSub is the verified token's "sub" claim; HasClaims whether the
+	// call carried a verified forwarded token (CallInfo.TokenClaims).
+	ClaimsSub string
+	HasClaims bool
 }
 
 func (whoReply) AsterWireType() string { return "test.gateway/WhoReply" }
@@ -47,6 +51,10 @@ func who(ctx context.Context) *whoReply {
 	}
 	if info.OnBehalfOf != nil {
 		r.Issuer = info.OnBehalfOf.Issuer
+	}
+	if info.TokenClaims != nil {
+		r.HasClaims = true
+		r.ClaimsSub, _ = info.TokenClaims["sub"].(string)
 	}
 	if tier, ok := info.NodeAttribute("tier"); ok {
 		r.Tier, _ = tier.Int()
@@ -198,7 +206,7 @@ func TestGatewayIdentity_EdgeMintedTokenAndNodeConfig(t *testing.T) {
 	edgeID := enrollPub(5)
 
 	me, err := notesCall(ctx, rc, "whoami")
-	if err != nil || me.Principal != edgeID || me.Actor != "" || me.Amr != "" {
+	if err != nil || me.Principal != edgeID || me.Actor != "" || me.Amr != "" || me.HasClaims {
 		t.Fatalf("edge as itself: %+v %v", me, err)
 	}
 	_, err = notesCall(ctx, rc, "read")
@@ -215,6 +223,9 @@ func TestGatewayIdentity_EdgeMintedTokenAndNodeConfig(t *testing.T) {
 	if alice.Principal != edgeID+"|alice" || alice.Peer != edgeID || alice.Actor != edgeID ||
 		alice.Amr != AMRWebAuthn || alice.Roles != "notes.read" || alice.Issuer != edgeID {
 		t.Fatalf("forwarded: %+v", alice)
+	}
+	if !alice.HasClaims || alice.ClaimsSub != "alice" {
+		t.Fatalf("a verified forwarded token's claims reach the handler: %+v", alice)
 	}
 	pwd, err := edge.MintUserToken("bob", []string{"notes.read"}, []string{AMRPassword}, time.Minute)
 	if err != nil {

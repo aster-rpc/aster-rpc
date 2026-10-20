@@ -1060,6 +1060,14 @@ minutes, as the service would. In the handler:
 | `auth_methods()` | the token's `amr` (`["webauthn"]`); require passkey sign-in by checking it |
 | `attributes()` | `aster.role` = the token's roles only |
 | `on_behalf_of()` | the whole verified identity: issuer, subject, `jti`, expiry |
+| `token_claims()` | every claim of the verified token as a read-only `serde_json::Map` (a provider token's custom claims such as `tenant` included); `None` for a call without a verified forwarded token |
+
+`token_claims()` holds the verified token's claims, as signed, and nothing
+else: a token that fails verification (issuer, signature, audience, lifetime)
+refuses the call, so no handler ever sees its claims. Treat them as read-only.
+Do not read identity from unverified headers or metadata: use `principal()`,
+`attributes()` and `token_claims()`, which come from the token the service
+verified.
 
 The service checks: `iss` is the transport peer (another node's token, or one
 replayed by another gateway, is `UNAUTHENTICATED`), the Ed25519 signature,

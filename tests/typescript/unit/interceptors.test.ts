@@ -22,6 +22,32 @@ function ctx(overrides?: Partial<ConstructorParameters<typeof CallContext>[0]>):
 
 // -- CallContext ---------------------------------------------------------------
 
+describe('CallContext.tokenClaims', () => {
+  const forwarded = (claims: object) => ({
+    principal: 'https://idp|alice',
+    actor: 'gw',
+    issuer: 'https://idp',
+    subject: 'alice',
+    roles: [],
+    authMethods: [],
+    jti: '',
+    expiresAt: 0,
+    claimsJson: JSON.stringify(claims),
+  });
+
+  it('is undefined without a verified forwarded token', () => {
+    expect(ctx().tokenClaims).toBeUndefined();
+  });
+
+  it('exposes every claim of the forwarded token, read-only', () => {
+    const c = ctx({ onBehalfOf: forwarded({ sub: 'alice', tenant: 'acme-synthetic', org: { id: 7 } }) });
+    expect(c.tokenClaims?.tenant).toBe('acme-synthetic');
+    expect(c.tokenClaims?.sub).toBe('alice');
+    expect(Object.isFrozen(c.tokenClaims)).toBe(true);
+    expect(Object.isFrozen(c.tokenClaims?.org)).toBe(true);
+  });
+});
+
 describe('CallContext', () => {
   it('generates a callId by default', () => {
     const c = ctx();

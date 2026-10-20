@@ -50,6 +50,9 @@ struct Who {
     amr: String,
     roles: String,
     jti: String,
+    /// `CallContext::token_claims` as JSON, or `none` for a call without a
+    /// verified forwarded token.
+    claims: String,
 }
 
 fn who(ctx: &CallContext) -> Who {
@@ -62,6 +65,10 @@ fn who(ctx: &CallContext) -> Who {
             .on_behalf_of()
             .map(|identity| identity.jti().to_string())
             .unwrap_or_default(),
+        claims: ctx.token_claims().map_or_else(
+            || "none".to_string(),
+            |claims| serde_json::to_string(claims).unwrap(),
+        ),
     }
 }
 
@@ -333,6 +340,7 @@ fn user_claims(iss: &str) -> serde_json::Value {
         "amr": ["pwd", "mfa"],
         "groups": ["data-readers", "not-mapped"],
         "scope": "openid data:read",
+        "tenant": "acme-synthetic",
     })
 }
 
@@ -482,12 +490,31 @@ async fn provider_tokens_verify_with_published_keys_rotate_and_follow_node_confi
             assert_eq!(alice.amr, "pwd,mfa");
             assert_eq!(alice.roles, "data.read");
             assert_eq!(alice.jti, "provider-jti-1");
+            // Every claim of the verified token reaches the handler: the
+            // custom `tenant`, and the raw `groups` (not only the mapped roles).
+            let seen: serde_json::Value = serde_json::from_str(&alice.claims).unwrap();
+            assert_eq!(
+                seen.as_object().unwrap().len(),
+                user_claims(ISS_A).as_object().unwrap().len(),
+                "no claim is dropped"
+            );
+            assert_eq!(seen["tenant"], "acme-synthetic");
+            assert_eq!(
+                seen["groups"],
+                serde_json::json!(["data-readers", "not-mapped"])
+            );
+            assert_eq!(seen["sub"], "alice");
             assert_eq!(
                 code(data(&edge, &token).admin().await),
                 Some(StatusCode::PermissionDenied),
                 "an unmapped group grants nothing"
             );
         }
+        // A call the edge makes as itself, with no forwarded token, has no
+        // claims: they exist only for a token that passed verification.
+        let plain = PtDataClient::new(edge.rpc()).with_options(options());
+        assert_eq!(plain.whoami().await.unwrap().claims, "none");
+
         let mut admin_claims = user_claims(ISS_A);
         admin_claims["groups"] = serde_json::json!(["data-admins"]);
         let admin_token = a_es.token("a-es", admin_claims);

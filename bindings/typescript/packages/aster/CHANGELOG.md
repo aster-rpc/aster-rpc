@@ -5,6 +5,10 @@ All notable changes to `@aster-rpc/aster` (and its native addon
 
 ## Unreleased
 
+### Added: `CallContext.tokenClaims`
+
+Every claim of the verified forwarded token, as signed (a provider token's custom claims such as `tenant` included), deeply frozen; `undefined` for a call without a verified forwarded token. Native addon: `ForwardedIdentity.claimsJson`.
+
 ### Added: `AsterServer.peerEvents()`
 
 `const { snapshot, events } = await server.peerEvents()` returns the peers

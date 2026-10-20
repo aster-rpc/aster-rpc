@@ -108,6 +108,12 @@ type CallInfo struct {
 	// id, expiry), nil for a call the peer made as itself. Its roles are
 	// Attributes, which Requires checked.
 	OnBehalfOf *ForwardedIdentity
+	// TokenClaims is every claim of the verified forwarded token, as signed
+	// (a provider token's custom claims such as "tenant" included), read-only;
+	// nil for a call without a verified forwarded token (Rust
+	// CallContext::token_claims; ABI 7.9). Numbers decode as float64. Never
+	// take identity from unverified metadata.
+	TokenClaims map[string]any
 	// ConnectionID identifies the peer connection: key per-connection state
 	// on it (ServerOptions.OnConnectionClosed reports its end).
 	ConnectionID uint64
