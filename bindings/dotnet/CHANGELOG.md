@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.1313 - 2026-10-20
+
 ### Added: `ServerCallContext.TokenClaims` (C ABI 7.9)
 
 Every claim of the verified forwarded token, as signed (a provider token's custom claims such as `tenant` included), as a read-only dictionary of `JsonElement` (`ForwardedIdentity.Claims`); null for a call without a verified forwarded token. Against an older native library the dictionary is empty.

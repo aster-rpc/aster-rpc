@@ -5,6 +5,8 @@ the repository; entries under **Unreleased** ship with the next tag.
 
 ## Unreleased
 
+## 0.3.1313 - 2026-10-20
+
 ### Added: `CallContext.token_claims`
 
 Every claim of the verified forwarded token, as signed (a provider token's custom claims such as `tenant` included), as a read-only mapping; `None` for a call without a verified forwarded token. Never take identity from unverified metadata.
