@@ -596,12 +596,76 @@ fn not_leader(runtime: &AttachedStore) -> RpcStatus {
     status
 }
 
+/// How long a leader may spend confirming leadership before the attempt is
+/// refused. Twice the election window: a healthy confirmation is one heartbeat
+/// round trip, so reaching this bound means the quorum is not answering, and
+/// the client's retry and backoff decide what happens next rather than the
+/// client's attempt deadline.
+const LEADERSHIP_CONFIRMATION_BUDGET: std::time::Duration = std::time::Duration::from_millis(
+    2 * crate::coordination::runtime::config::ELECTION_TIMEOUT_MAX_MS,
+);
+
+/// Whether this node already knows it cannot serve a leader-only operation.
+///
+/// `Some(reason)` is an immediate `UNAVAILABLE`; `None` means "ask Raft".
+/// Two cases, both from the metrics snapshot alone:
+///
+/// * **No leader.** A node that is not the leader and does not know one has no
+///   one to redirect to, and nothing it does can make progress. (A follower
+///   that names a leader still redirects, with the hint, in `barrier`.)
+/// * **A leader whose quorum has gone quiet.** `millis_since_quorum_ack` older
+///   than the election window means a majority has not acknowledged this
+///   leader for longer than it takes to elect a replacement. `None` is not
+///   treated as stale: a new leader has not been acked *yet*, and the bounded
+///   confirmation in `barrier` covers it.
+fn known_unservable(
+    metrics: &crate::coordination::runtime::lifecycle::Metrics,
+) -> Option<&'static str> {
+    use openraft::ServerState;
+    match metrics.state {
+        ServerState::Leader => metrics
+            .millis_since_quorum_ack
+            .filter(|ms| *ms > crate::coordination::runtime::config::ELECTION_TIMEOUT_MAX_MS)
+            .map(|_| "the leader cannot currently reach a quorum"),
+        ServerState::Follower if metrics.current_leader.is_some() => None,
+        ServerState::Follower | ServerState::Candidate => {
+            Some("the group has no leader; retry once one is elected")
+        }
+        ServerState::Learner | ServerState::Shutdown => None,
+    }
+}
+
 /// Take the linearizable barrier (stage 2's entry). A refusal is §5.4's
 /// `UNAVAILABLE`: either this node is not the leader (redirect hint) or it
 /// cannot currently prove a quorum.
+///
+/// Never waits out the client's deadline for a quorum that is not there: a
+/// node that knows it has no leader, or whose quorum acknowledgements are
+/// stale, refuses at once, and a leader still confirming after
+/// [`LEADERSHIP_CONFIRMATION_BUDGET`] refuses too. All three answers are the
+/// `UNAVAILABLE` the client already retries with backoff, resending the same
+/// journalled bytes.
 async fn barrier(runtime: &AttachedStore) -> Result<Option<LogId>, RpcStatus> {
     use openraft::error::CheckIsLeaderError;
-    match runtime.raft.ensure_linearizable().await {
+    let snapshot = runtime.raft.metrics().borrow().clone();
+    if let Some(reason) = known_unservable(&snapshot) {
+        return Err(RpcStatus::error(StatusCode::Unavailable, reason));
+    }
+    let confirmed = match tokio::time::timeout(
+        LEADERSHIP_CONFIRMATION_BUDGET,
+        runtime.raft.ensure_linearizable(),
+    )
+    .await
+    {
+        Ok(confirmed) => confirmed,
+        Err(_) => {
+            return Err(RpcStatus::error(
+                StatusCode::Unavailable,
+                "the leader cannot currently reach a quorum",
+            ))
+        }
+    };
+    match confirmed {
         Ok(read_log_id) => Ok(read_log_id.map(|id| LogId::from(&id))),
         Err(err) => match err.api_error() {
             Some(CheckIsLeaderError::ForwardToLeader(_)) => Err(not_leader(runtime)),

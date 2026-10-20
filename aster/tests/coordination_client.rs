@@ -385,6 +385,196 @@ async fn a_client_seeded_with_a_follower_follows_the_hint_to_the_leader() {
     }
 }
 
+/// **A group without a quorum answers `Unavailable` promptly, and the same
+/// journalled mutation commits when the quorum returns.**
+///
+/// With the quorum gone, a drive (eight attempts) used to cost eight attempt
+/// deadlines: the dead leader was a known member, so every attempt, after the
+/// survivor's prompt refusal, dialled it again. A drive now costs at most one
+/// discovery that a peer is silent, then refuses at once. The refused request
+/// stays journalled `Pending`; once the other voters return, `resume` resends
+/// the exact bytes (same operation id) and they commit.
+///
+/// Here the **leader** survives, alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_leader_without_a_quorum_refuses_promptly_and_the_same_request_commits_after() {
+    quorum_loss_scenario("client.noquorum.leader", 0xE5, true).await;
+}
+
+/// The same, with a **follower** surviving: it named the dead leader to the
+/// client, which then dialled the dead node on every attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_follower_without_a_quorum_refuses_promptly_and_the_same_request_commits_after() {
+    quorum_loss_scenario("client.noquorum.follower", 0xE6, false).await;
+}
+
+const ATTEMPT_DEADLINE: Duration = Duration::from_secs(5);
+
+async fn quorum_loss_scenario(domain: &str, seed: u8, survivor_is_leader: bool) {
+    let fixture = GroupFixture::new(domain, seed, 3);
+    let dirs: Vec<tempfile::TempDir> = (0..3)
+        .map(|_| tempfile::tempdir().expect("a directory"))
+        .collect();
+    let mut voters: Vec<Option<AsterServer>> = Vec::new();
+    for (index, dir) in dirs.iter().enumerate() {
+        voters.push(Some(
+            AsterServer::builder()
+                .config(fixture.aster_config(index))
+                .builtin_coordination(fixture.config(dir.path(), index))
+                .start()
+                .await
+                .expect("a voter starts"),
+        ));
+    }
+    let register = |voters: &[Option<AsterServer>]| {
+        let live: Vec<&AsterServer> = voters.iter().flatten().collect();
+        for voter in &live {
+            for peer in &live {
+                if peer.node().addr().node_id != voter.node().addr().node_id {
+                    voter
+                        .node()
+                        .add_node_addr(peer.node().addr())
+                        .expect("register a peer");
+                }
+            }
+        }
+    };
+    register(&voters);
+    for voter in voters.iter().flatten() {
+        within(
+            "readiness",
+            voter.coordination().expect("hosted").wait_ready(),
+        )
+        .await
+        .expect("the group becomes ready");
+    }
+    let leader_id = voters[0]
+        .as_ref()
+        .expect("up")
+        .coordination()
+        .expect("hosted")
+        .current_leader_for_testing()
+        .expect("a ready group leads");
+    let leader_index = (0..3)
+        .find(|i| {
+            aster::coordination::ids::CoordinationNodeId::from_slice(&fixture.node_id(*i))
+                .expect("a node id")
+                == leader_id
+        })
+        .expect("one voter leads");
+
+    let survivor = (0..3)
+        .find(|i| (*i == leader_index) == survivor_is_leader)
+        .expect("a survivor");
+    let secret = [seed ^ 0xFF; 32];
+    let root_id = ed25519_dalek::SigningKey::from_bytes(&secret)
+        .verifying_key()
+        .to_bytes();
+    let node = client_node(secret, &fixture, voters[survivor].as_ref().expect("up")).await;
+    // The leader must be dialable once a hint names it.
+    for voter in voters.iter().flatten() {
+        let _ = node.add_node_addr(voter.node().addr());
+    }
+    let journal_dir = tempfile::tempdir().expect("a directory");
+    let client_node_handle = node.clone();
+    let client = CoordinationClient::builder(node, group(&fixture))
+        .seed_tickets([voter_ticket(&fixture, survivor)])
+        .journal_dir(journal_dir.path())
+        // A short attempt deadline keeps the discovery of a silent peer
+        // cheap; the claim is about how many deadlines a drive spends.
+        .deadlines_for_testing(ATTEMPT_DEADLINE, Duration::from_secs(60))
+        .retry_backoff_for_testing(FAST_BACKOFF)
+        .build()
+        .expect("the client builds");
+
+    // One healthy mutation first, so the client learns the leader's id from
+    // the hint (when the survivor is a follower) exactly as a real client does.
+    let granted = within(
+        "a healthy mutation",
+        client.set_grant(resource(b"healthy"), root_id, RIGHT_READ, 0),
+    )
+    .await
+    .expect("a healthy group commits");
+    within("ack", granted.acknowledge()).await.expect("ack");
+
+    // The quorum goes: every voter but the survivor stops.
+    for (index, slot) in voters.iter_mut().enumerate() {
+        if index != survivor {
+            slot.take().expect("up").shutdown().await;
+        }
+    }
+
+    // The whole drive (eight attempts) must finish well inside one attempt
+    // deadline: a leader that has lost contact refuses within the
+    // confirmation budget (two election windows), and every later attempt
+    // sees the stale acknowledgement and refuses at once.
+    // Finding out that a peer died silently costs one attempt deadline; the
+    // other seven attempts must not each pay another. Without the fix this
+    // drive took about eight deadlines.
+    let bound = 2 * ATTEMPT_DEADLINE;
+    let started = std::time::Instant::now();
+    let doomed = client
+        .set_grant(resource(b"no-quorum"), root_id, RIGHT_READ, 0)
+        .await;
+    let elapsed = started.elapsed();
+    assert!(doomed.is_err(), "no quorum can commit the request");
+    assert!(
+        elapsed < bound,
+        "the drive took {elapsed:?}; a group without a quorum must cost at most one \
+         silent-peer discovery plus prompt refusals ({bound:?})"
+    );
+    let pending = client.journal_entry_for_testing().await;
+
+    // The quorum returns: the stopped voters restart onto their own storage.
+    for (index, slot) in voters.iter_mut().enumerate() {
+        if index != survivor {
+            *slot = Some(
+                AsterServer::builder()
+                    .config(fixture.aster_config(index))
+                    .builtin_coordination(fixture.existing_config(dirs[index].path()))
+                    .start()
+                    .await
+                    .expect("a follower restarts"),
+            );
+        }
+    }
+    register(&voters);
+    // The restarted voters have new addresses; the client's book is stale.
+    for voter in voters.iter().flatten() {
+        let _ = client_node_handle.add_node_addr(voter.node().addr());
+    }
+    for voter in voters.iter().flatten() {
+        within(
+            "readiness after the quorum returns",
+            voter.coordination().expect("hosted").wait_ready(),
+        )
+        .await
+        .expect("the group becomes ready again");
+    }
+
+    // The same journalled request resumes and commits, exactly once.
+    let resolved = within("resume", async {
+        loop {
+            match client.resume().await {
+                Ok(Some(resolved)) => return resolved,
+                Ok(None) => panic!("the doomed request left no pending entry"),
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        client.journal_entry_for_testing().await.2,
+        pending.2,
+        "the resumed request is the journalled bytes, unchanged"
+    );
+    within("ack", resolved.acknowledge()).await.expect("ack");
+
+    for voter in voters.into_iter().flatten() {
+        voter.shutdown().await;
+    }
+}
+
 /// **The §9.2/§9.4 lease surface end to end**: `CoordinationLease` drives the
 /// existing renewal engine through committed commands; a holder that stops
 /// renewing loses its fence at the self-limit *first*, and the leader's

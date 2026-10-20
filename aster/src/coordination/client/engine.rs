@@ -98,6 +98,9 @@ pub(crate) struct Engine {
     pub(crate) attempt_deadline: Duration,
     /// [`STREAM_BASE_DEADLINE`] unless a test shortened it.
     pub(crate) stream_base_deadline: Duration,
+    /// Members whose dial failed or timed out, and when. See
+    /// [`Engine::next_candidate`].
+    unreachable: std::sync::Mutex<std::collections::BTreeMap<[u8; 32], tokio::time::Instant>>,
 }
 
 impl Engine {
@@ -110,6 +113,7 @@ impl Engine {
             backoff_unit: Duration::from_millis(250),
             attempt_deadline: ATTEMPT_DEADLINE,
             stream_base_deadline: STREAM_BASE_DEADLINE,
+            unreachable: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -137,13 +141,56 @@ impl Engine {
         self.members.lock().await.iter().copied().collect()
     }
 
+    /// Whether a dial to `member` failed within the last attempt deadline.
+    fn recently_unreachable(&self, member: &[u8; 32]) -> bool {
+        let map = self.unreachable.lock().expect("the unreachable set");
+        map.get(member)
+            .is_some_and(|at| at.elapsed() < self.attempt_deadline)
+    }
+
+    /// The next member this call has not tried.
+    ///
+    /// A member whose dial failed within the last attempt deadline goes last,
+    /// and is not dialled at all once another member has answered this call.
+    /// Without this, a leader that died is a known member (the hint that named
+    /// it taught the client), so a surviving voter that refuses at once is
+    /// followed by a dial to the dead one that runs to the attempt deadline,
+    /// on every attempt: the refusal was prompt and the answer still took a
+    /// deadline. When *every* untried member is in that state and nobody has
+    /// answered, one is still dialled, so a client whose only seed was briefly
+    /// down is not stranded for a deadline.
+    async fn next_candidate(&self, tried: &BTreeSet<[u8; 32]>, reached: bool) -> Option<[u8; 32]> {
+        let untried: Vec<[u8; 32]> = self
+            .candidates()
+            .await
+            .into_iter()
+            .filter(|m| !tried.contains(m))
+            .collect();
+        untried
+            .iter()
+            .copied()
+            .find(|m| !self.recently_unreachable(m))
+            .or_else(|| (!reached).then(|| untried.first().copied()).flatten())
+    }
+
     async fn connect(&self, member: [u8; 32]) -> Result<RpcConnection, String> {
         let id = NodeId::from_hex(hex::encode(member));
-        match tokio::time::timeout(self.attempt_deadline, self.node.rpc_connect(&id)).await {
-            Ok(Ok(conn)) => Ok(conn),
-            Ok(Err(err)) => Err(format!("dialing {}: {err}", id.as_str())),
-            Err(_) => Err(format!("dialing {}: no answer", id.as_str())),
+        let dialled =
+            match tokio::time::timeout(self.attempt_deadline, self.node.rpc_connect(&id)).await {
+                Ok(Ok(conn)) => Ok(conn),
+                Ok(Err(err)) => Err(format!("dialing {}: {err}", id.as_str())),
+                Err(_) => Err(format!("dialing {}: no answer", id.as_str())),
+            };
+        let mut map = self.unreachable.lock().expect("the unreachable set");
+        match &dialled {
+            Ok(_) => {
+                map.remove(&member);
+            }
+            Err(_) => {
+                map.insert(member, tokio::time::Instant::now());
+            }
         }
+        dialled
     }
 
     /// Route one unary request: dial, follow authenticated redirects up to the
@@ -160,6 +207,8 @@ impl Engine {
         // Start from the connection that last worked, then walk candidates.
         let mut target: Option<[u8; 32]> = self.current.lock().await.as_ref().map(|(id, _)| *id);
         let mut last_ambiguity: Option<String> = None;
+        // Whether any member accepted a connection during this call.
+        let mut reached = false;
 
         loop {
             if hops >= cap {
@@ -176,12 +225,7 @@ impl Engine {
                 Some(member) => member,
                 None => {
                     // The next candidate nobody has tried this call.
-                    match self
-                        .candidates()
-                        .await
-                        .into_iter()
-                        .find(|m| !tried.contains(m))
-                    {
+                    match self.next_candidate(&tried, reached).await {
                         Some(member) => member,
                         None => {
                             return match last_ambiguity {
@@ -195,6 +239,11 @@ impl Engine {
                 }
             };
             tried.insert(member);
+            // A hinted member that just failed a dial is not worth another
+            // deadline once somebody has answered.
+            if reached && self.recently_unreachable(&member) {
+                continue;
+            }
 
             let conn = {
                 let held = self.current.lock().await;
@@ -215,6 +264,7 @@ impl Engine {
                     }
                 },
             };
+            reached = true;
 
             let outcome = tokio::time::timeout(
                 self.attempt_deadline,
@@ -286,6 +336,14 @@ impl Engine {
                 }
                 Err(_) => {
                     *self.current.lock().await = None;
+                    // A connection that goes silent is the same signal as a
+                    // dial that gets no answer: a peer that died without
+                    // closing. Remember it so the next walk doesn't spend
+                    // another deadline finding out.
+                    self.unreachable
+                        .lock()
+                        .expect("the unreachable set")
+                        .insert(member, tokio::time::Instant::now());
                     last_ambiguity = Some(format!(
                         "{method}: no answer in {:?}",
                         self.attempt_deadline
